@@ -154,21 +154,24 @@ Replace the Python mock client with a real native Android application. The app c
 - Implement automatic reconnection logic with exponential backoff.
 
 #### Deliverables
-- Android Studio project: `android/` directory.
-- `android/.../network/SnowWebSocketClient.kt`: OkHttp WebSocket wrapper with reconnection.
-- `android/.../service/SnowForegroundService.kt`: Foreground Service managing connection lifecycle.
-- `android/.../protocol/MessageModels.kt`: Kotlin data classes matching Device Protocol v1 envelopes.
-- `android/.../ui/MainActivity.kt`: User interface.
+- [x] Android Studio project: `android/` directory with Gradle wrapper (Gradle 8.5, AGP 8.2.2, compileSdk 34, minSdk 26).
+- [x] `android/.../network/SnowWebSocketClient.kt`: OkHttp WebSocket wrapper with single lifecycle controller, backoff reconnection, and heartbeats.
+- [x] `android/.../service/SnowForegroundService.kt`: Foreground Service (`connectedDevice`) managing connection lifecycle and persistent notification.
+- [x] `android/.../protocol/`: Kotlin models, serializer enforcing Clean Serialization Invariant, and strict validator matching SNOW Device Protocol v1.
+- [x] `android/.../ui/MainActivity.kt`: User interface with IP/port inputs, connect/disconnect, status indicator, ping test, and activity log.
+- [x] `android/README.md`: Android client documentation, architecture, cleartext security model, and build commands.
 
 #### Dependencies
 - Completion of Sub-Milestone 1.2.
 - Android Studio installed; physical Android phone with Developer Mode and USB debugging enabled.
 
 #### Acceptance Criteria
-- Android app connects to the desktop WebSocket server using manually entered IP:port.
-- Desktop logs show the real phone's IP and connection time.
-- Heartbeats exchange correctly between desktop and phone.
-- Disconnecting Wi-Fi on the phone triggers reconnection attempts with backoff; reconnecting Wi-Fi restores the connection.
+- [x] Android project compiles cleanly, passes JVM unit tests (`.\gradlew.bat testDebugUnitTest`), and successfully produces debug APK (`.\gradlew.bat assembleDebug`).
+- [x] Wire schema parity verified: Kotlin models and serializer enforce the clean serialization invariant (null fields omitted) and validate strictly against SNOW Device Protocol v1.
+- [ ] Physical Android app connects to the desktop WebSocket server using manually entered IP:port (requires physical hardware testing in Sub-Milestone 1.4).
+- [ ] Desktop logs show the real phone's IP and connection time (requires physical hardware testing in Sub-Milestone 1.4).
+- [ ] Heartbeats exchange correctly between desktop and physical phone (requires physical hardware testing in Sub-Milestone 1.4).
+- [ ] Disconnecting Wi-Fi on the physical phone triggers reconnection attempts with backoff; reconnecting Wi-Fi restores the connection (requires physical hardware testing in Sub-Milestone 1.4).
 
 #### Viva Concept Check
 - **Why a Foreground Service?** Android aggressively kills background tasks. A Foreground Service with a visible notification elevates process priority, though it does not guarantee permanent connectivity.

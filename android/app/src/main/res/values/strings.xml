@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SNOW</string>
+    <string name="title_connection">Desktop Core Connection</string>
+    <string name="label_ip">Desktop IP Address</string>
+    <string name="hint_ip">192.168.1.x or 10.0.2.2</string>
+    <string name="label_port">Port</string>
+    <string name="default_port">8765</string>
+    <string name="btn_connect">Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_send_ping">Send Ping</string>
+    <string name="btn_clear_log">Clear</string>
+    <string name="status_label">Status: </string>
+    <string name="title_event_log">Activity Log</string>
+</resources>
