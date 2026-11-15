@@ -114,21 +114,21 @@ The desktop runs a WebSocket server that speaks SNOW Device Protocol v1 — a ve
 - Configure the Windows Firewall rule for the Python 3.13 executable on TCP port 8765.
 
 #### Deliverables
-- `src/snow/protocol/messages.py`: Pydantic models for all protocol message types.
-- `src/snow/network/ws_server.py`: Async WebSocket server with connection handling and command routing.
+- `src/snow/protocol/`: Protocol constants, models, and strict validator (`constants.py`, `models.py`, `validator.py`).
+- `src/snow/network/ws_server.py`: Async WebSocket server with connection handling and bidirectional command routing.
 - `src/snow/network/connection_manager.py`: Tracks connected device state (ID, IP, last heartbeat, online/offline status).
-- `tests/mock_device.py`: Python CLI mock client responding to `GET_BATTERY_STATUS` and `PLAY_RINGTONE` commands.
+- `tests/mock_device.py`: Python CLI mock client supporting ping/pong and generic request/response protocol verification.
 - Windows Firewall rule documentation and verification commands.
 
 #### Dependencies
 - Completion of Sub-Milestone 1.1.
 
 #### Acceptance Criteria
-- Mock client connects over WebSocket to Desktop Core on `ws://<laptop-ip>:8765`.
-- Desktop sends `GET_BATTERY_STATUS`; mock client returns `{"battery_level": 88, "is_charging": true}`.
-- Heartbeats exchange every 15 seconds; killing the mock client triggers "offline" state within 45 seconds.
-- Correlation IDs correctly match requests to responses.
-- Windows Firewall rule is configured and verified.
+- [x] Mock client connects over WebSocket to Desktop Core on `ws://<laptop-ip>:8765` (or `ws://127.0.0.1:8765`).
+- [x] Bidirectional request/response correlation verified via generic protocol test (`send_request()` matches correlated response `id`; physical Android device capabilities remain unverified until later phases).
+- [x] Heartbeats exchange periodically; killing or idling mock client triggers offline reaping after heartbeat timeout.
+- [x] Correlation IDs correctly match requests to responses.
+- [ ] Windows Firewall rule documented (must be manually created in an elevated PowerShell session when needed; physical firewall rule configuration remains unverified).
 
 #### Viva Concept Check
 - **Why WebSockets instead of HTTP polling?** WebSockets provide a persistent, full-duplex TCP channel; the server can push commands to the phone instantly.

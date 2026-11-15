@@ -6,6 +6,8 @@ from typing import List, Optional
 
 from snow.core.config import CoreConfig
 from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
+from snow.network.connection_manager import ConnectionManager
+from snow.network.ws_server import SnowWebSocketServer
 
 logger = logging.getLogger(__name__)
 
@@ -14,10 +16,7 @@ class SnowCoreServer:
     """Headless asynchronous core server for SNOW.
 
     Coordinates the core lifecycle: configuration loading, network interface
-    enumeration, running wait loop, and graceful shutdown.
-    
-    In Milestone 1.1, this establishes the foundational async event-driven architecture
-    without opening network listeners or starting a WebSocket server.
+    enumeration, WebSocket server hosting, and graceful shutdown.
     """
 
     def __init__(self, config: Optional[CoreConfig] = None) -> None:
@@ -25,6 +24,11 @@ class SnowCoreServer:
         self._is_running = False
         self._shutdown_event = asyncio.Event()
         self._detected_interfaces: List[NetworkInterfaceInfo] = []
+        self.connection_manager = ConnectionManager()
+        self.ws_server = SnowWebSocketServer(
+            config=self.config,
+            connection_manager=self.connection_manager,
+        )
 
     @property
     def is_running(self) -> bool:
@@ -37,7 +41,7 @@ class SnowCoreServer:
         return list(self._detected_interfaces)
 
     async def start(self) -> None:
-        """Initialize the server lifecycle and report detected network interfaces.
+        """Initialize the server lifecycle, enumerate interfaces, and start WebSocket listener.
 
         Idempotent: Repeated invocations when the server is already running log a warning
         and return without re-initialization.
@@ -60,7 +64,7 @@ class SnowCoreServer:
             for iface in self._detected_interfaces:
                 status = "ACTIVE" if iface.is_up else "INACTIVE"
                 logger.info(
-                    "  - [%s] %s: %s (future port %d)",
+                    "  - [%s] %s: %s (WebSocket port %d)",
                     status,
                     iface.interface_name,
                     iface.ip_address,
@@ -74,15 +78,13 @@ class SnowCoreServer:
             logger.warning("No usable IPv4 addresses detected.")
             logger.warning("Please connect this laptop to Wi-Fi or an Android mobile hotspot.")
 
-        logger.info(
-            "Core server configured: bind=%s, future_port=%d, shutdown_timeout=%.1fs",
-            self.config.bind_host,
-            self.config.port,
-            self.config.shutdown_timeout,
-        )
+        # Start the WebSocket server
+        await self.ws_server.start()
 
         self._is_running = True
-        logger.info("%s started successfully (async core loop active).", self.config.app_name)
+        actual_port = self.ws_server.bound_port or self.config.port
+        logger.info("%s started successfully (async core loop active, listening on port %d).",
+                    self.config.app_name, actual_port)
 
     async def run(self) -> None:
         """Execute the asynchronous server loop until shutdown is signaled."""
@@ -120,4 +122,8 @@ class SnowCoreServer:
         logger.info("Stopping %s...", self.config.app_name)
         self._is_running = False
         self._shutdown_event.set()
+
+        # Stop WebSocket server and close client connections
+        await self.ws_server.stop()
+
         logger.info("%s stopped cleanly.", self.config.app_name)

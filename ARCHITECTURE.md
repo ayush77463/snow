@@ -133,38 +133,151 @@ SNOW uses two independent communication layers that must never be coupled:
 2. **Defensive Validation**: The Desktop Core acts as a safety barrier. If the phone is disconnected, MCP tool calls fail fast with informative errors rather than hanging.
 3. **Network Efficiency**: The device protocol is optimized for mobile constraints (lightweight JSON, low battery footprint, binary streaming offloaded to HTTP).
 
-### 3.4 SNOW Device Protocol v1 (JSON Specification)
+### 3.4 SNOW Device Protocol v1 (Wire Specification)
 
-All messages over the WebSocket link share a consistent envelope structure:
+All communication over the WebSocket transport link conforms to **SNOW Device Protocol v1**. Messages are serialized as lightweight, UTF-8 JSON objects conforming to a standardized, versioned envelope.
+
+#### 3.4.1 Generalized Envelope Structure
 
 ```json
 {
-  "version": "1.0",
-  "id": "uuid-v4-string",
-  "type": "COMMAND_REQUEST | COMMAND_RESPONSE | EVENT | HEARTBEAT",
-  "action": "ACTION_NAME",
-  "timestamp": 1773484800,
+  "version": 1,
+  "type": "request | response | error | heartbeat | heartbeat_ack",
+  "id": "<uuid-v4-string>",
+  "timestamp": "<iso-8601-utc-string>",
+  "correlation_id": "<uuid-v4-string>",
   "payload": {},
-  "error": null
+  "error": {}
 }
 ```
 
-#### Envelope Field Definitions
-| Field | Description |
-|:---|:---|
-| `version` | Protocol version string (`"1.0"`) for backwards compatibility. |
-| `id` | Unique correlation ID (UUID v4). Responses reuse the same ID to match asynchronous request/response pairs. |
-| `type` | One of: `COMMAND_REQUEST` (action instruction), `COMMAND_RESPONSE` (result or error for a request), `EVENT` (one-way unsolicited notification, e.g., `BATTERY_CRITICAL`), `HEARTBEAT` (periodic keepalive ping/pong). |
-| `action` | Operation identifier (e.g., `GET_BATTERY_STATUS`, `PLAY_RINGTONE`, `LAUNCH_APP`). |
-| `timestamp` | Unix timestamp (seconds) when the message was created. |
-| `payload` | Key-value parameters specific to the action. |
-| `error` | `null` on success, or an object `{"code": "...", "message": "..."}` on failure. |
+> [!NOTE]
+> **Clean Serialization Invariant**: Optional envelope fields (`correlation_id`, `payload`, `error`) are included in the serialized JSON **only when non-null and applicable** to the specific message type. They are never transmitted as `"field": null`.
 
-#### Protocol Responsibilities
-- **Request/Response Correlation**: Every `COMMAND_REQUEST` includes a unique `id`. The recipient must reply with a `COMMAND_RESPONSE` using the same `id` within a configurable timeout (default: 30 seconds).
-- **Heartbeats**: Both endpoints send periodic `HEARTBEAT` messages (default interval: 15 seconds). If no heartbeat is received within 3 intervals (45 seconds), the connection is considered dead and reconnection is attempted.
-- **Error Handling**: Malformed messages receive an error response. Unsupported actions receive `{"code": "UNSUPPORTED_ACTION", "message": "..."}`. Timeout expiry returns a timeout error to the waiting caller.
-- **Connection Lifecycle**: On WebSocket open, the client sends a `HELLO` message with its device ID and protocol version. On close or error, the Connection Manager updates state and logs the event.
+#### 3.4.2 Envelope Field Definitions
+
+| Field | Type | Presence | Description |
+|:---|:---|:---|:---|
+| `version` | `integer` | Required | Protocol version. Must be integer `1` (booleans and strings like `"1.0"` are strictly rejected). |
+| `type` | `string` | Required | Message classification. Must be one of five lowercase tokens: `request`, `response`, `error`, `heartbeat`, `heartbeat_ack`. |
+| `id` | `string` | Required | Unique message identifier. Must be a canonical, RFC 4122-compliant UUIDv4 string. |
+| `timestamp` | `string` | Required | Timestamp of message creation in strict UTC ISO-8601 format (must end in `Z` or `+00:00` with zero offset; naive timestamps are rejected). |
+| `correlation_id` | `string` | Conditional | Unique UUIDv4 identifier linking a message to its originating `request` or `heartbeat` `id`. Required on `response` and `heartbeat_ack`; optional on `error`. |
+| `payload` | `object` | Conditional | Structured JSON dictionary containing action parameters or execution results. Required on `request` and `response`; omitted on `error`, `heartbeat`, and `heartbeat_ack`. |
+| `error` | `object` | Conditional | Structured JSON dictionary with keys `code` (string) and `message` (string). Required on `error`; omitted on all other message types. |
+
+#### 3.4.3 Field Requirements by Message Type
+
+| Message Type | `version` | `type` | `id` | `timestamp` | `correlation_id` | `payload` | `error` |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `request` | Required (`1`) | Required (`"request"`) | Required (UUIDv4) | Required (UTC ISO) | Optional (UUIDv4) | Required (`{"action": "...", "data": {...}}`) | Omitted |
+| `response` | Required (`1`) | Required (`"response"`) | Required (UUIDv4) | Required (UTC ISO) | **Required** (UUIDv4) | Required (`{"status": "...", ...}`) | Omitted |
+| `error` | Required (`1`) | Required (`"error"`) | Required (UUIDv4) | Required (UTC ISO) | Optional (UUIDv4) | Omitted | Required (`{"code": "...", "message": "..."}`) |
+| `heartbeat` | Required (`1`) | Required (`"heartbeat"`) | Required (UUIDv4) | Required (UTC ISO) | Optional (UUIDv4) | Omitted | Omitted |
+| `heartbeat_ack` | Required (`1`) | Required (`"heartbeat_ack"`) | Required (UUIDv4) | Required (UTC ISO) | **Required** (UUIDv4) | Omitted | Omitted |
+
+#### 3.4.4 Standardized Protocol Error Codes
+
+When an incoming frame fails validation or an operation fails, an `error` message is generated with one of the standardized `ErrorCode` tokens:
+
+| Error Code | Trigger Condition |
+|:---|:---|
+| `INVALID_JSON` | Payload syntax error or non-UTF-8 character sequence. |
+| `OVERSIZED_MESSAGE` | Incoming payload size exceeds `max_message_size` (default: 65,536 bytes / 64 KB). |
+| `UNSUPPORTED_VERSION` | Envelope `version` is missing, not an integer, or not equal to `1`. |
+| `INVALID_MESSAGE_TYPE` | Envelope `type` is missing, not a string, or not in the allowed 5 message types. |
+| `INVALID_MESSAGE_ID` | Envelope `id` is missing, empty, not a string, or not a valid UUIDv4. |
+| `INVALID_CORRELATION_ID` | Required `correlation_id` is missing, or present `correlation_id` is not a valid UUIDv4. |
+| `INVALID_PAYLOAD` | Missing required `payload` / `error` object, missing `action` string, or non-object `data`. |
+| `INVALID_TIMESTAMP` | Missing timestamp, malformed ISO string, naive timestamp lacking timezone, or non-zero UTC offset. |
+| `UNSUPPORTED_ACTION` | Requested `action` string is not supported or permitted by the target endpoint. |
+| `HEARTBEAT_TIMEOUT` | Connection terminated due to exceeding client silence threshold (`heartbeat_timeout`, default 45s). |
+| `INTERNAL_ERROR` | Unhandled internal exception encountered while processing message. |
+
+#### 3.4.5 Operational Mechanics and Rules
+
+1. **Bidirectional Request / Response Correlation**:
+   - Every outbound `request` creates a unique UUIDv4 `id` and is tracked in an in-memory asynchronous table (`asyncio.Future` mapping).
+   - The recipient must formulate a `response` (or `error`) setting `correlation_id` to the request's `id`.
+   - The originating node matches incoming responses by `correlation_id` to resolve the pending future.
+   - If no response arrives within the configured timeout (default: 30 seconds), `TimeoutError` is raised and the pending future is discarded.
+2. **Heartbeats and Stale Connection Reaping**:
+   - Connected endpoints periodically exchange keepalive frames (default interval: 15 seconds).
+   - An endpoint sends a `heartbeat` message containing a unique UUIDv4 `id`.
+   - The receiving endpoint updates its monotonic connection activity timestamp (`time.monotonic()`) and immediately replies with a `heartbeat_ack` setting `correlation_id` to the heartbeat's `id`.
+   - A background connection reaper runs periodically. If an endpoint remains silent with no valid messages or heartbeats exceeding `heartbeat_timeout` (default: 45 seconds), the connection is closed with status code `1000 ("Heartbeat timeout")` and unregistered.
+3. **Transport Security Boundary (Phase 1 vs Phase 2)**:
+   - In Phase 1 development, communication runs over local plaintext WebSockets (`ws://`) strictly bounded to loopback/local LAN for connection lifecycle verification.
+   - Cryptographic device pairing, shared secret exchange, mutual authentication, and TLS/WSS encryption are enforced in Phase 2.
+
+#### 3.4.6 Wire Protocol Examples
+
+**1. Command Request (`request`)**:
+```json
+{
+  "version": 1,
+  "type": "request",
+  "id": "3b241101-e2bb-4255-8caf-4136c566a962",
+  "timestamp": "2026-11-15T12:00:00.000000Z",
+  "payload": {
+    "action": "ping",
+    "data": {
+      "sender": "snow-client"
+    }
+  }
+}
+```
+
+**2. Command Response (`response`)**:
+```json
+{
+  "version": 1,
+  "type": "response",
+  "id": "7a353683-9b93-4e4b-9706-e7a9b0c2a71d",
+  "correlation_id": "3b241101-e2bb-4255-8caf-4136c566a962",
+  "timestamp": "2026-11-15T12:00:00.005000Z",
+  "payload": {
+    "status": "success",
+    "action": "pong"
+  }
+}
+```
+
+**3. Error Response (`error`)**:
+```json
+{
+  "version": 1,
+  "type": "error",
+  "id": "c62a8c3e-0012-4a0b-9df2-5ea54367b613",
+  "correlation_id": "3b241101-e2bb-4255-8caf-4136c566a962",
+  "timestamp": "2026-11-15T12:00:00.008000Z",
+  "error": {
+    "code": "UNSUPPORTED_ACTION",
+    "message": "Action 'unauthorized_exec' is not supported."
+  }
+}
+```
+
+**4. Keepalive Heartbeat (`heartbeat`)**:
+```json
+{
+  "version": 1,
+  "type": "heartbeat",
+  "id": "f81d4fae-7dec-41d0-a765-00a0c91e6bf6",
+  "timestamp": "2026-11-15T12:00:15.000000Z"
+}
+```
+
+**5. Heartbeat Acknowledgment (`heartbeat_ack`)**:
+```json
+{
+  "version": 1,
+  "type": "heartbeat_ack",
+  "id": "d9b2d63d-a233-4123-8478-a62174c3e89b",
+  "correlation_id": "f81d4fae-7dec-41d0-a765-00a0c91e6bf6",
+  "timestamp": "2026-11-15T12:00:15.002000Z"
+}
+```
 
 ### 3.5 Sequence of an AI-Initiated Action
 
@@ -254,16 +367,17 @@ SNOW's WebSocket server (TCP port 8765) requires an inbound firewall rule for th
 - Restrict the rule to appropriate network profiles (Private for home Wi-Fi LAN; or Private + Public if using phone hotspot, which Windows may classify as Public).
 - Restrict to local subnet scope where practical.
 
-**Example creation** (PowerShell, run as Administrator):
+**Example creation** (PowerShell, run manually as Administrator only when external inbound testing is needed):
 ```powershell
-# Find the exact Python 3.13 path
-$pythonPath = (py -3.13 -c "import sys; print(sys.executable)")
+# Resolve the exact project virtual environment Python interpreter path
+$pythonPath = (Resolve-Path ".\.venv\Scripts\python.exe").Path
 
-# Create the rule
+# Create the scoped rule (TCP port 8765, local subnet, private profile)
 New-NetFirewallRule -DisplayName "SNOW WebSocket Server" `
     -Direction Inbound -Protocol TCP -LocalPort 8765 `
     -Program $pythonPath -Action Allow `
-    -Profile Private,Public `
+    -Profile Private `
+    -RemoteAddress LocalSubnet `
     -Description "Allow inbound connections to SNOW WebSocket server (development)"
 ```
 

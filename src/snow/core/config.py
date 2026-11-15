@@ -11,7 +11,8 @@ Configuration Error-Handling Policy:
    ValueError is raised immediately at startup so the user can correct it.
 3. Preserved Documented Defaults: When an environment variable is absent or unset,
    the frozen architectural defaults (bind_host='0.0.0.0', port=8765, log_level='INFO',
-   shutdown_timeout=5.0) are preserved.
+   shutdown_timeout=5.0, max_message_size=65536, heartbeat_timeout=45.0,
+   heartbeat_interval=15.0) are preserved.
 """
 
 from dataclasses import dataclass
@@ -28,9 +29,7 @@ VALID_LOG_LEVELS: FrozenSet[str] = frozenset(
 class CoreConfig:
     """Core configuration parameters for SNOW.
 
-    This configuration is centralized and decoupled from core execution logic.
-    Note: Defining bind_host and port here configures future network listeners;
-    it does not open any network sockets in Milestone 1.1.
+    Centralized and decoupled from protocol and networking logic.
     """
 
     app_name: str = "SNOW Desktop Core"
@@ -39,6 +38,9 @@ class CoreConfig:
     port: int = 8765
     log_level: str = "INFO"
     shutdown_timeout: float = 5.0
+    max_message_size: int = 65536
+    heartbeat_timeout: float = 45.0
+    heartbeat_interval: float = 15.0
 
     def __post_init__(self) -> None:
         """Validate configuration invariants upon instantiation."""
@@ -63,6 +65,24 @@ class CoreConfig:
             raise ValueError(
                 f"Log level must be one of {sorted(VALID_LOG_LEVELS)}, got {self.log_level!r}"
             )
+
+        # Validate max message size (integer >= 1024 bytes)
+        if not isinstance(self.max_message_size, int) or isinstance(self.max_message_size, bool):
+            raise ValueError(f"Max message size must be an integer, got {type(self.max_message_size).__name__}")
+        if self.max_message_size < 1024 or self.max_message_size > 10485760:
+            raise ValueError(f"Max message size must be between 1024 and 10485760 bytes, got {self.max_message_size}")
+
+        # Validate heartbeat timeout (> 0.0, finite)
+        if not isinstance(self.heartbeat_timeout, (int, float)) or isinstance(self.heartbeat_timeout, bool):
+            raise ValueError(f"Heartbeat timeout must be numeric, got {type(self.heartbeat_timeout).__name__}")
+        if not math.isfinite(self.heartbeat_timeout) or self.heartbeat_timeout <= 0:
+            raise ValueError(f"Heartbeat timeout must be a finite positive number (> 0), got {self.heartbeat_timeout}")
+
+        # Validate heartbeat interval (> 0.0, finite)
+        if not isinstance(self.heartbeat_interval, (int, float)) or isinstance(self.heartbeat_interval, bool):
+            raise ValueError(f"Heartbeat interval must be numeric, got {type(self.heartbeat_interval).__name__}")
+        if not math.isfinite(self.heartbeat_interval) or self.heartbeat_interval <= 0:
+            raise ValueError(f"Heartbeat interval must be a finite positive number (> 0), got {self.heartbeat_interval}")
 
     @classmethod
     def from_env(cls) -> "CoreConfig":
@@ -126,6 +146,54 @@ class CoreConfig:
         else:
             timeout = 5.0
 
+        # Parse and validate SNOW_MAX_MESSAGE_SIZE
+        raw_max_size = os.getenv("SNOW_MAX_MESSAGE_SIZE")
+        if raw_max_size is not None:
+            try:
+                max_message_size = int(raw_max_size)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_MAX_MESSAGE_SIZE '{raw_max_size}': must be an integer."
+                ) from None
+            if max_message_size < 1024 or max_message_size > 10485760:
+                raise ValueError(
+                    f"Invalid SNOW_MAX_MESSAGE_SIZE '{raw_max_size}': must be between 1024 and 10485760 bytes."
+                )
+        else:
+            max_message_size = 65536
+
+        # Parse and validate SNOW_HEARTBEAT_TIMEOUT
+        raw_hb_timeout = os.getenv("SNOW_HEARTBEAT_TIMEOUT")
+        if raw_hb_timeout is not None:
+            try:
+                hb_timeout = float(raw_hb_timeout)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_HEARTBEAT_TIMEOUT '{raw_hb_timeout}': must be a finite positive number."
+                ) from None
+            if not math.isfinite(hb_timeout) or hb_timeout <= 0:
+                raise ValueError(
+                    f"Invalid SNOW_HEARTBEAT_TIMEOUT '{raw_hb_timeout}': must be a finite positive number (> 0)."
+                )
+        else:
+            heartbeat_timeout = 45.0
+
+        # Parse and validate SNOW_HEARTBEAT_INTERVAL
+        raw_hb_interval = os.getenv("SNOW_HEARTBEAT_INTERVAL")
+        if raw_hb_interval is not None:
+            try:
+                hb_interval = float(raw_hb_interval)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_HEARTBEAT_INTERVAL '{raw_hb_interval}': must be a finite positive number."
+                ) from None
+            if not math.isfinite(hb_interval) or hb_interval <= 0:
+                raise ValueError(
+                    f"Invalid SNOW_HEARTBEAT_INTERVAL '{raw_hb_interval}': must be a finite positive number (> 0)."
+                )
+        else:
+            heartbeat_interval = 15.0
+
         return cls(
             app_name=app_name,
             version="0.1.0",
@@ -133,4 +201,7 @@ class CoreConfig:
             port=port,
             log_level=log_level,
             shutdown_timeout=timeout,
+            max_message_size=max_message_size,
+            heartbeat_timeout=heartbeat_timeout,
+            heartbeat_interval=heartbeat_interval,
         )
