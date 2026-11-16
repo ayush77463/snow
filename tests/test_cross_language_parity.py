@@ -249,6 +249,85 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["response_auth_success.json"] = resp_auth.to_json()
 
+    # --- Phase 3 File Transfer Protocol Fixtures ---
+    # 24. Valid file_transfer_offer request
+    req_offer = SnowMessage.create_request(
+        action="file_transfer_offer",
+        data={
+            "file_name": "photo_glacier.jpg",
+            "file_size": 204800,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "direction": "UPLOAD",
+        },
+    )
+    valid_fixtures["request_file_transfer_offer.json"] = req_offer.to_json()
+
+    # 25. Valid file_transfer_offer response
+    resp_offer = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "file_transfer_offer",
+            "data": {
+                "transfer_id": str(uuid.uuid4()),
+                "transfer_port": 8766,
+                "transfer_url": "/api/v1/transfers/upload/123",
+                "resume_offset": 0,
+                "already_exists": False,
+                "is_conflict": False,
+                "existing_sha256": None,
+            },
+        },
+    )
+    valid_fixtures["response_file_transfer_offer.json"] = resp_offer.to_json()
+
+    # 26. Valid file_list_transfers request
+    req_list = SnowMessage.create_request(action="file_list_transfers")
+    valid_fixtures["request_file_list_transfers.json"] = req_list.to_json()
+
+    # 27. Valid file_list_transfers response
+    resp_list = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "file_list_transfers",
+            "data": {
+                "transfers": [],
+            },
+        },
+    )
+    valid_fixtures["response_file_list_transfers.json"] = resp_list.to_json()
+
+    # 28. Valid file_transfer_status request
+    req_status = SnowMessage.create_request(
+        action="file_transfer_status",
+        data={"transfer_id": str(uuid.uuid4())},
+    )
+    valid_fixtures["request_file_transfer_status.json"] = req_status.to_json()
+
+    # 29. Valid file_transfer_cancel request
+    req_cancel = SnowMessage.create_request(
+        action="file_transfer_cancel",
+        data={"transfer_id": str(uuid.uuid4())},
+    )
+    valid_fixtures["request_file_transfer_cancel.json"] = req_cancel.to_json()
+
+    # 30. Error TRANSFER_NOT_FOUND
+    err_transfer_not_found = SnowMessage.create_error(
+        code=ErrorCode.TRANSFER_NOT_FOUND,
+        message="Requested transfer ID was not found.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_transfer_not_found.json"] = err_transfer_not_found.to_json()
+
+    # 31. Error INTEGRITY_MISMATCH
+    err_integrity = SnowMessage.create_error(
+        code=ErrorCode.INTEGRITY_MISMATCH,
+        message="SHA-256 integrity verification failed.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_integrity_mismatch.json"] = err_integrity.to_json()
+
     # --- Negative / Invalid Fixtures ---
     # 1. Malformed JSON
     invalid_fixtures["invalid_malformed_json.json"] = (

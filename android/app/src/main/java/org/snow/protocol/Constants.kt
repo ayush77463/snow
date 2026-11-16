@@ -41,4 +41,10 @@ object ErrorCode {
     const val UNAUTHORIZED = "UNAUTHORIZED"
     const val INVALID_TOKEN = "INVALID_TOKEN"
     const val DEVICE_NOT_FOUND = "DEVICE_NOT_FOUND"
+
+    // Phase 3 File Transfer Error Codes
+    const val TRANSFER_NOT_FOUND = "TRANSFER_NOT_FOUND"
+    const val INTEGRITY_MISMATCH = "INTEGRITY_MISMATCH"
+    const val FILE_NOT_FOUND = "FILE_NOT_FOUND"
+    const val INVALID_RANGE = "INVALID_RANGE"
 }

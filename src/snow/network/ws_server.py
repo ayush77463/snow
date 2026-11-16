@@ -30,6 +30,8 @@ from snow.security.tls import (
     ensure_tls_certificate,
     print_tls_fingerprint_banner,
 )
+from snow.transfer.manager import TransferDirection, TransferManager, TransferState
+from snow.transfer.storage import TransferStorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,8 @@ class SnowWebSocketServer:
         device_identity: Optional[DeviceIdentity] = None,
         db_manager: Optional[DatabaseManager] = None,
         session_manager: Optional[SessionManager] = None,
+        transfer_manager: Optional[TransferManager] = None,
+        storage_manager: Optional[TransferStorageManager] = None,
     ) -> None:
         self.config = config
         self.connection_manager = connection_manager or ConnectionManager()
@@ -57,6 +61,9 @@ class SnowWebSocketServer:
         self.device_identity = device_identity or load_or_create_device_identity()
         self.db_manager = db_manager or DatabaseManager()
         self.session_manager = session_manager or SessionManager()
+        self.transfer_manager = transfer_manager or TransferManager()
+        self.storage_manager = storage_manager or TransferStorageManager(root_dir=self.config.transfer_root)
+        self.http_transfer_server: Any = None
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -78,6 +85,11 @@ class SnowWebSocketServer:
             sock = self._server.sockets[0]
             return sock.getsockname()[1]
         return None
+
+    @property
+    def ssl_context(self) -> Optional[ssl.SSLContext]:
+        """Return the server SSLContext if TLS is configured."""
+        return self._ssl_context
 
     async def start(self, active_ips: Optional[list[str]] = None) -> None:
         """Start listening for incoming WebSocket connections.
@@ -377,6 +389,7 @@ class SnowWebSocketServer:
             await self._handle_unpair_request(client, message, data)
         else:
             # All other device operations require an authenticated session if auth is required
+            session = None
             if self.config.auth_required:
                 session = self.session_manager.get_session_by_connection(client.connection_id)
                 if session is None:
@@ -394,6 +407,7 @@ class SnowWebSocketServer:
                     return
 
                 self.session_manager.touch_session(session.session_id)
+
             if action == "ping":
                 logger.debug("Handling 'ping' action from client [%s]", client.connection_id)
                 response = SnowMessage.create_response(
@@ -401,6 +415,14 @@ class SnowWebSocketServer:
                     payload={"status": "success", "action": "pong"},
                 )
                 await client.websocket.send(response.to_json())
+            elif action == "file_transfer_offer":
+                await self._handle_file_transfer_offer(client, message, data, session)
+            elif action == "file_list_transfers":
+                await self._handle_file_list_transfers(client, message, data, session)
+            elif action == "file_transfer_status":
+                await self._handle_file_transfer_status(client, message, data, session)
+            elif action == "file_transfer_cancel":
+                await self._handle_file_transfer_cancel(client, message, data, session)
             else:
                 logger.warning("Rejected unsupported action '%s' from client [%s]",
                                action, client.connection_id)
@@ -708,6 +730,192 @@ class SnowWebSocketServer:
             details={"reason": "Desktop unpair_device invoked"},
         )
         return True
+
+    async def _handle_file_transfer_offer(
+        self, client, message: SnowMessage, data: dict[str, Any], session
+    ) -> None:
+        """Handle incoming file transfer offer request over WebSocket."""
+        file_name = data.get("file_name")
+        file_size = data.get("file_size")
+        sha256 = data.get("sha256")
+        dir_str = data.get("direction", "UPLOAD").upper()
+
+        if not file_name or file_size is None or not sha256:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="file_name, file_size, and sha256 are required.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        try:
+            direction = TransferDirection(dir_str)
+        except ValueError:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message=f"Invalid transfer direction: '{dir_str}'.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        device_id = session.device_id if session else data.get("device_id", "anonymous")
+
+        # Check duplicate
+        already_exists, is_conflict, existing_hash = self.storage_manager.check_duplicate(
+            file_name, sha256
+        )
+
+        try:
+            record = self.transfer_manager.create_transfer(
+                device_id=device_id,
+                file_name=file_name,
+                file_size=int(file_size),
+                sha256=sha256,
+                direction=direction,
+            )
+        except Exception as exc:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        # Check existing partial upload
+        resume_offset = 0
+        if direction == TransferDirection.UPLOAD:
+            part_path = self.storage_manager.get_part_path(record.transfer_id)
+            if part_path.exists() and part_path.is_file():
+                resume_offset = part_path.stat().st_size
+
+        bound_port = (
+            self.http_transfer_server.bound_port
+            if self.http_transfer_server
+            else self.config.transfer_port
+        )
+        transfer_path = (
+            f"/api/v1/transfers/{'upload' if direction == TransferDirection.UPLOAD else 'download'}/{record.transfer_id}"
+        )
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "file_transfer_offer",
+                "data": {
+                    "transfer_id": record.transfer_id,
+                    "transfer_port": bound_port,
+                    "transfer_url": transfer_path,
+                    "resume_offset": resume_offset,
+                    "already_exists": already_exists,
+                    "is_conflict": is_conflict,
+                    "existing_sha256": existing_hash,
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_file_list_transfers(
+        self, client, message: SnowMessage, data: dict[str, Any], session
+    ) -> None:
+        """Handle request to list active and completed transfers for the authenticated device."""
+        device_id = session.device_id if session else data.get("device_id", "anonymous")
+        transfers = self.transfer_manager.list_transfers_for_device(device_id)
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "file_list_transfers",
+                "data": {
+                    "transfers": [t.to_dict() for t in transfers],
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_file_transfer_status(
+        self, client, message: SnowMessage, data: dict[str, Any], session
+    ) -> None:
+        """Handle transfer status query."""
+        transfer_id = data.get("transfer_id")
+        if not transfer_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="transfer_id is required.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        device_id = session.device_id if session else data.get("device_id", "anonymous")
+        record = self.transfer_manager.get_transfer_for_device(transfer_id, device_id)
+        if not record:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.TRANSFER_NOT_FOUND,
+                message="Transfer record not found or not owned by device.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        part_path = self.storage_manager.get_part_path(transfer_id)
+        current_offset = (
+            part_path.stat().st_size
+            if part_path.exists() and record.status != TransferState.COMPLETED
+            else record.current_offset
+        )
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "file_transfer_status",
+                "data": {
+                    "transfer_id": record.transfer_id,
+                    "status": record.status.value,
+                    "current_offset": current_offset,
+                    "file_size": record.file_size,
+                    "sha256": record.sha256,
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_file_transfer_cancel(
+        self, client, message: SnowMessage, data: dict[str, Any], session
+    ) -> None:
+        """Handle transfer cancellation."""
+        transfer_id = data.get("transfer_id")
+        if not transfer_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="transfer_id is required.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        device_id = session.device_id if session else data.get("device_id", "anonymous")
+        cancelled = self.transfer_manager.cancel_transfer(transfer_id, device_id)
+        part_path = self.storage_manager.get_part_path(transfer_id)
+        self.storage_manager.delete_part_file(part_path)
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "file_transfer_cancel",
+                "data": {
+                    "transfer_id": transfer_id,
+                    "cancelled": cancelled,
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
 
     async def _stale_connection_reaper(self) -> None:
         """Periodically check for and disconnect inactive clients exceeding the heartbeat timeout."""

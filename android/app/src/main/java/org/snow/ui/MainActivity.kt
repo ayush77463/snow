@@ -6,9 +6,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.OpenableColumns
 import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
@@ -29,9 +31,13 @@ import org.snow.network.AuthState
 import org.snow.network.ConnectionState
 import org.snow.protocol.Constants
 import org.snow.security.DeviceIdentity
+import org.snow.security.EncryptedCertPinStorage
 import org.snow.security.PairingFlow
 import org.snow.security.PairingState
+import org.snow.security.SharedPreferencesTokenStorage
 import org.snow.service.SnowForegroundService
+import org.snow.transfer.FileTransferClient
+import org.snow.transfer.FileTransferClient.TransferResult
 
 class MainActivity : AppCompatActivity() {
 
@@ -40,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private var isBound = false
 
     private lateinit var identity: DeviceIdentity
+    private lateinit var tokenStorage: SharedPreferencesTokenStorage
     private lateinit var pairingFlow: PairingFlow
 
     private var stateJob: Job? = null
@@ -50,6 +57,11 @@ class MainActivity : AppCompatActivity() {
     private enum class ActivityFilter { ALL, CONNECTIONS, DIAGNOSTICS }
     private var currentFilter = ActivityFilter.ALL
     private val activityEvents = mutableListOf<String>()
+
+    private val filePickerLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            uri?.let { onFileSelectedForUpload(it) }
+        }
 
     private val requestNotificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
@@ -88,7 +100,7 @@ class MainActivity : AppCompatActivity() {
 
         checkNotificationPermission()
         identity = DeviceIdentity.getOrCreate(this)
-        val tokenStorage = org.snow.security.SharedPreferencesTokenStorage(this)
+        tokenStorage = SharedPreferencesTokenStorage(this)
         pairingFlow = PairingFlow(identity, tokenStorage)
 
         setupListeners()
@@ -208,7 +220,7 @@ class MainActivity : AppCompatActivity() {
             val startMs = System.currentTimeMillis()
             binding.tvPingLatency.text = "Pinging..."
 
-            client.sendRequest("ping") { response ->
+            client.sendRequest("ping") { _ ->
                 val rtt = System.currentTimeMillis() - startMs
                 runOnUiThread {
                     binding.tvPingLatency.text = "${rtt}ms RTT"
@@ -220,6 +232,19 @@ class MainActivity : AppCompatActivity() {
         binding.btnClearLog.setOnClickListener {
             activityEvents.clear()
             renderActivityTimeline()
+        }
+
+        binding.btnFileDrop.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Connect to desktop before sending files", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (pairingFlow.state.value !is PairingState.Paired) {
+                Toast.makeText(this, "Device must be paired to transfer files", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            filePickerLauncher.launch("*/*")
         }
 
         binding.btnPair.setOnClickListener {
@@ -247,6 +272,15 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (submitted) {
                     appendLog("Submitting PIN $pin for verification...")
+                } else {
+                    val currState = pairingFlow.state.value
+                    if (currState is PairingState.InProgress) {
+                        appendLog("Verification already in progress. Please wait...")
+                    } else if (!pairingFlow.validatePin(pin)) {
+                        appendLog("PIN must be 6 decimal digits.")
+                    } else {
+                        appendLog("Could not submit PIN at this time.")
+                    }
                 }
             }
         }
@@ -308,6 +342,82 @@ class MainActivity : AppCompatActivity() {
     private fun dismissKeyboard() {
         val windowInsetsController = WindowCompat.getInsetsController(window, binding.root)
         windowInsetsController.hide(WindowInsetsCompat.Type.ime())
+    }
+
+    private fun onFileSelectedForUpload(uri: Uri) {
+        var fileName = "file_${System.currentTimeMillis()}"
+        var fileSize = 0L
+
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (cursor.moveToFirst()) {
+                if (nameIdx != -1) fileName = cursor.getString(nameIdx)
+                if (sizeIdx != -1) fileSize = cursor.getLong(sizeIdx)
+            }
+        }
+
+        val host = binding.editHost.text?.toString()?.trim() ?: "127.0.0.1"
+        appendLog("Preparing file drop: $fileName (${fileSize / 1024} KB)...")
+
+        binding.cardTransferProgress.visibility = View.VISIBLE
+        binding.txtTransferFileName.text = fileName
+        binding.progressTransfer.progress = 0
+        binding.txtTransferPercent.text = "0%"
+        binding.txtTransferDetails.text = "Starting upload..."
+
+        lifecycleScope.launch {
+            val transferClient = FileTransferClient(
+                context = applicationContext,
+                deviceId = identity.deviceId,
+                certPinStorage = EncryptedCertPinStorage(this@MainActivity),
+                tokenStorage = tokenStorage,
+                useTls = true,
+            )
+
+            val result = transferClient.uploadUri(
+                serverHost = host,
+                transferPort = 8766,
+                uri = uri,
+                fileName = fileName,
+                fileSize = fileSize,
+                onProgress = { progress ->
+                    runOnUiThread {
+                        binding.progressTransfer.progress = progress.percent
+                        binding.txtTransferPercent.text = "${progress.percent}%"
+                        binding.txtTransferDetails.text =
+                            "${progress.bytesTransferred / 1024} KB / ${progress.totalBytes / 1024} KB"
+                    }
+                }
+            )
+
+            when (result) {
+                is TransferResult.Success -> {
+                    appendLog("File drop complete: $fileName (Verified SHA-256: ${result.sha256.take(16)}...)")
+                    Toast.makeText(this@MainActivity, "File Transfer Complete!", Toast.LENGTH_SHORT).show()
+                    binding.txtTransferDetails.text = "Transfer Verified and Completed"
+                    binding.root.postDelayed({
+                        binding.cardTransferProgress.visibility = View.GONE
+                    }, 2500)
+                }
+                is TransferResult.Duplicate -> {
+                    appendLog("File $fileName already exists on desktop (SHA-256 match, duplicate skipped)")
+                    Toast.makeText(this@MainActivity, "Duplicate: File already on desktop", Toast.LENGTH_SHORT).show()
+                    binding.txtTransferDetails.text = "Already present on server (duplicate)"
+                    binding.root.postDelayed({
+                        binding.cardTransferProgress.visibility = View.GONE
+                    }, 2000)
+                }
+                is TransferResult.Error -> {
+                    appendLog("File drop failed: ${result.message}")
+                    Toast.makeText(this@MainActivity, "Transfer Failed: ${result.message}", Toast.LENGTH_LONG).show()
+                    binding.txtTransferDetails.text = "Failed: ${result.message}"
+                    binding.root.postDelayed({
+                        binding.cardTransferProgress.visibility = View.GONE
+                    }, 3000)
+                }
+            }
+        }
     }
 
     private fun observeService() {
@@ -421,6 +531,7 @@ class MainActivity : AppCompatActivity() {
                 binding.btnPair.isEnabled = false
                 binding.btnRequestPin.isEnabled = false
 
+                pairingFlow.resetSubmitting()
                 pairingFlow.reset()
                 updatePairingUi(pairingFlow.state.value)
             }
@@ -469,6 +580,8 @@ class MainActivity : AppCompatActivity() {
                 binding.editPin.isEnabled = false
                 binding.btnPair.isEnabled = false
                 binding.btnRequestPin.isEnabled = false
+
+                pairingFlow.resetSubmitting()
             }
         }
     }
@@ -552,6 +665,7 @@ class MainActivity : AppCompatActivity() {
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
                 binding.tvPairingStatus.text = "Connection lost during pairing."
                 binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.editPin.isEnabled = false
                 binding.btnPair.isEnabled = false
                 binding.btnRequestPin.isEnabled = false
             }
@@ -562,6 +676,7 @@ class MainActivity : AppCompatActivity() {
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
                 binding.tvPairingStatus.text = "Error: ${state.message}"
                 binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.editPin.isEnabled = isConnected
                 binding.btnPair.isEnabled = isConnected
                 binding.btnRequestPin.isEnabled = isConnected
                 appendLog("Pairing error: ${state.message}")

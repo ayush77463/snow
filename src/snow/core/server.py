@@ -8,6 +8,9 @@ from snow.core.config import CoreConfig
 from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
 from snow.network.connection_manager import ConnectionManager
 from snow.network.ws_server import SnowWebSocketServer
+from snow.transfer.http_server import SnowHttpTransferServer
+from snow.transfer.manager import TransferManager
+from snow.transfer.storage import TransferStorageManager
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +28,15 @@ class SnowCoreServer:
         self._shutdown_event = asyncio.Event()
         self._detected_interfaces: List[NetworkInterfaceInfo] = []
         self.connection_manager = ConnectionManager()
+        self.transfer_manager = TransferManager()
+        self.storage_manager = TransferStorageManager(root_dir=self.config.transfer_root)
         self.ws_server = SnowWebSocketServer(
             config=self.config,
             connection_manager=self.connection_manager,
+            transfer_manager=self.transfer_manager,
+            storage_manager=self.storage_manager,
         )
+        self.http_transfer_server: Optional[SnowHttpTransferServer] = None
 
     @property
     def is_running(self) -> bool:
@@ -102,10 +110,26 @@ class SnowCoreServer:
         active_ips = [iface.ip_address for iface in self._detected_interfaces if iface.is_up]
         await self.ws_server.start(active_ips=active_ips)
 
+        # Start the HTTP/HTTPS file transfer server reusing WSS ssl_context
+        self.http_transfer_server = SnowHttpTransferServer(
+            config=self.config,
+            db_manager=self.db_manager,
+            transfer_manager=self.transfer_manager,
+            storage_manager=self.storage_manager,
+            ssl_context=self.ws_server.ssl_context,
+        )
+        self.ws_server.http_transfer_server = self.http_transfer_server
+        await self.http_transfer_server.start()
+
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port
-        logger.info("%s started successfully (async core loop active, listening on port %d).",
-                    self.config.app_name, actual_port)
+        actual_http_port = self.http_transfer_server.bound_port or self.config.transfer_port
+        logger.info(
+            "%s started successfully (listening on WSS port %d, HTTP transfer port %d).",
+            self.config.app_name,
+            actual_port,
+            actual_http_port,
+        )
 
     async def run(self) -> None:
         """Execute the asynchronous server loop until shutdown is signaled."""
@@ -143,6 +167,11 @@ class SnowCoreServer:
         logger.info("Stopping %s...", self.config.app_name)
         self._is_running = False
         self._shutdown_event.set()
+
+        # Stop HTTP transfer server
+        if self.http_transfer_server:
+            await self.http_transfer_server.stop()
+            self.http_transfer_server = None
 
         # Stop WebSocket server and close client connections
         await self.ws_server.stop()

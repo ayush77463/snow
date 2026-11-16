@@ -339,7 +339,12 @@ class TestSubprocessLifecycleAndStdoutIsolation(unittest.TestCase):
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
-        sub_env = {**os.environ, "SNOW_PORT": str(_get_free_port()), "SNOW_TLS_ENABLED": "false"}
+        sub_env = {
+            **os.environ,
+            "SNOW_PORT": str(_get_free_port()),
+            "SNOW_TRANSFER_PORT": str(_get_free_port()),
+            "SNOW_TLS_ENABLED": "false",
+        }
         proc = subprocess.Popen(
             [python_exe, "-m", "snow.main"],
             stdout=subprocess.PIPE,

@@ -58,6 +58,7 @@ class PairingFlow(
     val state: StateFlow<PairingState> = _state.asStateFlow()
 
     private val isSubmitting = AtomicBoolean(false)
+    private var lastSubmitTimeMs: Long = 0L
 
     /**
      * Validate whether a string is a valid 6-digit decimal PIN.
@@ -104,10 +105,17 @@ class PairingFlow(
             return false
         }
 
-        // Prevent duplicate concurrent submissions
-        if (!isSubmitting.compareAndSet(false, true)) {
-            return false
+        // Prevent duplicate concurrent submissions, with 5s timeout reset for stalled requests
+        val now = System.currentTimeMillis()
+        if (isSubmitting.get()) {
+            if (now - lastSubmitTimeMs > 5000L) {
+                isSubmitting.set(false)
+            } else {
+                return false
+            }
         }
+        isSubmitting.set(true)
+        lastSubmitTimeMs = now
 
         _state.value = PairingState.InProgress
         onStateChanged?.invoke(PairingState.InProgress)
@@ -130,6 +138,13 @@ class PairingFlow(
         }
 
         return true
+    }
+
+    /**
+     * Explicitly reset in-flight submission lock.
+     */
+    fun resetSubmitting() {
+        isSubmitting.set(false)
     }
 
     /**

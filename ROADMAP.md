@@ -379,9 +379,9 @@ File transfer uses authenticated HTTP streaming — large binary payloads are de
 - Completion of Phase 2 (authenticated communication established).
 
 #### Acceptance Criteria
-- A test file transfers successfully from desktop to phone's `Downloads/SNOW` directory.
-- A test file transfers from phone to a configured desktop directory.
-- Unauthenticated HTTP requests are rejected.
+- [x] A test file transfers successfully from desktop to phone's `Downloads/SNOW` directory.
+- [x] A test file transfers from phone to a configured desktop directory (`~/.snow/transfers/`).
+- [x] Unauthenticated HTTP requests are rejected (401 Unauthorized).
 
 #### Viva Concept Check
 - **Why HTTP streaming instead of WebSocket Base64?** Base64 encoding increases payload size by ~33% and large frames can block the real-time control channel. HTTP streaming handles large files efficiently with chunked transfer encoding.
@@ -403,8 +403,8 @@ File transfer uses authenticated HTTP streaming — large binary payloads are de
 - Completion of Sub-Milestone 3.1.
 
 #### Acceptance Criteria
-- Transferred files have matching SHA-256 hashes on source and destination.
-- Deliberately corrupting a transferred file (by modifying bytes in transit) triggers a verification failure.
+- [x] Transferred files have matching SHA-256 hashes on source and destination.
+- [x] Deliberately corrupting a transferred file (by modifying bytes in transit) triggers a verification failure (422 Unprocessable Entity).
 
 #### Viva Concept Check
 - **What is SHA-256?** A cryptographic hash function producing a 256-bit digest. Any change to the input produces a completely different hash, enabling integrity verification.
@@ -427,8 +427,8 @@ File transfer uses authenticated HTTP streaming — large binary payloads are de
 - Completion of Sub-Milestone 3.2.
 
 #### Acceptance Criteria
-- Killing the connection mid-transfer does not leave orphaned partial files.
-- Transfer timeout produces a clear error message.
+- [x] Killing the connection mid-transfer or cancelling does not leave orphaned partial files.
+- [x] Transfer timeout or error produces a clear error message.
 
 #### Viva Concept Check
 - **Why clean up partial files?** Incomplete files can confuse users and waste storage. A robust transfer system ensures either a complete verified file or a clean failure.
@@ -449,8 +449,8 @@ File transfer uses authenticated HTTP streaming — large binary payloads are de
 - Completion of Sub-Milestone 3.3.
 
 #### Acceptance Criteria
-- Interrupting and resuming a large file transfer completes successfully with correct SHA-256.
-- Attempting to transfer an already-present identical file (same hash) skips the transfer and reports "already exists."
+- [x] Interrupting and resuming a large file transfer completes successfully with correct SHA-256.
+- [x] Attempting to transfer an already-present identical file (same hash) skips the transfer and reports "already exists."
 
 #### Viva Concept Check
 - **How do HTTP Range headers enable resume?** The client requests bytes starting from where the previous transfer stopped (`Range: bytes=<offset>-`). The server responds with the remaining content.

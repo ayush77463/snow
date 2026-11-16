@@ -66,6 +66,10 @@ class SnowWebSocketClient(
     var onUnconfirmedFingerprint: ((String) -> Unit)? = null,
     var onCertificateMismatch: ((String, String) -> Unit)? = null
 ) {
+    companion object {
+        private const val TAG = "SnowWebSocketClient"
+    }
+
     private var webSocket: WebSocket? = null
     private var reconnectJob: Job? = null
     private var heartbeatJob: Job? = null
@@ -161,7 +165,22 @@ class SnowWebSocketClient(
         return builder.build()
     }
 
+    @Synchronized
     private fun initiateConnection() {
+        if (userInitiatedDisconnect.get()) return
+        if (_connectionState.value == ConnectionState.CONNECTED && webSocket != null) {
+            log("Already connected to desktop core. Skipping redundant initiateConnection().")
+            return
+        }
+
+        // Clean up previous socket instance before opening a new one to prevent connection leaks
+        try {
+            webSocket?.close(1000, "Opening new connection")
+        } catch (_: Exception) {
+            webSocket?.cancel()
+        }
+        webSocket = null
+
         val scheme = if (useTls) "wss" else "ws"
         val wsUrl = "$scheme://$targetHost:$targetPort"
         log("Connecting to $wsUrl ...")
@@ -174,6 +193,23 @@ class SnowWebSocketClient(
 
         val client = buildOkHttpClient()
         webSocket = client.newWebSocket(request, SnowListener())
+    }
+
+    private fun failPendingRequests(errorMessage: String) {
+        if (pendingRequests.isEmpty()) return
+        val errResponse = SnowMessage.createError(
+            code = ErrorCode.INTERNAL_ERROR,
+            message = errorMessage
+        )
+        val callbacks = pendingRequests.values.toList()
+        pendingRequests.clear()
+        for (cb in callbacks) {
+            try {
+                cb.invoke(errResponse)
+            } catch (e: Exception) {
+                SafeLog.e(TAG, "Error notifying pending request callback: ${e.message}", e)
+            }
+        }
     }
 
     /**
@@ -201,7 +237,7 @@ class SnowWebSocketClient(
             webSocket?.cancel()
         }
         webSocket = null
-        pendingRequests.clear()
+        failPendingRequests("Client disconnected.")
         pendingHeartbeatId = null
     }
 
@@ -216,6 +252,12 @@ class SnowWebSocketClient(
         val currentWs = webSocket
         if (_connectionState.value != ConnectionState.CONNECTED || currentWs == null) {
             log("Cannot send request: Not connected.")
+            onResponse?.invoke(
+                SnowMessage.createError(
+                    code = ErrorCode.INTERNAL_ERROR,
+                    message = "Cannot send request: Client is not connected to desktop."
+                )
+            )
             return
         }
 
@@ -231,6 +273,12 @@ class SnowWebSocketClient(
         } else {
             log("Failed to send request id=${requestMessage.id}")
             pendingRequests.remove(requestMessage.id)
+            onResponse?.invoke(
+                SnowMessage.createError(
+                    code = ErrorCode.INTERNAL_ERROR,
+                    message = "Failed to send WebSocket frame to desktop."
+                )
+            )
         }
     }
 
@@ -326,9 +374,15 @@ class SnowWebSocketClient(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (this@SnowWebSocketClient.webSocket !== webSocket) {
+                log("Ignoring onClosed from stale socket (code=$code).")
+                return
+            }
             log("Connection closed: $code - $reason")
             heartbeatJob?.cancel()
             _authState.value = AuthState.Disconnected
+            failPendingRequests("Connection closed ($code: $reason)")
+            this@SnowWebSocketClient.webSocket = null
             if (!userInitiatedDisconnect.get()) {
                 scheduleReconnection()
             } else {
@@ -337,7 +391,13 @@ class SnowWebSocketClient(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (this@SnowWebSocketClient.webSocket !== webSocket) {
+                log("Ignoring onFailure from stale socket: ${t.message}")
+                return
+            }
             heartbeatJob?.cancel()
+            failPendingRequests("Connection failed: ${t.message}")
+            this@SnowWebSocketClient.webSocket = null
 
             // 1. Check for specific TLS certificate verification exceptions in cause chain
             var certException: Throwable? = t
@@ -431,7 +491,19 @@ class SnowWebSocketClient(
             }
         } else {
             _authState.value = AuthState.ConnectedUnauthenticated
-            log("Connected over WSS. Device is not paired; ready for PIN pairing flow.")
+            log("Connected over WSS. Device is not paired; initializing pairing on desktop...")
+            if (!devId.isNullOrBlank()) {
+                // Immunize connection from handshake timeout and generate fresh PIN banner on desktop
+                sendRequest(
+                    action = "pair_request",
+                    data = mapOf(
+                        "device_id" to devId,
+                        "device_name" to (identity?.deviceName ?: "Android-Device")
+                    )
+                ) { response ->
+                    log("Desktop core pairing initialized (status=${response.payload?.get("status")})")
+                }
+            }
         }
     }
 

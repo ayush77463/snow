@@ -42,8 +42,10 @@ class CoreConfig:
     heartbeat_timeout: float = 45.0
     heartbeat_interval: float = 15.0
     tls_enabled: bool = True
-    auth_timeout: float = 5.0
+    auth_timeout: float = 30.0
     auth_required: bool = True
+    transfer_port: int = 8766
+    transfer_root: str | None = None
     tls_cert_path: str | None = None
     tls_key_path: str | None = None
 
@@ -102,6 +104,19 @@ class CoreConfig:
         # Validate auth_required (boolean)
         if not isinstance(self.auth_required, bool):
             raise ValueError(f"auth_required must be a boolean, got {type(self.auth_required).__name__}")
+
+        # Validate transfer port range (0 - 65535, 0 permitted for ephemeral test ports)
+        if not isinstance(self.transfer_port, int) or isinstance(self.transfer_port, bool):
+            raise ValueError(
+                f"transfer_port must be an integer, got {type(self.transfer_port).__name__}: {self.transfer_port!r}"
+            )
+        if not (0 <= self.transfer_port <= 65535):
+            raise ValueError(f"transfer_port must be in range 0-65535, got {self.transfer_port}")
+
+        # Validate transfer root path if provided
+        if self.transfer_root is not None:
+            if not isinstance(self.transfer_root, str) or not self.transfer_root.strip():
+                raise ValueError("transfer_root must be a non-empty string or None")
 
         # Validate TLS cert/key paths if provided
         if self.tls_cert_path is not None:
@@ -250,7 +265,7 @@ class CoreConfig:
                     f"Invalid SNOW_AUTH_TIMEOUT '{raw_auth_timeout}': must be a finite positive number (> 0)."
                 )
         else:
-            auth_timeout = 5.0
+            auth_timeout = 30.0
 
         # Parse and validate SNOW_AUTH_REQUIRED
         raw_auth_required = os.getenv("SNOW_AUTH_REQUIRED")
@@ -266,6 +281,26 @@ class CoreConfig:
                 )
         else:
             auth_required = True
+
+        # Parse and validate SNOW_TRANSFER_PORT
+        raw_xfer_port = os.getenv("SNOW_TRANSFER_PORT")
+        if raw_xfer_port is not None:
+            try:
+                transfer_port = int(raw_xfer_port)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_TRANSFER_PORT '{raw_xfer_port}': must be an integer."
+                ) from None
+            if not (0 <= transfer_port <= 65535):
+                raise ValueError(
+                    f"Invalid SNOW_TRANSFER_PORT '{raw_xfer_port}': must be between 0 and 65535."
+                )
+        else:
+            transfer_port = 8766
+
+        # Parse SNOW_TRANSFER_ROOT
+        raw_xfer_root = os.getenv("SNOW_TRANSFER_ROOT")
+        transfer_root = raw_xfer_root.strip() if raw_xfer_root and raw_xfer_root.strip() else None
 
         # Parse SNOW_TLS_CERT_PATH and SNOW_TLS_KEY_PATH
         raw_cert_path = os.getenv("SNOW_TLS_CERT_PATH")
@@ -287,6 +322,8 @@ class CoreConfig:
             tls_enabled=tls_enabled,
             auth_timeout=auth_timeout,
             auth_required=auth_required,
+            transfer_port=transfer_port,
+            transfer_root=transfer_root,
             tls_cert_path=tls_cert_path,
             tls_key_path=tls_key_path,
         )
