@@ -150,6 +150,9 @@ class TransferManager:
         logger.warning("Transfer [%s] marked as FAILED: %s", transfer_id, error_message)
         return True
 
+    complete_transfer = mark_completed
+    fail_transfer = mark_failed
+
     def cancel_transfer(self, transfer_id: str, device_id: str) -> bool:
         """Cancel an in-flight transfer, enforcing device ownership."""
         record = self.get_transfer_for_device(transfer_id, device_id)

@@ -541,7 +541,7 @@ class MainActivity : AppCompatActivity() {
                 binding.tvStatusPill.setBackgroundResource(R.drawable.bg_pill_status)
                 binding.tvStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connecting_dark))
 
-                binding.btnConnect.isEnabled = false
+                binding.btnConnect.isEnabled = true
                 binding.btnDisconnect.isEnabled = true
                 binding.btnPing.alpha = 0.5f
                 binding.editPin.isEnabled = false
@@ -574,7 +574,7 @@ class MainActivity : AppCompatActivity() {
                 binding.tvStatusPill.setBackgroundResource(R.drawable.bg_pill_status)
                 binding.tvStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_reconnecting))
 
-                binding.btnConnect.isEnabled = false
+                binding.btnConnect.isEnabled = true
                 binding.btnDisconnect.isEnabled = true
                 binding.btnPing.alpha = 0.5f
                 binding.editPin.isEnabled = false

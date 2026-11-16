@@ -328,6 +328,164 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["error_integrity_mismatch.json"] = err_integrity.to_json()
 
+    # --- Phase 6 Android Capability Protocol Fixtures ---
+    # 32. Valid battery_status request
+    req_battery = SnowMessage.create_request(
+        action="battery_status",
+        data={},
+    )
+    valid_fixtures["request_battery_status.json"] = req_battery.to_json()
+
+    # 33. Valid battery_status response
+    resp_battery = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "battery_status",
+            "level": 92,
+            "charging": True,
+            "power_source": "AC",
+            "health": "GOOD",
+            "temperature_celsius": 29.5,
+            "device_model": "RMX5110",
+            "manufacturer": "realme",
+            "android_version": "17",
+            "sdk_int": 34,
+        },
+    )
+    valid_fixtures["response_battery_status.json"] = resp_battery.to_json()
+
+    # 34. Valid ring_phone request
+    req_ring = SnowMessage.create_request(
+        action="ring_phone",
+        data={"duration_seconds": 5},
+    )
+    valid_fixtures["request_ring_phone.json"] = req_ring.to_json()
+
+    # 35. Valid ring_phone response
+    resp_ring = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "ring_phone",
+            "duration_seconds": 5,
+            "message": "Audible alert initiated on Android device for 5 seconds.",
+        },
+    )
+    valid_fixtures["response_ring_phone.json"] = resp_ring.to_json()
+
+    # 36. Valid clipboard_push request
+    req_clip = SnowMessage.create_request(
+        action="clipboard_push",
+        data={"text": "Hello SNOW cross-device clipboard"},
+    )
+    valid_fixtures["request_clipboard_push.json"] = req_clip.to_json()
+
+    # 37. Valid clipboard_push response
+    resp_clip = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "clipboard_push",
+            "bytes_written": 34,
+            "message": "Text successfully copied to Android clipboard.",
+        },
+    )
+    valid_fixtures["response_clipboard_push.json"] = resp_clip.to_json()
+
+    # 38. Valid list_apps request
+    req_list_apps = SnowMessage.create_request(
+        action="list_apps",
+        data={"limit": 50},
+    )
+    valid_fixtures["request_list_apps.json"] = req_list_apps.to_json()
+
+    # 39. Valid list_apps response
+    resp_list_apps = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "list_apps",
+            "count": 2,
+            "apps": [
+                {"package_name": "com.android.settings", "label": "Settings"},
+                {"package_name": "org.snow.app", "label": "SNOW"},
+            ],
+        },
+    )
+    valid_fixtures["response_list_apps.json"] = resp_list_apps.to_json()
+
+    # 40. Valid launch_app request
+    req_launch = SnowMessage.create_request(
+        action="launch_app",
+        data={"package_name": "com.android.settings"},
+    )
+    valid_fixtures["request_launch_app.json"] = req_launch.to_json()
+
+    # 41. Valid launch_app response
+    resp_launch = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "launch_app",
+            "package_name": "com.android.settings",
+            "message": "Successfully launched application 'com.android.settings'.",
+        },
+    )
+    valid_fixtures["response_launch_app.json"] = resp_launch.to_json()
+
+    # 42. Valid file_send_request request
+    req_file_send = SnowMessage.create_request(
+        action="file_send_request",
+        data={
+            "transfer_id": str(uuid.uuid4()),
+            "file_name": "sample_document.pdf",
+            "file_size": 10240,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "transfer_port": 8766,
+        },
+    )
+    valid_fixtures["request_file_send_request.json"] = req_file_send.to_json()
+
+    # 43. Valid file_send_request response
+    resp_file_send = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "file_send_request",
+            "transfer_id": str(uuid.uuid4()),
+            "file_name": "sample_document.pdf",
+            "bytes_downloaded": 10240,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "saved_path": "/storage/emulated/0/Download/SNOW/sample_document.pdf",
+        },
+    )
+    valid_fixtures["response_file_send_request.json"] = resp_file_send.to_json()
+
+    # 44. Valid file_receive_request request
+    req_file_recv = SnowMessage.create_request(
+        action="file_receive_request",
+        data={
+            "file_name": "sample_document.pdf",
+            "transfer_port": 8766,
+        },
+    )
+    valid_fixtures["request_file_receive_request.json"] = req_file_recv.to_json()
+
+    # 45. Valid file_receive_request response
+    resp_file_recv = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "file_receive_request",
+            "transfer_id": str(uuid.uuid4()),
+            "file_name": "sample_document.pdf",
+            "bytes_uploaded": 10240,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        },
+    )
+    valid_fixtures["response_file_receive_request.json"] = resp_file_recv.to_json()
+
     # --- Negative / Invalid Fixtures ---
     # 1. Malformed JSON
     invalid_fixtures["invalid_malformed_json.json"] = (
@@ -612,6 +770,18 @@ def generate_python_fixtures() -> tuple[int, int]:
             "payload": {"status": "success", "action": "auth_request"},
         }),
         ErrorCode.INVALID_CORRELATION_ID,
+    )
+
+    # 27. Phase 6 Request payload data not an object (malformed battery_status payload)
+    invalid_fixtures["invalid_request_battery_data_not_object.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"action": "battery_status", "data": "not_an_object"},
+        }),
+        ErrorCode.INVALID_PAYLOAD,
     )
 
     # Write valid fixtures

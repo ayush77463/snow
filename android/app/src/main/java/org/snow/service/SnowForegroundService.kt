@@ -21,12 +21,14 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import org.snow.R
+import org.snow.capabilities.AndroidCapabilityDispatcher
 import org.snow.network.ConnectionState
 import org.snow.network.SnowWebSocketClient
 import org.snow.protocol.Constants
 import org.snow.security.DeviceIdentity
 import org.snow.security.EncryptedCertPinStorage
 import org.snow.security.SharedPreferencesTokenStorage
+import org.snow.transfer.FileTransferClient
 import org.snow.ui.MainActivity
 
 /**
@@ -49,6 +51,26 @@ class SnowForegroundService : Service() {
         )
     }
 
+    val transferClient: FileTransferClient by lazy {
+        val identity = DeviceIdentity.getOrCreate(applicationContext)
+        val tokenStorage = SharedPreferencesTokenStorage(applicationContext)
+        val certPinStorage = EncryptedCertPinStorage(applicationContext)
+        FileTransferClient(
+            context = applicationContext,
+            deviceId = identity.deviceId,
+            certPinStorage = certPinStorage,
+            tokenStorage = tokenStorage,
+            useTls = true
+        )
+    }
+
+    val capabilityDispatcher: AndroidCapabilityDispatcher by lazy {
+        AndroidCapabilityDispatcher(
+            context = applicationContext,
+            transferClientProvider = { transferClient }
+        )
+    }
+
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -63,6 +85,14 @@ class SnowForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        client.requestDispatcher = { action, data ->
+            capabilityDispatcher.dispatch(
+                action = action,
+                data = data,
+                serverHost = client.currentTargetHost,
+                defaultTransferPort = 8766
+            )
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

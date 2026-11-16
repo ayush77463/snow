@@ -224,7 +224,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         return json.dumps(result.get("data", {}), indent=2)
 
     # =========================================================================
-    # 3. Android Tools (Phase 6 Implementation Deferred)
+    # 3. Android Tools (Phase 6 Live Capabilities via Core IPC)
     # =========================================================================
 
     @server.tool(
@@ -232,95 +232,102 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         description="Query battery level, temperature, and charging status from paired Android phone.",
     )
     async def snow_android_battery(device_id: str = "") -> str:
-        """Query Android phone battery telemetry (Phase 6)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_android_battery",
-            "planned_phase": "Phase 6 (Android Capabilities)",
-            "message": "Android battery status query capability is planned for Phase 6.",
-        }, indent=2)
+        """Query Android phone battery telemetry via Core."""
+        result = await bridge.android_battery(device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed querying Android battery telemetry."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_android_ring",
         description="Trigger an audible alert/ringtone on the paired Android phone to locate it.",
     )
-    async def snow_android_ring(duration_seconds: int = 10, device_id: str = "") -> str:
-        """Trigger audible ringtone on Android phone (Phase 6)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_android_ring",
-            "planned_phase": "Phase 6 (Android Capabilities)",
-            "message": "Find My Phone audible alert capability is planned for Phase 6.",
-        }, indent=2)
+    async def snow_android_ring(duration_seconds: int = 5, device_id: str = "") -> str:
+        """Trigger audible ringtone on Android phone via Core."""
+        result = await bridge.android_ring(duration_seconds=duration_seconds, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed triggering ringtone on Android phone."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_android_clipboard_push",
         description="Push text content to the Android device clipboard.",
     )
     async def snow_android_clipboard_push(text: str, device_id: str = "") -> str:
-        """Push text to Android clipboard (Phase 6)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_android_clipboard_push",
-            "planned_phase": "Phase 6 (Android Capabilities)",
-            "message": "Android clipboard push capability is planned for Phase 6.",
-        }, indent=2)
+        """Push text to Android clipboard via Core."""
+        result = await bridge.android_clipboard_push(text=text, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed pushing text to Android clipboard."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_android_launch_app",
         description="Launch an application on the paired Android device from the approved package whitelist.",
     )
     async def snow_android_launch_app(package_name: str, device_id: str = "") -> str:
-        """Launch an approved application on Android (Phase 6)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_android_launch_app",
-            "planned_phase": "Phase 6 (Android Capabilities)",
-            "message": f"Android application launch for '{package_name}' is planned for Phase 6.",
-        }, indent=2)
+        """Launch an approved application on Android via Core."""
+        result = await bridge.android_launch_app(package_name=package_name, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed launching application '{package_name}' on Android."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_android_list_apps",
         description="List installed applications on the paired Android phone.",
     )
-    async def snow_android_list_apps(device_id: str = "") -> str:
-        """List installed applications on Android (Phase 6)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_android_list_apps",
-            "planned_phase": "Phase 6 (Android Capabilities)",
-            "message": "Android application listing capability is planned for Phase 6.",
-        }, indent=2)
+    async def snow_android_list_apps(limit: int = 50, device_id: str = "") -> str:
+        """List installed applications on Android via Core."""
+        result = await bridge.android_list_apps(limit=limit, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed listing applications on Android phone."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_android_file_send",
         description="Send a file from Windows to the paired Android phone's Downloads/SNOW directory.",
     )
     async def snow_android_file_send(source_path: str, device_id: str = "") -> str:
-        """Send a file to the paired Android device (Phase 6 capability integration)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_android_file_send",
-            "planned_phase": "Phase 6 (Android Capabilities)",
-            "message": "Autonomous AI-driven file push capability is planned for Phase 6 capability integration.",
-        }, indent=2)
+        """Send a file to the paired Android device via Core."""
+        result = await bridge.android_file_send(file_path=source_path, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed sending file '{source_path}' to Android phone."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_android_file_receive",
         description="Request a file from the paired Android phone to the Windows transfer directory.",
     )
     async def snow_android_file_receive(remote_file_name: str, device_id: str = "") -> str:
-        """Request a file from the paired Android device (Phase 6 capability integration)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_android_file_receive",
-            "planned_phase": "Phase 6 (Android Capabilities)",
-            "message": "Autonomous AI-driven file pull capability is planned for Phase 6 capability integration.",
-        }, indent=2)
+        """Request a file from the paired Android device via Core."""
+        result = await bridge.android_file_receive(file_name=remote_file_name, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed receiving file '{remote_file_name}' from Android phone."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)

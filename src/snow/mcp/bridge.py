@@ -254,3 +254,66 @@ class SnowMcpBridge:
             payload={"directory_path": directory_path, "limit": limit},
             timeout=5.0,
         )
+
+    async def _resolve_target_device_id(self) -> Optional[str]:
+        """Helper to resolve the first active connected device ID."""
+        res = await self.list_devices()
+        if res.get("success"):
+            devices = res.get("data", {}).get("devices", [])
+            for dev in devices:
+                if dev.get("is_connected"):
+                    return dev.get("device_id")
+        return None
+
+    async def android_battery(self, device_id: str = "") -> dict[str, Any]:
+        """Query paired Android phone battery telemetry."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(target_id, "battery_status", {})
+
+    async def android_ring(self, duration_seconds: int = 5, device_id: str = "") -> dict[str, Any]:
+        """Trigger audible alert / ringtone on Android phone."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(
+            target_id, "ring_phone", {"duration_seconds": duration_seconds}
+        )
+
+    async def android_clipboard_push(self, text: str, device_id: str = "") -> dict[str, Any]:
+        """Push text to Android clipboard."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(target_id, "clipboard_push", {"text": text})
+
+    async def android_launch_app(self, package_name: str, device_id: str = "") -> dict[str, Any]:
+        """Launch an application on Android phone."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(target_id, "launch_app", {"package_name": package_name})
+
+    async def android_list_apps(self, limit: int = 50, device_id: str = "") -> dict[str, Any]:
+        """List launchable applications on Android phone."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(target_id, "list_apps", {"limit": limit})
+
+    async def android_file_send(self, file_path: str, device_id: str = "") -> dict[str, Any]:
+        """Send a local file from Desktop to Android phone."""
+        return await self.call(
+            "android_file_send",
+            payload={"file_path": file_path, "device_id": device_id},
+            timeout=60.0,
+        )
+
+    async def android_file_receive(self, file_name: str, device_id: str = "") -> dict[str, Any]:
+        """Request and download a file from Android phone to Desktop."""
+        return await self.call(
+            "android_file_receive",
+            payload={"file_name": file_name, "device_id": device_id},
+            timeout=60.0,
+        )

@@ -199,3 +199,9 @@ class SnowCoreServer:
         await self.ws_server.stop()
 
         logger.info("%s stopped cleanly.", self.config.app_name)
+
+
+if __name__ == "__main__":
+    import sys
+    from snow.main import main
+    sys.exit(main())

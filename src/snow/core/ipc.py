@@ -17,18 +17,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import hmac
 import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import shutil
 import subprocess
 import sys
 from typing import Any, Dict, Optional, Set
 import uuid
 
 from snow.core.config import CoreConfig
+from snow.protocol.models import MessageType
 
 logger = logging.getLogger(__name__)
 
@@ -488,6 +491,28 @@ class SnowIpcServer:
                 "error": res.get("error"),
             }, now_authed
 
+        if op == "android_file_send":
+            res = await self._handle_android_file_send(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "android_file_receive":
+            res = await self._handle_android_file_receive(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
         return {
             "version": IPC_PROTOCOL_VERSION,
             "request_id": request_id,
@@ -630,11 +655,20 @@ class SnowIpcServer:
                 payload=data,
                 timeout=timeout,
             )
+            is_ok = response.type == MessageType.RESPONSE and (
+                response.payload is None or response.payload.get("status") != "error"
+            )
+            err_msg = None
+            if response.error:
+                err_msg = response.error.get("message") if isinstance(response.error, dict) else str(response.error)
+            elif not is_ok and response.payload:
+                err_msg = response.payload.get("message") or response.payload.get("error")
+
             return {
-                "success": response.is_success,
-                "status": "SUCCESS" if response.is_success else "DEVICE_ERROR",
+                "success": is_ok,
+                "status": "SUCCESS" if is_ok else "DEVICE_ERROR",
                 "data": response.payload,
-                "error": response.error.message if response.error else None,
+                "error": err_msg,
             }
         except TimeoutError:
             return {
@@ -800,3 +834,191 @@ class SnowIpcServer:
             }
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed listing files: {exc}"}
+
+    def _get_default_connected_device_id(self) -> Optional[str]:
+        """Resolve the first actively connected paired device ID."""
+        cs = self.core_server
+        for sid in list(cs.session_manager._sessions.keys()):
+            session = cs.session_manager.get_session(sid)
+            if session and session.connection_id:
+                conn = cs.connection_manager.get(session.connection_id)
+                if conn and conn.is_active:
+                    return session.device_id
+        return None
+
+    async def _handle_android_file_send(self, payload: dict) -> dict:
+        """Coordinate sending a file from Desktop to a connected Android phone."""
+        cs = self.core_server
+        device_id = payload.get("device_id")
+        file_path_raw = payload.get("file_path")
+        timeout = float(payload.get("timeout") or 60.0)
+
+        if not file_path_raw or not isinstance(file_path_raw, str):
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "Missing or non-string 'file_path'."}
+
+        if not device_id:
+            device_id = self._get_default_connected_device_id()
+            if not device_id:
+                return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+
+        paired = cs.db_manager.get_paired_device(device_id)
+        if not paired:
+            return {"success": False, "status": "DEVICE_NOT_PAIRED", "error": f"Device '{device_id}' is not paired."}
+
+        session = cs.session_manager.get_session_by_device(device_id)
+        if not session or not session.connection_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
+
+        conn = cs.connection_manager.get(session.connection_id)
+        if not conn or not conn.is_active:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
+
+        # Resolve safe path
+        safe_path, err = cs.windows_files.resolve_safe_path(file_path_raw, must_exist=True)
+        if err or not safe_path or not safe_path.is_file():
+            return {"success": False, "status": err or "FILE_NOT_FOUND", "error": f"File access denied or not found: '{file_path_raw}'"}
+
+        file_size = safe_path.stat().st_size
+        hasher = hashlib.sha256()
+        with open(safe_path, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        file_sha256 = hasher.hexdigest()
+
+        # Ensure file exists at destination inside storage_manager so download handler can serve it
+        dest_path = cs.storage_manager.resolve_destination_path(safe_path.name)
+        if dest_path.resolve() != safe_path.resolve():
+            shutil.copy2(safe_path, dest_path)
+
+        from snow.transfer.manager import TransferDirection
+        record = cs.transfer_manager.create_transfer(
+            device_id=device_id,
+            file_name=safe_path.name,
+            file_size=file_size,
+            sha256=file_sha256,
+            direction=TransferDirection.DOWNLOAD,
+        )
+
+        transfer_port = (
+            cs.http_transfer_server.bound_port
+            if cs.http_transfer_server
+            else cs.config.transfer_port
+        )
+
+        req_data = {
+            "transfer_id": record.transfer_id,
+            "file_name": safe_path.name,
+            "file_size": file_size,
+            "sha256": file_sha256,
+            "transfer_port": transfer_port,
+        }
+
+        try:
+            resp = await cs.ws_server.send_request(
+                connection_id=session.connection_id,
+                action="file_send_request",
+                payload=req_data,
+                timeout=timeout,
+            )
+            is_ok = resp.type == MessageType.RESPONSE and (
+                resp.payload is None or resp.payload.get("status") != "error"
+            )
+            if is_ok:
+                cs.transfer_manager.complete_transfer(record.transfer_id)
+                return {
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": resp.payload,
+                }
+            else:
+                err_msg = (
+                    resp.error.get("message")
+                    if isinstance(resp.error, dict)
+                    else (resp.payload.get("error") if resp.payload else "Transfer failed on Android device.")
+                )
+                cs.transfer_manager.fail_transfer(record.transfer_id, err_msg)
+                return {
+                    "success": False,
+                    "status": "TRANSFER_FAILED",
+                    "error": err_msg,
+                }
+        except TimeoutError:
+            cs.transfer_manager.fail_transfer(record.transfer_id, "Timed out")
+            return {"success": False, "status": "REQUEST_TIMEOUT", "error": f"File transfer timed out after {timeout:.1f}s."}
+        except Exception as exc:
+            cs.transfer_manager.fail_transfer(record.transfer_id, str(exc))
+            return {"success": False, "status": "INTERNAL_ERROR", "error": f"Error dispatching file transfer: {exc}"}
+
+    async def _handle_android_file_receive(self, payload: dict) -> dict:
+        """Coordinate requesting a file from an Android phone and uploading to Desktop."""
+        cs = self.core_server
+        device_id = payload.get("device_id")
+        file_name = payload.get("file_name")
+        timeout = float(payload.get("timeout") or 60.0)
+
+        if not file_name or not isinstance(file_name, str):
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "Missing or non-string 'file_name'."}
+
+        clean_name = Path(file_name).name
+        if not clean_name or ".." in clean_name:
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "Invalid file name."}
+
+        if not device_id:
+            device_id = self._get_default_connected_device_id()
+            if not device_id:
+                return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+
+        paired = cs.db_manager.get_paired_device(device_id)
+        if not paired:
+            return {"success": False, "status": "DEVICE_NOT_PAIRED", "error": f"Device '{device_id}' is not paired."}
+
+        session = cs.session_manager.get_session_by_device(device_id)
+        if not session or not session.connection_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
+
+        conn = cs.connection_manager.get(session.connection_id)
+        if not conn or not conn.is_active:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
+
+        transfer_port = (
+            cs.http_transfer_server.bound_port
+            if cs.http_transfer_server
+            else cs.config.transfer_port
+        )
+
+        req_data = {
+            "file_name": clean_name,
+            "transfer_port": transfer_port,
+        }
+
+        try:
+            resp = await cs.ws_server.send_request(
+                connection_id=session.connection_id,
+                action="file_receive_request",
+                payload=req_data,
+                timeout=timeout,
+            )
+            is_ok = resp.type == MessageType.RESPONSE and (
+                resp.payload is None or resp.payload.get("status") != "error"
+            )
+            if is_ok:
+                return {
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": resp.payload,
+                }
+            else:
+                err_msg = (
+                    resp.error.get("message")
+                    if isinstance(resp.error, dict)
+                    else (resp.payload.get("error") if resp.payload else "File receive failed on Android device.")
+                )
+                return {
+                    "success": False,
+                    "status": "TRANSFER_FAILED",
+                    "error": err_msg,
+                }
+        except TimeoutError:
+            return {"success": False, "status": "REQUEST_TIMEOUT", "error": f"File request timed out after {timeout:.1f}s."}
+        except Exception as exc:
+            return {"success": False, "status": "INTERNAL_ERROR", "error": f"Error requesting file from Android: {exc}"}

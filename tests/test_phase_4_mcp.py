@@ -399,24 +399,77 @@ class TestMcpToolsRegistry(unittest.IsolatedAsyncioTestCase):
         res = json.loads(text)
         self.assertEqual(res.get("count"), 0)
 
-    async def test_deferred_android_tools_return_not_implemented(self) -> None:
-        """Android tools must return NOT_IMPLEMENTED_YET (Phase 6)."""
-        android_tools = [
-            ("snow_android_battery", {}),
-            ("snow_android_ring", {"duration_seconds": 5}),
-            ("snow_android_clipboard_push", {"text": "hello"}),
-            ("snow_android_launch_app", {"package_name": "org.snow"}),
-            ("snow_android_list_apps", {}),
-            ("snow_android_file_send", {"source_path": "doc.pdf"}),
-            ("snow_android_file_receive", {"remote_file_name": "pic.jpg"}),
-        ]
-        for name, args in android_tools:
-            res_obj = await self.server.call_tool(name, args)
-            text = self._extract_text(res_obj)
-            res = json.loads(text)
-            self.assertFalse(res["success"], f"Tool {name} should report success=False")
-            self.assertEqual(res["status"], "NOT_IMPLEMENTED_YET", f"Tool {name} should return NOT_IMPLEMENTED_YET")
-            self.assertIn("Phase 6", res["planned_phase"])
+    async def test_android_tools_route_to_bridge(self) -> None:
+        """Android tools in Phase 6 route to bridge methods and format output."""
+        self.mock_bridge.android_battery.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"level": 85, "charging": True},
+        }
+        res_obj = await self.server.call_tool("snow_android_battery", {})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("level"), 85)
+
+        self.mock_bridge.android_ring.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"duration_seconds": 5},
+        }
+        res_obj = await self.server.call_tool("snow_android_ring", {"duration_seconds": 5})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("duration_seconds"), 5)
+
+        self.mock_bridge.android_clipboard_push.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"bytes_written": 5},
+        }
+        res_obj = await self.server.call_tool("snow_android_clipboard_push", {"text": "hello"})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("bytes_written"), 5)
+
+        self.mock_bridge.android_launch_app.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"package_name": "org.snow"},
+        }
+        res_obj = await self.server.call_tool("snow_android_launch_app", {"package_name": "org.snow"})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("package_name"), "org.snow")
+
+        self.mock_bridge.android_list_apps.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"count": 1, "apps": [{"package_name": "org.snow", "label": "SNOW"}]},
+        }
+        res_obj = await self.server.call_tool("snow_android_list_apps", {})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("count"), 1)
+
+        self.mock_bridge.android_file_send.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"file_name": "doc.pdf", "bytes_downloaded": 1024},
+        }
+        res_obj = await self.server.call_tool("snow_android_file_send", {"source_path": "doc.pdf"})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("file_name"), "doc.pdf")
+
+        self.mock_bridge.android_file_receive.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"file_name": "pic.jpg", "bytes_uploaded": 2048},
+        }
+        res_obj = await self.server.call_tool("snow_android_file_receive", {"remote_file_name": "pic.jpg"})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("file_name"), "pic.jpg")
 
 
 class TestMcpSubprocessStdoutIsolation(unittest.TestCase):

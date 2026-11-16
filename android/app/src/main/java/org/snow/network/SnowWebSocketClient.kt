@@ -24,6 +24,7 @@ import org.snow.protocol.JsonSerialization
 import org.snow.protocol.MessageType
 import org.snow.protocol.ProtocolValidationError
 import org.snow.protocol.ProtocolValidator
+import org.snow.protocol.SnowError
 import org.snow.protocol.SnowMessage
 import org.snow.security.CertPinStorage
 import org.snow.security.CertificateMismatchException
@@ -92,6 +93,10 @@ class SnowWebSocketClient(
 
     private val pendingRequests = ConcurrentHashMap<String, (SnowMessage) -> Unit>()
     private var currentTrustManager: SnowTrustManager? = null
+
+    var requestDispatcher: (suspend (action: String, data: Map<String, Any?>?) -> Pair<Map<String, Any?>?, SnowError?>)? = null
+    val currentTargetHost: String get() = targetHost
+    val currentTargetPort: Int get() = targetPort
 
     private fun log(message: String) {
         val entry = "[${SnowMessage.currentIsoTimestamp()}] $message"
@@ -559,6 +564,7 @@ class SnowWebSocketClient(
 
             MessageType.REQUEST -> {
                 val action = message.payload?.get("action") as? String
+                val data = message.payload?.get("data") as? Map<String, Any?>
                 log("Received request from server action='$action' id=${message.id}")
                 if (action == "ping") {
                     val respPayload = mapOf<String, Any?>(
@@ -571,6 +577,31 @@ class SnowWebSocketClient(
                     )
                     incomingSocket.send(JsonSerialization.toJson(response))
                     log("Replied to ping request with status 'success', action 'pong'")
+                } else if (action != null && requestDispatcher != null) {
+                    scope.launch {
+                        val (respPayload, error) = try {
+                            requestDispatcher?.invoke(action, data)
+                                ?: Pair(null, SnowError(ErrorCode.UNSUPPORTED_ACTION, "No request dispatcher registered."))
+                        } catch (e: Exception) {
+                            Pair(null, SnowError(ErrorCode.INTERNAL_ERROR, "Error handling action '$action': ${e.message}"))
+                        }
+                        if (error != null) {
+                            val errMessage = SnowMessage.createError(
+                                code = error.code,
+                                message = error.message,
+                                correlationId = message.id
+                            )
+                            incomingSocket.send(JsonSerialization.toJson(errMessage))
+                            log("Replied to request id=${message.id} with error: ${error.code} - ${error.message}")
+                        } else {
+                            val response = SnowMessage.createResponse(
+                                correlationId = message.id,
+                                payload = respPayload ?: emptyMap()
+                            )
+                            incomingSocket.send(JsonSerialization.toJson(response))
+                            log("Replied to request id=${message.id} with success")
+                        }
+                    }
                 } else {
                     val err = SnowMessage.createError(
                         code = ErrorCode.UNSUPPORTED_ACTION,

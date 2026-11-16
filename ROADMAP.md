@@ -648,12 +648,12 @@ Implement authorized Android device capabilities, each verified with tests and t
 - Completion of Phase 5 (Windows capabilities done; MCP bridge fully functional).
 
 ### Acceptance Criteria
-- AI agent executing `snow_android_battery` returns the phone's live battery percentage.
-- AI agent executing `snow_android_ring` causes the phone to audibly ring.
-- Clipboard push from desktop writes text to the phone's clipboard.
-- App launch via notification-tap flow works when SNOW is backgrounded.
-- File transfer moves a test file between desktop and phone with SHA-256 verification.
-- All operations log to `sys.stderr` on the desktop.
+- [x] AI agent executing `snow_android_battery` returns the phone's live battery percentage and device status.
+- [x] AI agent executing `snow_android_ring` causes the phone to audibly ring for the bounded duration (1–15s).
+- [x] Clipboard push from desktop writes text to the phone's clipboard (write-only, bounded to 64 KiB).
+- [x] App enumeration and launching via explicit package intent implemented with Android package visibility queries.
+- [x] Bidirectional file transfer coordinates desktop core HTTPS streaming (port 8766) and phone scoped storage (`Downloads/SNOW`) with SHA-256 verification.
+- [x] All operations log to `sys.stderr` on the desktop with zero stdout pollution on MCP stdio.
 
 ### Viva Concept Check
 - **Why can't a background service directly launch an app on Android 10+?** The OS restricts background Activity launches to prevent intrusive screen takeovers. `FLAG_ACTIVITY_NEW_TASK` specifies task affinity, not launch permission. SNOW uses a notification-based flow where the user taps to authorize the launch.

@@ -263,6 +263,242 @@ class CrossLanguageParityTest {
             )
             valid["response_auth_success.json"] = JsonSerialization.toJson(respAuth)
 
+            // --- Phase 3 File Transfer Protocol Fixtures ---
+            // 24. Valid file_transfer_offer request
+            val reqOffer = SnowMessage.createRequest(
+                "file_transfer_offer",
+                mapOf(
+                    "file_name" to "photo_glacier.jpg",
+                    "file_size" to 204800,
+                    "sha256" to "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "direction" to "UPLOAD"
+                )
+            )
+            valid["request_file_transfer_offer.json"] = JsonSerialization.toJson(reqOffer)
+
+            // 25. Valid file_transfer_offer response
+            val respOffer = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "file_transfer_offer",
+                    "data" to mapOf(
+                        "transfer_id" to UUID.randomUUID().toString(),
+                        "transfer_port" to 8766,
+                        "transfer_url" to "/api/v1/transfers/upload/123",
+                        "resume_offset" to 0,
+                        "already_exists" to false,
+                        "is_conflict" to false
+                    )
+                )
+            )
+            valid["response_file_transfer_offer.json"] = JsonSerialization.toJson(respOffer)
+
+            // 26. Valid file_list_transfers request
+            val reqList = SnowMessage.createRequest("file_list_transfers")
+            valid["request_file_list_transfers.json"] = JsonSerialization.toJson(reqList)
+
+            // 27. Valid file_list_transfers response
+            val respList = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "file_list_transfers",
+                    "data" to mapOf(
+                        "transfers" to emptyList<Any>()
+                    )
+                )
+            )
+            valid["response_file_list_transfers.json"] = JsonSerialization.toJson(respList)
+
+            // 28. Valid file_transfer_status request
+            val reqStatus = SnowMessage.createRequest(
+                "file_transfer_status",
+                mapOf("transfer_id" to UUID.randomUUID().toString())
+            )
+            valid["request_file_transfer_status.json"] = JsonSerialization.toJson(reqStatus)
+
+            // 29. Valid file_transfer_cancel request
+            val reqCancel = SnowMessage.createRequest(
+                "file_transfer_cancel",
+                mapOf("transfer_id" to UUID.randomUUID().toString())
+            )
+            valid["request_file_transfer_cancel.json"] = JsonSerialization.toJson(reqCancel)
+
+            // 30. Error TRANSFER_NOT_FOUND
+            val errTransferNotFound = SnowMessage.createError(
+                ErrorCode.TRANSFER_NOT_FOUND,
+                "Requested transfer ID was not found.",
+                reqId
+            )
+            valid["error_transfer_not_found.json"] = JsonSerialization.toJson(errTransferNotFound)
+
+            // 31. Error INTEGRITY_MISMATCH
+            val errIntegrity = SnowMessage.createError(
+                ErrorCode.INTEGRITY_MISMATCH,
+                "SHA-256 integrity verification failed.",
+                reqId
+            )
+            valid["error_integrity_mismatch.json"] = JsonSerialization.toJson(errIntegrity)
+
+            // --- Phase 6 Android Capability Protocol Fixtures ---
+            // 32. Valid battery_status request
+            val reqBattery = SnowMessage.createRequest(
+                "battery_status",
+                emptyMap<String, Any>()
+            )
+            valid["request_battery_status.json"] = JsonSerialization.toJson(reqBattery)
+
+            // 33. Valid battery_status response
+            val respBattery = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "battery_status",
+                    "level" to 92,
+                    "charging" to true,
+                    "power_source" to "AC",
+                    "health" to "GOOD",
+                    "temperature_celsius" to 29.5,
+                    "device_model" to "RMX5110",
+                    "manufacturer" to "realme",
+                    "android_version" to "17",
+                    "sdk_int" to 34
+                )
+            )
+            valid["response_battery_status.json"] = JsonSerialization.toJson(respBattery)
+
+            // 34. Valid ring_phone request
+            val reqRing = SnowMessage.createRequest(
+                "ring_phone",
+                mapOf("duration_seconds" to 5)
+            )
+            valid["request_ring_phone.json"] = JsonSerialization.toJson(reqRing)
+
+            // 35. Valid ring_phone response
+            val respRing = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "ring_phone",
+                    "duration_seconds" to 5,
+                    "message" to "Audible alert initiated on Android device for 5 seconds."
+                )
+            )
+            valid["response_ring_phone.json"] = JsonSerialization.toJson(respRing)
+
+            // 36. Valid clipboard_push request
+            val reqClip = SnowMessage.createRequest(
+                "clipboard_push",
+                mapOf("text" to "Hello SNOW cross-device clipboard")
+            )
+            valid["request_clipboard_push.json"] = JsonSerialization.toJson(reqClip)
+
+            // 37. Valid clipboard_push response
+            val respClip = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "clipboard_push",
+                    "bytes_written" to 34,
+                    "message" to "Text successfully copied to Android clipboard."
+                )
+            )
+            valid["response_clipboard_push.json"] = JsonSerialization.toJson(respClip)
+
+            // 38. Valid list_apps request
+            val reqListApps = SnowMessage.createRequest(
+                "list_apps",
+                mapOf("limit" to 50)
+            )
+            valid["request_list_apps.json"] = JsonSerialization.toJson(reqListApps)
+
+            // 39. Valid list_apps response
+            val respListApps = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "list_apps",
+                    "count" to 2,
+                    "apps" to listOf(
+                        mapOf("package_name" to "com.android.settings", "label" to "Settings"),
+                        mapOf("package_name" to "org.snow.app", "label" to "SNOW")
+                    )
+                )
+            )
+            valid["response_list_apps.json"] = JsonSerialization.toJson(respListApps)
+
+            // 40. Valid launch_app request
+            val reqLaunch = SnowMessage.createRequest(
+                "launch_app",
+                mapOf("package_name" to "com.android.settings")
+            )
+            valid["request_launch_app.json"] = JsonSerialization.toJson(reqLaunch)
+
+            // 41. Valid launch_app response
+            val respLaunch = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "launch_app",
+                    "package_name" to "com.android.settings",
+                    "message" to "Successfully launched application 'com.android.settings'."
+                )
+            )
+            valid["response_launch_app.json"] = JsonSerialization.toJson(respLaunch)
+
+            // 42. Valid file_send_request request
+            val reqFileSend = SnowMessage.createRequest(
+                "file_send_request",
+                mapOf(
+                    "transfer_id" to UUID.randomUUID().toString(),
+                    "file_name" to "sample_document.pdf",
+                    "file_size" to 10240,
+                    "sha256" to "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "transfer_port" to 8766
+                )
+            )
+            valid["request_file_send_request.json"] = JsonSerialization.toJson(reqFileSend)
+
+            // 43. Valid file_send_request response
+            val respFileSend = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "file_send_request",
+                    "transfer_id" to UUID.randomUUID().toString(),
+                    "file_name" to "sample_document.pdf",
+                    "bytes_downloaded" to 10240,
+                    "sha256" to "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                    "saved_path" to "/storage/emulated/0/Download/SNOW/sample_document.pdf"
+                )
+            )
+            valid["response_file_send_request.json"] = JsonSerialization.toJson(respFileSend)
+
+            // 44. Valid file_receive_request request
+            val reqFileRecv = SnowMessage.createRequest(
+                "file_receive_request",
+                mapOf(
+                    "file_name" to "sample_document.pdf",
+                    "transfer_port" to 8766
+                )
+            )
+            valid["request_file_receive_request.json"] = JsonSerialization.toJson(reqFileRecv)
+
+            // 45. Valid file_receive_request response
+            val respFileRecv = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "file_receive_request",
+                    "transfer_id" to UUID.randomUUID().toString(),
+                    "file_name" to "sample_document.pdf",
+                    "bytes_uploaded" to 10240,
+                    "sha256" to "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                )
+            )
+            valid["response_file_receive_request.json"] = JsonSerialization.toJson(respFileRecv)
+
             for ((filename, content) in valid) {
                 File(ktToPyValid, filename).writeText(content, Charsets.UTF_8)
             }
@@ -530,6 +766,18 @@ class CrossLanguageParityTest {
                     put("payload", JSONObject(mapOf("status" to "success", "action" to "auth_request")))
                 }.toString(),
                 ErrorCode.INVALID_CORRELATION_ID
+            )
+
+            // 27. Phase 6 Request payload data not an object (malformed battery_status payload)
+            invalid["invalid_request_battery_data_not_object.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "request")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("action" to "battery_status", "data" to "not_an_object")))
+                }.toString(),
+                ErrorCode.INVALID_PAYLOAD
             )
 
             val manifest = JSONObject()
