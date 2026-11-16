@@ -111,7 +111,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         }, indent=2)
 
     # =========================================================================
-    # 2. Windows Tools (Phase 5 Implementation Deferred)
+    # 2. Windows Tools (Phase 5 Live Capabilities via Core IPC)
     # =========================================================================
 
     @server.tool(
@@ -119,98 +119,109 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         description="Retrieve battery percentage, power line status, and battery health of the Windows laptop.",
     )
     async def snow_windows_battery() -> str:
-        """Query Windows laptop battery telemetry (Phase 5)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_windows_battery",
-            "planned_phase": "Phase 5 (Windows Capabilities)",
-            "message": "Windows battery telemetry capability is planned for Phase 5.",
-        }, indent=2)
+        """Query Windows laptop battery telemetry via Core."""
+        result = await bridge.windows_battery()
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed retrieving battery telemetry."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_windows_system_info",
         description="Retrieve Windows system hardware specifications, OS build, and CPU/RAM utilization.",
     )
     async def snow_windows_system_info() -> str:
-        """Query Windows system and hardware telemetry (Phase 5)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_windows_system_info",
-            "planned_phase": "Phase 5 (Windows Capabilities)",
-            "message": "Windows system info capability is planned for Phase 5.",
-        }, indent=2)
+        """Query Windows system and hardware telemetry via Core."""
+        result = await bridge.windows_system_info()
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed retrieving system telemetry."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_windows_processes",
         description="List running Windows processes with PID, name, and resource usage.",
     )
-    async def snow_windows_processes(limit: int = 20) -> str:
-        """Query running Windows processes (Phase 5)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_windows_processes",
-            "planned_phase": "Phase 5 (Windows Capabilities)",
-            "message": "Windows process enumeration capability is planned for Phase 5.",
-        }, indent=2)
+    async def snow_windows_processes(limit: int = 25, sort_by: str = "memory") -> str:
+        """Query running Windows processes via Core."""
+        result = await bridge.windows_processes(limit=limit, sort_by=sort_by)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed retrieving processes."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_windows_launch_app",
-        description="Launch an explicitly permitted Windows application from the approved whitelist.",
+        description="Launch an explicitly permitted Windows application from the approved whitelist (notepad, calc, explorer, taskmgr, mspaint).",
     )
     async def snow_windows_launch_app(app_name: str) -> str:
-        """Launch an approved Windows application (Phase 5)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_windows_launch_app",
-            "planned_phase": "Phase 5 (Windows Capabilities)",
-            "message": f"Windows app launching for '{app_name}' is planned for Phase 5.",
-        }, indent=2)
+        """Launch an approved Windows application via Core."""
+        result = await bridge.windows_launch_app(app_name=app_name)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed launching application '{app_name}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_windows_file_read",
-        description="Read file contents from configured approved directories on the Windows laptop.",
+        description="Read UTF-8 text file contents from configured approved directories on the Windows laptop (up to 256 KiB).",
     )
-    async def snow_windows_file_read(file_path: str, max_bytes: int = 65536) -> str:
-        """Read a file in approved Windows directories (Phase 5)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_windows_file_read",
-            "planned_phase": "Phase 5 (Windows Capabilities)",
-            "message": f"Scoped Windows file read for '{file_path}' is planned for Phase 5.",
-        }, indent=2)
+    async def snow_windows_file_read(file_path: str, max_bytes: int = 262144) -> str:
+        """Read a file in approved Windows directories via Core."""
+        result = await bridge.windows_file_read(file_path=file_path, max_bytes=max_bytes)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed reading file '{file_path}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_windows_file_write",
-        description="Write content to a file in configured approved directories on the Windows laptop.",
+        description="Write UTF-8 text content atomically to a file in configured approved directories on the Windows laptop (up to 256 KiB).",
     )
-    async def snow_windows_file_write(file_path: str, content: str) -> str:
-        """Write content to an approved Windows file path (Phase 5)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_windows_file_write",
-            "planned_phase": "Phase 5 (Windows Capabilities)",
-            "message": f"Scoped Windows file write for '{file_path}' is planned for Phase 5.",
-        }, indent=2)
+    async def snow_windows_file_write(
+        file_path: str, content: str, overwrite: bool = False, max_bytes: int = 262144
+    ) -> str:
+        """Write content to an approved Windows file path via Core."""
+        result = await bridge.windows_file_write(
+            file_path=file_path, content=content, overwrite=overwrite, max_bytes=max_bytes
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed writing file '{file_path}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     @server.tool(
         name="snow_windows_file_list",
         description="List files within approved directories on the Windows laptop.",
     )
-    async def snow_windows_file_list(directory_path: str = "") -> str:
-        """List files in approved Windows directories (Phase 5)."""
-        return json.dumps({
-            "success": False,
-            "status": "NOT_IMPLEMENTED_YET",
-            "capability": "snow_windows_file_list",
-            "planned_phase": "Phase 5 (Windows Capabilities)",
-            "message": "Scoped Windows directory listing is planned for Phase 5.",
-        }, indent=2)
+    async def snow_windows_file_list(directory_path: str = "", limit: int = 50) -> str:
+        """List files in approved Windows directories via Core."""
+        result = await bridge.windows_file_list(directory_path=directory_path, limit=limit)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed listing directory '{directory_path}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
 
     # =========================================================================
     # 3. Android Tools (Phase 6 Implementation Deferred)

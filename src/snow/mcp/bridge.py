@@ -189,3 +189,68 @@ class SnowMcpBridge:
     async def ping(self) -> dict[str, Any]:
         """Test IPC transport reachability."""
         return await self.call("ping", timeout=3.0)
+
+    async def windows_battery(self) -> dict[str, Any]:
+        """Query host battery telemetry via Core IPC."""
+        return await self.call("windows_battery", timeout=5.0)
+
+    async def windows_system_info(self) -> dict[str, Any]:
+        """Query host system and hardware telemetry via Core IPC."""
+        return await self.call("windows_system_info", timeout=5.0)
+
+    async def windows_processes(
+        self, limit: int = 25, sort_by: str = "memory"
+    ) -> dict[str, Any]:
+        """Query host active processes via Core IPC."""
+        return await self.call(
+            "windows_processes",
+            payload={"limit": limit, "sort_by": sort_by},
+            timeout=5.0,
+        )
+
+    async def windows_launch_app(self, app_name: str) -> dict[str, Any]:
+        """Launch an allowlisted Windows desktop app via Core IPC."""
+        return await self.call(
+            "windows_launch_app",
+            payload={"app_name": app_name},
+            timeout=5.0,
+        )
+
+    async def windows_file_read(
+        self, file_path: str, max_bytes: int = 256 * 1024
+    ) -> dict[str, Any]:
+        """Read a scoped text file via Core IPC."""
+        return await self.call(
+            "windows_file_read",
+            payload={"file_path": file_path, "max_bytes": max_bytes},
+            timeout=5.0,
+        )
+
+    async def windows_file_write(
+        self,
+        file_path: str,
+        content: str,
+        overwrite: bool = False,
+        max_bytes: int = 256 * 1024,
+    ) -> dict[str, Any]:
+        """Write a scoped text file atomically via Core IPC."""
+        return await self.call(
+            "windows_file_write",
+            payload={
+                "file_path": file_path,
+                "content": content,
+                "overwrite": overwrite,
+                "max_bytes": max_bytes,
+            },
+            timeout=5.0,
+        )
+
+    async def windows_file_list(
+        self, directory_path: str = "", limit: int = 50
+    ) -> dict[str, Any]:
+        """List contents of a scoped directory via Core IPC."""
+        return await self.call(
+            "windows_file_list",
+            payload={"directory_path": directory_path, "limit": limit},
+            timeout=5.0,
+        )

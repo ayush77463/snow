@@ -326,24 +326,78 @@ class TestMcpToolsRegistry(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["status"], "CORE_OFFLINE")
         self.assertIn("hint", res)
 
-    async def test_deferred_windows_tools_return_not_implemented(self) -> None:
-        """Windows tools must return NOT_IMPLEMENTED_YET (Phase 5)."""
-        windows_tools = [
-            ("snow_windows_battery", {}),
-            ("snow_windows_system_info", {}),
-            ("snow_windows_processes", {"limit": 10}),
-            ("snow_windows_launch_app", {"app_name": "notepad"}),
-            ("snow_windows_file_read", {"file_path": "test.txt"}),
-            ("snow_windows_file_write", {"file_path": "test.txt", "content": "hi"}),
-            ("snow_windows_file_list", {"directory_path": "C:\\"}),
-        ]
-        for name, args in windows_tools:
-            res_obj = await self.server.call_tool(name, args)
-            text = self._extract_text(res_obj)
-            res = json.loads(text)
-            self.assertFalse(res["success"], f"Tool {name} should report success=False")
-            self.assertEqual(res["status"], "NOT_IMPLEMENTED_YET", f"Tool {name} should return NOT_IMPLEMENTED_YET")
-            self.assertIn("Phase 5", res["planned_phase"])
+    async def test_windows_tools_route_to_bridge(self) -> None:
+        """Windows tools in Phase 5 route to bridge methods and format output."""
+        self.mock_bridge.windows_battery.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"available": True, "percent": 90.0, "status": "FULL"},
+        }
+        res_obj = await self.server.call_tool("snow_windows_battery", {})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertTrue(res.get("available"))
+        self.assertEqual(res.get("percent"), 90.0)
+
+        self.mock_bridge.windows_system_info.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"hostname": "TEST-PC", "os_name": "Windows"},
+        }
+        res_obj = await self.server.call_tool("snow_windows_system_info", {})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("hostname"), "TEST-PC")
+
+        self.mock_bridge.windows_processes.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"count": 1, "processes": [{"pid": 100, "name": "test.exe"}]},
+        }
+        res_obj = await self.server.call_tool("snow_windows_processes", {"limit": 10})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("count"), 1)
+
+        self.mock_bridge.windows_launch_app.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"app_name": "notepad", "pid": 1234},
+        }
+        res_obj = await self.server.call_tool("snow_windows_launch_app", {"app_name": "notepad"})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("app_name"), "notepad")
+
+        self.mock_bridge.windows_file_read.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"content": "hello", "size_bytes": 5},
+        }
+        res_obj = await self.server.call_tool("snow_windows_file_read", {"file_path": "test.txt"})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("content"), "hello")
+
+        self.mock_bridge.windows_file_write.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"name": "test.txt", "bytes_written": 5},
+        }
+        res_obj = await self.server.call_tool("snow_windows_file_write", {"file_path": "test.txt", "content": "hello"})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("name"), "test.txt")
+
+        self.mock_bridge.windows_file_list.return_value = {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {"count": 0, "items": []},
+        }
+        res_obj = await self.server.call_tool("snow_windows_file_list", {"directory_path": ""})
+        text = self._extract_text(res_obj)
+        res = json.loads(text)
+        self.assertEqual(res.get("count"), 0)
 
     async def test_deferred_android_tools_return_not_implemented(self) -> None:
         """Android tools must return NOT_IMPLEMENTED_YET (Phase 6)."""

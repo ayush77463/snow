@@ -589,12 +589,12 @@ Implement authorized Windows operations that the AI assistant can invoke through
 - Completion of Phase 4 (MCP server and bridge functional).
 
 ### Acceptance Criteria
-- `snow_windows_battery` returns current battery percentage and charging state.
-- `snow_windows_system_info` returns CPU usage percentage and RAM usage.
-- `snow_windows_processes` returns a list of running processes.
-- `snow_windows_file_list` lists files only within configured allowed directories; requests outside those directories are rejected.
-- `snow_windows_launch_app` launches only whitelisted applications; non-whitelisted requests are rejected with a clear error.
-- All operations log to `sys.stderr`.
+- [x] `snow_windows_battery` returns current battery percentage and charging state (or graceful `NO_BATTERY` for desktop).
+- [x] `snow_windows_system_info` returns CPU usage percentage, RAM, disk, OS, and uptime telemetry.
+- [x] `snow_windows_processes` returns a bounded, sorted list of running processes without leaking sensitive command-lines or environments.
+- [x] `snow_windows_file_list` lists files only within configured allowed directories; requests outside those directories are rejected.
+- [x] `snow_windows_launch_app` launches only whitelisted applications (`notepad`, `calc`, `explorer`, `taskmgr`, `mspaint`); non-whitelisted requests are rejected with a clear error (`APP_NOT_ALLOWED`).
+- [x] All operations log to `sys.stderr` with zero stdout pollution on MCP stdio.
 
 ### Viva Concept Check
 - **Why whitelist applications instead of allowing arbitrary launches?** Arbitrary program execution is a critical security risk. An AI assistant (or compromised prompt) could launch malware, delete files, or escalate privileges. Whitelisting restricts launches to user-approved, known-safe applications.

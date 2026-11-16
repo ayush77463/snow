@@ -4,6 +4,12 @@ import asyncio
 import logging
 from typing import List, Optional
 
+from snow.capabilities.windows import (
+    WindowsAppLauncher,
+    WindowsFileManager,
+    WindowsProcessMonitor,
+    WindowsTelemetry,
+)
 from snow.core.config import CoreConfig
 from snow.core.ipc import SnowIpcServer
 from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
@@ -38,6 +44,11 @@ class SnowCoreServer:
             storage_manager=self.storage_manager,
         )
         self.http_transfer_server: Optional[SnowHttpTransferServer] = None
+        self.windows_telemetry = WindowsTelemetry()
+        self.windows_processes = WindowsProcessMonitor()
+        roots = [self.config.transfer_root] if self.config.transfer_root else None
+        self.windows_files = WindowsFileManager(allowed_roots=roots)
+        self.windows_apps = WindowsAppLauncher()
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
 
     @property

@@ -411,6 +411,83 @@ class SnowIpcServer:
                 "error": dev_resp.get("error"),
             }, now_authed
 
+        if op == "windows_battery":
+            res = await self._handle_windows_battery()
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_system_info":
+            res = await self._handle_windows_system_info()
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_processes":
+            res = await self._handle_windows_processes(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_launch_app":
+            res = await self._handle_windows_launch_app(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_file_read":
+            res = await self._handle_windows_file_read(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_file_write":
+            res = await self._handle_windows_file_write(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_file_list":
+            res = await self._handle_windows_file_list(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
         return {
             "version": IPC_PROTOCOL_VERSION,
             "request_id": request_id,
@@ -571,3 +648,155 @@ class SnowIpcServer:
                 "status": "INTERNAL_ERROR",
                 "error": f"Failed dispatching to device: {exc}",
             }
+
+    async def _handle_windows_battery(self) -> dict:
+        """Query host battery telemetry via Core."""
+        telemetry = getattr(self.core_server, "windows_telemetry", None)
+        if not telemetry:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows telemetry capability not initialized.",
+            }
+        try:
+            res = await telemetry.get_battery_info()
+            is_ok = res.get("status") != "ERROR"
+            return {
+                "success": is_ok,
+                "status": res.get("status", "SUCCESS"),
+                "data": res,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed querying battery telemetry: {exc}"}
+
+    async def _handle_windows_system_info(self) -> dict:
+        """Query host system and hardware telemetry via Core."""
+        telemetry = getattr(self.core_server, "windows_telemetry", None)
+        if not telemetry:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows telemetry capability not initialized.",
+            }
+        try:
+            res = await telemetry.get_system_telemetry()
+            return {"success": True, "status": "SUCCESS", "data": res}
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed querying system telemetry: {exc}"}
+
+    async def _handle_windows_processes(self, payload: dict) -> dict:
+        """Query host active processes via Core."""
+        pm = getattr(self.core_server, "windows_processes", None)
+        if not pm:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows process capability not initialized.",
+            }
+        limit = payload.get("limit", 25)
+        sort_by = payload.get("sort_by", "memory")
+        try:
+            res = await pm.list_processes(limit=limit, sort_by=sort_by)
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed querying processes: {exc}"}
+
+    async def _handle_windows_launch_app(self, payload: dict) -> dict:
+        """Launch an allowlisted Windows desktop app via Core."""
+        launcher = getattr(self.core_server, "windows_apps", None)
+        if not launcher:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows app launcher capability not initialized.",
+            }
+        app_name = payload.get("app_name", "")
+        try:
+            res = await launcher.launch_app(app_name=app_name)
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed launching application: {exc}"}
+
+    async def _handle_windows_file_read(self, payload: dict) -> dict:
+        """Read a scoped text file via Core."""
+        fm = getattr(self.core_server, "windows_files", None)
+        if not fm:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows file capability not initialized.",
+            }
+        file_path = payload.get("file_path", "")
+        max_bytes = payload.get("max_bytes", 256 * 1024)
+        try:
+            res = await fm.read_file(file_path=file_path, max_bytes=max_bytes)
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed reading file: {exc}"}
+
+    async def _handle_windows_file_write(self, payload: dict) -> dict:
+        """Write a scoped text file atomically via Core."""
+        fm = getattr(self.core_server, "windows_files", None)
+        if not fm:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows file capability not initialized.",
+            }
+        file_path = payload.get("file_path", "")
+        content = payload.get("content", "")
+        overwrite = payload.get("overwrite", False)
+        max_bytes = payload.get("max_bytes", 256 * 1024)
+        try:
+            res = await fm.write_file(
+                file_path=file_path,
+                content=content,
+                overwrite=overwrite,
+                max_bytes=max_bytes,
+            )
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed writing file: {exc}"}
+
+    async def _handle_windows_file_list(self, payload: dict) -> dict:
+        """List contents of a scoped directory via Core."""
+        fm = getattr(self.core_server, "windows_files", None)
+        if not fm:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows file capability not initialized.",
+            }
+        directory_path = payload.get("directory_path", "")
+        limit = payload.get("limit", 50)
+        try:
+            res = await fm.list_files(directory_path=directory_path, limit=limit)
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed listing files: {exc}"}
