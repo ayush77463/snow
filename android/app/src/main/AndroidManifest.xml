@@ -3,6 +3,13 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Android 14+ (API 34+) connectedDevice FGS prerequisite:
+         Starting a Foreground Service with type "connectedDevice" strictly requires
+         at least one qualifying permission (e.g. CHANGE_NETWORK_STATE, CHANGE_WIFI_MULTICAST_STATE,
+         or BLUETOOTH_*). CHANGE_NETWORK_STATE satisfies the FGS requirement, while
+         CHANGE_WIFI_MULTICAST_STATE is retained for Wi-Fi multicast/broadcast lock reception. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

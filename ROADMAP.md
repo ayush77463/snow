@@ -168,10 +168,10 @@ Replace the Python mock client with a real native Android application. The app c
 #### Acceptance Criteria
 - [x] Android project compiles cleanly, passes JVM unit tests (`.\gradlew.bat testDebugUnitTest`), and successfully produces debug APK (`.\gradlew.bat assembleDebug`).
 - [x] Wire schema parity verified: Kotlin models and serializer enforce the clean serialization invariant (null fields omitted) and validate strictly against SNOW Device Protocol v1.
-- [ ] Physical Android app connects to the desktop WebSocket server using manually entered IP:port (requires physical hardware testing in Sub-Milestone 1.4).
-- [ ] Desktop logs show the real phone's IP and connection time (requires physical hardware testing in Sub-Milestone 1.4).
-- [ ] Heartbeats exchange correctly between desktop and physical phone (requires physical hardware testing in Sub-Milestone 1.4).
-- [ ] Disconnecting Wi-Fi on the physical phone triggers reconnection attempts with backoff; reconnecting Wi-Fi restores the connection (requires physical hardware testing in Sub-Milestone 1.4).
+- [x] Physical Android app connects to the desktop WebSocket server using manually entered IP:port (empirically verified in Sub-Milestone 1.4).
+- [x] Desktop logs show the real phone's IP and connection time (empirically verified in Sub-Milestone 1.4).
+- [x] Heartbeats exchange correctly between desktop and physical phone (empirically verified in Sub-Milestone 1.4).
+- [x] Disconnecting Wi-Fi on the physical phone triggers reconnection attempts with backoff; reconnecting Wi-Fi restores the connection (empirically verified in Sub-Milestone 1.4).
 
 #### Viva Concept Check
 - **Why a Foreground Service?** Android aggressively kills background tasks. A Foreground Service with a visible notification elevates process priority, though it does not guarantee permanent connectivity.
@@ -200,9 +200,9 @@ Verify that the laptop and phone can actually communicate over real-world networ
 - Physical Android phone and Windows laptop available.
 
 #### Acceptance Criteria
-- At least one connectivity method (hotspot or Wi-Fi LAN) reliably establishes and maintains a WebSocket connection between the physical devices.
-- Test results document which network configurations work, which have limitations, and why.
-- Any connectivity workarounds are documented.
+- [x] At least one connectivity method (hotspot or Wi-Fi LAN) reliably establishes and maintains a WebSocket connection between the physical devices (both Wi-Fi LAN and Mobile Hotspot verified).
+- [x] Test results document which network configurations work, which have limitations, and why (`docs/CONNECTIVITY_TEST_RESULTS.md`).
+- [x] Any connectivity workarounds are documented (e.g. Android 14+ FGS permissions, Windows Firewall Public profile constraints).
 
 #### Viva Concept Check
 - **Why test on physical hardware?** Network behaviour (hotspot routing, AP isolation, firewall rules) varies by manufacturer and environment. Simulated tests cannot validate real-world connectivity.
