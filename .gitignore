@@ -32,6 +32,8 @@ htmlcov/
 *.crt
 *.der
 *.token
+*.secret
+ipc.secret
 *.p12
 .snow/
 *device_identity*.json

@@ -5,6 +5,7 @@ import logging
 from typing import List, Optional
 
 from snow.core.config import CoreConfig
+from snow.core.ipc import SnowIpcServer
 from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
 from snow.network.connection_manager import ConnectionManager
 from snow.network.ws_server import SnowWebSocketServer
@@ -37,6 +38,7 @@ class SnowCoreServer:
             storage_manager=self.storage_manager,
         )
         self.http_transfer_server: Optional[SnowHttpTransferServer] = None
+        self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
 
     @property
     def is_running(self) -> bool:
@@ -121,14 +123,19 @@ class SnowCoreServer:
         self.ws_server.http_transfer_server = self.http_transfer_server
         await self.http_transfer_server.start()
 
+        # Start the authenticated loopback IPC server for MCP subprocess communication
+        await self.ipc_server.start()
+
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port
         actual_http_port = self.http_transfer_server.bound_port or self.config.transfer_port
+        actual_ipc_port = self.ipc_server.bound_port or self.config.ipc_port
         logger.info(
-            "%s started successfully (listening on WSS port %d, HTTP transfer port %d).",
+            "%s started successfully (listening on WSS port %d, HTTP transfer port %d, IPC port %d).",
             self.config.app_name,
             actual_port,
             actual_http_port,
+            actual_ipc_port,
         )
 
     async def run(self) -> None:
@@ -167,6 +174,10 @@ class SnowCoreServer:
         logger.info("Stopping %s...", self.config.app_name)
         self._is_running = False
         self._shutdown_event.set()
+
+        # Stop IPC server first so external tool requests terminate cleanly before core shuts down
+        if self.ipc_server:
+            await self.ipc_server.stop()
 
         # Stop HTTP transfer server
         if self.http_transfer_server:

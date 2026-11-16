@@ -48,6 +48,9 @@ class CoreConfig:
     transfer_root: str | None = None
     tls_cert_path: str | None = None
     tls_key_path: str | None = None
+    ipc_host: str = "127.0.0.1"
+    ipc_port: int = 8767
+    ipc_secret_path: str | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration invariants upon instantiation."""
@@ -125,6 +128,24 @@ class CoreConfig:
         if self.tls_key_path is not None:
             if not isinstance(self.tls_key_path, str) or not self.tls_key_path.strip():
                 raise ValueError("tls_key_path must be a non-empty string or None")
+
+        # Validate IPC host (must be loopback)
+        if not isinstance(self.ipc_host, str) or not self.ipc_host.strip():
+            raise ValueError("ipc_host must be a non-empty string")
+        norm_ipc_host = self.ipc_host.strip().lower()
+        if norm_ipc_host not in ("127.0.0.1", "localhost", "::1"):
+            raise ValueError(f"ipc_host must be a loopback address ('127.0.0.1' or 'localhost'), got {self.ipc_host!r}")
+
+        # Validate IPC port (0 permitted for ephemeral test ports)
+        if not isinstance(self.ipc_port, int) or isinstance(self.ipc_port, bool):
+            raise ValueError(f"ipc_port must be an integer, got {type(self.ipc_port).__name__}: {self.ipc_port!r}")
+        if not (0 <= self.ipc_port <= 65535):
+            raise ValueError(f"ipc_port must be in range 0-65535, got {self.ipc_port}")
+
+        # Validate IPC secret path if provided
+        if self.ipc_secret_path is not None:
+            if not isinstance(self.ipc_secret_path, str) or not self.ipc_secret_path.strip():
+                raise ValueError("ipc_secret_path must be a non-empty string or None")
 
     @classmethod
     def from_env(cls) -> "CoreConfig":
@@ -309,6 +330,30 @@ class CoreConfig:
         raw_key_path = os.getenv("SNOW_TLS_KEY_PATH")
         tls_key_path = raw_key_path.strip() if raw_key_path and raw_key_path.strip() else None
 
+        # Parse SNOW_IPC_HOST
+        raw_ipc_host = os.getenv("SNOW_IPC_HOST")
+        ipc_host = raw_ipc_host.strip() if raw_ipc_host and raw_ipc_host.strip() else "127.0.0.1"
+
+        # Parse SNOW_IPC_PORT
+        raw_ipc_port = os.getenv("SNOW_IPC_PORT")
+        if raw_ipc_port is not None:
+            try:
+                ipc_port = int(raw_ipc_port)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_IPC_PORT '{raw_ipc_port}': must be an integer."
+                ) from None
+            if not (0 <= ipc_port <= 65535):
+                raise ValueError(
+                    f"Invalid SNOW_IPC_PORT '{raw_ipc_port}': must be between 0 and 65535."
+                )
+        else:
+            ipc_port = 8767
+
+        # Parse SNOW_IPC_SECRET_PATH
+        raw_ipc_secret = os.getenv("SNOW_IPC_SECRET_PATH")
+        ipc_secret_path = raw_ipc_secret.strip() if raw_ipc_secret and raw_ipc_secret.strip() else None
+
         return cls(
             app_name=app_name,
             version="0.1.0",
@@ -326,4 +371,7 @@ class CoreConfig:
             transfer_root=transfer_root,
             tls_cert_path=tls_cert_path,
             tls_key_path=tls_key_path,
+            ipc_host=ipc_host,
+            ipc_port=ipc_port,
+            ipc_secret_path=ipc_secret_path,
         )

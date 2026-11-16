@@ -343,6 +343,7 @@ class TestSubprocessLifecycleAndStdoutIsolation(unittest.TestCase):
             **os.environ,
             "SNOW_PORT": str(_get_free_port()),
             "SNOW_TRANSFER_PORT": str(_get_free_port()),
+            "SNOW_IPC_PORT": str(_get_free_port()),
             "SNOW_TLS_ENABLED": "false",
         }
         proc = subprocess.Popen(
