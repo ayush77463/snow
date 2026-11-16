@@ -294,9 +294,9 @@ Before enabling device capabilities, we must secure the communication channel. T
 - Completion of Sub-Milestone 2.1.
 
 #### Acceptance Criteria
-- `snow_devices.db` correctly records paired device ID, name, and token hash.
-- Unpairing a device removes its record and rejects subsequent connection attempts.
-- Database file is added to `.gitignore`.
+- [x] `snow_devices.db` correctly records paired device ID, name, and token hash.
+- [x] Unpairing a device removes its record and rejects subsequent connection attempts.
+- [x] Database file is added to `.gitignore`.
 
 #### Viva Concept Check
 - **Why SQLite?** Lightweight, embedded, zero-configuration database. Perfect for single-user local storage without requiring a database server.

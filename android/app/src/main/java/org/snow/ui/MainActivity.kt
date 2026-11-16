@@ -86,7 +86,8 @@ class MainActivity : AppCompatActivity() {
 
         checkNotificationPermission()
         identity = DeviceIdentity.getOrCreate(this)
-        pairingFlow = PairingFlow(identity)
+        val tokenStorage = org.snow.security.SharedPreferencesTokenStorage(this)
+        pairingFlow = PairingFlow(identity, tokenStorage)
 
         setupListeners()
         setupPinFocusAndKeyboard()
@@ -220,21 +221,31 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.btnPair.setOnClickListener {
-            val pin = binding.editPin.text?.toString()?.trim() ?: ""
             val client = service?.client
             if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
                 Toast.makeText(this, "Must be connected to desktop to pair", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
 
-            // Dismiss keyboard cleanly upon submission
+            // Dismiss keyboard cleanly upon action
             dismissKeyboard()
 
-            val submitted = pairingFlow.submitPin(pin, client) { state ->
-                runOnUiThread { updatePairingUi(state) }
-            }
-            if (submitted) {
-                appendLog("Submitting PIN $pin for verification...")
+            if (pairingFlow.state.value is PairingState.Paired) {
+                appendLog("Requesting device unpair from desktop...")
+                val dispatched = pairingFlow.unpair(client) { state ->
+                    runOnUiThread { updatePairingUi(state) }
+                }
+                if (!dispatched) {
+                    appendLog("Could not dispatch unpair request.")
+                }
+            } else {
+                val pin = binding.editPin.text?.toString()?.trim() ?: ""
+                val submitted = pairingFlow.submitPin(pin, client) { state ->
+                    runOnUiThread { updatePairingUi(state) }
+                }
+                if (submitted) {
+                    appendLog("Submitting PIN $pin for verification...")
+                }
             }
         }
 
@@ -398,6 +409,7 @@ class MainActivity : AppCompatActivity() {
 
         when (state) {
             is PairingState.Idle, is PairingState.WaitingForPin -> {
+                binding.btnPair.text = getString(R.string.btn_pair)
                 binding.tvPairingBadge.text = getString(R.string.badge_unpaired)
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.secondary_text))
                 binding.tvPairingStatus.text = "Enter 6-digit PIN shown on desktop console."
@@ -418,17 +430,19 @@ class MainActivity : AppCompatActivity() {
             }
 
             is PairingState.Paired -> {
+                binding.btnPair.text = getString(R.string.btn_unpair)
                 binding.tvPairingBadge.text = getString(R.string.badge_paired)
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_connected_dark))
                 binding.tvPairingStatus.text = "✓ Paired with ${state.desktopName}"
                 binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_connected_dark))
                 binding.editPin.isEnabled = false
-                binding.btnPair.isEnabled = false
+                binding.btnPair.isEnabled = isConnected
                 binding.btnRequestPin.isEnabled = false
                 appendLog("Pairing confirmed with ${state.desktopName} (Session: ${state.sessionId.take(8)}...)")
             }
 
             is PairingState.WrongPin -> {
+                binding.btnPair.text = getString(R.string.btn_pair)
                 binding.tvPairingBadge.text = "WRONG PIN"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
                 binding.tvPairingStatus.text = "✗ ${state.message}"
@@ -440,6 +454,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             is PairingState.Expired -> {
+                binding.btnPair.text = getString(R.string.btn_pair)
                 binding.tvPairingBadge.text = "EXPIRED"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_connecting_dark))
                 binding.tvPairingStatus.text = "⏳ ${state.message}"
@@ -451,6 +466,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             is PairingState.Locked -> {
+                binding.btnPair.text = getString(R.string.btn_pair)
                 binding.tvPairingBadge.text = getString(R.string.badge_locked)
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
                 binding.tvPairingStatus.text = "🔒 ${state.message}"
@@ -462,6 +478,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             is PairingState.ConnectionLost -> {
+                binding.btnPair.text = getString(R.string.btn_pair)
                 binding.tvPairingBadge.text = "OFFLINE"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
                 binding.tvPairingStatus.text = "Connection lost during pairing."
@@ -471,6 +488,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             is PairingState.Error -> {
+                binding.btnPair.text = getString(R.string.btn_pair)
                 binding.tvPairingBadge.text = "ERROR"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
                 binding.tvPairingStatus.text = "Error: ${state.message}"

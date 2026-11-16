@@ -24,6 +24,7 @@
     <string name="subtitle_pairing">Enter the 6-digit PIN shown on the desktop console.</string>
     <string name="label_pin">ENTER 6-DIGIT DESKTOP PIN</string>
     <string name="btn_pair">Pair Device</string>
+    <string name="btn_unpair">Unpair Device</string>
     <string name="btn_request_pin">Request New PIN</string>
     <string name="badge_unpaired">UNPAIRED</string>
     <string name="badge_pairing">PAIRING...</string>

@@ -21,7 +21,8 @@ sealed class PairingState {
     data class Paired(
         val desktopId: String,
         val desktopName: String,
-        val sessionId: String
+        val sessionId: String,
+        val authToken: String? = null
     ) : PairingState()
 
     data class WrongPin(
@@ -50,7 +51,8 @@ sealed class PairingState {
  * Controller managing the 6-digit PIN entry and verification handshake for Android.
  */
 class PairingFlow(
-    private val identity: DeviceIdentity
+    private val identity: DeviceIdentity,
+    val tokenStorage: TokenStorage? = null
 ) {
     private val _state = MutableStateFlow<PairingState>(PairingState.WaitingForPin)
     val state: StateFlow<PairingState> = _state.asStateFlow()
@@ -165,6 +167,65 @@ class PairingFlow(
     }
 
     /**
+     * Unpair this device from the connected desktop core.
+     *
+     * Dispatches an authenticated 'unpair_request' with the device's token.
+     * On successful unpairing, clears the stored token and resets state to WaitingForPin.
+     *
+     * @return true if the unpair request was successfully dispatched.
+     */
+    fun unpair(
+        client: SnowWebSocketClient,
+        onStateChanged: ((PairingState) -> Unit)? = null
+    ): Boolean {
+        if (client.connectionState.value != ConnectionState.CONNECTED) {
+            val lostState = PairingState.ConnectionLost("Cannot unpair: Not connected to desktop.")
+            _state.value = lostState
+            onStateChanged?.invoke(lostState)
+            return false
+        }
+
+        if (!isSubmitting.compareAndSet(false, true)) {
+            return false
+        }
+
+        val token = tokenStorage?.getToken() ?: ""
+        val requestData = mapOf(
+            "device_id" to identity.deviceId,
+            "auth_token" to token
+        )
+
+        client.sendRequest(
+            action = "unpair_request",
+            data = requestData
+        ) { message ->
+            isSubmitting.set(false)
+            val newState = when (message.type) {
+                MessageType.RESPONSE -> {
+                    tokenStorage?.clearToken()
+                    PairingState.WaitingForPin
+                }
+                MessageType.ERROR -> {
+                    val code = message.error?.code ?: ErrorCode.INTERNAL_ERROR
+                    val errorMsg = message.error?.message ?: "Unpair failed."
+                    if (code == ErrorCode.DEVICE_NOT_FOUND || code == ErrorCode.UNAUTHORIZED) {
+                        // Device is already not recognized on desktop; clean local state
+                        tokenStorage?.clearToken()
+                        PairingState.WaitingForPin
+                    } else {
+                        PairingState.Error(errorMsg)
+                    }
+                }
+                else -> PairingState.Error("Unexpected response type during unpair: ${message.type}")
+            }
+            _state.value = newState
+            onStateChanged?.invoke(newState)
+        }
+
+        return true
+    }
+
+    /**
      * Reset pairing state back to WaitingForPin unless locked.
      */
     fun reset() {
@@ -181,11 +242,17 @@ class PairingFlow(
                 val desktopId = data?.get("device_id") as? String ?: "unknown"
                 val desktopName = data?.get("device_name") as? String ?: "SNOW Desktop"
                 val sessionId = data?.get("session_id") as? String ?: "session-active"
+                val authToken = data?.get("auth_token") as? String
+
+                if (!authToken.isNullOrBlank()) {
+                    tokenStorage?.saveToken(authToken)
+                }
 
                 PairingState.Paired(
                     desktopId = desktopId,
                     desktopName = desktopName,
-                    sessionId = sessionId
+                    sessionId = sessionId,
+                    authToken = authToken
                 )
             }
 

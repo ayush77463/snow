@@ -175,6 +175,55 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["error_already_paired.json"] = err_already_paired.to_json()
 
+    # --- Phase 2.2 Unpairing & Security Protocol Fixtures ---
+    # 17. Valid unpair_request
+    req_unpair = SnowMessage.create_request(
+        action="unpair_request",
+        data={
+            "device_id": str(uuid.uuid4()),
+            "auth_token": "valid-auth-token-sample-12345",
+        },
+    )
+    valid_fixtures["request_unpair_request.json"] = req_unpair.to_json()
+
+    # 18. Valid unpair_request response
+    resp_unpair = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "unpair_request",
+            "data": {
+                "device_id": str(uuid.uuid4()),
+                "unpaired": True,
+            },
+        },
+    )
+    valid_fixtures["response_unpair_success.json"] = resp_unpair.to_json()
+
+    # 19. Error UNAUTHORIZED
+    err_unauthorized = SnowMessage.create_error(
+        code=ErrorCode.UNAUTHORIZED,
+        message="Invalid authentication token for unpair request.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_unauthorized.json"] = err_unauthorized.to_json()
+
+    # 20. Error DEVICE_NOT_FOUND
+    err_device_not_found = SnowMessage.create_error(
+        code=ErrorCode.DEVICE_NOT_FOUND,
+        message="Device is not registered as a paired device.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_device_not_found.json"] = err_device_not_found.to_json()
+
+    # 21. Error INVALID_TOKEN
+    err_invalid_token = SnowMessage.create_error(
+        code=ErrorCode.INVALID_TOKEN,
+        message="Authentication token has expired or is invalid.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_invalid_token.json"] = err_invalid_token.to_json()
+
     # --- Negative / Invalid Fixtures ---
     # 1. Malformed JSON
     invalid_fixtures["invalid_malformed_json.json"] = (

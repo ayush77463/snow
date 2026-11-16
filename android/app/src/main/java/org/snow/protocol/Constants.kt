@@ -36,4 +36,9 @@ object ErrorCode {
     const val PIN_EXPIRED = "PIN_EXPIRED"
     const val PAIRING_LOCKED = "PAIRING_LOCKED"
     const val ALREADY_PAIRED = "ALREADY_PAIRED"
+
+    // Phase 2.2 Security / Session Error Codes
+    const val UNAUTHORIZED = "UNAUTHORIZED"
+    const val INVALID_TOKEN = "INVALID_TOKEN"
+    const val DEVICE_NOT_FOUND = "DEVICE_NOT_FOUND"
 }

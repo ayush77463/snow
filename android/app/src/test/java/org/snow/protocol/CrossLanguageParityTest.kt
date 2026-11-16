@@ -190,6 +190,55 @@ class CrossLanguageParityTest {
             )
             valid["error_already_paired.json"] = JsonSerialization.toJson(errAlreadyPaired)
 
+            // --- Phase 2.2 Unpairing & Security Protocol Fixtures ---
+            // 17. Valid unpair_request
+            val reqUnpair = SnowMessage.createRequest(
+                "unpair_request",
+                mapOf(
+                    "device_id" to UUID.randomUUID().toString(),
+                    "auth_token" to "valid-auth-token-sample-12345"
+                )
+            )
+            valid["request_unpair_request.json"] = JsonSerialization.toJson(reqUnpair)
+
+            // 18. Valid unpair_request response
+            val respUnpair = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "unpair_request",
+                    "data" to mapOf(
+                        "device_id" to UUID.randomUUID().toString(),
+                        "unpaired" to true
+                    )
+                )
+            )
+            valid["response_unpair_success.json"] = JsonSerialization.toJson(respUnpair)
+
+            // 19. Error UNAUTHORIZED
+            val errUnauthorized = SnowMessage.createError(
+                ErrorCode.UNAUTHORIZED,
+                "Invalid authentication token for unpair request.",
+                reqId
+            )
+            valid["error_unauthorized.json"] = JsonSerialization.toJson(errUnauthorized)
+
+            // 20. Error DEVICE_NOT_FOUND
+            val errDeviceNotFound = SnowMessage.createError(
+                ErrorCode.DEVICE_NOT_FOUND,
+                "Device is not registered as a paired device.",
+                reqId
+            )
+            valid["error_device_not_found.json"] = JsonSerialization.toJson(errDeviceNotFound)
+
+            // 21. Error INVALID_TOKEN
+            val errInvalidToken = SnowMessage.createError(
+                ErrorCode.INVALID_TOKEN,
+                "Authentication token has expired or is invalid.",
+                reqId
+            )
+            valid["error_invalid_token.json"] = JsonSerialization.toJson(errInvalidToken)
+
             for ((filename, content) in valid) {
                 File(ktToPyValid, filename).writeText(content, Charsets.UTF_8)
             }

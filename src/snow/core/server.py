@@ -50,6 +50,16 @@ class SnowCoreServer:
         """Return the core server's device identity."""
         return self.ws_server.device_identity
 
+    @property
+    def db_manager(self):
+        """Return the core server's SQLite database manager."""
+        return self.ws_server.db_manager
+
+    @property
+    def session_manager(self):
+        """Return the core server's active session manager."""
+        return self.ws_server.session_manager
+
     async def start(self) -> None:
         """Initialize the server lifecycle, enumerate interfaces, and start WebSocket listener.
 

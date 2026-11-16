@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from typing import Any, Optional
 
 from websockets.asyncio.server import Server, ServerConnection, serve
@@ -14,8 +15,10 @@ from snow.network.connection_manager import ConnectionManager
 from snow.protocol.constants import ErrorCode, MessageType
 from snow.protocol.models import SnowMessage
 from snow.protocol.validator import ProtocolValidationError, validate_raw_message
+from snow.security.db import DatabaseManager, hash_token
 from snow.security.identity import DeviceIdentity, load_or_create_device_identity
-from snow.security.pairing import PairingManager
+from snow.security.pairing import PairingManager, PairingOutcome
+from snow.security.session import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +27,8 @@ class SnowWebSocketServer:
     """Asynchronous WebSocket server implementing SNOW Device Protocol v1.
 
     Manages incoming client connections, message validation, ping/pong request
-    correlation, heartbeat tracking, and stale connection reaping.
+    correlation, heartbeat tracking, stale connection reaping, SQLite paired records,
+    and active session lifecycles.
     """
 
     def __init__(
@@ -33,11 +37,15 @@ class SnowWebSocketServer:
         connection_manager: Optional[ConnectionManager] = None,
         pairing_manager: Optional[PairingManager] = None,
         device_identity: Optional[DeviceIdentity] = None,
+        db_manager: Optional[DatabaseManager] = None,
+        session_manager: Optional[SessionManager] = None,
     ) -> None:
         self.config = config
         self.connection_manager = connection_manager or ConnectionManager()
         self.pairing_manager = pairing_manager or PairingManager()
         self.device_identity = device_identity or load_or_create_device_identity()
+        self.db_manager = db_manager or DatabaseManager()
+        self.session_manager = session_manager or SessionManager()
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -142,6 +150,7 @@ class SnowWebSocketServer:
             logger.warning("Unexpected error handling client [%s]: %s",
                            client.connection_id, exc, exc_info=True)
         finally:
+            self.session_manager.cleanup_connection(client.connection_id)
             self.connection_manager.unregister(client.connection_id)
             for req_id, (cid, fut) in list(self._pending_requests.items()):
                 if cid == client.connection_id and not fut.done():
@@ -267,6 +276,8 @@ class SnowWebSocketServer:
             await client.websocket.send(response.to_json())
         elif action in ("pair_request", "pair_verify"):
             await self._handle_pairing_request(client, message, action, data)
+        elif action == "unpair_request":
+            await self._handle_unpair_request(client, message, data)
         else:
             logger.warning("Rejected unsupported action '%s' from client [%s]",
                            action, client.connection_id)
@@ -290,6 +301,35 @@ class SnowWebSocketServer:
             if result.is_success:
                 logger.info("Successfully paired with device [%s] from client [%s]",
                             client_device_id, client.connection_id)
+                auth_token = secrets.token_urlsafe(32)
+                token_hash = hash_token(auth_token)
+                client_device_name = data.get(
+                    "device_name",
+                    f"Android-{client_device_id[:8]}" if client_device_id else "Android-Device",
+                )
+
+                if client_device_id:
+                    # Clean up prior records / sessions if re-pairing
+                    existing = self.db_manager.get_paired_device(client_device_id)
+                    if existing:
+                        self.db_manager.delete_paired_device(client_device_id)
+                        self.session_manager.revoke_device_sessions(client_device_id)
+
+                    self.db_manager.insert_paired_device(
+                        device_id=client_device_id,
+                        device_name=client_device_name,
+                        auth_token_hash=token_hash,
+                    )
+                    self.db_manager.log_audit_event(
+                        event_type="PAIR_SUCCESS",
+                        device_id=client_device_id,
+                        details={"device_name": client_device_name, "connection_id": client.connection_id},
+                    )
+                    self.session_manager.create_session(
+                        device_id=client_device_id,
+                        connection_id=client.connection_id,
+                    )
+
                 response = SnowMessage.create_response(
                     correlation_id=message.id,
                     payload={
@@ -299,12 +339,25 @@ class SnowWebSocketServer:
                             "device_id": self.device_identity.device_id,
                             "device_name": self.device_identity.device_name,
                             "session_id": result.session_id,
+                            "auth_token": auth_token,
                         },
                     },
                 )
                 await client.websocket.send(response.to_json())
             else:
                 error_code = result.error_code or ErrorCode.INTERNAL_ERROR
+                if error_code == ErrorCode.PAIRING_LOCKED:
+                    self.db_manager.log_audit_event(
+                        event_type="PAIR_LOCKOUT",
+                        device_id=client_device_id,
+                        details={"reason": result.message},
+                    )
+                else:
+                    self.db_manager.log_audit_event(
+                        event_type="PAIR_FAILED",
+                        device_id=client_device_id,
+                        details={"error_code": error_code, "reason": result.message},
+                    )
                 logger.warning("Pairing failed for client [%s]: %s (code=%s)",
                                client.connection_id, result.message, error_code)
                 error_response = SnowMessage.create_error(
@@ -329,6 +382,116 @@ class SnowWebSocketServer:
                 },
             )
             await client.websocket.send(response.to_json())
+
+    async def _handle_unpair_request(
+        self, client, message: SnowMessage, data: dict[str, Any]
+    ) -> None:
+        """Handle an authenticated unpair request from a paired client device."""
+        device_id = data.get("device_id")
+        auth_token = data.get("auth_token")
+
+        if not device_id or not auth_token:
+            logger.warning("Unpair request missing device_id or auth_token from client [%s]",
+                           client.connection_id)
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_REQUEST,
+                message="Unpair request requires 'device_id' and 'auth_token'.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        device_record = self.db_manager.get_paired_device(device_id)
+        if not device_record:
+            logger.warning("Unpair rejected: device [%s] not found in paired database", device_id)
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.DEVICE_NOT_FOUND,
+                message=f"Device [{device_id}] is not registered as a paired device.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        if not self.db_manager.verify_device_token(device_id, auth_token):
+            logger.warning("Unpair rejected: invalid auth token presented for device [%s]", device_id)
+            self.db_manager.log_audit_event(
+                event_type="UNPAIR_UNAUTHORIZED",
+                device_id=device_id,
+                details={"reason": "Invalid auth token presented during unpair"},
+            )
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Invalid authentication token for unpair request.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        # Successfully verified: remove device, revoke active sessions, record audit trail
+        self.db_manager.delete_paired_device(device_id)
+        self.session_manager.revoke_device_sessions(device_id)
+        self.db_manager.log_audit_event(
+            event_type="UNPAIR",
+            device_id=device_id,
+            details={"initiated_by": "client", "connection_id": client.connection_id},
+        )
+        self.db_manager.log_audit_event(
+            event_type="SESSION_REVOKED",
+            device_id=device_id,
+            details={"reason": "Device unpaired via client unpair_request"},
+        )
+
+        logger.info("Successfully unpaired device [%s] via client [%s]",
+                    device_id, client.connection_id)
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "unpair_request",
+                "data": {
+                    "device_id": device_id,
+                    "unpaired": True,
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    def authorize_request(self, device_id: str, auth_token: str) -> bool:
+        """Authorize an incoming request using persistent token verification.
+
+        Updates last-seen timestamp upon successful authorization.
+        """
+        if not device_id or not auth_token:
+            return False
+        is_valid = self.db_manager.verify_device_token(device_id, auth_token)
+        if is_valid:
+            self.db_manager.update_last_seen(device_id)
+            session = self.session_manager.get_session_by_device(device_id)
+            if session:
+                self.session_manager.touch_session(session.session_id)
+        return is_valid
+
+    def unpair_device(self, device_id: str) -> bool:
+        """Desktop-initiated unpairing of a registered device.
+
+        Deletes SQLite record, revokes active session, and logs audit events.
+        """
+        existing = self.db_manager.get_paired_device(device_id)
+        if not existing:
+            return False
+        self.db_manager.delete_paired_device(device_id)
+        self.session_manager.revoke_device_sessions(device_id)
+        self.db_manager.log_audit_event(
+            event_type="UNPAIR",
+            device_id=device_id,
+            details={"initiated_by": "desktop"},
+        )
+        self.db_manager.log_audit_event(
+            event_type="SESSION_REVOKED",
+            device_id=device_id,
+            details={"reason": "Desktop unpair_device invoked"},
+        )
+        return True
 
     async def _stale_connection_reaper(self) -> None:
         """Periodically check for and disconnect inactive clients exceeding the heartbeat timeout."""

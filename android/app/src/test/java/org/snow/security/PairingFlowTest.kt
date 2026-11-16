@@ -136,4 +136,36 @@ class PairingFlowTest {
         val state = flow.handlePairingResponse(errorResponse)
         assertTrue("Already paired maps gracefully to Paired state", state is PairingState.Paired)
     }
+
+    @Test
+    fun testSuccessResponseSavesTokenWhenPresent() {
+        val storage = InMemoryTokenStorage()
+        val flowWithStorage = PairingFlow(identity, storage)
+
+        val requestId = UUID.randomUUID().toString()
+        val desktopId = UUID.randomUUID().toString()
+        val sessionId = UUID.randomUUID().toString()
+        val authToken = "secret-token-xyz789"
+
+        val response = SnowMessage.createResponse(
+            correlationId = requestId,
+            payload = mapOf(
+                "status" to "success",
+                "action" to "pair_request",
+                "data" to mapOf(
+                    "device_id" to desktopId,
+                    "device_name" to "SNOW Desktop Core",
+                    "session_id" to sessionId,
+                    "auth_token" to authToken
+                )
+            )
+        )
+
+        val state = flowWithStorage.handlePairingResponse(response)
+        assertTrue(state is PairingState.Paired)
+        val paired = state as PairingState.Paired
+        assertEquals(authToken, paired.authToken)
+        assertTrue(storage.hasToken())
+        assertEquals(authToken, storage.getToken())
+    }
 }
