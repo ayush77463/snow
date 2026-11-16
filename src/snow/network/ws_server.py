@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 import secrets
+import ssl
 from typing import Any, Optional
 
 from websockets.asyncio.server import Server, ServerConnection, serve
@@ -19,6 +21,15 @@ from snow.security.db import DatabaseManager, hash_token
 from snow.security.identity import DeviceIdentity, load_or_create_device_identity
 from snow.security.pairing import PairingManager, PairingOutcome
 from snow.security.session import SessionManager
+from snow.security.tls import (
+    DEFAULT_CERT_FILE,
+    DEFAULT_KEY_FILE,
+    DEFAULT_TLS_DIR,
+    CertificateInfo,
+    create_server_ssl_context,
+    ensure_tls_certificate,
+    print_tls_fingerprint_banner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +61,10 @@ class SnowWebSocketServer:
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
         self._pending_requests: dict[str, tuple[str, asyncio.Future[SnowMessage]]] = {}
+        self.certificate_info: Optional[CertificateInfo] = None
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        self._auth_timers: dict[str, asyncio.Task] = {}
+        self._pairing_in_progress: set[str] = set()
 
     @property
     def is_running(self) -> bool:
@@ -64,29 +79,70 @@ class SnowWebSocketServer:
             return sock.getsockname()[1]
         return None
 
-    async def start(self) -> None:
-        """Start listening for incoming WebSocket connections."""
+    async def start(self, active_ips: Optional[list[str]] = None) -> None:
+        """Start listening for incoming WebSocket connections.
+
+        Args:
+            active_ips: Optional list of active IPv4 addresses to ensure presence in
+                the TLS certificate Subject Alternative Names (SAN).
+        """
         if self._is_running:
             logger.warning("SnowWebSocketServer is already running; start() ignored.")
             return
 
         logger.info(
-            "Starting WebSocket server on %s:%d (max_message_size=%d bytes)...",
+            "Starting %s server on %s:%d (max_message_size=%d bytes)...",
+            "WSS (TLS)" if self.config.tls_enabled else "WebSocket (plaintext)",
             self.config.bind_host,
             self.config.port,
             self.config.max_message_size,
         )
 
         try:
+            if self.config.tls_enabled:
+                cert_path = (
+                    Path(self.config.tls_cert_path)
+                    if self.config.tls_cert_path
+                    else (DEFAULT_TLS_DIR / DEFAULT_CERT_FILE)
+                )
+                key_path = (
+                    Path(self.config.tls_key_path)
+                    if self.config.tls_key_path
+                    else (DEFAULT_TLS_DIR / DEFAULT_KEY_FILE)
+                )
+                self.certificate_info = ensure_tls_certificate(
+                    cert_path=cert_path,
+                    key_path=key_path,
+                    active_ips=active_ips,
+                )
+                self._ssl_context = create_server_ssl_context(
+                    cert_path=cert_path,
+                    key_path=key_path,
+                )
+            else:
+                self.certificate_info = None
+                self._ssl_context = None
+
             self._server = await serve(
                 self._handle_client,
                 self.config.bind_host,
                 self.config.port,
                 max_size=self.config.max_message_size,
+                ssl=self._ssl_context,
             )
             self._is_running = True
             actual_port = self.bound_port or self.config.port
-            logger.info("WebSocket server listening on ws://%s:%d", self.config.bind_host, actual_port)
+
+            if self.config.tls_enabled and self.certificate_info:
+                print_tls_fingerprint_banner(self.certificate_info.fingerprint_sha256)
+                logger.info(
+                    "WSS server listening on wss://%s:%d (TLS 1.2+ active, SHA-256: %s)",
+                    self.config.bind_host,
+                    actual_port,
+                    self.certificate_info.fingerprint_sha256,
+                )
+            else:
+                logger.info("WebSocket server listening on ws://%s:%d", self.config.bind_host, actual_port)
 
             # Start background reaper task for stale client connections
             self._reaper_task = asyncio.create_task(self._stale_connection_reaper())
@@ -106,6 +162,13 @@ class SnowWebSocketServer:
 
         logger.info("Stopping WebSocket server...")
         self._is_running = False
+
+        # Cancel all pending handshake timers
+        for cid, timer_task in list(self._auth_timers.items()):
+            if not timer_task.done():
+                timer_task.cancel()
+        self._auth_timers.clear()
+        self._pairing_in_progress.clear()
 
         # Cancel background stale connection reaper
         if self._reaper_task:
@@ -138,6 +201,13 @@ class SnowWebSocketServer:
         logger.info("Accepted new WebSocket connection from %s [id=%s]",
                     client.remote_address, client.connection_id)
 
+        # Enforce unauthenticated connection timeout (default 5.0 seconds)
+        if self.config.auth_required and self.config.auth_timeout > 0:
+            timer_task = asyncio.create_task(
+                self._enforce_handshake_timeout(client.connection_id, self.config.auth_timeout)
+            )
+            self._auth_timers[client.connection_id] = timer_task
+
         try:
             async for raw_message in websocket:
                 await self._process_message(client, raw_message)
@@ -150,6 +220,10 @@ class SnowWebSocketServer:
             logger.warning("Unexpected error handling client [%s]: %s",
                            client.connection_id, exc, exc_info=True)
         finally:
+            timer = self._auth_timers.pop(client.connection_id, None)
+            if timer and not timer.done():
+                timer.cancel()
+            self._pairing_in_progress.discard(client.connection_id)
             self.session_manager.cleanup_connection(client.connection_id)
             self.connection_manager.unregister(client.connection_id)
             for req_id, (cid, fut) in list(self._pending_requests.items()):
@@ -157,6 +231,29 @@ class SnowWebSocketServer:
                     fut.set_exception(
                         ConnectionResetError(f"Client [{client.connection_id}] disconnected.")
                     )
+
+    async def _enforce_handshake_timeout(self, connection_id: str, timeout: float) -> None:
+        """Close connection if client fails to authenticate or initiate pairing within timeout."""
+        try:
+            await asyncio.sleep(timeout)
+            # If pairing has legitimately started, do not interrupt the user entering their PIN
+            if connection_id in self._pairing_in_progress:
+                return
+            session = self.session_manager.get_session_by_connection(connection_id)
+            if session is None:
+                logger.warning(
+                    "Handshake timeout: Client [%s] did not authenticate or initiate pairing within %.1fs. Closing connection.",
+                    connection_id,
+                    timeout,
+                )
+                client = self.connection_manager.get(connection_id)
+                if client and client.websocket:
+                    try:
+                        await client.websocket.close(code=4001, reason="Handshake timeout")
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
 
     async def _process_message(self, client, raw_message: str | bytes) -> None:
         """Validate and dispatch an incoming client message."""
@@ -267,26 +364,139 @@ class SnowWebSocketServer:
         action = message.payload.get("action")
         data = message.payload.get("data") if isinstance(message.payload.get("data"), dict) else {}
 
-        if action == "ping":
-            logger.debug("Handling 'ping' action from client [%s]", client.connection_id)
-            response = SnowMessage.create_response(
-                correlation_id=message.id,
-                payload={"status": "success", "action": "pong"},
-            )
-            await client.websocket.send(response.to_json())
+        if action == "auth_request":
+            await self._handle_auth_request(client, message, data)
         elif action in ("pair_request", "pair_verify"):
+            # Mark pairing flow as in progress to prevent handshake timeout interruption
+            self._pairing_in_progress.add(client.connection_id)
+            timer = self._auth_timers.pop(client.connection_id, None)
+            if timer and not timer.done():
+                timer.cancel()
             await self._handle_pairing_request(client, message, action, data)
         elif action == "unpair_request":
             await self._handle_unpair_request(client, message, data)
         else:
-            logger.warning("Rejected unsupported action '%s' from client [%s]",
-                           action, client.connection_id)
+            # All other device operations require an authenticated session if auth is required
+            if self.config.auth_required:
+                session = self.session_manager.get_session_by_connection(client.connection_id)
+                if session is None:
+                    logger.warning(
+                        "Rejected unauthenticated action '%s' from client [%s]",
+                        action,
+                        client.connection_id,
+                    )
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.UNAUTHORIZED,
+                        message="Client is not authenticated. Send 'auth_request' first.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+
+                self.session_manager.touch_session(session.session_id)
+            if action == "ping":
+                logger.debug("Handling 'ping' action from client [%s]", client.connection_id)
+                response = SnowMessage.create_response(
+                    correlation_id=message.id,
+                    payload={"status": "success", "action": "pong"},
+                )
+                await client.websocket.send(response.to_json())
+            else:
+                logger.warning("Rejected unsupported action '%s' from client [%s]",
+                               action, client.connection_id)
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.UNSUPPORTED_ACTION,
+                    message=f"Action '{action}' is not supported.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+
+    async def _handle_auth_request(
+        self, client, message: SnowMessage, data: dict[str, Any]
+    ) -> None:
+        """Handle incoming auth_request to establish an authenticated session."""
+        device_id = data.get("device_id")
+        auth_token = data.get("auth_token")
+
+        if not device_id or not isinstance(device_id, str) or not auth_token or not isinstance(auth_token, str):
+            logger.warning(
+                "auth_request missing or invalid device_id or auth_token from client [%s]",
+                client.connection_id,
+            )
             error_response = SnowMessage.create_error(
-                code=ErrorCode.UNSUPPORTED_ACTION,
-                message=f"Action '{action}' is not supported.",
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="auth_request requires string 'device_id' and 'auth_token'.",
                 correlation_id=message.id,
             )
             await client.websocket.send(error_response.to_json())
+            return
+
+        device_record = self.db_manager.get_paired_device(device_id)
+        if not device_record:
+            logger.warning("auth_request rejected: device [%s] not found in database", device_id)
+            self.db_manager.log_audit_event(
+                event_type="AUTH_FAILED",
+                device_id=device_id,
+                details={"reason": "Device not found in pairing database", "connection_id": client.connection_id},
+            )
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.DEVICE_NOT_FOUND,
+                message=f"Device [{device_id}] is not registered as a paired device.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        if not self.db_manager.verify_device_token(device_id, auth_token):
+            logger.warning("auth_request rejected: invalid auth token presented for device [%s]", device_id)
+            self.db_manager.log_audit_event(
+                event_type="AUTH_FAILED",
+                device_id=device_id,
+                details={"reason": "Invalid auth token presented", "connection_id": client.connection_id},
+            )
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Invalid authentication token.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        # Verification successful: cancel handshake timeout
+        timer = self._auth_timers.pop(client.connection_id, None)
+        if timer and not timer.done():
+            timer.cancel()
+
+        session = self.session_manager.create_session(
+            device_id=device_id,
+            connection_id=client.connection_id,
+        )
+        self.db_manager.update_last_seen(device_id)
+        self.db_manager.log_audit_event(
+            event_type="AUTH_SUCCESS",
+            device_id=device_id,
+            details={"session_id": session.session_id, "connection_id": client.connection_id},
+        )
+
+        logger.info(
+            "Successfully authenticated device [%s] (session=%s) from client [%s]",
+            device_id,
+            session.session_id,
+            client.connection_id,
+        )
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "auth_request",
+                "data": {
+                    "device_id": device_id,
+                    "session_id": session.session_id,
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
 
     async def _handle_pairing_request(
         self, client, message: SnowMessage, action: str, data: dict[str, Any]
@@ -329,6 +539,12 @@ class SnowWebSocketServer:
                         device_id=client_device_id,
                         connection_id=client.connection_id,
                     )
+
+                # Successful pairing: clear pairing in-progress state and cancel handshake timer
+                self._pairing_in_progress.discard(client.connection_id)
+                timer = self._auth_timers.pop(client.connection_id, None)
+                if timer and not timer.done():
+                    timer.cancel()
 
                 response = SnowMessage.create_response(
                     correlation_id=message.id,

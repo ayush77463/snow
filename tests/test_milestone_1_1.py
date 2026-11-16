@@ -13,6 +13,7 @@ Test Coverage:
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import sys
 import unittest
@@ -26,6 +27,13 @@ from snow.core.network import (
     is_usable_ipv4,
 )
 from snow.core.server import SnowCoreServer
+
+
+def _get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
 
 
 class TestNetworkDetection(unittest.TestCase):
@@ -217,10 +225,14 @@ class TestCoreConfig(unittest.TestCase):
 class TestSnowCoreServerLifecycle(unittest.TestCase):
     """Validate async server lifecycle, idempotence, and clean state transitions."""
 
+    def _create_test_server(self) -> SnowCoreServer:
+        config = CoreConfig(bind_host="127.0.0.1", port=_get_free_port(), tls_enabled=False)
+        return SnowCoreServer(config=config)
+
     def test_server_startup_and_shutdown(self):
         """Verify start(), is_running, and stop() in an asyncio loop."""
         async def _test():
-            server = SnowCoreServer()
+            server = self._create_test_server()
             self.assertFalse(server.is_running)
 
             await server.start()
@@ -235,7 +247,7 @@ class TestSnowCoreServerLifecycle(unittest.TestCase):
     def test_repeated_start_is_idempotent(self):
         """Verify that repeated start() calls do not re-initialize an already running server."""
         async def _test():
-            server = SnowCoreServer()
+            server = self._create_test_server()
             await server.start()
             self.assertTrue(server.is_running)
 
@@ -251,7 +263,7 @@ class TestSnowCoreServerLifecycle(unittest.TestCase):
     def test_repeated_stop_is_idempotent(self):
         """Verify that repeated stop() calls are safe no-ops."""
         async def _test():
-            server = SnowCoreServer()
+            server = self._create_test_server()
             await server.start()
             await server.stop()
             self.assertFalse(server.is_running)
@@ -265,7 +277,7 @@ class TestSnowCoreServerLifecycle(unittest.TestCase):
     def test_shutdown_request_after_stop(self):
         """Verify request_shutdown() is safe when called after server has already stopped."""
         async def _test():
-            server = SnowCoreServer()
+            server = self._create_test_server()
             await server.start()
             await server.stop()
             self.assertFalse(server.is_running)
@@ -279,7 +291,7 @@ class TestSnowCoreServerLifecycle(unittest.TestCase):
     def test_server_restart_after_stop(self):
         """Verify that a server can be cleanly restarted after being stopped."""
         async def _test():
-            server = SnowCoreServer()
+            server = self._create_test_server()
             await server.start()
             self.assertTrue(server.is_running)
             await server.stop()
@@ -296,7 +308,7 @@ class TestSnowCoreServerLifecycle(unittest.TestCase):
     def test_server_run_and_request_shutdown(self):
         """Verify run() wait loop terminates cleanly when request_shutdown() is called."""
         async def _test():
-            server = SnowCoreServer()
+            server = self._create_test_server()
             run_task = asyncio.create_task(server.run())
 
             # Yield control so server starts running
@@ -327,12 +339,14 @@ class TestSubprocessLifecycleAndStdoutIsolation(unittest.TestCase):
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
 
+        sub_env = {**os.environ, "SNOW_PORT": str(_get_free_port()), "SNOW_TLS_ENABLED": "false"}
         proc = subprocess.Popen(
             [python_exe, "-m", "snow.main"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             creationflags=creationflags,
+            env=sub_env,
         )
 
         captured_stderr_lines = []

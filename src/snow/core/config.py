@@ -41,6 +41,11 @@ class CoreConfig:
     max_message_size: int = 65536
     heartbeat_timeout: float = 45.0
     heartbeat_interval: float = 15.0
+    tls_enabled: bool = True
+    auth_timeout: float = 5.0
+    auth_required: bool = True
+    tls_cert_path: str | None = None
+    tls_key_path: str | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration invariants upon instantiation."""
@@ -83,6 +88,28 @@ class CoreConfig:
             raise ValueError(f"Heartbeat interval must be numeric, got {type(self.heartbeat_interval).__name__}")
         if not math.isfinite(self.heartbeat_interval) or self.heartbeat_interval <= 0:
             raise ValueError(f"Heartbeat interval must be a finite positive number (> 0), got {self.heartbeat_interval}")
+
+        # Validate tls_enabled (boolean)
+        if not isinstance(self.tls_enabled, bool):
+            raise ValueError(f"tls_enabled must be a boolean, got {type(self.tls_enabled).__name__}")
+
+        # Validate auth timeout (> 0.0, finite)
+        if not isinstance(self.auth_timeout, (int, float)) or isinstance(self.auth_timeout, bool):
+            raise ValueError(f"auth_timeout must be numeric, got {type(self.auth_timeout).__name__}")
+        if not math.isfinite(self.auth_timeout) or self.auth_timeout <= 0:
+            raise ValueError(f"auth_timeout must be a finite positive number (> 0), got {self.auth_timeout}")
+
+        # Validate auth_required (boolean)
+        if not isinstance(self.auth_required, bool):
+            raise ValueError(f"auth_required must be a boolean, got {type(self.auth_required).__name__}")
+
+        # Validate TLS cert/key paths if provided
+        if self.tls_cert_path is not None:
+            if not isinstance(self.tls_cert_path, str) or not self.tls_cert_path.strip():
+                raise ValueError("tls_cert_path must be a non-empty string or None")
+        if self.tls_key_path is not None:
+            if not isinstance(self.tls_key_path, str) or not self.tls_key_path.strip():
+                raise ValueError("tls_key_path must be a non-empty string or None")
 
     @classmethod
     def from_env(cls) -> "CoreConfig":
@@ -194,6 +221,59 @@ class CoreConfig:
         else:
             heartbeat_interval = 15.0
 
+        # Parse and validate SNOW_TLS_ENABLED
+        raw_tls = os.getenv("SNOW_TLS_ENABLED")
+        if raw_tls is not None:
+            norm_tls = raw_tls.strip().lower()
+            if norm_tls in ("true", "1", "yes", "on"):
+                tls_enabled = True
+            elif norm_tls in ("false", "0", "no", "off"):
+                tls_enabled = False
+            else:
+                raise ValueError(
+                    f"Invalid SNOW_TLS_ENABLED '{raw_tls}': must be 'true' or 'false'."
+                )
+        else:
+            tls_enabled = True
+
+        # Parse and validate SNOW_AUTH_TIMEOUT
+        raw_auth_timeout = os.getenv("SNOW_AUTH_TIMEOUT")
+        if raw_auth_timeout is not None:
+            try:
+                auth_timeout = float(raw_auth_timeout)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_AUTH_TIMEOUT '{raw_auth_timeout}': must be a finite positive number."
+                ) from None
+            if not math.isfinite(auth_timeout) or auth_timeout <= 0:
+                raise ValueError(
+                    f"Invalid SNOW_AUTH_TIMEOUT '{raw_auth_timeout}': must be a finite positive number (> 0)."
+                )
+        else:
+            auth_timeout = 5.0
+
+        # Parse and validate SNOW_AUTH_REQUIRED
+        raw_auth_required = os.getenv("SNOW_AUTH_REQUIRED")
+        if raw_auth_required is not None:
+            norm_auth = raw_auth_required.strip().lower()
+            if norm_auth in ("true", "1", "yes", "on"):
+                auth_required = True
+            elif norm_auth in ("false", "0", "no", "off"):
+                auth_required = False
+            else:
+                raise ValueError(
+                    f"Invalid SNOW_AUTH_REQUIRED '{raw_auth_required}': must be 'true' or 'false'."
+                )
+        else:
+            auth_required = True
+
+        # Parse SNOW_TLS_CERT_PATH and SNOW_TLS_KEY_PATH
+        raw_cert_path = os.getenv("SNOW_TLS_CERT_PATH")
+        tls_cert_path = raw_cert_path.strip() if raw_cert_path and raw_cert_path.strip() else None
+
+        raw_key_path = os.getenv("SNOW_TLS_KEY_PATH")
+        tls_key_path = raw_key_path.strip() if raw_key_path and raw_key_path.strip() else None
+
         return cls(
             app_name=app_name,
             version="0.1.0",
@@ -204,4 +284,9 @@ class CoreConfig:
             max_message_size=max_message_size,
             heartbeat_timeout=heartbeat_timeout,
             heartbeat_interval=heartbeat_interval,
+            tls_enabled=tls_enabled,
+            auth_timeout=auth_timeout,
+            auth_required=auth_required,
+            tls_cert_path=tls_cert_path,
+            tls_key_path=tls_key_path,
         )

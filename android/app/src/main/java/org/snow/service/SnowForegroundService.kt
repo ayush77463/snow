@@ -24,6 +24,9 @@ import org.snow.R
 import org.snow.network.ConnectionState
 import org.snow.network.SnowWebSocketClient
 import org.snow.protocol.Constants
+import org.snow.security.DeviceIdentity
+import org.snow.security.EncryptedCertPinStorage
+import org.snow.security.SharedPreferencesTokenStorage
 import org.snow.ui.MainActivity
 
 /**
@@ -35,7 +38,15 @@ class SnowForegroundService : Service() {
     private var stateObserverJob: Job? = null
 
     val client: SnowWebSocketClient by lazy {
-        SnowWebSocketClient()
+        val identity = DeviceIdentity.getOrCreate(applicationContext)
+        val tokenStorage = SharedPreferencesTokenStorage(applicationContext)
+        val certPinStorage = EncryptedCertPinStorage(applicationContext)
+        SnowWebSocketClient(
+            certPinStorage = certPinStorage,
+            tokenStorage = tokenStorage,
+            identity = identity,
+            useTls = true
+        )
     }
 
     private val binder = LocalBinder()

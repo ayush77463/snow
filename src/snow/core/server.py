@@ -99,7 +99,8 @@ class SnowCoreServer:
             logger.warning("Please connect this laptop to Wi-Fi or an Android mobile hotspot.")
 
         # Start the WebSocket server
-        await self.ws_server.start()
+        active_ips = [iface.ip_address for iface in self._detected_interfaces if iface.is_up]
+        await self.ws_server.start(active_ips=active_ips)
 
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port

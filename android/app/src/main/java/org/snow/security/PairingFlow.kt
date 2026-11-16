@@ -234,6 +234,18 @@ class PairingFlow(
         }
     }
 
+    /**
+     * Mark state as Paired upon successful automatic post-connection authentication handshake.
+     */
+    fun setAuthenticated(sessionId: String, desktopName: String = "SNOW Desktop") {
+        val newState = PairingState.Paired(
+            desktopId = "desktop-core",
+            desktopName = desktopName,
+            sessionId = sessionId
+        )
+        _state.value = newState
+    }
+
     internal fun handlePairingResponse(message: SnowMessage): PairingState {
         return when (message.type) {
             MessageType.RESPONSE -> {

@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import org.snow.R
 import org.snow.databinding.ActivityMainBinding
+import org.snow.network.AuthState
 import org.snow.network.ConnectionState
 import org.snow.protocol.Constants
 import org.snow.security.DeviceIdentity
@@ -43,6 +44,7 @@ class MainActivity : AppCompatActivity() {
 
     private var stateJob: Job? = null
     private var logsJob: Job? = null
+    private var authJob: Job? = null
 
     // Activity timeline events list and current filter
     private enum class ActivityFilter { ALL, CONNECTIONS, DIAGNOSTICS }
@@ -323,6 +325,71 @@ class MainActivity : AppCompatActivity() {
                 appendLog(logLine)
             }
         }
+
+        authJob = lifecycleScope.launch {
+            currentService.client.authState.collectLatest { authState ->
+                when (authState) {
+                    is AuthState.FingerprintConfirmationRequired -> {
+                        showFingerprintConfirmationDialog(authState.fingerprint, currentService.client)
+                    }
+                    is AuthState.FingerprintMismatch -> {
+                        showFingerprintMismatchDialog(authState.pinned, authState.presented, currentService.client)
+                    }
+                    is AuthState.Authenticated -> {
+                        pairingFlow.setAuthenticated(authState.sessionId)
+                        updatePairingUi(pairingFlow.state.value)
+                        appendLog("Device authenticated with desktop core (Session: ${authState.sessionId.take(8)}...)")
+                    }
+                    is AuthState.AuthFailed -> {
+                        pairingFlow.reset()
+                        updatePairingUi(pairingFlow.state.value)
+                        appendLog("Authentication failed: ${authState.reason}")
+                    }
+                    else -> {}
+                }
+            }
+        }
+    }
+
+    private fun showFingerprintConfirmationDialog(fingerprint: String, client: org.snow.network.SnowWebSocketClient) {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Verify Server Certificate")
+            .setMessage(
+                "The desktop core presented the following SHA-256 fingerprint:\n\n" +
+                "$fingerprint\n\n" +
+                "Verify that this matches the fingerprint displayed on your laptop terminal.\n\n" +
+                "Do you trust this desktop endpoint?"
+            )
+            .setPositiveButton("Trust & Connect") { _, _ ->
+                client.confirmAndPinCertificate(fingerprint)
+                appendLog("User confirmed and pinned certificate: $fingerprint")
+            }
+            .setNegativeButton("Reject") { _, _ ->
+                client.disconnect()
+                appendLog("User rejected certificate fingerprint.")
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun showFingerprintMismatchDialog(pinned: String, presented: String, client: org.snow.network.SnowWebSocketClient) {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Security Warning: Certificate Mismatch")
+            .setMessage(
+                "The desktop presented a certificate that does NOT match the previously pinned identity!\n\n" +
+                "Pinned:\n$pinned\n\n" +
+                "Presented:\n$presented\n\n" +
+                "This could indicate a Man-in-the-Middle attack or a regenerated server certificate."
+            )
+            .setPositiveButton("Reset Trust Decision") { _, _ ->
+                client.resetCertificateTrust()
+                appendLog("Certificate pin reset by user.")
+            }
+            .setNegativeButton("Disconnect") { _, _ ->
+                client.disconnect()
+            }
+            .setCancelable(false)
+            .show()
     }
 
     private fun cleanupObservers() {
@@ -330,6 +397,8 @@ class MainActivity : AppCompatActivity() {
         stateJob = null
         logsJob?.cancel()
         logsJob = null
+        authJob?.cancel()
+        authJob = null
     }
 
     private fun updateUiForState(state: ConnectionState) {

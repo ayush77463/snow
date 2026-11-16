@@ -277,7 +277,7 @@ class TestPairingOverWebSocket(unittest.IsolatedAsyncioTestCase):
             s.bind(("127.0.0.1", 0))
             test_port = s.getsockname()[1]
 
-        self.config = CoreConfig(bind_host="127.0.0.1", port=test_port)
+        self.config = CoreConfig(bind_host="127.0.0.1", port=test_port, tls_enabled=False)
         self.conn_mgr = ConnectionManager()
 
         self.server = SnowWebSocketServer(

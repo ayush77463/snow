@@ -239,6 +239,30 @@ class CrossLanguageParityTest {
             )
             valid["error_invalid_token.json"] = JsonSerialization.toJson(errInvalidToken)
 
+            // 22. Valid auth_request request
+            val reqAuth = SnowMessage.createRequest(
+                "auth_request",
+                mapOf(
+                    "device_id" to UUID.randomUUID().toString(),
+                    "auth_token" to "valid-auth-token-sample-secure"
+                )
+            )
+            valid["request_auth_request.json"] = JsonSerialization.toJson(reqAuth)
+
+            // 23. Valid auth_request success response
+            val respAuth = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "auth_request",
+                    "data" to mapOf(
+                        "device_id" to UUID.randomUUID().toString(),
+                        "session_id" to UUID.randomUUID().toString()
+                    )
+                )
+            )
+            valid["response_auth_success.json"] = JsonSerialization.toJson(respAuth)
+
             for ((filename, content) in valid) {
                 File(ktToPyValid, filename).writeText(content, Charsets.UTF_8)
             }
@@ -479,6 +503,31 @@ class CrossLanguageParityTest {
                     put("id", UUID.randomUUID().toString())
                     put("timestamp", SnowMessage.currentIsoTimestamp())
                     put("payload", JSONObject(mapOf("status" to "success", "action" to "pair_request")))
+                }.toString(),
+                ErrorCode.INVALID_CORRELATION_ID
+            )
+
+            // 25. Request payload data not an object (malformed auth payload)
+            invalid["invalid_auth_request_data_not_object.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "request")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("action" to "auth_request", "data" to "not_an_object")))
+                }.toString(),
+                ErrorCode.INVALID_PAYLOAD
+            )
+
+            // 26. Auth response invalid correlation_id
+            invalid["invalid_auth_response_invalid_correlation_id.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "response")
+                    put("id", UUID.randomUUID().toString())
+                    put("correlation_id", "not-a-valid-uuid")
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("status" to "success", "action" to "auth_request")))
                 }.toString(),
                 ErrorCode.INVALID_CORRELATION_ID
             )

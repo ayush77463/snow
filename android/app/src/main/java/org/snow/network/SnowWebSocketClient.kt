@@ -25,24 +25,47 @@ import org.snow.protocol.MessageType
 import org.snow.protocol.ProtocolValidationError
 import org.snow.protocol.ProtocolValidator
 import org.snow.protocol.SnowMessage
+import org.snow.security.CertPinStorage
+import org.snow.security.CertificateMismatchException
+import org.snow.security.DeviceIdentity
+import org.snow.security.InMemoryCertPinStorage
+import org.snow.security.SafeLog
+import org.snow.security.SnowTrustManager
+import org.snow.security.TlsConfig
+import org.snow.security.TokenStorage
+import org.snow.security.UnconfirmedCertificateException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
+ * Authentication and authorization states for the SNOW connection lifecycle.
+ */
+sealed class AuthState {
+    object Disconnected : AuthState()
+    object Connecting : AuthState()
+    object ConnectedUnauthenticated : AuthState()
+    data class Authenticated(val sessionId: String) : AuthState()
+    data class AuthFailed(val reason: String) : AuthState()
+    data class FingerprintConfirmationRequired(val fingerprint: String) : AuthState()
+    data class FingerprintMismatch(val pinned: String, val presented: String) : AuthState()
+}
+
+/**
  * WebSocket client implementing SNOW Device Protocol v1 with single connection lifecycle,
- * exponential backoff reconnection, and application-level heartbeats.
+ * exponential backoff reconnection, WSS/TLS transport with SHA-256 certificate pinning,
+ * and automatic post-connection authentication handshake.
  */
 class SnowWebSocketClient(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
-    private val backoffPolicy: BackoffPolicy = BackoffPolicy()
+    private val backoffPolicy: BackoffPolicy = BackoffPolicy(),
+    var certPinStorage: CertPinStorage? = null,
+    var tokenStorage: TokenStorage? = null,
+    var identity: DeviceIdentity? = null,
+    var useTls: Boolean = true,
+    var onUnconfirmedFingerprint: ((String) -> Unit)? = null,
+    var onCertificateMismatch: ((String, String) -> Unit)? = null
 ) {
-    private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // WebSocket requires no read timeout
-        .pingInterval(0, TimeUnit.SECONDS) // Use application-level heartbeats
-        .build()
-
     private var webSocket: WebSocket? = null
     private var reconnectJob: Job? = null
     private var heartbeatJob: Job? = null
@@ -57,10 +80,14 @@ class SnowWebSocketClient(
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
+    private val _authState = MutableStateFlow<AuthState>(AuthState.Disconnected)
+    val authState: StateFlow<AuthState> = _authState.asStateFlow()
+
     private val _logs = MutableSharedFlow<String>(replay = 50, extraBufferCapacity = 100)
     val logs: SharedFlow<String> = _logs.asSharedFlow()
 
     private val pendingRequests = ConcurrentHashMap<String, (SnowMessage) -> Unit>()
+    private var currentTrustManager: SnowTrustManager? = null
 
     private fun log(message: String) {
         val entry = "[${SnowMessage.currentIsoTimestamp()}] $message"
@@ -68,7 +95,30 @@ class SnowWebSocketClient(
     }
 
     /**
-     * Connect to the desktop SNOW core server at ws://host:port.
+     * Explicitly confirm and pin a server certificate SHA-256 fingerprint (Trust-On-First-Use).
+     *
+     * Saves the verified fingerprint to encrypted storage and immediately triggers connection.
+     */
+    fun confirmAndPinCertificate(fingerprint: String) {
+        val normalized = TlsConfig.formatFingerprint(fingerprint)
+        certPinStorage?.pinFingerprint(normalized)
+        log("Certificate pinned: $normalized. Reconnecting...")
+        backoffPolicy.reset()
+        if (targetHost.isNotBlank()) {
+            initiateConnection()
+        }
+    }
+
+    /**
+     * Clear the pinned certificate fingerprint (trust reset / certificate rotation).
+     */
+    fun resetCertificateTrust() {
+        certPinStorage?.clearPinnedFingerprint()
+        log("Certificate trust reset. Next connection will require re-confirmation.")
+    }
+
+    /**
+     * Connect to the desktop SNOW core server at wss://host:port (or ws:// if useTls is false).
      */
     @Synchronized
     fun connect(host: String, port: Int = Constants.DEFAULT_PORT) {
@@ -87,16 +137,43 @@ class SnowWebSocketClient(
         initiateConnection()
     }
 
+    private fun buildOkHttpClient(): OkHttpClient {
+        val builder = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(0, TimeUnit.SECONDS)
+
+        if (useTls) {
+            val storage = certPinStorage ?: InMemoryCertPinStorage()
+            val trustManager = SnowTrustManager(
+                pinStorage = storage,
+                onUnconfirmedFingerprint = { fp ->
+                    _authState.value = AuthState.FingerprintConfirmationRequired(fp)
+                    onUnconfirmedFingerprint?.invoke(fp)
+                }
+            )
+            currentTrustManager = trustManager
+            val sslContext = TlsConfig.createSslContext(trustManager)
+            builder.sslSocketFactory(sslContext.socketFactory, trustManager)
+            builder.hostnameVerifier(TlsConfig.createHostnameVerifier(storage))
+        }
+
+        return builder.build()
+    }
+
     private fun initiateConnection() {
-        val wsUrl = "ws://$targetHost:$targetPort"
+        val scheme = if (useTls) "wss" else "ws"
+        val wsUrl = "$scheme://$targetHost:$targetPort"
         log("Connecting to $wsUrl ...")
         _connectionState.value = ConnectionState.CONNECTING
+        _authState.value = AuthState.Connecting
 
         val request = Request.Builder()
             .url(wsUrl)
             .build()
 
-        webSocket = okHttpClient.newWebSocket(request, SnowListener())
+        val client = buildOkHttpClient()
+        webSocket = client.newWebSocket(request, SnowListener())
     }
 
     /**
@@ -108,6 +185,7 @@ class SnowWebSocketClient(
         disconnectInternal()
         backoffPolicy.reset()
         _connectionState.value = ConnectionState.DISCONNECTED
+        _authState.value = AuthState.Disconnected
         log("Client disconnected by user.")
     }
 
@@ -119,7 +197,7 @@ class SnowWebSocketClient(
 
         try {
             webSocket?.close(1000, "User disconnect")
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             webSocket?.cancel()
         }
         webSocket = null
@@ -160,14 +238,23 @@ class SnowWebSocketClient(
      * Send a raw SnowMessage directly.
      */
     fun sendMessage(message: SnowMessage): Boolean {
-        val currentWs = webSocket
-        if (currentWs == null) return false
+        val currentWs = webSocket ?: return false
         val json = JsonSerialization.toJson(message)
         return currentWs.send(json)
     }
 
     private fun scheduleReconnection() {
         if (userInitiatedDisconnect.get()) return
+
+        // If the failure was due to an unconfirmed certificate or fingerprint mismatch,
+        // do not hammer the server with rapid auto-reconnects until user acts
+        val currentAuth = _authState.value
+        if (currentAuth is AuthState.FingerprintConfirmationRequired ||
+            currentAuth is AuthState.FingerprintMismatch
+        ) {
+            log("Auto-reconnection paused awaiting certificate verification.")
+            return
+        }
 
         _connectionState.value = ConnectionState.RECONNECTING
         val delayMs = backoffPolicy.nextDelayMs()
@@ -219,9 +306,14 @@ class SnowWebSocketClient(
             }
 
             _connectionState.value = ConnectionState.CONNECTED
-            log("Connected to ws://$targetHost:$targetPort")
+            backoffPolicy.reset()
+            val scheme = if (useTls) "wss" else "ws"
+            log("Connected to $scheme://$targetHost:$targetPort")
             lastAckTimestamp = System.currentTimeMillis()
             startHeartbeatLoop()
+
+            // Automatic post-connection authentication handshake
+            performPostConnectionHandshake()
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -236,6 +328,7 @@ class SnowWebSocketClient(
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             log("Connection closed: $code - $reason")
             heartbeatJob?.cancel()
+            _authState.value = AuthState.Disconnected
             if (!userInitiatedDisconnect.get()) {
                 scheduleReconnection()
             } else {
@@ -244,8 +337,60 @@ class SnowWebSocketClient(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            log("Connection error: ${t.message ?: t.javaClass.simpleName}")
             heartbeatJob?.cancel()
+
+            // 1. Check for specific TLS certificate verification exceptions in cause chain
+            var certException: Throwable? = t
+            while (certException != null) {
+                if (certException is UnconfirmedCertificateException) {
+                    val fp = certException.presentedFingerprint
+                    _authState.value = AuthState.FingerprintConfirmationRequired(fp)
+                    onUnconfirmedFingerprint?.invoke(fp)
+                    log("Server certificate not yet confirmed by user. Fingerprint: $fp")
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                    currentTrustManager?.resetLastPresentedFingerprint()
+                    return
+                }
+                if (certException is CertificateMismatchException) {
+                    val pinned = certException.pinnedFingerprint
+                    val presented = certException.presentedFingerprint
+                    _authState.value = AuthState.FingerprintMismatch(pinned, presented)
+                    onCertificateMismatch?.invoke(pinned, presented)
+                    log("Untrusted server certificate! Mismatch detected. Pinned: $pinned, Presented: $presented")
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                    currentTrustManager?.resetLastPresentedFingerprint()
+                    return
+                }
+                certException = certException.cause
+            }
+
+            // 2. Fallback check: If Conscrypt wrapped or stripped the custom exception,
+            // check currentTrustManager's lastPresentedFingerprint against pinned storage.
+            val trustMgr = currentTrustManager
+            val storage = certPinStorage ?: InMemoryCertPinStorage()
+            val presentedFp = trustMgr?.lastPresentedFingerprint
+            val pinnedFp = storage.getPinnedFingerprint()
+
+            if (presentedFp != null) {
+                if (pinnedFp == null) {
+                    _authState.value = AuthState.FingerprintConfirmationRequired(presentedFp)
+                    onUnconfirmedFingerprint?.invoke(presentedFp)
+                    log("Server certificate not yet confirmed by user (via trust manager). Fingerprint: $presentedFp")
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                    trustMgr.resetLastPresentedFingerprint()
+                    return
+                } else if (!TlsConfig.fingerprintsMatch(pinnedFp, presentedFp)) {
+                    _authState.value = AuthState.FingerprintMismatch(pinnedFp, presentedFp)
+                    onCertificateMismatch?.invoke(pinnedFp, presentedFp)
+                    log("Untrusted server certificate! Mismatch detected. Pinned: $pinnedFp, Presented: $presentedFp")
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                    trustMgr.resetLastPresentedFingerprint()
+                    return
+                }
+            }
+
+            log("Connection error: ${t.message ?: t.javaClass.simpleName}")
+            _authState.value = AuthState.Disconnected
             if (!userInitiatedDisconnect.get()) {
                 scheduleReconnection()
             } else {
@@ -254,12 +399,47 @@ class SnowWebSocketClient(
         }
     }
 
+    private fun performPostConnectionHandshake() {
+        val devId = identity?.deviceId
+        val token = tokenStorage?.getToken()
+
+        if (!devId.isNullOrBlank() && !token.isNullOrBlank()) {
+            log("Initiating automatic authentication handshake (device_id=${devId.take(8)}...)...")
+            sendRequest(
+                action = "auth_request",
+                data = mapOf(
+                    "device_id" to devId,
+                    "auth_token" to token
+                )
+            ) { response ->
+                if (response.type == MessageType.RESPONSE && response.payload?.get("status") == "success") {
+                    val data = response.payload["data"] as? Map<*, *>
+                    val sessionId = data?.get("session_id") as? String ?: "active"
+                    _authState.value = AuthState.Authenticated(sessionId)
+                    log("Authenticated successfully with desktop core [session=$sessionId]")
+                } else {
+                    val errCode = response.error?.code ?: ErrorCode.UNAUTHORIZED
+                    val errMsg = response.error?.message ?: "Authentication rejected."
+                    log("Authentication failed: $errMsg (code=$errCode)")
+                    _authState.value = AuthState.AuthFailed(errMsg)
+
+                    if (errCode == ErrorCode.UNAUTHORIZED || errCode == ErrorCode.DEVICE_NOT_FOUND) {
+                        log("Stored token is invalid or revoked. Clearing stale token.")
+                        tokenStorage?.clearToken()
+                    }
+                }
+            }
+        } else {
+            _authState.value = AuthState.ConnectedUnauthenticated
+            log("Connected over WSS. Device is not paired; ready for PIN pairing flow.")
+        }
+    }
+
     private fun handleIncomingMessage(incomingSocket: WebSocket, rawText: String) {
         val message = try {
             ProtocolValidator.validateRawMessage(rawText)
         } catch (e: ProtocolValidationError) {
             log("Received invalid message: ${e.message}")
-            // Reply with error if correlation_id is present
             if (e.correlationId != null) {
                 val err = SnowMessage.createError(
                     code = e.code,
@@ -273,7 +453,6 @@ class SnowWebSocketClient(
 
         when (message.type) {
             MessageType.HEARTBEAT -> {
-                // Respond with heartbeat_ack
                 log("Received heartbeat from server id=${message.id}. Sending ack.")
                 val ack = SnowMessage.createHeartbeatAck(correlationId = message.id)
                 incomingSocket.send(JsonSerialization.toJson(ack))

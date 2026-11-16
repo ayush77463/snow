@@ -10,6 +10,7 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "psutil>=6.0.0",
     "websockets>=13.0",
+    "cryptography>=43.0.0",
 ]
 
 [tool.setuptools.packages.find]

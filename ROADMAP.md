@@ -346,10 +346,10 @@ Before enabling device capabilities, we must secure the communication channel. T
 - Completion of Sub-Milestone 2.3.
 
 #### Acceptance Criteria
-- Communication occurs over `wss://` (encrypted).
-- Unauthenticated connections are rejected within 5 seconds.
-- Paired devices authenticate automatically using stored tokens.
-- An unpaired device cannot communicate even if it knows the IP:port.
+- [x] Communication occurs over `wss://` (encrypted).
+- [x] Unauthenticated connections are rejected within 5 seconds.
+- [x] Paired devices authenticate automatically using stored tokens.
+- [x] An unpaired device cannot communicate even if it knows the IP:port.
 
 #### Viva Concept Check
 - **Why is TLS mandatory before treating pairing as secure?** Without TLS, the PIN, token exchange, and all subsequent commands travel in plaintext and can be intercepted by any observer on the network.

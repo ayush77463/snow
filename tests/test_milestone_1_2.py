@@ -369,6 +369,8 @@ class TestWebSocketServerIntegration(unittest.IsolatedAsyncioTestCase):
             port=test_port,
             heartbeat_timeout=1.5,
             max_message_size=4096,
+            tls_enabled=False,
+            auth_required=False,
         )
         self.server = SnowWebSocketServer(self.config)
         await self.server.start()

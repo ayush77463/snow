@@ -224,6 +224,31 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["error_invalid_token.json"] = err_invalid_token.to_json()
 
+    # --- Phase 2.4 Authentication & WSS Protocol Fixtures ---
+    # 22. Valid auth_request request
+    req_auth = SnowMessage.create_request(
+        action="auth_request",
+        data={
+            "device_id": str(uuid.uuid4()),
+            "auth_token": "valid-auth-token-sample-secure",
+        },
+    )
+    valid_fixtures["request_auth_request.json"] = req_auth.to_json()
+
+    # 23. Valid auth_request success response
+    resp_auth = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "auth_request",
+            "data": {
+                "device_id": str(uuid.uuid4()),
+                "session_id": str(uuid.uuid4()),
+            },
+        },
+    )
+    valid_fixtures["response_auth_success.json"] = resp_auth.to_json()
+
     # --- Negative / Invalid Fixtures ---
     # 1. Malformed JSON
     invalid_fixtures["invalid_malformed_json.json"] = (
@@ -481,6 +506,31 @@ def generate_python_fixtures() -> tuple[int, int]:
             "id": str(uuid.uuid4()),
             "timestamp": current_iso_timestamp(),
             "payload": {"status": "success", "action": "pair_request"},
+        }),
+        ErrorCode.INVALID_CORRELATION_ID,
+    )
+
+    # 25. Request payload data not an object (malformed auth payload)
+    invalid_fixtures["invalid_auth_request_data_not_object.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"action": "auth_request", "data": "not_an_object"},
+        }),
+        ErrorCode.INVALID_PAYLOAD,
+    )
+
+    # 26. Auth response invalid correlation_id
+    invalid_fixtures["invalid_auth_response_invalid_correlation_id.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "response",
+            "id": str(uuid.uuid4()),
+            "correlation_id": "not-a-valid-uuid",
+            "timestamp": current_iso_timestamp(),
+            "payload": {"status": "success", "action": "auth_request"},
         }),
         ErrorCode.INVALID_CORRELATION_ID,
     )

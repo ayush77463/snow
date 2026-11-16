@@ -260,3 +260,60 @@ Optical QR scanning transfers connection metadata out-of-band to eliminate manua
 | **Notification shade disconnect lifecycle** | **PASS** | Notification disappears completely on disconnect; `MainActivity` remains open; 0 crashes; clean reconnect verified on Android 16. |
 
 **Milestone Verdict**: **SUB-MILESTONE 1.5 COMPLETE & FULLY VERIFIED (PASS)**.
+
+---
+
+## 9. Phase 2.4 Authenticated Communication and TLS/WSS Physical Verification Results
+
+**Date of Execution**: November 16, 2026<br/>
+**Environment**: Windows 11 Laptop (`Lenovo_V15`) + Physical Realme `RMX5110` (Android 16, API 36)<br/>
+**Network Topology**: Wi-Fi Subnet (`192.168.31.0/24`), Laptop `192.168.31.190`, WSS port `8765`<br/>
+**Evaluation Target**: TLS 1.2+ WSS transport, X.509 SAN IP extension, TOFU modal dialog, SHA-256 fingerprint pinning, Keystore AES-GCM credential persistence, 5-second unauthenticated handshake timeout, and auto-authentication on reconnection.
+
+### 9.1 Empirical Observations & Physical Test Scenarios
+
+1. **Self-Signed X.509 Certificate Generation & SAN Validation**: **PASS**
+   - Desktop core generated self-signed X.509 certificate and 2048-bit RSA private key in `~/.snow/tls/`.
+   - Dynamic network detection enumerated active IPv4 Wi-Fi interface (`192.168.31.190`), embedding SAN entries: `('localhost', '127.0.0.1', '0.0.0.0', 'Lenovo_V15', '192.168.31.190')`.
+   - Fingerprint printed strictly to `sys.stderr`: `6F:6F:FF:B5:93:14:41:3A:D6:96:50:80:81:BB:91:00:4C:4C:8A:A4:14:94:90:82:11:57:EE:A1:F7:6E:15:4C`.
+
+2. **Trust-On-First-Use (TOFU) Fingerprint Verification**: **PASS**
+   - Connecting from Realme `RMX5110` to `wss://192.168.31.190:8765` triggered `SnowTrustManager`.
+   - Because no certificate pin existed in storage, the app paused the connection and displayed the **"Verify Server Certificate"** modal dialog showing `6F:6F:FF:B5:93:14:...`.
+   - User verified fingerprint parity against desktop terminal and tapped **"Trust & Connect"**.
+   - Pinned SHA-256 fingerprint was encrypted using Android Keystore AES-GCM and saved in `EncryptedCertPinStorage`.
+
+3. **Fresh PIN Pairing Over Encrypted WSS**: **PASS**
+   - User entered 6-digit PIN from desktop terminal.
+   - Handshake 5-second timeout was successfully immunized upon receiving pairing action.
+   - Server issued cryptographic authorization token; token hash stored in desktop SQLite `snow_devices.db`.
+   - Token was encrypted via Android Keystore AES-GCM and stored in Android `SharedPreferencesTokenStorage`.
+   - Status badge transitioned to **PAIRED**.
+
+4. **Automatic Reconnection & Transparent Authentication**: **PASS**
+   - Desktop server was restarted (`Ctrl+C` then `python -m snow`).
+   - Phone reconnected over `wss://`.
+   - Certificate was recognized immediately from pinned storage (no duplicate TOFU prompt).
+   - Phone automatically dispatched `auth_request` with device ID and Keystore-decrypted token.
+   - Desktop server verified token in constant time, established active session, and replied `auth_response` with status `success`.
+   - Phone transitioned directly to **PAIRED** without human intervention or PIN re-entry.
+
+5. **Authenticated Unpairing**: **PASS**
+   - User tapped **UNPAIR DEVICE** in app.
+   - Client issued authenticated `unpair_request`.
+   - Desktop removed record from `snow_devices.db`, revoked active session, and recorded audit event `UNPAIR`.
+   - Phone cleared Keystore-encrypted token and reset state to `DISCONNECTED` / `UNPAIRED`.
+
+### 9.2 Sub-Milestone 2.4 Acceptance Criteria Matrix
+
+| Criterion | Empirical Result | Evidence |
+| :--- | :---: | :--- |
+| **Communication occurs over `wss://` (encrypted)** | **PASS** | OkHttp client connected via TLS 1.2+ WSS; wire sniffing reveals zero plaintext PINs or tokens. |
+| **Unauthenticated connections rejected within 5 seconds** | **PASS** | Port scanners / unauthenticated sockets dropped with code 4001 after 5.0s timeout. |
+| **Paired devices authenticate automatically using stored tokens** | **PASS** | Auto-handshake on reconnect verified on physical Realme RMX5110 (Android 16). |
+| **An unpaired device cannot communicate even if it knows IP:port** | **PASS** | Protected actions (e.g., `ping`) rejected with `UNAUTHORIZED` error response. |
+| **Trust-On-First-Use (TOFU) certificate pinning** | **PASS** | Modal dialog displays fingerprint; pinned in hardware Keystore AES-GCM. |
+| **Zero stdout pollution** | **PASS** | Certificate banner and logs directed strictly to `sys.stderr`; stdout reserved for MCP. |
+
+**Milestone Verdict**: **SUB-MILESTONE 2.4 COMPLETE & FULLY VERIFIED ON HARDWARE (PASS)**.
+**Phase 2 Verdict**: **PHASE 2 (PAIRING AND SECURITY) IS OFFICIALLY COMPLETE (PASS)**.
