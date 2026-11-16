@@ -52,24 +52,6 @@ class SnowForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            buildNotification("Initializing SNOW bridge..."),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        )
-
-        stateObserverJob = serviceScope.launch {
-            client.connectionState.collectLatest { state ->
-                val statusText = when (state) {
-                    ConnectionState.DISCONNECTED -> "Disconnected"
-                    ConnectionState.CONNECTING -> "Connecting..."
-                    ConnectionState.CONNECTED -> "Connected to desktop"
-                    ConnectionState.RECONNECTING -> "Reconnecting..."
-                }
-                updateNotification(statusText)
-            }
-        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -77,15 +59,81 @@ class SnowForegroundService : Service() {
             ACTION_CONNECT -> {
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, Constants.DEFAULT_PORT)
+
+                // In Android 8.0+ (and strictly enforced in Android 14/16), any service
+                // invoked via startForegroundService MUST call startForeground() synchronously
+                // in onStartCommand() to satisfy the OS timeout contract.
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildNotification("Connecting to $host:$port..."),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+
+                startObservingState()
                 client.connect(host, port)
             }
             ACTION_DISCONNECT -> {
-                client.disconnect()
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                handleDisconnect()
+            }
+            else -> {
+                // Defensive fallback: if invoked via startForegroundService with null or unexpected action,
+                // fulfill the OS contract immediately then cleanly stop.
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildNotification("SNOW Capability Bridge"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
         return START_NOT_STICKY
+    }
+
+    private fun startObservingState() {
+        stateObserverJob?.cancel()
+        stateObserverJob = serviceScope.launch {
+            client.connectionState.collectLatest { state ->
+                when (state) {
+                    ConnectionState.DISCONNECTED -> {
+                        // When disconnected, remove the ongoing foreground notification completely.
+                        ServiceCompat.stopForeground(this@SnowForegroundService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        manager.cancel(NOTIFICATION_ID)
+                    }
+                    ConnectionState.CONNECTING -> {
+                        updateNotification("Connecting...")
+                    }
+                    ConnectionState.CONNECTED -> {
+                        updateNotification("Connected to desktop")
+                    }
+                    ConnectionState.RECONNECTING -> {
+                        updateNotification("Reconnecting...")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun handleDisconnect() {
+        // 1. Cancel the state observer first so that DISCONNECTED state does NOT trigger updateNotification()
+        stateObserverJob?.cancel()
+        stateObserverJob = null
+
+        // 2. Disconnect the WebSocket client (sends clean 1000 close frame)
+        client.disconnect()
+
+        // 3. Remove foreground service status and remove the notification
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+
+        // 4. Explicitly cancel the notification to ensure OEM notification managers clear it immediately
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.cancel(NOTIFICATION_ID)
+
+        // 5. Stop the service
+        stopSelf()
     }
 
     private fun createNotificationChannel() {
@@ -142,7 +190,11 @@ class SnowForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         stateObserverJob?.cancel()
+        stateObserverJob = null
         client.disconnect()
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.cancel(NOTIFICATION_ID)
         serviceScope.cancel()
     }
 

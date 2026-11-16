@@ -228,10 +228,11 @@ Stress-test the connection lifecycle under real-world disruption scenarios to en
 - Completion of Sub-Milestone 1.4.
 
 #### Acceptance Criteria
-- Connection recovers automatically within 30 seconds after screen-off/screen-on and brief Wi-Fi dropout.
-- After airplane mode toggle, reconnection occurs within 60 seconds of network restoration.
-- Force-stopping and reopening the Android app re-establishes the connection.
-- All failure modes are documented with observed behaviour.
+- [x] Connection recovers automatically within 30 seconds after screen-off/screen-on and brief Wi-Fi dropout (verified empirically in Sub-Milestone 1.5: 2.08s for screen-on, 10.0s for Wi-Fi dropout).
+- [x] After airplane mode toggle, reconnection occurs within 60 seconds of network restoration (verified empirically in Sub-Milestone 1.5: 35.0s after radio restoration).
+- [x] Force-stopping and reopening the Android app re-establishes the connection (verified empirically in Sub-Milestone 1.5).
+- [x] All failure modes are documented with observed behaviour (`docs/CONNECTIVITY_TEST_RESULTS.md`).
+- [x] Notification shade disconnect lifecycle verified on physical device (Scenario 5B verified on Android 16).
 
 #### Viva Concept Check
 - **Does a Foreground Service guarantee the WebSocket stays alive during Doze?** No. Deep Doze restricts network access. The client must implement reconnection logic and test behaviour empirically on the target device.
