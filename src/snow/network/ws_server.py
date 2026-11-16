@@ -14,6 +14,8 @@ from snow.network.connection_manager import ConnectionManager
 from snow.protocol.constants import ErrorCode, MessageType
 from snow.protocol.models import SnowMessage
 from snow.protocol.validator import ProtocolValidationError, validate_raw_message
+from snow.security.identity import DeviceIdentity, load_or_create_device_identity
+from snow.security.pairing import PairingManager
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +31,13 @@ class SnowWebSocketServer:
         self,
         config: CoreConfig,
         connection_manager: Optional[ConnectionManager] = None,
+        pairing_manager: Optional[PairingManager] = None,
+        device_identity: Optional[DeviceIdentity] = None,
     ) -> None:
         self.config = config
         self.connection_manager = connection_manager or ConnectionManager()
+        self.pairing_manager = pairing_manager or PairingManager()
+        self.device_identity = device_identity or load_or_create_device_identity()
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -76,6 +82,9 @@ class SnowWebSocketServer:
 
             # Start background reaper task for stale client connections
             self._reaper_task = asyncio.create_task(self._stale_connection_reaper())
+
+            # Generate initial pairing PIN and display to sys.stderr
+            self.pairing_manager.generate_pin(display_to_stderr=True)
         except Exception as exc:
             logger.error("Failed to start WebSocket server on %s:%d: %s",
                          self.config.bind_host, self.config.port, exc)
@@ -247,6 +256,7 @@ class SnowWebSocketServer:
         """
         assert message.payload is not None
         action = message.payload.get("action")
+        data = message.payload.get("data") if isinstance(message.payload.get("data"), dict) else {}
 
         if action == "ping":
             logger.debug("Handling 'ping' action from client [%s]", client.connection_id)
@@ -255,6 +265,8 @@ class SnowWebSocketServer:
                 payload={"status": "success", "action": "pong"},
             )
             await client.websocket.send(response.to_json())
+        elif action in ("pair_request", "pair_verify"):
+            await self._handle_pairing_request(client, message, action, data)
         else:
             logger.warning("Rejected unsupported action '%s' from client [%s]",
                            action, client.connection_id)
@@ -264,6 +276,59 @@ class SnowWebSocketServer:
                 correlation_id=message.id,
             )
             await client.websocket.send(error_response.to_json())
+
+    async def _handle_pairing_request(
+        self, client, message: SnowMessage, action: str, data: dict[str, Any]
+    ) -> None:
+        """Handle pairing verification or PIN generation request."""
+        pin = data.get("pin")
+        client_device_id = data.get("device_id")
+
+        if pin is not None:
+            # PIN verification attempt
+            result = self.pairing_manager.verify_pin(str(pin), client_device_id=client_device_id)
+            if result.is_success:
+                logger.info("Successfully paired with device [%s] from client [%s]",
+                            client_device_id, client.connection_id)
+                response = SnowMessage.create_response(
+                    correlation_id=message.id,
+                    payload={
+                        "status": "success",
+                        "action": action,
+                        "data": {
+                            "device_id": self.device_identity.device_id,
+                            "device_name": self.device_identity.device_name,
+                            "session_id": result.session_id,
+                        },
+                    },
+                )
+                await client.websocket.send(response.to_json())
+            else:
+                error_code = result.error_code or ErrorCode.INTERNAL_ERROR
+                logger.warning("Pairing failed for client [%s]: %s (code=%s)",
+                               client.connection_id, result.message, error_code)
+                error_response = SnowMessage.create_error(
+                    code=error_code,
+                    message=result.message,
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+        else:
+            # Request to generate and display a fresh PIN on desktop stderr
+            fresh_pin = self.pairing_manager.generate_pin(display_to_stderr=True)
+            response = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={
+                    "status": "pin_displayed",
+                    "action": action,
+                    "data": {
+                        "device_id": self.device_identity.device_id,
+                        "device_name": self.device_identity.device_name,
+                        "expires_in": int(self.pairing_manager.pin_lifetime),
+                    },
+                },
+            )
+            await client.websocket.send(response.to_json())
 
     async def _stale_connection_reaper(self) -> None:
         """Periodically check for and disconnect inactive clients exceeding the heartbeat timeout."""

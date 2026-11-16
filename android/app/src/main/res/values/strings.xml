@@ -1,15 +1,48 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">SNOW</string>
-    <string name="title_connection">Desktop Core Connection</string>
-    <string name="label_ip">Desktop IP Address</string>
-    <string name="hint_ip">192.168.1.x or 10.0.2.2</string>
-    <string name="label_port">Port</string>
+    <string name="app_subtitle">Your devices, connected.</string>
+
+    <!-- Header & Status -->
+    <string name="status_connected_desc">Connected • Local Network</string>
+    <string name="status_disconnected_desc">Disconnected</string>
+    <string name="status_connecting_desc">Connecting...</string>
+    <string name="status_reconnecting_desc">Reconnecting...</string>
+
+    <!-- Connection Card -->
+    <string name="title_connection">Desktop Connection</string>
+    <string name="label_ip">HOST IP</string>
+    <string name="hint_ip">192.168.31.190</string>
+    <string name="label_port">PORT</string>
     <string name="default_port">8765</string>
-    <string name="btn_connect">Connect</string>
+    <string name="btn_connect">Connect Device</string>
     <string name="btn_disconnect">Disconnect</string>
+    <string name="banner_connected_to">Connected to Desktop</string>
+
+    <!-- Device Pairing Card -->
+    <string name="title_pairing">Device Pairing</string>
+    <string name="subtitle_pairing">Enter the 6-digit PIN shown on the desktop console.</string>
+    <string name="label_pin">ENTER 6-DIGIT DESKTOP PIN</string>
+    <string name="btn_pair">Pair Device</string>
+    <string name="btn_request_pin">Request New PIN</string>
+    <string name="badge_unpaired">UNPAIRED</string>
+    <string name="badge_pairing">PAIRING...</string>
+    <string name="badge_paired">PAIRED</string>
+    <string name="badge_locked">LOCKED</string>
+
+    <!-- Quick Actions -->
+    <string name="title_quick_actions">Quick Actions</string>
     <string name="btn_send_ping">Send Ping</string>
+    <string name="btn_file_drop">File Drop</string>
+    <string name="btn_telemetry">Telemetry</string>
+    <string name="badge_soon">Soon</string>
+    <string name="badge_instant">Instant</string>
+
+    <!-- Recent Activity Timeline -->
+    <string name="title_recent_activity">Recent Activity</string>
+    <string name="filter_all">All</string>
+    <string name="filter_connections">Connections</string>
+    <string name="filter_diagnostics">Diagnostics</string>
     <string name="btn_clear_log">Clear</string>
-    <string name="status_label">Status: </string>
-    <string name="title_event_log">Activity Log</string>
+    <string name="empty_activity">No activity recorded yet.</string>
 </resources>

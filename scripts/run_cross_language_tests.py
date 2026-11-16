@@ -8,6 +8,7 @@ and the Kotlin Android client:
   4. Reports comprehensive bidirectional compatibility status.
 """
 
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -20,6 +21,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from tests.test_cross_language_parity import (
     FIXTURES_ROOT,
+    KT_TO_PY_INVALID,
+    KT_TO_PY_VALID,
     generate_python_fixtures,
     TestCrossLanguageKotlinToPython,
 )
@@ -62,17 +65,22 @@ def main() -> int:
         print("  [ERROR] Python validation of Kotlin fixtures failed!")
         return 1
 
+    kt_valid_count = len(list(KT_TO_PY_VALID.glob("*.json"))) if KT_TO_PY_VALID.exists() else 0
+    kt_expected_file = KT_TO_PY_INVALID / "expected_errors.json"
+    kt_invalid_count = len(json.loads(kt_expected_file.read_text(encoding="utf-8"))) if kt_expected_file.exists() else 0
+
     print("\n" + "=" * 70)
     print("BIDIRECTIONAL CROSS-LANGUAGE VERIFICATION SUMMARY")
     print("=" * 70)
     print(f"Direction A (Kotlin -> Python):")
-    print(f"  - Valid Kotlin envelopes accepted by Python:    10 / 10 PASS")
-    print(f"  - Invalid Kotlin envelopes rejected by Python: 22 / 22 PASS")
+    print(f"  - Valid Kotlin envelopes accepted by Python:    {kt_valid_count} / {kt_valid_count} PASS")
+    print(f"  - Invalid Kotlin envelopes rejected by Python: {kt_invalid_count} / {kt_invalid_count} PASS")
     print(f"  - Clean null omission verified:                 PASS")
     print(f"\nDirection B (Python -> Kotlin):")
     print(f"  - Valid Python envelopes accepted by Kotlin:    {py_valid_count} / {py_valid_count} PASS")
     print(f"  - Invalid Python envelopes rejected by Kotlin: {py_invalid_count} / {py_invalid_count} PASS")
     print(f"  - Clean null omission verified:                 PASS")
+    print(f"\nTotal bidirectional fixtures verified: {kt_valid_count + kt_invalid_count + py_valid_count + py_invalid_count}")
     print("=" * 70)
     print("RESULT: 100% BIDIRECTIONAL PROTOCOL v1 WIRE PARITY VERIFIED")
     print("=" * 70)

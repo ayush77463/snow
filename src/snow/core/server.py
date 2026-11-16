@@ -40,6 +40,16 @@ class SnowCoreServer:
         """Return the list of detected network interfaces."""
         return list(self._detected_interfaces)
 
+    @property
+    def pairing_manager(self):
+        """Return the core server's pairing manager."""
+        return self.ws_server.pairing_manager
+
+    @property
+    def device_identity(self):
+        """Return the core server's device identity."""
+        return self.ws_server.device_identity
+
     async def start(self) -> None:
         """Initialize the server lifecycle, enumerate interfaces, and start WebSocket listener.
 

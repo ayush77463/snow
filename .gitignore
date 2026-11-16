@@ -24,11 +24,15 @@ htmlcov/
 
 # Databases, credentials, and local state
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
 *.key
 *.pem
 *.token
 *.p12
+.snow/
+*device_identity*.json
 
 # Local logs
 *.log

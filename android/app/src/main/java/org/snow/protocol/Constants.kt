@@ -30,4 +30,10 @@ object ErrorCode {
     const val UNSUPPORTED_ACTION = "UNSUPPORTED_ACTION"
     const val HEARTBEAT_TIMEOUT = "HEARTBEAT_TIMEOUT"
     const val INTERNAL_ERROR = "INTERNAL_ERROR"
+
+    // Phase 2.1 Pairing Error Codes
+    const val INVALID_PIN = "INVALID_PIN"
+    const val PIN_EXPIRED = "PIN_EXPIRED"
+    const val PAIRING_LOCKED = "PAIRING_LOCKED"
+    const val ALREADY_PAIRED = "ALREADY_PAIRED"
 }

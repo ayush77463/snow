@@ -128,11 +128,11 @@ or JSON:
 | **AP Isolation Sensitivity (Metadata Delivery)** | **High Failure Risk**: Broadcast packets dropped by routers with client isolation enabled | **Network Independent**: Optical scanning does not rely on router packet forwarding |
 | **Subsequent TCP Connection** | Required (WebSocket TCP handshake) | **Still Subject to Network Restrictions**: Scanned IP:port must still establish a TCP/WebSocket connection subject to firewalls, routing, and AP isolation |
 | **User Friction** | Zero-touch if working, but brittle troubleshooting when blocked | 1-second optical scan; eliminates manual typing of changing IP addresses |
-| **Security Scope** | Broadcasts IP/port across entire subnet | Displayed only on physical laptop screen (requires local physical proximity) |
-| **Architectural Role** | Optional secondary convenience fallback | **Recommended Primary Connection Bootstrap Mechanism for Phase 2** |
+| **Security Scope** | Broadcasts IP/port across entire subnet | Displayed on physical screen (requires line-of-sight proximity; observable by nearby cameras or individuals; not immune to interception) |
+| **Architectural Role** | Optional secondary convenience fallback | Evaluated conceptual out-of-band delivery mechanism for Phase 2 |
 
 ### Summary
-Optical QR scanning eliminates manual typing of dynamic IP addresses and bypasses UDP discovery unreliability. However, **QR codes improve connection-information delivery, not underlying network reachability**: the subsequent TCP/WebSocket connection remains strictly dependent on network routing, firewall allowance, and router forwarding policies.
+Optical QR scanning transfers connection metadata out-of-band to eliminate manual typing of dynamic IP addresses and bypass UDP discovery unreliability. However, **QR codes improve connection-information delivery, not underlying network reachability or transport confidentiality**: a displayed QR code can still be photographed, captured, or observed by third parties with visual access to the screen. Furthermore, the subsequent TCP/WebSocket connection (configured on default port `8765`) remains strictly subject to network routing, firewall allowance, AP client isolation, and transport-security requirements. Manual 6-digit PIN entry remains the supported baseline authentication mechanism for Sub-Milestone 2.1.
 
 ---
 
@@ -158,7 +158,7 @@ Optical QR scanning eliminates manual typing of dynamic IP addresses and bypasse
 | Application-level heartbeats & acknowledgements | **PASS** | `heartbeat` / `heartbeat_ack` exchanged every 15s with matching IDs |
 | Network drop & automatic backoff reconnection | **PASS** | Wi-Fi toggle triggered `RECONNECTING` with backoff; reconnection succeeded |
 | UDP discovery feasibility evaluated | **PASS** | Laptop $\rightarrow$ Phone broadcast works; Phone $\rightarrow$ Laptop blocked by Windows Firewall |
-| QR code alternative evaluated | **PASS** | Documented as the recommended robust, firewall-immune bootstrap mechanism |
+| QR code alternative evaluated | **PASS** | Evaluated out-of-band optical transfer of connection metadata; subsequent WebSocket connection on port 8765 remains subject to firewall and network routing policy |
 
 **Milestone Verdict**: **SUB-MILESTONE 1.4 COMPLETE & FULLY VERIFIED (PASS)**.
 

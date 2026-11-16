@@ -1,16 +1,49 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="primary">#1E293B</color>
-    <color name="primary_dark">#0F172A</color>
-    <color name="accent">#0284C7</color>
-    <color name="background">#F8FAFC</color>
+    <!-- Glacier Blue (Glacier Crisp) Design System Tokens -->
+    <color name="app_background">#F5F8FD</color>
+    <color name="card_surface">#FFFFFF</color>
+    <color name="card_border">#E4EAF3</color>
+    <color name="primary_blue">#2563EB</color>
+    <color name="secondary_cyan">#06B6D4</color>
+    <color name="tertiary_blue">#1D4ED8</color>
+    <color name="primary_text">#172B4D</color>
+    <color name="secondary_text">#73839A</color>
+    <color name="soft_blue_surface">#DBEAFE</color>
+
+    <!-- Legacy / Compatibility Aliases -->
+    <color name="primary">#2563EB</color>
+    <color name="primary_dark">#1D4ED8</color>
+    <color name="accent">#06B6D4</color>
+    <color name="background">#F5F8FD</color>
     <color name="surface">#FFFFFF</color>
-    <color name="text_primary">#0F172A</color>
-    <color name="text_secondary">#64748B</color>
-    <color name="status_disconnected">#EF4444</color>
-    <color name="status_connecting">#F59E0B</color>
+    <color name="text_primary">#172B4D</color>
+    <color name="text_secondary">#73839A</color>
+
+    <!-- Status Colors & Soft Pills -->
     <color name="status_connected">#10B981</color>
+    <color name="status_connected_soft">#D1FAE5</color>
+    <color name="status_connected_dark">#047857</color>
+
+    <color name="status_disconnected">#EF4444</color>
+    <color name="status_disconnected_soft">#FEE2E2</color>
+    <color name="status_disconnected_dark">#B91C1C</color>
+
+    <color name="status_connecting">#F59E0B</color>
+    <color name="status_connecting_soft">#FEF3C7</color>
+    <color name="status_connecting_dark">#B45309</color>
+
     <color name="status_reconnecting">#8B5CF6</color>
-    <color name="log_background">#1E1E1E</color>
-    <color name="log_text">#D4D4D4</color>
+    <color name="status_reconnecting_soft">#EDE9FE</color>
+
+    <!-- Input & UI Surfaces -->
+    <color name="input_background">#F8FAFC</color>
+    <color name="input_border">#E2E8F0</color>
+    <color name="badge_soon_bg">#F1F5F9</color>
+    <color name="badge_soon_text">#64748B</color>
+    <color name="filter_pill_unselected">#F1F5F9</color>
+    <color name="filter_pill_text_unselected">#64748B</color>
+    <color name="log_background">#F8FAFC</color>
+    <color name="log_text">#172B4D</color>
+    <color name="log_timestamp">#73839A</color>
 </resources>

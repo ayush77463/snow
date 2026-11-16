@@ -116,6 +116,65 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["request_large_payload.json"] = large_req.to_json()
 
+    # --- Phase 2.1 Pairing Protocol Fixtures ---
+    # 11. Valid pair_request request
+    req_pair = SnowMessage.create_request(
+        action="pair_request",
+        data={
+            "device_id": str(uuid.uuid4()),
+            "device_name": "Test Client Device",
+            "pin": "123456",
+        },
+    )
+    valid_fixtures["request_pair_request.json"] = req_pair.to_json()
+
+    # 12. Valid pairing success response with correlation_id
+    resp_pair = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "pair_request",
+            "data": {
+                "session_id": str(uuid.uuid4()),
+                "device_id": str(uuid.uuid4()),
+                "device_name": "SNOW Desktop Core",
+            },
+        },
+    )
+    valid_fixtures["response_pair_success.json"] = resp_pair.to_json()
+
+    # 13. Error INVALID_PIN
+    err_invalid_pin = SnowMessage.create_error(
+        code=ErrorCode.INVALID_PIN,
+        message="Invalid pairing PIN. 2 attempt(s) remaining.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_invalid_pin.json"] = err_invalid_pin.to_json()
+
+    # 14. Error PIN_EXPIRED
+    err_pin_expired = SnowMessage.create_error(
+        code=ErrorCode.PIN_EXPIRED,
+        message="Pairing PIN has expired. Request a new PIN on desktop.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_pin_expired.json"] = err_pin_expired.to_json()
+
+    # 15. Error PAIRING_LOCKED
+    err_pairing_locked = SnowMessage.create_error(
+        code=ErrorCode.PAIRING_LOCKED,
+        message="Too many failed pairing attempts. Locked out for 300s.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_pairing_locked.json"] = err_pairing_locked.to_json()
+
+    # 16. Error ALREADY_PAIRED
+    err_already_paired = SnowMessage.create_error(
+        code=ErrorCode.ALREADY_PAIRED,
+        message="Device is already paired or session is already established.",
+        correlation_id=req_id,
+    )
+    valid_fixtures["error_already_paired.json"] = err_already_paired.to_json()
+
     # --- Negative / Invalid Fixtures ---
     # 1. Malformed JSON
     invalid_fixtures["invalid_malformed_json.json"] = (
@@ -351,6 +410,30 @@ def generate_python_fixtures() -> tuple[int, int]:
             "payload": {"action": "bulk", "data": "A" * 70000},
         }),
         ErrorCode.OVERSIZED_MESSAGE,
+    )
+
+    # 23. Request payload data not an object (malformed pairing payload)
+    invalid_fixtures["invalid_request_pair_data_not_object.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"action": "pair_request", "data": "not_an_object"},
+        }),
+        ErrorCode.INVALID_PAYLOAD,
+    )
+
+    # 24. Response missing correlation_id
+    invalid_fixtures["invalid_pair_response_missing_correlation.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "response",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"status": "success", "action": "pair_request"},
+        }),
+        ErrorCode.INVALID_CORRELATION_ID,
     )
 
     # Write valid fixtures

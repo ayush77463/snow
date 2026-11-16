@@ -252,22 +252,24 @@ Before enabling device capabilities, we must secure the communication channel. T
 - Generate a unique device identity (UUID) for each endpoint on first run.
 - Implement a 6-digit PIN pairing flow: desktop displays PIN; user enters it on the Android app.
 - Enforce PIN expiry (60 seconds) and rate limiting (3 failed attempts → lockout).
-- Evaluate QR code as an alternative/supplement to manual PIN entry.
+- Evaluate QR code as an alternative/supplement to manual PIN entry (manual 6-digit PIN entry remains the supported baseline for Sub-Milestone 2.1).
 
 #### Deliverables
 - `src/snow/security/identity.py`: Device identity generation and persistence.
 - `src/snow/security/pairing.py`: PIN generation, expiry, and rate limiting.
 - `android/.../security/PairingFlow.kt`: PIN entry UI and verification.
-- Pairing protocol messages (`PAIR_REQUEST`, `PAIR_CHALLENGE`, `PAIR_RESPONSE`).
+- Pairing protocol operations (action: `pair_request`, `pair_verify` inside canonical `request`/`response`/`error` envelopes).
 
 #### Dependencies
 - Completion of Phase 1 (all sub-milestones).
 
 #### Acceptance Criteria
-- Desktop generates and displays a 6-digit PIN on `sys.stderr`.
-- Entering the correct PIN within 60 seconds pairs the devices.
-- Entering incorrect PIN 3 times triggers lockout.
-- Expired PINs are rejected with a clear error.
+- [x] Desktop generates and displays a 6-digit PIN on `sys.stderr` (`src/snow/security/pairing.py`).
+- [x] Entering the correct PIN within 60 seconds pairs the devices (empirically verified on physical Realme RMX5110; session established).
+- [x] Entering incorrect PIN enforces rate-limiting and attempt countdown (empirically verified with 'WRONG PIN' on physical device; automated suite verified 3-attempt lockout ceiling).
+- [x] Expired PINs are rejected with a clear error (`PIN_EXPIRED`).
+- [x] Persistent unique device identities (UUIDv4) generated and validated for both desktop and Android (`src/snow/security/identity.py` and `org.snow.security.DeviceIdentity`).
+- [x] QR code connection & pairing payload evaluated conceptually for Phase 2 (metadata transfer is out-of-band, observable by cameras; manual 6-digit PIN entry remains the supported baseline).
 
 #### Viva Concept Check
 - **Why use a 6-digit PIN?** Out-of-band authentication establishes initial trust between devices. The user physically verifies both endpoints.
@@ -278,7 +280,9 @@ Before enabling device capabilities, we must secure the communication channel. T
 ### Sub-Milestone 2.2: SQLite Pairing Records and Session Management
 
 #### Objectives
-- Store paired device records (device ID, display name, pairing timestamp, auth token hash) in SQLite.
+- Store paired device records (device ID, display name, pairing timestamp, auth token hash) in SQLite using Python standard-library `sqlite3`.
+- Store authentication-token hash (SHA-256) as specified by the frozen architecture.
+- Do not introduce SQLCipher or third-party SQLite C extensions (standard library `sqlite3` only).
 - Implement session management: track active sessions, support device unpairing.
 - Log pairing events for audit.
 

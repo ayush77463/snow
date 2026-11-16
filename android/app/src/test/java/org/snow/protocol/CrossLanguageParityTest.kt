@@ -131,6 +131,65 @@ class CrossLanguageParityTest {
             )
             valid["request_large_payload.json"] = JsonSerialization.toJson(largeReq)
 
+            // --- Phase 2.1 Pairing Protocol Fixtures ---
+            // 11. Request pair_request
+            val reqPair = SnowMessage.createRequest(
+                "pair_request",
+                mapOf(
+                    "device_id" to UUID.randomUUID().toString(),
+                    "device_name" to "Test Client Device",
+                    "pin" to "123456"
+                )
+            )
+            valid["request_pair_request.json"] = JsonSerialization.toJson(reqPair)
+
+            // 12. Response pair success
+            val respPair = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "pair_request",
+                    "data" to mapOf(
+                        "session_id" to UUID.randomUUID().toString(),
+                        "device_id" to UUID.randomUUID().toString(),
+                        "device_name" to "SNOW Desktop Core"
+                    )
+                )
+            )
+            valid["response_pair_success.json"] = JsonSerialization.toJson(respPair)
+
+            // 13. Error INVALID_PIN
+            val errInvalidPin = SnowMessage.createError(
+                ErrorCode.INVALID_PIN,
+                "Invalid pairing PIN. 2 attempt(s) remaining.",
+                reqId
+            )
+            valid["error_invalid_pin.json"] = JsonSerialization.toJson(errInvalidPin)
+
+            // 14. Error PIN_EXPIRED
+            val errPinExpired = SnowMessage.createError(
+                ErrorCode.PIN_EXPIRED,
+                "Pairing PIN has expired. Request a new PIN on desktop.",
+                reqId
+            )
+            valid["error_pin_expired.json"] = JsonSerialization.toJson(errPinExpired)
+
+            // 15. Error PAIRING_LOCKED
+            val errPairingLocked = SnowMessage.createError(
+                ErrorCode.PAIRING_LOCKED,
+                "Too many failed pairing attempts. Locked out for 300s.",
+                reqId
+            )
+            valid["error_pairing_locked.json"] = JsonSerialization.toJson(errPairingLocked)
+
+            // 16. Error ALREADY_PAIRED
+            val errAlreadyPaired = SnowMessage.createError(
+                ErrorCode.ALREADY_PAIRED,
+                "Device is already paired or session is already established.",
+                reqId
+            )
+            valid["error_already_paired.json"] = JsonSerialization.toJson(errAlreadyPaired)
+
             for ((filename, content) in valid) {
                 File(ktToPyValid, filename).writeText(content, Charsets.UTF_8)
             }
@@ -349,6 +408,30 @@ class CrossLanguageParityTest {
                     put("payload", JSONObject(mapOf("action" to "bulk", "data" to "A".repeat(70000))))
                 }.toString(),
                 ErrorCode.OVERSIZED_MESSAGE
+            )
+
+            // 23. Request payload data not an object (malformed pairing payload)
+            invalid["invalid_request_pair_data_not_object.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "request")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("action" to "pair_request", "data" to "not_an_object")))
+                }.toString(),
+                ErrorCode.INVALID_PAYLOAD
+            )
+
+            // 24. Response missing correlation_id
+            invalid["invalid_pair_response_missing_correlation.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "response")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("status" to "success", "action" to "pair_request")))
+                }.toString(),
+                ErrorCode.INVALID_CORRELATION_ID
             )
 
             val manifest = JSONObject()

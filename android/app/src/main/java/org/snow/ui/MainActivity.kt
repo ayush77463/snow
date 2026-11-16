@@ -9,10 +9,16 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.View
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
@@ -21,6 +27,9 @@ import org.snow.R
 import org.snow.databinding.ActivityMainBinding
 import org.snow.network.ConnectionState
 import org.snow.protocol.Constants
+import org.snow.security.DeviceIdentity
+import org.snow.security.PairingFlow
+import org.snow.security.PairingState
 import org.snow.service.SnowForegroundService
 
 class MainActivity : AppCompatActivity() {
@@ -29,8 +38,16 @@ class MainActivity : AppCompatActivity() {
     private var service: SnowForegroundService? = null
     private var isBound = false
 
+    private lateinit var identity: DeviceIdentity
+    private lateinit var pairingFlow: PairingFlow
+
     private var stateJob: Job? = null
     private var logsJob: Job? = null
+
+    // Activity timeline events list and current filter
+    private enum class ActivityFilter { ALL, CONNECTIONS, DIAGNOSTICS }
+    private var currentFilter = ActivityFilter.ALL
+    private val activityEvents = mutableListOf<String>()
 
     private val requestNotificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
@@ -57,12 +74,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Enforce Light Mode strictly before super.onCreate (Glacier Blue Design System)
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
+
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        // Setup Window Insets handling for Android 16 keyboard & system bars
+        setupWindowInsets()
+
         checkNotificationPermission()
+        identity = DeviceIdentity.getOrCreate(this)
+        pairingFlow = PairingFlow(identity)
+
         setupListeners()
+        setupPinFocusAndKeyboard()
+        setupFilterPills()
+
+        appendLog("Device Identity: ${identity.deviceId.take(8)}... (${identity.deviceName})")
     }
 
     override fun onStart() {
@@ -77,6 +107,52 @@ class MainActivity : AppCompatActivity() {
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false
+        }
+    }
+
+    /**
+     * Handle window insets dynamically for Android 16 / API 36.
+     * Applies the maximum of system bar bottom and IME bottom insets to the root scroll container.
+     */
+    private fun setupWindowInsets() {
+        val initialPaddingLeft = binding.rootScrollView.paddingLeft
+        val initialPaddingTop = binding.rootScrollView.paddingTop
+        val initialPaddingRight = binding.rootScrollView.paddingRight
+        val initialPaddingBottom = binding.rootScrollView.paddingBottom
+
+        ViewCompat.setOnApplyWindowInsetsListener(binding.rootScrollView) { v, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            val effectiveBottom = maxOf(systemBars.bottom, ime.bottom)
+
+            v.setPadding(
+                initialPaddingLeft,
+                initialPaddingTop,
+                initialPaddingRight,
+                initialPaddingBottom + effectiveBottom
+            )
+            insets
+        }
+    }
+
+    /**
+     * Ensure the PIN field and Pair Device button remain fully visible when the soft keyboard opens.
+     */
+    private fun setupPinFocusAndKeyboard() {
+        binding.editPin.setOnFocusChangeListener { _, hasFocus ->
+            if (hasFocus) {
+                binding.rootScrollView.post {
+                    val cardTop = binding.cardPairing.top
+                    binding.rootScrollView.smoothScrollTo(0, cardTop)
+                }
+            }
+        }
+
+        binding.editPin.setOnClickListener {
+            binding.rootScrollView.post {
+                val cardTop = binding.cardPairing.top
+                binding.rootScrollView.smoothScrollTo(0, cardTop)
+            }
         }
     }
 
@@ -108,28 +184,117 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
 
+            dismissKeyboard()
             SnowForegroundService.startConnect(this, host, port)
             appendLog("Initiating connection to $host:$port ...")
         }
 
         binding.btnDisconnect.setOnClickListener {
+            dismissKeyboard()
             SnowForegroundService.stop(this)
             appendLog("Disconnect requested.")
         }
 
         binding.btnPing.setOnClickListener {
-            service?.client?.sendRequest("ping") { response ->
-                runOnUiThread {
-                    appendLog("Ping reply received! Payload: ${response.payload}")
-                }
-            } ?: run {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
                 Toast.makeText(this, "Not connected", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            val startMs = System.currentTimeMillis()
+            binding.tvPingLatency.text = "Pinging..."
+
+            client.sendRequest("ping") { response ->
+                val rtt = System.currentTimeMillis() - startMs
+                runOnUiThread {
+                    binding.tvPingLatency.text = "${rtt}ms RTT"
+                    appendLog("Ping reply: ${rtt}ms round-trip latency")
+                }
             }
         }
 
         binding.btnClearLog.setOnClickListener {
-            binding.tvLog.text = ""
+            activityEvents.clear()
+            renderActivityTimeline()
         }
+
+        binding.btnPair.setOnClickListener {
+            val pin = binding.editPin.text?.toString()?.trim() ?: ""
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Must be connected to desktop to pair", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            // Dismiss keyboard cleanly upon submission
+            dismissKeyboard()
+
+            val submitted = pairingFlow.submitPin(pin, client) { state ->
+                runOnUiThread { updatePairingUi(state) }
+            }
+            if (submitted) {
+                appendLog("Submitting PIN $pin for verification...")
+            }
+        }
+
+        binding.btnRequestPin.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Must be connected to desktop to request PIN", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            dismissKeyboard()
+            pairingFlow.requestNewPin(client) { state ->
+                runOnUiThread { updatePairingUi(state) }
+            }
+            appendLog("Requested fresh pairing PIN on desktop console...")
+        }
+    }
+
+    private fun setupFilterPills() {
+        binding.filterAll.setOnClickListener {
+            setFilter(ActivityFilter.ALL)
+        }
+        binding.filterConnections.setOnClickListener {
+            setFilter(ActivityFilter.CONNECTIONS)
+        }
+        binding.filterDiagnostics.setOnClickListener {
+            setFilter(ActivityFilter.DIAGNOSTICS)
+        }
+    }
+
+    private fun setFilter(filter: ActivityFilter) {
+        currentFilter = filter
+
+        binding.filterAll.setBackgroundResource(
+            if (filter == ActivityFilter.ALL) R.drawable.bg_pill_filter_selected else R.drawable.bg_pill_filter_unselected
+        )
+        binding.filterAll.setTextColor(
+            ContextCompat.getColor(this, if (filter == ActivityFilter.ALL) R.color.primary_blue else R.color.secondary_text)
+        )
+
+        binding.filterConnections.setBackgroundResource(
+            if (filter == ActivityFilter.CONNECTIONS) R.drawable.bg_pill_filter_selected else R.drawable.bg_pill_filter_unselected
+        )
+        binding.filterConnections.setTextColor(
+            ContextCompat.getColor(this, if (filter == ActivityFilter.CONNECTIONS) R.color.primary_blue else R.color.secondary_text)
+        )
+
+        binding.filterDiagnostics.setBackgroundResource(
+            if (filter == ActivityFilter.DIAGNOSTICS) R.drawable.bg_pill_filter_selected else R.drawable.bg_pill_filter_unselected
+        )
+        binding.filterDiagnostics.setTextColor(
+            ContextCompat.getColor(this, if (filter == ActivityFilter.DIAGNOSTICS) R.color.primary_blue else R.color.secondary_text)
+        )
+
+        renderActivityTimeline()
+    }
+
+    private fun dismissKeyboard() {
+        val windowInsetsController = WindowCompat.getInsetsController(window, binding.root)
+        windowInsetsController.hide(WindowInsetsCompat.Type.ime())
     }
 
     private fun observeService() {
@@ -161,36 +326,196 @@ class MainActivity : AppCompatActivity() {
 
         when (state) {
             ConnectionState.DISCONNECTED -> {
-                binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected))
+                binding.tvStatusPill.text = "● Disconnected"
+                binding.tvStatusPill.setBackgroundResource(R.drawable.bg_pill_status)
+                binding.tvStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+
+                binding.layoutConnectionInputs.visibility = View.VISIBLE
+                binding.layoutConnectedBanner.visibility = View.GONE
                 binding.btnConnect.isEnabled = true
                 binding.btnDisconnect.isEnabled = false
-                binding.btnPing.isEnabled = false
+
+                binding.btnPing.alpha = 0.5f
+                binding.tvPingLatency.text = "Disabled"
+                binding.editPin.isEnabled = false
+                binding.btnPair.isEnabled = false
+                binding.btnRequestPin.isEnabled = false
+
+                pairingFlow.reset()
+                updatePairingUi(pairingFlow.state.value)
             }
+
             ConnectionState.CONNECTING -> {
-                binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.status_connecting))
+                binding.tvStatusPill.text = "● Connecting..."
+                binding.tvStatusPill.setBackgroundResource(R.drawable.bg_pill_status)
+                binding.tvStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connecting_dark))
+
                 binding.btnConnect.isEnabled = false
                 binding.btnDisconnect.isEnabled = true
-                binding.btnPing.isEnabled = false
+                binding.btnPing.alpha = 0.5f
+                binding.editPin.isEnabled = false
+                binding.btnPair.isEnabled = false
+                binding.btnRequestPin.isEnabled = false
             }
+
             ConnectionState.CONNECTED -> {
-                binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.status_connected))
+                val host = binding.editHost.text?.toString()?.trim() ?: "Desktop"
+                val port = binding.editPort.text?.toString()?.trim() ?: "8765"
+
+                binding.tvStatusPill.text = "● Connected • Local Network"
+                binding.tvStatusPill.setBackgroundResource(R.drawable.bg_pill_status)
+                binding.tvStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connected_dark))
+
+                binding.layoutConnectionInputs.visibility = View.GONE
+                binding.layoutConnectedBanner.visibility = View.VISIBLE
+                binding.tvConnectedEndpoint.text = "Connected to $host:$port"
+
                 binding.btnConnect.isEnabled = false
                 binding.btnDisconnect.isEnabled = true
-                binding.btnPing.isEnabled = true
+                binding.btnPing.alpha = 1.0f
+                binding.tvPingLatency.text = "Ready"
+
+                updatePairingUi(pairingFlow.state.value)
             }
+
             ConnectionState.RECONNECTING -> {
-                binding.tvStatus.setTextColor(ContextCompat.getColor(this, R.color.status_reconnecting))
+                binding.tvStatusPill.text = "● Reconnecting..."
+                binding.tvStatusPill.setBackgroundResource(R.drawable.bg_pill_status)
+                binding.tvStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_reconnecting))
+
                 binding.btnConnect.isEnabled = false
                 binding.btnDisconnect.isEnabled = true
-                binding.btnPing.isEnabled = false
+                binding.btnPing.alpha = 0.5f
+                binding.editPin.isEnabled = false
+                binding.btnPair.isEnabled = false
+                binding.btnRequestPin.isEnabled = false
+            }
+        }
+    }
+
+    private fun updatePairingUi(state: PairingState) {
+        val isConnected = service?.client?.connectionState?.value == ConnectionState.CONNECTED
+
+        when (state) {
+            is PairingState.Idle, is PairingState.WaitingForPin -> {
+                binding.tvPairingBadge.text = getString(R.string.badge_unpaired)
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.secondary_text))
+                binding.tvPairingStatus.text = "Enter 6-digit PIN shown on desktop console."
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.secondary_text))
+                binding.editPin.isEnabled = isConnected
+                binding.btnPair.isEnabled = isConnected
+                binding.btnRequestPin.isEnabled = isConnected
+            }
+
+            is PairingState.InProgress -> {
+                binding.tvPairingBadge.text = getString(R.string.badge_pairing)
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_connecting_dark))
+                binding.tvPairingStatus.text = "Verifying PIN with desktop..."
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_connecting_dark))
+                binding.editPin.isEnabled = false
+                binding.btnPair.isEnabled = false
+                binding.btnRequestPin.isEnabled = false
+            }
+
+            is PairingState.Paired -> {
+                binding.tvPairingBadge.text = getString(R.string.badge_paired)
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_connected_dark))
+                binding.tvPairingStatus.text = "✓ Paired with ${state.desktopName}"
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_connected_dark))
+                binding.editPin.isEnabled = false
+                binding.btnPair.isEnabled = false
+                binding.btnRequestPin.isEnabled = false
+                appendLog("Pairing confirmed with ${state.desktopName} (Session: ${state.sessionId.take(8)}...)")
+            }
+
+            is PairingState.WrongPin -> {
+                binding.tvPairingBadge.text = "WRONG PIN"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.tvPairingStatus.text = "✗ ${state.message}"
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.editPin.isEnabled = isConnected
+                binding.btnPair.isEnabled = isConnected
+                binding.btnRequestPin.isEnabled = isConnected
+                appendLog("Pairing failed: ${state.message}")
+            }
+
+            is PairingState.Expired -> {
+                binding.tvPairingBadge.text = "EXPIRED"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_connecting_dark))
+                binding.tvPairingStatus.text = "⏳ ${state.message}"
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_connecting_dark))
+                binding.editPin.isEnabled = isConnected
+                binding.btnPair.isEnabled = isConnected
+                binding.btnRequestPin.isEnabled = isConnected
+                appendLog("Pairing PIN expired. Tap 'Request New PIN' to regenerate.")
+            }
+
+            is PairingState.Locked -> {
+                binding.tvPairingBadge.text = getString(R.string.badge_locked)
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.tvPairingStatus.text = "🔒 ${state.message}"
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.editPin.isEnabled = false
+                binding.btnPair.isEnabled = false
+                binding.btnRequestPin.isEnabled = isConnected
+                appendLog("Pairing locked: ${state.message}")
+            }
+
+            is PairingState.ConnectionLost -> {
+                binding.tvPairingBadge.text = "OFFLINE"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.tvPairingStatus.text = "Connection lost during pairing."
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.btnPair.isEnabled = false
+                binding.btnRequestPin.isEnabled = false
+            }
+
+            is PairingState.Error -> {
+                binding.tvPairingBadge.text = "ERROR"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.tvPairingStatus.text = "Error: ${state.message}"
+                binding.tvPairingStatus.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected_dark))
+                binding.btnPair.isEnabled = isConnected
+                binding.btnRequestPin.isEnabled = isConnected
+                appendLog("Pairing error: ${state.message}")
             }
         }
     }
 
     private fun appendLog(line: String) {
-        binding.tvLog.append("$line\n")
-        binding.scrollLog.post {
-            binding.scrollLog.fullScroll(android.view.View.FOCUS_DOWN)
+        activityEvents.add(line)
+        renderActivityTimeline()
+    }
+
+    private fun renderActivityTimeline() {
+        val filtered = activityEvents.filter { event ->
+            when (currentFilter) {
+                ActivityFilter.ALL -> true
+                ActivityFilter.CONNECTIONS -> {
+                    event.contains("Connect", ignoreCase = true) ||
+                    event.contains("Disconnect", ignoreCase = true) ||
+                    event.contains("Heartbeat", ignoreCase = true) ||
+                    event.contains("Handshake", ignoreCase = true) ||
+                    event.contains("Reconnecting", ignoreCase = true)
+                }
+                ActivityFilter.DIAGNOSTICS -> {
+                    event.contains("Ping", ignoreCase = true) ||
+                    event.contains("Error", ignoreCase = true) ||
+                    event.contains("Fail", ignoreCase = true) ||
+                    event.contains("Warning", ignoreCase = true) ||
+                    event.contains("Pairing", ignoreCase = true) ||
+                    event.contains("Identity", ignoreCase = true)
+                }
+            }
+        }
+
+        if (filtered.isEmpty()) {
+            binding.tvEmptyActivity.visibility = View.VISIBLE
+            binding.tvLog.visibility = View.GONE
+        } else {
+            binding.tvEmptyActivity.visibility = View.GONE
+            binding.tvLog.visibility = View.VISIBLE
+            binding.tvLog.text = filtered.joinToString("\n")
         }
     }
 }
