@@ -319,9 +319,9 @@ Before enabling device capabilities, we must secure the communication channel. T
 - Completion of Sub-Milestone 2.2.
 
 #### Acceptance Criteria
-- Token encryption uses a Keystore-managed AES key with AES-GCM.
-- Ciphertext is stored in SharedPreferences/DataStore; plaintext key is never written to disk.
-- Tampering with the stored ciphertext causes decryption to fail with an authentication error.
+- [x] Token encryption uses a Keystore-managed AES key with AES-GCM.
+- [x] Ciphertext is stored in SharedPreferences/DataStore; plaintext key is never written to disk.
+- [x] Tampering with the stored ciphertext causes decryption to fail with an authentication error.
 
 #### Viva Concept Check
 - **How does Android Keystore protect keys?** Keys are generated and stored inside a hardware-isolated security module (TEE/StrongBox). They cannot be extracted, even by a rooted device.
