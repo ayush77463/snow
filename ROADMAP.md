@@ -778,14 +778,15 @@ Discovered beacons serve as connection candidates; full trust still requires TLS
 - Phase 8 standalone execution and auto-daemon lifecycle.
 
 ### Acceptance Criteria
-- [ ] UDP discovery broadcaster sends periodic signed/structured JSON beacons on port `8768`.
-- [ ] UDP listener discovers active peers on the LAN, parses payloads, and evicts stale beacons after timeout.
-- [ ] Android `DiscoveryManager.kt` discovers Core daemon on Wi-Fi and updates candidate IP for paired devices.
-- [ ] Cross-device execution targeting a disconnected paired device triggers a wake burst and awaits reconnection within the configurable grace period.
-- [ ] Target resolution correctly resolves device by ID, friendly name, or unambiguous substring, returning `AMBIGUOUS_DEVICE` on collision.
-- [ ] Unified file transfer tool coordinates transfers seamlessly between laptop and remote targets.
-- [ ] Windows-to-Windows peer client connects, authenticates, and executes remote peer tools.
-- [ ] Android dashboard displays discovered LAN peers in a clean card view.
+- [x] UDP discovery broadcaster sends periodic signed/structured JSON beacons on port `8768`.
+- [x] UDP listener discovers active peers on the LAN, parses payloads, and evicts stale beacons after timeout.
+- [x] Android `DiscoveryManager.kt` discovers Core daemon on Wi-Fi and updates candidate IP for paired devices.
+- [x] Cross-device execution targeting a disconnected paired device triggers a wake burst and awaits reconnection within the configurable grace period.
+- [x] Target resolution correctly resolves device by ID, friendly name, or unambiguous substring, returning `AMBIGUOUS_DEVICE` on collision.
+- [x] Unified file transfer tool coordinates transfers seamlessly between laptop and remote targets.
+- [x] Windows-to-Windows peer client connects, authenticates, and executes remote peer tools.
+- [x] Android dashboard displays discovered LAN peers in a clean card view with 1-tap endpoint selection.
+- [x] 230/230 Python tests, 83/83 Android JVM tests, and 144/144 cross-language parity fixtures pass cleanly.
 
 ---
 

@@ -34,7 +34,7 @@ from snow.capabilities.windows.terminal import (
 from snow.cli import atomic_write_json, merge_mcp_config, run_setup, run_status
 from snow.daemon import CoreDaemonManager
 from snow.mcp.bridge import SnowMcpBridge
-from snow.mcp.registry import ToolCategory, get_tool_category, is_cross_device_tool, is_local_windows_tool
+from snow.mcp.registry import TOOL_REGISTRY, ToolCategory, get_tool_category, is_cross_device_tool, is_local_windows_tool
 from snow.mcp.server import create_snow_mcp_server
 from snow.mcp.tools import ALL_TOOL_NAMES, register_all_tools
 
@@ -43,7 +43,8 @@ class TestToolRegistryClassification(unittest.TestCase):
     """Test explicit tool classification layer."""
 
     def test_all_21_tools_classified(self) -> None:
-        self.assertEqual(len(ALL_TOOL_NAMES), 21)
+        self.assertEqual(len(ALL_TOOL_NAMES), len(TOOL_REGISTRY))
+        self.assertGreaterEqual(len(ALL_TOOL_NAMES), 21)
         for tool_name in ALL_TOOL_NAMES:
             category = get_tool_category(tool_name)
             self.assertIsNotNone(category, f"Tool '{tool_name}' must be explicitly categorized.")

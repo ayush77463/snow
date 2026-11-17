@@ -4,6 +4,7 @@ object Constants {
     const val PROTOCOL_VERSION: Int = 1
     const val DEFAULT_MAX_MESSAGE_SIZE: Int = 65536
     const val DEFAULT_PORT: Int = 8765
+    const val DEFAULT_DISCOVERY_PORT: Int = 8768
     const val HEARTBEAT_INTERVAL_MS: Long = 15000L
     const val HEARTBEAT_TIMEOUT_MS: Long = 45000L
 }

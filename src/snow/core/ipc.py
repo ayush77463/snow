@@ -27,6 +27,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from typing import Any, Dict, Optional, Set
 import uuid
 
@@ -615,11 +616,13 @@ class SnowIpcServer:
         paired = cs.db_manager.list_paired_devices()
         results = []
 
+        paired_ids = set()
         for p in paired:
             session = cs.session_manager.get_session_by_device(p.device_id)
             is_connected = False
             remote_addr = None
             session_id = None
+            paired_ids.add(p.device_id)
 
             if session:
                 session_id = session.session_id
@@ -639,6 +642,22 @@ class SnowIpcServer:
                 "paired_at": p.pairing_timestamp,
                 "last_seen": p.last_seen_timestamp,
             })
+
+        # Append discovered LAN candidates if discovery service is active
+        if getattr(cs, "discovery_service", None) and cs.discovery_service.is_running:
+            for peer in cs.discovery_service.list_discovered_peers():
+                if peer.device_id not in paired_ids:
+                    results.append({
+                        "device_id": peer.device_id,
+                        "device_name": peer.device_name,
+                        "is_paired": False,
+                        "is_connected": False,
+                        "is_discovered": True,
+                        "remote_address": f"{peer.ip_address}:{peer.port}",
+                        "device_type": peer.device_type,
+                        "cert_fingerprint": peer.cert_fingerprint,
+                        "last_seen": peer.last_seen_timestamp,
+                    })
 
         return results
 
@@ -674,8 +693,36 @@ class SnowIpcServer:
                 "error": f"Device '{device_id}' is not paired with this desktop.",
             }
 
-        # 2. Verify active session
+        # 2. Verify active session (with on-demand discovery wake & grace period)
         session = cs.session_manager.get_session_by_device(device_id)
+        conn = cs.connection_manager.get(session.connection_id) if session and session.connection_id else None
+
+        if not conn or not conn.is_active:
+            grace_period = getattr(cs.config, "device_connect_grace_period", 6.0)
+            disc_svc = getattr(cs, "discovery_service", None)
+            if disc_svc and disc_svc.is_running and grace_period > 0:
+                logger.info(
+                    "Device '%s' is paired but disconnected. Sending wake burst and awaiting reconnection (grace period %.1fs)...",
+                    device_id, grace_period
+                )
+                try:
+                    await disc_svc.send_wake_burst(device_id)
+                except Exception as exc:
+                    logger.debug("Failed sending wake burst: %s", exc)
+
+                start_wait = time.time()
+                while time.time() - start_wait < grace_period:
+                    await asyncio.sleep(0.2)
+                    session = cs.session_manager.get_session_by_device(device_id)
+                    if session and session.connection_id:
+                        conn = cs.connection_manager.get(session.connection_id)
+                        if conn and conn.is_active:
+                            logger.info(
+                                "Device '%s' reconnected successfully within grace period (took %.2fs).",
+                                device_id, time.time() - start_wait
+                            )
+                            break
+
         if not session or not session.connection_id:
             return {
                 "success": False,

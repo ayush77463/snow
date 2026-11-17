@@ -47,6 +47,93 @@ from snow.mcp.registry import ToolCategory, get_tool_category, is_local_windows_
 logger = logging.getLogger(__name__)
 
 
+def resolve_target_device(
+    devices: list[dict[str, Any]], target_query: str = ""
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Resolve a target device query into a concrete device_id or structured error.
+
+    Resolution rules:
+    1. If target_query is empty, 'default', or None:
+       - Filter to paired devices.
+       - If 0 paired devices: return (None, {"success": False, "status": "NO_DEVICES_PAIRED", "error": "No paired devices found. Pair a device with SNOW first."})
+       - If exactly 1 paired device: return (device_id, None)
+       - If > 1 paired devices:
+         - Check connected devices among paired devices.
+         - If exactly 1 is connected: return (device_id, None)
+         - Otherwise: return (None, {"success": False, "status": "DEVICE_REQUIRED", "error": f"Multiple devices available ({len(paired)} paired). Please specify device ID or name.", "data": {"available_devices": paired}})
+    2. If target_query is specified:
+       - Check exact device_id match.
+       - Check exact device_name match (case-insensitive).
+       - Check substring or prefix match (case-insensitive, min 3 chars).
+       - If multiple matches: return (None, {"success": False, "status": "AMBIGUOUS_DEVICE", "error": f"Target '{target_query}' matches multiple devices.", "data": {"matches": matches}})
+       - If no matches: return (None, {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"No device found matching '{target_query}'."})
+    """
+    clean_q = (target_query or "").strip()
+    paired = [d for d in devices if d.get("is_paired")]
+
+    if not clean_q or clean_q.lower() == "default":
+        if not paired:
+            return None, {
+                "success": False,
+                "status": "NO_DEVICES_PAIRED",
+                "error": "No paired devices found. Pair a device with SNOW first.",
+            }
+        if len(paired) == 1:
+            return paired[0]["device_id"], None
+
+        connected = [d for d in paired if d.get("is_connected")]
+        if len(connected) == 1:
+            return connected[0]["device_id"], None
+
+        return None, {
+            "success": False,
+            "status": "DEVICE_REQUIRED",
+            "error": f"Multiple devices available ({len(paired)} paired, {len(connected)} connected). Please specify device ID or name.",
+            "data": {"available_devices": paired},
+        }
+
+    # Explicit query provided
+    # 1. Exact match on device_id
+    for d in devices:
+        if d.get("device_id") == clean_q:
+            return d["device_id"], None
+
+    # 2. Exact match on device_name (case-insensitive)
+    exact_names = [d for d in devices if d.get("device_name", "").lower() == clean_q.lower()]
+    if len(exact_names) == 1:
+        return exact_names[0]["device_id"], None
+    elif len(exact_names) > 1:
+        return None, {
+            "success": False,
+            "status": "AMBIGUOUS_DEVICE",
+            "error": f"Target '{clean_q}' matches multiple devices with the same name.",
+            "data": {"matches": exact_names},
+        }
+
+    # 3. Substring match on name or ID (minimum 3 characters)
+    if len(clean_q) >= 3:
+        matches = [
+            d for d in devices
+            if clean_q.lower() in d.get("device_name", "").lower()
+            or clean_q.lower() in d.get("device_id", "").lower()
+        ]
+        if len(matches) == 1:
+            return matches[0]["device_id"], None
+        elif len(matches) > 1:
+            return None, {
+                "success": False,
+                "status": "AMBIGUOUS_DEVICE",
+                "error": f"Target '{clean_q}' matches multiple devices.",
+                "data": {"matches": matches},
+            }
+
+    return None, {
+        "success": False,
+        "status": "DEVICE_NOT_FOUND",
+        "error": f"No device found matching '{clean_q}'.",
+    }
+
+
 class SnowMcpBridge:
     """IPC and in-process execution bridge allowing MCP tool handlers to command SNOW."""
 
@@ -396,15 +483,18 @@ class SnowMcpBridge:
     # Android Tools (Cross-Device via Core IPC)
     # =========================================================================
 
-    async def _resolve_target_device_id(self) -> Optional[str]:
-        """Helper to resolve the first active connected device ID."""
+    async def resolve_target(self, target_query: str = "") -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Resolve a device query against currently paired and discovered devices."""
         res = await self.list_devices()
-        if res.get("success"):
-            devices = res.get("data", {}).get("devices", [])
-            for dev in devices:
-                if dev.get("is_connected"):
-                    return dev.get("device_id")
-        return None
+        if not res.get("success"):
+            return None, res
+        devices = res.get("data", {}).get("devices", [])
+        return resolve_target_device(devices, target_query)
+
+    async def _resolve_target_device_id(self, target_query: str = "") -> Optional[str]:
+        """Helper to resolve a target device ID using unified resolution rules."""
+        target_id, _ = await self.resolve_target(target_query)
+        return target_id
 
     async def android_battery(self, device_id: str = "") -> dict[str, Any]:
         """Query paired Android phone battery telemetry."""
@@ -445,17 +535,19 @@ class SnowMcpBridge:
 
     async def android_file_send(self, file_path: str, device_id: str = "") -> dict[str, Any]:
         """Send a local file from Desktop to Android phone."""
+        target_id = device_id or await self._resolve_target_device_id()
         return await self.call_cross_device(
             "android_file_send",
-            payload={"file_path": file_path, "device_id": device_id},
+            payload={"file_path": file_path, "device_id": target_id or ""},
             timeout=60.0,
         )
 
     async def android_file_receive(self, file_name: str, device_id: str = "") -> dict[str, Any]:
         """Request and download a file from Android phone to Desktop."""
+        target_id = device_id or await self._resolve_target_device_id()
         return await self.call_cross_device(
             "android_file_receive",
-            payload={"file_name": file_name, "device_id": device_id},
+            payload={"file_name": file_name, "device_id": target_id or ""},
             timeout=60.0,
         )
 
@@ -531,3 +623,71 @@ class SnowMcpBridge:
                 "direction": direction,
                 "error": f"Invalid direction '{direction}'. Must be 'laptop_to_phone' or 'phone_to_laptop'.",
             }
+
+    async def transfer_file(
+        self,
+        source_path: str,
+        destination_path: str = "",
+        direction: str = "to_device",
+        target_device: str = "",
+    ) -> dict[str, Any]:
+        """Unified cross-device file transfer between Windows and connected peers/phones.
+
+        Args:
+            source_path: Local path (for to_device) or remote filename (for from_device).
+            destination_path: Optional destination name/path.
+            direction: 'to_device' or 'from_device'.
+            target_device: Optional target device ID, name, or substring.
+        """
+        clean_dir = (direction or "").strip().lower()
+        if clean_dir not in ("to_device", "from_device"):
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": f"Invalid direction '{direction}'. Must be 'to_device' or 'from_device'.",
+            }
+
+        target_id, err = await self.resolve_target(target_device)
+        if not target_id:
+            return err or {
+                "success": False,
+                "status": "DEVICE_OFFLINE",
+                "error": "No target device resolved for transfer.",
+            }
+
+        if clean_dir == "to_device":
+            return await self.android_file_send(file_path=source_path, device_id=target_id)
+        else:
+            return await self.android_file_receive(file_name=source_path, device_id=target_id)
+
+    async def mesh_connect_peer(
+        self,
+        host: str,
+        port: int = 8765,
+        pin: str = "",
+        expected_fingerprint: str = "",
+    ) -> dict[str, Any]:
+        """Federate with another SNOW Desktop Core peer on the LAN."""
+        from snow.network.peer_client import SnowPeerClient
+
+        client = SnowPeerClient(
+            host=host,
+            port=port,
+            expected_fingerprint=expected_fingerprint or None,
+            use_tls=True,
+        )
+        try:
+            res = await client.connect(pin=pin, timeout=10.0)
+            return {
+                "success": res.success,
+                "status": res.status,
+                "data": {
+                    "remote_device_id": res.remote_device_id,
+                    "remote_device_name": res.remote_device_name,
+                    "session_id": res.session_id,
+                    "cert_fingerprint": res.cert_fingerprint,
+                },
+                "error": res.error,
+            }
+        finally:
+            await client.close()

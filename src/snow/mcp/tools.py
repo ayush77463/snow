@@ -46,6 +46,9 @@ ALL_TOOL_NAMES: List[str] = [
     "snow_android_list_apps",
     "snow_android_file_send",
     "snow_android_file_receive",
+    # Mesh and Unified Transfer (Phase 9)
+    "snow_transfer_file",
+    "snow_mesh_connect_peer",
 ]
 
 
@@ -432,3 +435,58 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "error": result.get("error", f"Failed receiving file '{remote_file_name}' from Android phone."),
             }, indent=2)
         return json.dumps(result.get("data", {}), indent=2)
+
+    @server.tool(
+        name="snow_transfer_file",
+        description=(
+            "Unified cross-device file transfer tool. Coordinates file transfers between Windows "
+            "and a remote Android phone or peer device. Direction must be 'to_device' or 'from_device'."
+        ),
+    )
+    async def snow_transfer_file(
+        source_path: str,
+        destination_path: str = "",
+        direction: str = "to_device",
+        target_device: str = "",
+    ) -> str:
+        """Transfer file between devices."""
+        result = await bridge.transfer_file(
+            source_path=source_path,
+            destination_path=destination_path,
+            direction=direction,
+            target_device=target_device,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "File transfer operation failed."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_mesh_connect_peer",
+        description=(
+            "Connect, authenticate, or pair with a remote SNOW Desktop Core peer on the local network."
+        ),
+    )
+    async def snow_mesh_connect_peer(
+        host: str,
+        port: int = 8765,
+        pin: str = "",
+        expected_fingerprint: str = "",
+    ) -> str:
+        """Connect to a peer SNOW Desktop Core."""
+        result = await bridge.mesh_connect_peer(
+            host=host,
+            port=port,
+            pin=pin,
+            expected_fingerprint=expected_fingerprint,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Peer connection to {host}:{port} failed."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)

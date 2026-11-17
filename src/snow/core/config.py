@@ -51,6 +51,10 @@ class CoreConfig:
     ipc_host: str = "127.0.0.1"
     ipc_port: int = 8767
     ipc_secret_path: str | None = None
+    discovery_port: int = 8768
+    discovery_enabled: bool = True
+    beacon_interval: float = 3.0
+    device_connect_grace_period: float = 6.0
 
     def __post_init__(self) -> None:
         """Validate configuration invariants upon instantiation."""
@@ -146,6 +150,30 @@ class CoreConfig:
         if self.ipc_secret_path is not None:
             if not isinstance(self.ipc_secret_path, str) or not self.ipc_secret_path.strip():
                 raise ValueError("ipc_secret_path must be a non-empty string or None")
+
+        # Validate discovery port (0 permitted for ephemeral test ports)
+        if not isinstance(self.discovery_port, int) or isinstance(self.discovery_port, bool):
+            raise ValueError(
+                f"discovery_port must be an integer, got {type(self.discovery_port).__name__}: {self.discovery_port!r}"
+            )
+        if not (0 <= self.discovery_port <= 65535):
+            raise ValueError(f"discovery_port must be in range 0-65535, got {self.discovery_port}")
+
+        # Validate discovery_enabled
+        if not isinstance(self.discovery_enabled, bool):
+            raise ValueError(f"discovery_enabled must be a boolean, got {type(self.discovery_enabled).__name__}")
+
+        # Validate beacon_interval (> 0.0, finite)
+        if not isinstance(self.beacon_interval, (int, float)) or isinstance(self.beacon_interval, bool):
+            raise ValueError(f"beacon_interval must be numeric, got {type(self.beacon_interval).__name__}")
+        if not math.isfinite(self.beacon_interval) or self.beacon_interval <= 0:
+            raise ValueError(f"beacon_interval must be a finite positive number (> 0), got {self.beacon_interval}")
+
+        # Validate device_connect_grace_period (> 0.0, finite)
+        if not isinstance(self.device_connect_grace_period, (int, float)) or isinstance(self.device_connect_grace_period, bool):
+            raise ValueError(f"device_connect_grace_period must be numeric, got {type(self.device_connect_grace_period).__name__}")
+        if not math.isfinite(self.device_connect_grace_period) or self.device_connect_grace_period <= 0:
+            raise ValueError(f"device_connect_grace_period must be a finite positive number (> 0), got {self.device_connect_grace_period}")
 
     @classmethod
     def from_env(cls) -> "CoreConfig":
@@ -354,6 +382,68 @@ class CoreConfig:
         raw_ipc_secret = os.getenv("SNOW_IPC_SECRET_PATH")
         ipc_secret_path = raw_ipc_secret.strip() if raw_ipc_secret and raw_ipc_secret.strip() else None
 
+        # Parse SNOW_DISCOVERY_PORT
+        raw_disc_port = os.getenv("SNOW_DISCOVERY_PORT")
+        if raw_disc_port is not None:
+            try:
+                discovery_port = int(raw_disc_port)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_DISCOVERY_PORT '{raw_disc_port}': must be an integer."
+                ) from None
+            if not (0 <= discovery_port <= 65535):
+                raise ValueError(
+                    f"Invalid SNOW_DISCOVERY_PORT '{raw_disc_port}': must be between 0 and 65535."
+                )
+        else:
+            discovery_port = 8768
+
+        # Parse SNOW_DISCOVERY_ENABLED
+        raw_disc_enabled = os.getenv("SNOW_DISCOVERY_ENABLED")
+        if raw_disc_enabled is not None:
+            if raw_disc_enabled.strip().lower() in ("true", "1", "yes"):
+                discovery_enabled = True
+            elif raw_disc_enabled.strip().lower() in ("false", "0", "no"):
+                discovery_enabled = False
+            else:
+                raise ValueError(
+                    f"Invalid SNOW_DISCOVERY_ENABLED '{raw_disc_enabled}': must be 'true' or 'false'."
+                )
+        else:
+            discovery_enabled = True
+
+        # Parse SNOW_BEACON_INTERVAL
+        raw_beacon_int = os.getenv("SNOW_BEACON_INTERVAL")
+        if raw_beacon_int is not None:
+            try:
+                beacon_interval = float(raw_beacon_int)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_BEACON_INTERVAL '{raw_beacon_int}': must be numeric."
+                ) from None
+            if not math.isfinite(beacon_interval) or beacon_interval <= 0:
+                raise ValueError(
+                    f"Invalid SNOW_BEACON_INTERVAL '{raw_beacon_int}': must be a positive number."
+                )
+        else:
+            beacon_interval = 3.0
+
+        # Parse SNOW_DEVICE_CONNECT_GRACE_PERIOD
+        raw_grace = os.getenv("SNOW_DEVICE_CONNECT_GRACE_PERIOD")
+        if raw_grace is not None:
+            try:
+                device_connect_grace_period = float(raw_grace)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_DEVICE_CONNECT_GRACE_PERIOD '{raw_grace}': must be numeric."
+                ) from None
+            if not math.isfinite(device_connect_grace_period) or device_connect_grace_period <= 0:
+                raise ValueError(
+                    f"Invalid SNOW_DEVICE_CONNECT_GRACE_PERIOD '{raw_grace}': must be a positive number."
+                )
+        else:
+            device_connect_grace_period = 6.0
+
         return cls(
             app_name=app_name,
             version="0.1.0",
@@ -374,4 +464,8 @@ class CoreConfig:
             ipc_host=ipc_host,
             ipc_port=ipc_port,
             ipc_secret_path=ipc_secret_path,
+            discovery_port=discovery_port,
+            discovery_enabled=discovery_enabled,
+            beacon_interval=beacon_interval,
+            device_connect_grace_period=device_connect_grace_period,
         )

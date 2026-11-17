@@ -16,6 +16,7 @@ from snow.core.config import CoreConfig
 from snow.core.ipc import SnowIpcServer
 from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
 from snow.network.connection_manager import ConnectionManager
+from snow.network.discovery import SnowDiscoveryService
 from snow.network.ws_server import SnowWebSocketServer
 from snow.transfer.http_server import SnowHttpTransferServer
 from snow.transfer.manager import TransferManager
@@ -54,6 +55,7 @@ class SnowCoreServer:
         self.windows_terminal = WindowsTerminalExecutor()
         self.windows_clipboard = WindowsClipboardManager()
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
+        self.discovery_service: Optional[SnowDiscoveryService] = None
 
     @property
     def is_running(self) -> bool:
@@ -141,6 +143,24 @@ class SnowCoreServer:
         # Start the authenticated loopback IPC server for MCP subprocess communication
         await self.ipc_server.start()
 
+        # Start zero-touch UDP discovery service
+        if self.config.discovery_enabled:
+            def _check_paired(dev_id: str, cert_fp: str) -> bool:
+                paired = self.db_manager.get_paired_device(dev_id)
+                if not paired:
+                    return False
+                if paired.cert_fingerprint and cert_fp:
+                    return paired.cert_fingerprint.lower() == cert_fp.lower()
+                return True
+
+            self.discovery_service = SnowDiscoveryService(
+                config=self.config,
+                device_identity=self.device_identity,
+                cert_fingerprint=getattr(self.ws_server, "cert_fingerprint", ""),
+                paired_device_checker=_check_paired,
+            )
+            await self.discovery_service.start()
+
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port
         actual_http_port = self.http_transfer_server.bound_port or self.config.transfer_port
@@ -193,6 +213,11 @@ class SnowCoreServer:
         # Stop IPC server first so external tool requests terminate cleanly before core shuts down
         if self.ipc_server:
             await self.ipc_server.stop()
+
+        # Stop discovery service
+        if self.discovery_service:
+            await self.discovery_service.stop()
+            self.discovery_service = None
 
         # Stop HTTP transfer server
         if self.http_transfer_server:

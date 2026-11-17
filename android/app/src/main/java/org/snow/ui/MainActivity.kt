@@ -7,12 +7,16 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.OpenableColumns
+import android.view.Gravity
 import android.view.View
 import android.view.inputmethod.InputMethodManager
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -29,6 +33,8 @@ import org.snow.R
 import org.snow.databinding.ActivityMainBinding
 import org.snow.network.AuthState
 import org.snow.network.ConnectionState
+import org.snow.network.DiscoveredPeer
+import org.snow.network.DiscoveryManager
 import org.snow.protocol.Constants
 import org.snow.security.DeviceIdentity
 import org.snow.security.EncryptedCertPinStorage
@@ -48,10 +54,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var identity: DeviceIdentity
     private lateinit var tokenStorage: SharedPreferencesTokenStorage
     private lateinit var pairingFlow: PairingFlow
+    private lateinit var discoveryManager: DiscoveryManager
 
     private var stateJob: Job? = null
     private var logsJob: Job? = null
     private var authJob: Job? = null
+    private var discoveryJob: Job? = null
 
     // Activity timeline events list and current filter
     private enum class ActivityFilter { ALL, CONNECTIONS, DIAGNOSTICS }
@@ -102,6 +110,10 @@ class MainActivity : AppCompatActivity() {
         identity = DeviceIdentity.getOrCreate(this)
         tokenStorage = SharedPreferencesTokenStorage(this)
         pairingFlow = PairingFlow(identity, tokenStorage)
+        discoveryManager = DiscoveryManager(
+            certPinStorage = EncryptedCertPinStorage(this),
+            tokenStorage = tokenStorage
+        )
 
         setupListeners()
         setupPinFocusAndKeyboard()
@@ -114,11 +126,20 @@ class MainActivity : AppCompatActivity() {
         super.onStart()
         val intent = Intent(this, SnowForegroundService::class.java)
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        discoveryManager.startListening()
+        discoveryJob = lifecycleScope.launch {
+            discoveryManager.peers.collectLatest { peers ->
+                renderDiscoveredPeers(peers)
+            }
+        }
     }
 
     override fun onStop() {
         super.onStop()
         cleanupObservers()
+        discoveryJob?.cancel()
+        discoveryJob = null
+        discoveryManager.stopListening()
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false
@@ -342,6 +363,72 @@ class MainActivity : AppCompatActivity() {
     private fun dismissKeyboard() {
         val windowInsetsController = WindowCompat.getInsetsController(window, binding.root)
         windowInsetsController.hide(WindowInsetsCompat.Type.ime())
+    }
+
+    private fun renderDiscoveredPeers(peers: List<DiscoveredPeer>) {
+        val nonStale = peers.filter { !it.isStale }
+        if (nonStale.isEmpty()) {
+            binding.layoutDiscoveredPeers.visibility = View.GONE
+            binding.containerDiscoveredList.removeAllViews()
+            return
+        }
+
+        binding.layoutDiscoveredPeers.visibility = View.VISIBLE
+        binding.containerDiscoveredList.removeAllViews()
+
+        for (peer in nonStale) {
+            val peerView = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(16, 12, 16, 12)
+                setBackgroundResource(R.drawable.bg_card_glacier)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    bottomMargin = 8
+                }
+                isClickable = true
+                isFocusable = true
+                setOnClickListener {
+                    binding.editHost.setText(peer.ipAddress)
+                    binding.editPort.setText(peer.port.toString())
+                    Toast.makeText(this@MainActivity, "Selected ${peer.deviceName} (${peer.ipAddress})", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            val infoLayout = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val titleView = TextView(this).apply {
+                text = "${peer.deviceName} (${peer.ipAddress})"
+                textSize = 13f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.primary_text))
+            }
+
+            val statusView = TextView(this).apply {
+                text = if (peer.isPaired) "Paired Core • Port ${peer.port}" else "Available Peer • Port ${peer.port}"
+                textSize = 11f
+                setTextColor(ContextCompat.getColor(this@MainActivity, if (peer.isPaired) R.color.primary_blue else R.color.secondary_text))
+            }
+
+            infoLayout.addView(titleView)
+            infoLayout.addView(statusView)
+            peerView.addView(infoLayout)
+
+            val tapHint = TextView(this).apply {
+                text = "USE"
+                textSize = 11f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.primary_blue))
+            }
+            peerView.addView(tapHint)
+
+            binding.containerDiscoveredList.addView(peerView)
+        }
     }
 
     private fun onFileSelectedForUpload(uri: Uri) {
