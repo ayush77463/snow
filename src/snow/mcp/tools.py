@@ -1,11 +1,14 @@
 """Unified static MCP tool registry for SNOW.
 
 Exposes standardized MCP tools for both Windows and Android capabilities to AI assistants.
-All 16 tools are statically discoverable via list_tools, even when the Core or Android
+All 21 tools are statically discoverable via list_tools, even when the Core or Android
 device is currently offline.
 
-Deferred tools (Phase 5 Windows and Phase 6 Android) return structured NOT_IMPLEMENTED_YET
-responses without failing discovery or crashing the MCP server.
+In Phase 8:
+- Windows capabilities (telemetry, processes, files, apps, terminal, clipboard) execute
+  directly in-process without requiring Core to be running.
+- Cross-device capabilities (Android operations, device list, status, clipboard sync)
+  automatically start the background Core daemon on-demand.
 """
 
 from __future__ import annotations
@@ -16,12 +19,12 @@ from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 from snow.mcp.bridge import SnowMcpBridge
 
-# Complete static catalog of the 16 SNOW tool names
+# Complete static catalog of the 21 SNOW tool names
 ALL_TOOL_NAMES: List[str] = [
     # General (Live Core)
     "snow_get_device_status",
     "snow_list_devices",
-    # Windows Capabilities (Phase 5 Deferred)
+    # Windows Capabilities
     "snow_windows_battery",
     "snow_windows_system_info",
     "snow_windows_processes",
@@ -29,7 +32,13 @@ ALL_TOOL_NAMES: List[str] = [
     "snow_windows_file_read",
     "snow_windows_file_write",
     "snow_windows_file_list",
-    # Android Capabilities (Phase 6 Deferred)
+    "snow_windows_file_search",
+    "snow_windows_terminal_exec",
+    "snow_windows_clipboard_get",
+    "snow_windows_clipboard_set",
+    # Cross-Device Synchronization
+    "snow_sync_clipboard",
+    # Android Capabilities
     "snow_android_battery",
     "snow_android_ring",
     "snow_android_clipboard_push",
@@ -41,10 +50,10 @@ ALL_TOOL_NAMES: List[str] = [
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 16 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 21 static MCP tools onto the provided FastMCP server instance."""
 
     # =========================================================================
-    # 1. General Tools (Live Core via IPC)
+    # 1. General Tools (Core Daemon via IPC)
     # =========================================================================
 
     @server.tool(
@@ -62,7 +71,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "success": False,
                 "status": result.get("status", "CORE_OFFLINE"),
                 "error": result.get("error", "SNOW Desktop Core is unreachable."),
-                "hint": "Ensure 'python -m snow' is running on the host machine.",
+                "hint": "Ensure 'snow daemon start' or 'python -m snow' is running.",
             }, indent=2)
 
         data = result.get("data", {})
@@ -111,7 +120,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         }, indent=2)
 
     # =========================================================================
-    # 2. Windows Tools (Phase 5 Live Capabilities via Core IPC)
+    # 2. Windows Tools (Standalone Local Execution)
     # =========================================================================
 
     @server.tool(
@@ -119,7 +128,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         description="Retrieve battery percentage, power line status, and battery health of the Windows laptop.",
     )
     async def snow_windows_battery() -> str:
-        """Query Windows laptop battery telemetry via Core."""
+        """Query Windows laptop battery telemetry."""
         result = await bridge.windows_battery()
         if not result.get("success", False):
             return json.dumps({
@@ -134,7 +143,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         description="Retrieve Windows system hardware specifications, OS build, and CPU/RAM utilization.",
     )
     async def snow_windows_system_info() -> str:
-        """Query Windows system and hardware telemetry via Core."""
+        """Query Windows system and hardware telemetry."""
         result = await bridge.windows_system_info()
         if not result.get("success", False):
             return json.dumps({
@@ -149,7 +158,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         description="List running Windows processes with PID, name, and resource usage.",
     )
     async def snow_windows_processes(limit: int = 25, sort_by: str = "memory") -> str:
-        """Query running Windows processes via Core."""
+        """Query running Windows processes."""
         result = await bridge.windows_processes(limit=limit, sort_by=sort_by)
         if not result.get("success", False):
             return json.dumps({
@@ -161,10 +170,13 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
 
     @server.tool(
         name="snow_windows_launch_app",
-        description="Launch an explicitly permitted Windows application from the approved whitelist (notepad, calc, explorer, taskmgr, mspaint).",
+        description=(
+            "Launch an explicitly permitted Windows application from the approved whitelist "
+            "(notepad, calc, explorer, taskmgr, mspaint, code, chrome, msedge, powershell, wt)."
+        ),
     )
     async def snow_windows_launch_app(app_name: str) -> str:
-        """Launch an approved Windows application via Core."""
+        """Launch an approved Windows application."""
         result = await bridge.windows_launch_app(app_name=app_name)
         if not result.get("success", False):
             return json.dumps({
@@ -176,10 +188,10 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
 
     @server.tool(
         name="snow_windows_file_read",
-        description="Read UTF-8 text file contents from configured approved directories on the Windows laptop (up to 256 KiB).",
+        description="Read UTF-8 text file contents from authorized directories on the Windows laptop (up to 256 KiB).",
     )
     async def snow_windows_file_read(file_path: str, max_bytes: int = 262144) -> str:
-        """Read a file in approved Windows directories via Core."""
+        """Read a file in approved Windows directories."""
         result = await bridge.windows_file_read(file_path=file_path, max_bytes=max_bytes)
         if not result.get("success", False):
             return json.dumps({
@@ -191,12 +203,12 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
 
     @server.tool(
         name="snow_windows_file_write",
-        description="Write UTF-8 text content atomically to a file in configured approved directories on the Windows laptop (up to 256 KiB).",
+        description="Write UTF-8 text content atomically to a file in authorized directories on the Windows laptop (up to 256 KiB).",
     )
     async def snow_windows_file_write(
         file_path: str, content: str, overwrite: bool = False, max_bytes: int = 262144
     ) -> str:
-        """Write content to an approved Windows file path via Core."""
+        """Write content to an approved Windows file path."""
         result = await bridge.windows_file_write(
             file_path=file_path, content=content, overwrite=overwrite, max_bytes=max_bytes
         )
@@ -210,10 +222,10 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
 
     @server.tool(
         name="snow_windows_file_list",
-        description="List files within approved directories on the Windows laptop.",
+        description="List files within authorized directories on the Windows laptop.",
     )
     async def snow_windows_file_list(directory_path: str = "", limit: int = 50) -> str:
-        """List files in approved Windows directories via Core."""
+        """List files in approved Windows directories."""
         result = await bridge.windows_file_list(directory_path=directory_path, limit=limit)
         if not result.get("success", False):
             return json.dumps({
@@ -223,8 +235,97 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
             }, indent=2)
         return json.dumps(result.get("data", {}), indent=2)
 
+    @server.tool(
+        name="snow_windows_file_search",
+        description="Search files recursively matching a query string within authorized directories on the Windows laptop.",
+    )
+    async def snow_windows_file_search(
+        query: str, root_path: str = "", limit: int = 50
+    ) -> str:
+        """Search files recursively within authorized Windows directories."""
+        result = await bridge.windows_file_search(query=query, root_path=root_path, limit=limit)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed searching for '{query}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
+
+    @server.tool(
+        name="snow_windows_terminal_exec",
+        description=(
+            "Execute a shell command on the Windows laptop with output bounds (128 KiB), "
+            "execution timeout, and safety policies preventing catastrophic commands."
+        ),
+    )
+    async def snow_windows_terminal_exec(
+        command: str, cwd: str = "", timeout: float = 30.0
+    ) -> str:
+        """Execute a controlled shell command on Windows."""
+        result = await bridge.windows_terminal_exec(
+            command=command, cwd=cwd or None, timeout=timeout
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Command execution failed."),
+                "details": result.get("data", {}),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
+
+    @server.tool(
+        name="snow_windows_clipboard_get",
+        description="Read the current text contents of the Windows laptop clipboard.",
+    )
+    async def snow_windows_clipboard_get() -> str:
+        """Read text from Windows clipboard."""
+        result = await bridge.windows_clipboard_get()
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed reading Windows clipboard."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
+
+    @server.tool(
+        name="snow_windows_clipboard_set",
+        description="Write text to the Windows laptop clipboard.",
+    )
+    async def snow_windows_clipboard_set(text: str) -> str:
+        """Write text to Windows clipboard."""
+        result = await bridge.windows_clipboard_set(text=text)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed setting Windows clipboard."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}), indent=2)
+
     # =========================================================================
-    # 3. Android Tools (Phase 6 Live Capabilities via Core IPC)
+    # 3. Cross-Device Synchronization Tools
+    # =========================================================================
+
+    @server.tool(
+        name="snow_sync_clipboard",
+        description=(
+            "Synchronize clipboard between Windows laptop and Android phone. "
+            "Directions: 'laptop_to_phone' pushes Windows clipboard to Android. "
+            "'phone_to_laptop' reports unsupported due to Android OS background restrictions."
+        ),
+    )
+    async def snow_sync_clipboard(
+        direction: str = "laptop_to_phone", device_id: str = ""
+    ) -> str:
+        """Synchronize clipboard between laptop and phone."""
+        result = await bridge.sync_clipboard(direction=direction, device_id=device_id)
+        return json.dumps(result, indent=2)
+
+    # =========================================================================
+    # 4. Android Tools (Cross-Device via Core IPC)
     # =========================================================================
 
     @server.tool(

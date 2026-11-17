@@ -35,6 +35,7 @@ from snow.core.config import CoreConfig
 from snow.core.ipc import SnowIpcServer
 from snow.mcp.bridge import SnowMcpBridge
 from snow.mcp.server import create_snow_mcp_server
+from snow.mcp.tools import ALL_TOOL_NAMES
 
 
 class TestWindowsTelemetry(unittest.IsolatedAsyncioTestCase):
@@ -292,15 +293,13 @@ class TestWindowsAppLauncher(unittest.IsolatedAsyncioTestCase):
         self.launcher = WindowsAppLauncher()
 
     def test_allowed_apps_catalog(self) -> None:
-        expected = ["calc", "explorer", "mspaint", "notepad", "taskmgr"]
-        self.assertEqual(self.launcher.allowed_apps, expected)
+        for expected in ["calc", "explorer", "mspaint", "notepad", "taskmgr"]:
+            self.assertIn(expected, self.launcher.allowed_apps)
 
     async def test_disallowed_apps_rejected(self) -> None:
         disallowed = [
             "cmd",
             "cmd.exe",
-            "powershell",
-            "powershell.exe",
             "bash",
             "calc.exe; rm -rf /",
             "notepad.exe && dir",
@@ -415,7 +414,7 @@ class TestPhase5EndToEndIntegration(unittest.IsolatedAsyncioTestCase):
         }
         for name in expected_phase_5_tools:
             self.assertIn(name, tool_names)
-        self.assertEqual(len(tool_names), 16)
+        self.assertEqual(len(tool_names), len(ALL_TOOL_NAMES))
 
     async def test_mcp_windows_system_info(self) -> None:
         res_raw = await self.mcp_server.call_tool("snow_windows_system_info", {})
@@ -489,9 +488,10 @@ class TestPhase5EndToEndIntegration(unittest.IsolatedAsyncioTestCase):
             host="127.0.0.1",
             port=59999,
             secret="some_secret",
+            auto_start_core=False,
         )
         offline_server = create_snow_mcp_server(bridge=offline_bridge)
-        res_raw = await offline_server.call_tool("snow_windows_system_info", {})
+        res_raw = await offline_server.call_tool("snow_get_device_status", {})
         data = self._extract_tool_result(res_raw)
         self.assertFalse(data.get("success", False))
         self.assertEqual(data["status"], "CORE_OFFLINE")

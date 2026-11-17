@@ -693,3 +693,154 @@ Bring all components together into an end-to-end demonstration, verify resilienc
 ### Viva Concept Check
 - **Walk through a complete tool invocation**: AI host → MCP tool call → Bridge routing → Device Protocol command → Android handler → Response → MCP result → AI host display.
 - **What happens if the phone disconnects mid-command?** The Connection Manager detects the disconnection, the pending request times out, and the MCP bridge returns an error result to the AI host.
+
+---
+
+# SNOW V2 Product Roadmap
+
+> The fundamental product principle of SNOW V2 is:
+> **The AI assistant is the interface. SNOW provides capabilities. Devices are the execution environments.**
+>
+> SNOW V1 established the frozen security, local networking, cross-language protocol parity, and capability transport foundation. SNOW V2 transforms SNOW into an autonomous, multi-device, AI-centric platform that users connect effortlessly to compatible MCP clients (Claude Desktop, Gemini, Cursor, ChatGPT, Antigravity) with zero friction.
+
+```mermaid
+flowchart LR
+    V1["SNOW V1\nPhases 0-7\n(Frozen Baseline)"] --> P8["Phase 8\nStandalone Execution\n& Product CLI"]
+    P8 --> P9["Phase 9\nZero-Touch Discovery\n& Peer Mesh"]
+    P9 --> P10["Phase 10\nUnified Operations\n& Bidirectional Mesh"]
+    P10 --> P11["Phase 11\nProductization &\nHost Integrations"]
+```
+
+---
+
+## Phase 8: Standalone Local Execution, Auto-Daemon Lifecycle, Power-User Windows Capabilities & One-Command Setup
+
+### Concept Explained
+In SNOW V1, every MCP tool invocation required the background Desktop Core WebSocket daemon to be actively running, even when performing purely local Windows tasks. If the daemon was offline or the phone was disconnected, local queries could fail.
+
+Phase 8 decouples MCP tool execution into two clear tiers:
+1. **Local-Only Windows Tools**: Execute immediately in-process within the FastMCP server process via direct capability handlers, requiring zero daemon overhead and zero network sockets.
+2. **Cross-Device Tools**: Automatically check Core daemon health via IPC, seamlessly auto-spawn the detached Core daemon (`CREATE_NO_WINDOW`) if needed, and route requests via authenticated IPC.
+
+In addition, Phase 8 introduces safe, power-user Windows capabilities (sandboxed terminal command execution, Win32 clipboard read/write/sync, recursive filesystem search, and safe application launching) and a unified `snow` product CLI for zero-friction setup and lifecycle management.
+
+### Objectives
+- Enable standalone in-process execution for local Windows tools when Core daemon is offline.
+- Implement an atomic auto-daemon lifecycle manager (`CoreDaemonManager`) that starts the headless daemon only on cross-device demand.
+- Add power-user Windows tools: `snow_windows_terminal_execute`, `snow_windows_clipboard_get`, `snow_windows_clipboard_set`, `snow_windows_clipboard_sync`, and `snow_windows_search_files`.
+- Implement `snow` CLI with `setup`, `status`, `daemon start`, and `daemon stop`.
+- Maintain strict MCP `stdio` stream isolation and complete zero stdout pollution.
+
+### Deliverables
+- `src/snow/mcp/registry.py`: Declarative categorization (`ExecutionTier.LOCAL_WINDOWS` vs `ExecutionTier.CROSS_DEVICE`).
+- `src/snow/daemon.py`: `CoreDaemonManager` implementing detached background process spawning with PID tracking, lock coordination, and log redirection.
+- `src/snow/capabilities/windows/terminal.py`: `WindowsTerminalExecutor` with output truncation (128 KiB), execution timeouts (30–120s), and catastrophic command blocklist.
+- `src/snow/capabilities/windows/clipboard.py`: `WindowsClipboardManager` using standard Win32 `ctypes` (`CF_UNICODETEXT`).
+- `src/snow/cli.py`: Production CLI entry points for setup, status, and daemon control.
+- `tests/test_phase_8_product_core.py`: 30 unit and integration tests verifying all Phase 8 deliverables.
+
+### Dependencies
+- SNOW V1 baseline (`f37626c`).
+
+### Acceptance Criteria
+- [x] Local Windows tools execute in-process within MCP without Core daemon running (`snow_windows_system_info`, `snow_windows_list_dir`, `snow_windows_search_files`, `snow_windows_read_file`, `snow_windows_terminal_execute`, `snow_windows_clipboard_get`, `snow_windows_clipboard_set`).
+- [x] Cross-device tools trigger automatic on-demand daemon startup (`CoreDaemonManager`) when Core is not running.
+- [x] Sandboxed terminal execution supports PowerShell/cmd, enforces timeouts, caps output at 128 KiB, and rejects blocked catastrophic commands.
+- [x] Win32 clipboard read and write work cleanly using standard library ctypes without third-party dependencies.
+- [x] `snow setup` correctly detects or writes configuration for Claude Desktop and other MCP clients (`--dry-run` supported).
+- [x] 204/204 Python tests, 75/75 Android JVM tests, and 144/144 cross-language parity fixtures pass cleanly.
+
+---
+
+## Phase 9: Zero-Touch UDP Discovery, On-Demand Auto-Connect & Multi-Device Peer Mesh
+
+### Concept Explained
+In SNOW V1, connecting an Android device required manual IP address entry or hardcoded loopback configurations. Phase 9 introduces zero-touch LAN discovery via UDP beacons on port `8768`, enabling devices on the same local network to discover each other automatically while preserving strict cryptographic trust boundaries.
+
+Discovered beacons serve as connection candidates; full trust still requires TLS/WSS certificate fingerprint pinning and paired session authentication. In addition, Phase 9 adds an on-demand auto-connect grace period, multi-device target resolution (routing commands by device ID, device name, or friendly alias), a Windows-to-Windows peer mesh client (`SnowPeerClient`), and unified file transfer (`snow_transfer_file`).
+
+### Objectives
+- Implement UDP discovery announcer and listener on port `8768` for both Windows and Android (`DiscoveryManager.kt`).
+- Implement an on-demand connection grace period (up to 6.0s) sending wake bursts when cross-device commands target a known but currently disconnected peer.
+- Implement unified target resolution (exact ID, exact name, unambiguous prefix/substring, rejecting ambiguous targets).
+- Create a Windows-to-Windows peer client (`SnowPeerClient`) allowing laptop-to-laptop federation.
+- Provide unified file transfer tool `snow_transfer_file(source_path, destination_path, direction, target_device)`.
+- Update the Android UI with live discovery status and discovered peer candidate cards.
+
+### Deliverables
+- `src/snow/network/discovery.py`: Async UDP beacon broadcaster and listener with rate limiting, subnet broadcast calculation, and stale peer eviction.
+- `android/app/src/main/java/org/snow/network/DiscoveryManager.kt`: Android UDP discovery service exposing `StateFlow<List<DiscoveredPeer>>`.
+- `src/snow/network/peer_client.py`: `SnowPeerClient` implementing Windows-to-Windows WebSocket client with TLS fingerprint pinning.
+- `src/snow/mcp/tools.py`: New MCP tools `snow_mesh_connect_peer` and `snow_transfer_file`.
+- `tests/test_phase_9_mesh_discovery.py` & `DiscoveryManagerTest.kt`: Unit and integration test suites.
+
+### Dependencies
+- Phase 8 standalone execution and auto-daemon lifecycle.
+
+### Acceptance Criteria
+- [ ] UDP discovery broadcaster sends periodic signed/structured JSON beacons on port `8768`.
+- [ ] UDP listener discovers active peers on the LAN, parses payloads, and evicts stale beacons after timeout.
+- [ ] Android `DiscoveryManager.kt` discovers Core daemon on Wi-Fi and updates candidate IP for paired devices.
+- [ ] Cross-device execution targeting a disconnected paired device triggers a wake burst and awaits reconnection within the configurable grace period.
+- [ ] Target resolution correctly resolves device by ID, friendly name, or unambiguous substring, returning `AMBIGUOUS_DEVICE` on collision.
+- [ ] Unified file transfer tool coordinates transfers seamlessly between laptop and remote targets.
+- [ ] Windows-to-Windows peer client connects, authenticates, and executes remote peer tools.
+- [ ] Android dashboard displays discovered LAN peers in a clean card view.
+
+---
+
+## Phase 10: Unified Cross-Device Operations and Bidirectional Capability Expansion
+
+### Concept Explained
+With multi-device discovery and peer mesh operational, Phase 10 deepens bidirectional capabilities across all enrolled devices. Rather than treating mobile devices solely as command sinks, Phase 10 turns every node into both a sensor and an actuator.
+
+### Objectives
+- Implement true bidirectional clipboard synchronization (laptop ↔ phone, laptop ↔ laptop) with user consent and focus detection.
+- Add unified cross-device notification forwarding and triage.
+- Support audio streaming and remote media control across peers.
+- Implement secure, user-authorized screen capture and snapshot retrieval.
+- Enable mobile-to-desktop command invocation with strict authorization.
+
+### Deliverables
+- Bidirectional clipboard sync agent with foreground focus detection.
+- Cross-device notification dispatcher and Android notification listener.
+- Mobile-to-desktop capability caller with signed authorization tokens.
+- Integration test suite for bidirectional flows.
+
+### Dependencies
+- Phase 9 Zero-Touch Discovery and Multi-Device Peer Mesh.
+
+### Acceptance Criteria
+- [ ] Clipboard updates propagate securely between authorized devices.
+- [ ] Mobile notifications can be listed, dismissed, or queried via MCP.
+- [ ] Screen snapshots can be retrieved from authorized devices with on-screen indicator.
+- [ ] Mobile client can issue authorized commands to the Windows Desktop Core.
+
+---
+
+## Phase 11: SNOW Productization, Onboarding and AI-Host Integration
+
+### Concept Explained
+The final phase packages SNOW for end-user deployment. It provides zero-configuration installers, automated local TLS certificate provisioning, one-click integration with major AI clients (Claude Desktop, OpenAI macOS/Windows client, Cursor, Antigravity, Open-WebUI), and a lightweight system tray status indicator.
+
+### Objectives
+- Provide a single-file executable or installer for Windows Desktop Core.
+- Provide automated release APK builds with signed artifacts.
+- Implement one-click MCP configuration for all major AI desktop hosts.
+- Add an optional, ultra-lightweight Windows system tray icon for visual connection status and quick pairing PIN display.
+- Package complete end-user documentation and onboarding wizard.
+
+### Deliverables
+- Single-command installer and environment bootstrapper.
+- System tray helper (optional, non-blocking, zero heavyweight framework).
+- Multi-host MCP installer scripts (`snow setup --all`).
+- Production documentation and user onboarding guide.
+
+### Dependencies
+- Phases 8, 9, and 10.
+
+### Acceptance Criteria
+- [ ] `snow setup --host <claude|cursor|chatgpt>` configures respective client config files automatically.
+- [ ] Windows daemon runs seamlessly as a background service or tray utility.
+- [ ] Clean uninstallation removes all configurations and certificates without leaving residue.
+- [ ] Zero cloud dependencies, zero external telemetry, 100% local operation verified.

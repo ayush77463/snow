@@ -39,8 +39,8 @@ def create_snow_mcp_server(
     # Attach bridge reference
     server.bridge = mcp_bridge  # type: ignore[attr-defined]
 
-    # Register all 16 static tools
+    # Register all 21 static tools
     register_all_tools(server, mcp_bridge)
 
-    logger.debug("SNOW FastMCP server created and 16 static tools registered.")
+    logger.debug("SNOW FastMCP server created and 21 static tools registered.")
     return server

@@ -6,9 +6,11 @@ from typing import List, Optional
 
 from snow.capabilities.windows import (
     WindowsAppLauncher,
+    WindowsClipboardManager,
     WindowsFileManager,
     WindowsProcessMonitor,
     WindowsTelemetry,
+    WindowsTerminalExecutor,
 )
 from snow.core.config import CoreConfig
 from snow.core.ipc import SnowIpcServer
@@ -49,6 +51,8 @@ class SnowCoreServer:
         roots = [self.config.transfer_root] if self.config.transfer_root else None
         self.windows_files = WindowsFileManager(allowed_roots=roots)
         self.windows_apps = WindowsAppLauncher()
+        self.windows_terminal = WindowsTerminalExecutor()
+        self.windows_clipboard = WindowsClipboardManager()
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
 
     @property

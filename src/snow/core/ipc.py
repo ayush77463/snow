@@ -491,6 +491,50 @@ class SnowIpcServer:
                 "error": res.get("error"),
             }, now_authed
 
+        if op == "windows_file_search":
+            res = await self._handle_windows_file_search(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_terminal_exec":
+            res = await self._handle_windows_terminal_exec(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_clipboard_get":
+            res = await self._handle_windows_clipboard_get()
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "windows_clipboard_set":
+            res = await self._handle_windows_clipboard_set(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
         if op == "android_file_send":
             res = await self._handle_android_file_send(payload)
             return {
@@ -834,6 +878,93 @@ class SnowIpcServer:
             }
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed listing files: {exc}"}
+
+    async def _handle_windows_file_search(self, payload: dict) -> dict:
+        """Search files recursively within approved roots via Core."""
+        fm = getattr(self.core_server, "windows_files", None)
+        if not fm:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows file capability not initialized.",
+            }
+        query = payload.get("query", "")
+        root_path = payload.get("root_path", "")
+        limit = payload.get("limit", 50)
+        try:
+            res = await fm.search_files(query=query, root_path=root_path, limit=limit)
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed searching files: {exc}"}
+
+    async def _handle_windows_terminal_exec(self, payload: dict) -> dict:
+        """Execute a controlled shell command via Core."""
+        term = getattr(self.core_server, "windows_terminal", None)
+        if not term:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows terminal capability not initialized.",
+            }
+        command = payload.get("command", "")
+        cwd = payload.get("cwd")
+        timeout = float(payload.get("timeout") or 30.0)
+        try:
+            res = await term.execute_command(command=command, cwd=cwd, timeout=timeout)
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed executing terminal command: {exc}"}
+
+    async def _handle_windows_clipboard_get(self) -> dict:
+        """Read Windows clipboard via Core."""
+        cb = getattr(self.core_server, "windows_clipboard", None)
+        if not cb:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows clipboard capability not initialized.",
+            }
+        try:
+            res = await cb.get_clipboard()
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed reading clipboard: {exc}"}
+
+    async def _handle_windows_clipboard_set(self, payload: dict) -> dict:
+        """Write Windows clipboard via Core."""
+        cb = getattr(self.core_server, "windows_clipboard", None)
+        if not cb:
+            return {
+                "success": False,
+                "status": "CAPABILITY_UNAVAILABLE",
+                "error": "Windows clipboard capability not initialized.",
+            }
+        text = payload.get("text", "")
+        try:
+            res = await cb.set_clipboard(text=text)
+            return {
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
+                "data": res,
+                "error": res.get("error"),
+            }
+        except Exception as exc:
+            return {"success": False, "status": "ERROR", "error": f"Failed setting clipboard: {exc}"}
 
     def _get_default_connected_device_id(self) -> Optional[str]:
         """Resolve the first actively connected paired device ID."""

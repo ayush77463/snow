@@ -1,9 +1,9 @@
 """Strictly scoped Windows filesystem capability for SNOW.
 
-Enforces containment within approved root directories (default ~/.snow/transfers/),
-forbids access to credentials, databases, TLS keys, and Windows system directories,
-prevents symlink/junction escapes and path traversal, and enforces bounded 256 KiB
-file read/write size limits.
+Enforces containment within approved root directories (default user home and user folders),
+forbids access to credentials, databases, TLS keys, the entire ~/.snow/ state directory,
+and Windows system directories, prevents symlink/junction escapes and path traversal,
+and enforces bounded file read/write size limits.
 """
 
 from __future__ import annotations
@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_FILE_BYTES: int = 256 * 1024  # 256 KiB
 DEFAULT_LIST_LIMIT: int = 50
 MAX_LIST_LIMIT: int = 200
+DEFAULT_SEARCH_LIMIT: int = 50
+MAX_SEARCH_LIMIT: int = 200
+MAX_SEARCH_SCAN_ENTRIES: int = 10000  # Cap directory entries scanned to prevent DoS
 
 # Forbidden sensitive filenames, extensions, and directory names
 FORBIDDEN_NAME_PATTERNS = {
@@ -47,12 +50,14 @@ FORBIDDEN_EXTENSIONS = {
 }
 
 FORBIDDEN_DIR_NAMES = {
+    ".snow",
     "tls",
     ".parts",
     "windows",
     "system32",
     "program files",
     "program files (x86)",
+    "config",
 }
 
 # Windows reserved DOS device names (e.g. CON, PRN, AUX, NUL, COM1..9, LPT1..9)
@@ -82,17 +87,50 @@ RESERVED_DEVICE_NAMES = {
 }
 
 
-class WindowsFileManager:
-    """Manages strictly scoped, safe filesystem read, write, and list operations."""
+def get_default_allowed_roots() -> list[Path]:
+    """Resolve default authorized roots for practical user filesystem access.
 
-    def __init__(self, allowed_roots: Optional[List[Path | str]] = None) -> None:
-        valid_roots = [Path(r).resolve() for r in (allowed_roots or []) if r is not None]
-        if valid_roots:
-            self.allowed_roots = valid_roots
+    Includes the user's home directory and prominent standard user folders
+    (Desktop, Documents, Downloads), plus any configured workspace directory.
+    """
+    home = Path.home().resolve()
+    candidates = [
+        home,
+        (home / "Desktop").resolve(),
+        (home / "Documents").resolve(),
+        (home / "Downloads").resolve(),
+    ]
+    roots: list[Path] = []
+    for c in candidates:
+        if c.exists() and c not in roots:
+            roots.append(c)
+    if not roots:
+        roots.append(home)
+    return roots
+
+
+class WindowsFileManager:
+    """Manages strictly scoped, safe filesystem read, write, list, and search operations."""
+
+    def __init__(
+        self,
+        allowed_roots: Optional[List[Path | str]] = None,
+        additional_roots: Optional[List[Path | str]] = None,
+    ) -> None:
+        valid_roots: list[Path] = []
+        if allowed_roots:
+            valid_roots.extend([Path(r).resolve() for r in allowed_roots if r is not None])
         else:
-            default_root = (Path.home() / ".snow" / "transfers").resolve()
-            default_root.mkdir(parents=True, exist_ok=True)
-            self.allowed_roots = [default_root]
+            valid_roots.extend(get_default_allowed_roots())
+
+        if additional_roots:
+            for extra in additional_roots:
+                if extra is not None:
+                    p = Path(extra).resolve()
+                    if p.exists() and p not in valid_roots:
+                        valid_roots.append(p)
+
+        self.allowed_roots = valid_roots
 
     def _is_forbidden_path(self, resolved: Path) -> bool:
         """Check whether a resolved path matches any forbidden location, name, or extension."""
@@ -105,18 +143,19 @@ class WindowsFileManager:
         if ext_lower in FORBIDDEN_EXTENSIONS:
             return True
 
-        # Check path parts for forbidden directory names
+        # Check path parts for forbidden directory names (including .snow, windows, system32, config)
         for part in resolved.parts:
             part_lower = part.lower().strip()
             if part_lower in FORBIDDEN_DIR_NAMES:
                 return True
 
-        # Ensure path does not reside within ~/.snow/tls or point to ipc.secret
+        # Ensure path does not reside within ~/.snow directory or point to ipc.secret
         home_snow = (Path.home() / ".snow").resolve()
-        if (home_snow / "tls").resolve() in resolved.parents or resolved == (home_snow / "tls").resolve():
-            return True
-        if resolved == (home_snow / "ipc.secret").resolve():
-            return True
+        try:
+            if resolved == home_snow or resolved.is_relative_to(home_snow):
+                return True
+        except Exception:
+            pass
 
         return False
 
@@ -396,3 +435,118 @@ class WindowsFileManager:
     ) -> dict[str, Any]:
         """Asynchronously write file contents on a worker thread."""
         return await asyncio.to_thread(self.write_file_sync, file_path, content, overwrite, max_bytes)
+
+    def search_files_sync(
+        self,
+        query: str,
+        root_path: str = "",
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> dict[str, Any]:
+        """Synchronously search files recursively matching a query string or pattern.
+
+        Args:
+            query: Non-empty search string (case-insensitive substring match).
+            root_path: Directory within approved roots to search from.
+            limit: Maximum matching file entries to return (1 to 200).
+
+        Returns:
+            Structured dictionary with search matches and metadata.
+        """
+        if not query or not isinstance(query, str) or not query.strip():
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "Search query must be a non-empty string.",
+                "matches": [],
+            }
+
+        if not isinstance(limit, int) or limit < 1:
+            limit = DEFAULT_SEARCH_LIMIT
+        limit = min(limit, MAX_SEARCH_LIMIT)
+
+        safe_root, err_status = self.resolve_safe_path(root_path, must_exist=True)
+        if err_status or safe_root is None:
+            return {
+                "success": False,
+                "status": err_status or "PATH_NOT_ALLOWED",
+                "error": f"Search root denied or not found: '{root_path}' ({err_status}).",
+                "matches": [],
+            }
+
+        if not safe_root.is_dir():
+            return {
+                "success": False,
+                "status": "NOT_A_DIRECTORY",
+                "error": f"Search root '{root_path}' is not a directory.",
+                "matches": [],
+            }
+
+        normalized_query = query.strip().lower()
+        matches: List[dict[str, Any]] = []
+        scanned_count = 0
+
+        try:
+            for dirpath, dirnames, filenames in os.walk(safe_root, topdown=True):
+                # Prune forbidden directories from traversal in-place
+                dirnames[:] = [
+                    d for d in dirnames
+                    if not d.startswith(".tmp_")
+                    and not d.startswith(".")
+                    and not self._is_forbidden_path(Path(dirpath) / d)
+                ]
+
+                for fname in filenames:
+                    scanned_count += 1
+                    if scanned_count > MAX_SEARCH_SCAN_ENTRIES:
+                        break
+
+                    if normalized_query in fname.lower():
+                        file_path = Path(dirpath) / fname
+                        if self._is_forbidden_path(file_path):
+                            continue
+
+                        try:
+                            stat = file_path.stat()
+                            mod_iso = datetime.fromtimestamp(
+                                stat.st_mtime, tz=timezone.utc
+                            ).isoformat()
+                            rel_path = str(file_path.relative_to(safe_root))
+                            matches.append({
+                                "name": fname,
+                                "path": rel_path,
+                                "full_path": str(file_path),
+                                "size_bytes": stat.st_size,
+                                "modified_at": mod_iso,
+                            })
+                            if len(matches) >= limit:
+                                break
+                        except (OSError, PermissionError):
+                            continue
+
+                if len(matches) >= limit or scanned_count > MAX_SEARCH_SCAN_ENTRIES:
+                    break
+
+            return {
+                "success": True,
+                "status": "SUCCESS",
+                "query": query,
+                "root": str(safe_root),
+                "count": len(matches),
+                "matches": matches,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "FILE_OPERATION_FAILED",
+                "error": f"Error during file search: {exc}",
+                "matches": [],
+            }
+
+    async def search_files(
+        self,
+        query: str,
+        root_path: str = "",
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> dict[str, Any]:
+        """Asynchronously search files recursively on a worker thread."""
+        return await asyncio.to_thread(self.search_files_sync, query, root_path, limit)
