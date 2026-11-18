@@ -847,29 +847,191 @@ Crucially, Phase 10 enforces strict defense-in-depth boundaries:
 
 ---
 
-## Phase 11: SNOW Productization, Onboarding and AI-Host Integration
+## Phase 11: V2 Four-Layer Architecture Specification & Codebase Gap Audit
 
 ### Concept Explained
-The final phase packages SNOW for end-user deployment. It provides zero-configuration installers, automated local TLS certificate provisioning, one-click integration with major AI clients (Claude Desktop, OpenAI macOS/Windows client, Cursor, Antigravity, Open-WebUI), and a lightweight system tray status indicator.
+Phase 11 formalizes the SNOW V2 architectural evolution from an asymmetric Windows-server / Android-peripheral bridge into an AI-native, symmetric, multi-node capability mesh. It establishes the comprehensive 4-layer specification (`docs/ARCHITECTURE_V2.md`), defines the platform-independent `DeviceNode` contract, maps the Android 17 security and permission boundaries, details the four structured terminal execution security tiers, and audits the Phase 0–10 codebase to eliminate architectural duplication while strictly preserving local-first in-process execution.
 
 ### Objectives
-- Provide a single-file executable or installer for Windows Desktop Core.
-- Provide automated release APK builds with signed artifacts.
-- Implement one-click MCP configuration for all major AI desktop hosts.
-- Add an optional, ultra-lightweight Windows system tray icon for visual connection status and quick pairing PIN display.
-- Package complete end-user documentation and onboarding wizard.
+- Define the Four Logical Layers: Layer 1 (AI Integration: MCP/CLI), Layer 2 (Capability Engine), Layer 3 (Device Networking), Layer 4 (Device Runtime).
+- Establish the platform-independent `DeviceNode` JSON contract and capability manifest schema.
+- Define the Android 17 permission and execution matrix (`BACKGROUND_SAFE`, `RUNTIME_PERMISSION_REQUIRED`, `FOREGROUND_USER_INTERACTION_REQUIRED`).
+- Define the four structured terminal security tiers (`READ_ONLY`, `WORKSPACE_SCOPED`, `OWNER_CONFIRMED`, `RESTRICTED_BLOCKED`).
+- Conduct a complete codebase gap audit identifying execution duplication (GAP-1, GAP-2, GAP-3) while explicitly preserving local-first in-process capability execution for AI assistants when the daemon is offline.
+- Update the forward roadmap for Phases 11–18 with frozen approved milestones.
 
 ### Deliverables
-- Single-command installer and environment bootstrapper.
-- System tray helper (optional, non-blocking, zero heavyweight framework).
-- Multi-host MCP installer scripts (`snow setup --all`).
-- Production documentation and user onboarding guide.
+- `docs/ARCHITECTURE_V2.md`: Comprehensive V2 architecture specification.
+- Updated `ROADMAP.md`: Preserved Phase 0–10 historical records and approved Phase 11–18 roadmap.
 
 ### Dependencies
-- Phases 8, 9, and 10.
+- Phase 10 bidirectional control release (`e13bf4a`).
 
 ### Acceptance Criteria
-- [ ] `snow setup --host <claude|cursor|chatgpt>` configures respective client config files automatically.
-- [ ] Windows daemon runs seamlessly as a background service or tray utility.
-- [ ] Clean uninstallation removes all configurations and certificates without leaving residue.
-- [ ] Zero cloud dependencies, zero external telemetry, 100% local operation verified.
+- [x] Four-layer architecture specification fully defined with clean Layer 1–4 separation.
+- [x] Local-first in-process execution invariant explicitly preserved; daemon-only requirement rejected.
+- [x] Structured terminal security tiers specified with exact approved tier names.
+- [x] Platform-independent `DeviceNode` schema and Android 17 permission matrix documented.
+- [x] Phase 0–10 codebase gaps analyzed with explicit remediation plans.
+
+---
+
+## Phase 12: Layer 2 Unified `CapabilityEngine` & Structured Terminal Security Tiers
+
+### Concept Explained
+Phase 12 implements the central Layer 2 `CapabilityEngine` (`src/snow/capabilities/engine.py`), unifying capability execution, shared capability instance ownership, principal-aware authorization, and structured results across all callers (local in-process MCP, loopback IPC, WSS peer dispatch, and CLI). It replaces ad-hoc command filtering with four structured terminal execution security tiers (`READ_ONLY`, `WORKSPACE_SCOPED`, `OWNER_CONFIRMED`, `RESTRICTED_BLOCKED`), enforcing canonical path validation and server-side confirmation validation.
+
+### Objectives
+- Create `src/snow/capabilities/engine.py` exposing unified `execute(request: CapabilityRequest, ctx: ExecutionContext) -> CapabilityResponse`.
+- Centralize ownership of Windows capability instances (`WindowsTelemetry`, `WindowsFileManager`, `WindowsAppLauncher`, `WindowsTerminalExecutor`, `WindowsClipboardManager`, `WindowsProcessMonitor`).
+- Refactor `ws_server.py`, `ipc.py`, and `bridge.py` to delegate capability execution exclusively to the shared `CapabilityEngine`.
+- Preserve local-first in-process execution: local Windows MCP tools execute successfully via in-process `CapabilityEngine` when the networking daemon is stopped.
+- Implement four structured terminal execution security tiers in `terminal.py`.
+- Enforce strict principal isolation: IPC and in-process MCP are stamped `AI_MCP`; WSS derives context from authenticated sessions; client-supplied confirmation or principal fields are never trusted.
+
+### Deliverables
+- `src/snow/capabilities/engine.py`: Unified CapabilityEngine, CapabilityRequest, CapabilityResponse.
+- Refactored `src/snow/capabilities/windows/terminal.py`: Structured 4-tier terminal execution.
+- Refactored `src/snow/network/ws_server.py`, `src/snow/core/ipc.py`, `src/snow/mcp/bridge.py`.
+- `tests/test_phase_12_capability_engine.py`: Comprehensive test suite verifying unified dispatch, local-first execution, terminal tiers, and principal isolation.
+
+### Dependencies
+- Phase 11 architecture specification.
+
+### Acceptance Criteria
+- [ ] All capability invocations (WSS, IPC, MCP Bridge, CLI) route through the shared `CapabilityEngine`.
+- [ ] Local Windows MCP tools succeed when the Core networking daemon is stopped (zero daemon dependency for local ops).
+- [ ] Terminal execution enforces the four structured security tiers (`READ_ONLY`, `WORKSPACE_SCOPED`, `OWNER_CONFIRMED`, `RESTRICTED_BLOCKED`).
+- [ ] Principal isolation verified: AI callers cannot acquire owner privilege; client-supplied confirmation booleans are ignored.
+- [ ] All existing Python tests, Android JVM tests, and cross-language parity tests pass with zero regression.
+
+---
+
+## Phase 13: Layer 3 Unified `NodeRegistry` & Platform-Independent `DeviceNode` Capability Manifest Protocol
+
+### Concept Explained
+Phase 13 establishes the unified Layer 3 `NodeRegistry`, consolidating active WSS sessions and UDP mesh discovery peers into a single thread-safe state store backed by SQLite reachability tracking. It implements the platform-independent `DeviceNode` model and introduces the capability manifest exchange protocol during peer handshake.
+
+### Objectives
+- Implement `NodeRegistry` consolidating `_authenticated_clients` and `_discovered_peers`.
+- Implement `DeviceNode` dataclass with serialized JSON capability manifests.
+- Implement bidirectional capability manifest exchange during WSS handshake.
+- Support multi-device tracking with unified reachability state queries.
+
+### Dependencies
+- Phase 12 unified `CapabilityEngine`.
+
+### Acceptance Criteria
+- [ ] Unified `NodeRegistry` tracks all local, connected, and discovered nodes.
+- [ ] Capability manifests dynamically advertised and queried across paired devices.
+- [ ] Device queries resolve cleanly across heterogeneous nodes without state fragmentation.
+
+---
+
+## Phase 14: Multi-Transport Reachability State Machine & Automatic On-Demand Session Routing
+
+### Concept Explained
+Phase 14 delivers full dynamic network resilience. Devices seamlessly transition across the four reachability states (`ONLINE_DIRECT`, `ONLINE_ROUTED`, `DORMANT_REACHABLE`, `OFFLINE`) without endpoint hardcoding. When a laptop or phone changes networks (hotspot, home Wi-Fi, campus LAN), the system detects interface transitions, invalidates stale addresses, and rebinds connections automatically.
+
+### Objectives
+- Implement reachability state machine with automated state transitions and timeouts.
+- Implement dynamic interface detection via `psutil` and Android `ConnectivityManager` callbacks.
+- Eliminate stale IP lockups; support automatic re-discovery within 10 seconds of network switch.
+- Support on-demand session routing when direct IP path is blocked.
+
+### Dependencies
+- Phase 13 `NodeRegistry` and `DeviceNode` protocol.
+
+### Acceptance Criteria
+- [ ] Network transitions (Wi-Fi to hotspot) recover connectivity without manual IP entry.
+- [ ] Stale endpoints automatically pruned after TTL expiry.
+- [ ] Zero endpoint hardcoding verified across all connection paths.
+
+---
+
+## Phase 15: Android 17 OS Execution Contract, Permission Matrix & Cross-Device Sync Hardening
+
+### Concept Explained
+Phase 15 hardens the Android application against modern Android OS restrictions (API 34 through 36+). It formalizes the execution matrix across `BACKGROUND_SAFE`, `RUNTIME_PERMISSION_REQUIRED`, and `FOREGROUND_USER_INTERACTION_REQUIRED`, adds resilient Foreground Service lifecycle handling, and hardens cross-device clipboard and file synchronization against process death and OS throttling.
+
+### Objectives
+- Implement runtime permission elevation flows for Android 15–17.
+- Enforce strict user-intent gates for foreground clipboard reading and SMS dispatch.
+- Optimize foreground service battery utilization and Doze-mode recovery.
+- Hardened file transfer client with resume support and integrity checks.
+
+### Dependencies
+- Phase 14 dynamic reachability state machine.
+
+### Acceptance Criteria
+- [ ] Compliant with Android 17 background execution limitations and FGS policies.
+- [ ] Foreground user confirmation dialogs operate reliably without ANR or lifecycle leaks.
+- [ ] Zero crash rate across background-to-foreground transitions.
+
+---
+
+## Phase 16: Symmetric Peer-to-Peer Mesh
+
+### Concept Explained
+Phase 16 transforms SNOW from a PC-centric hub into a symmetric peer-to-peer mesh. Android devices can operate in explicit foreground Host Mode to serve capabilities to paired peers when the PC is offline, and Windows workstations can federate symmetrically (Windows ↔ Windows, Android ↔ Android).
+
+### Objectives
+- Implement lightweight Android WSS host mode in `SnowForegroundService`.
+- Enable peer-to-peer capability invocation across any paired node pair.
+- Implement symmetric pairing and mutual capability negotiation.
+
+### Dependencies
+- Phase 15 Android hardening and Phase 13 capability manifests.
+
+### Acceptance Criteria
+- [ ] Android device can accept incoming connections from paired peers in foreground Host Mode.
+- [ ] Windows-to-Windows and Android-to-Android capability exchange verified.
+- [ ] Consistent security policy and principal isolation enforced across all mesh topologies.
+
+---
+
+## Phase 17: One-Command Onboarding & Multi-Host AI Integrations
+
+### Concept Explained
+Phase 17 streamlines productization for non-developer end-users. It delivers a one-command installer, automated TLS certificate generation, one-click MCP configuration for major AI desktop clients (Claude Desktop, Cursor, ChatGPT, Antigravity), and an enhanced `snow devices` management CLI.
+
+### Objectives
+- Implement `snow setup --host <claude|cursor|chatgpt|antigravity>` automated configurer.
+- Provide single-command bootstrap for local TLS and database initialization.
+- Enhance CLI for device management, pairing PIN display, and capability inspection.
+- Target clean zero-dependency deployment.
+
+### Deliverables
+- Setup and onboarding scripts.
+- Multi-host configuration generator.
+- Enhanced CLI commands (`snow devices`, `snow pair`, `snow config`).
+
+### Dependencies
+- Phases 11–16.
+
+### Acceptance Criteria
+- [ ] One-click MCP setup configures target AI assistant without manual JSON editing.
+- [ ] Zero cloud dependencies, zero external telemetry verified.
+- [ ] Clean onboarding flow completes in under 60 seconds.
+
+---
+
+## Phase 18: End-to-End Product Acceptance, Low-Spec Resource Verification & `snow-v2` Release
+
+### Concept Explained
+Phase 18 is the capstone release milestone. It validates all functional, performance, and security acceptance criteria across physical devices, verifies the low-spec resource target (< 30 MB idle RAM on Windows, minimal battery drain on Android), updates the viva defense guide, and tags the final `snow-v2` release.
+
+### Objectives
+- Execute full physical test suite across Windows PC and Android smartphone.
+- Validate resource consumption: verify Windows headless daemon operates under 30 MB idle RAM.
+- Update `docs/VIVA_DEFENSE_GUIDE.md` with complete Phase 11–18 theoretical and practical Q&A.
+- Create release artifacts, comprehensive capstone report, and tag `snow-v2`.
+
+### Dependencies
+- All prior phases (11–17) complete and verified.
+
+### Acceptance Criteria
+- [ ] Idle memory consumption of Windows headless core strictly under 30 MB RAM.
+- [ ] 100% pass rate on end-to-end physical verification checklist.
+- [ ] Viva defense guide fully covers V2 architecture, security tiers, and mesh networking.
+- [ ] Final `snow-v2` release tagged on `master`.
