@@ -84,6 +84,10 @@ class SnowForegroundService : Service() {
         )
     }
 
+    val peerHostManager: org.snow.network.AndroidPeerHostManager by lazy {
+        org.snow.network.AndroidPeerHostManager()
+    }
+
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -219,6 +223,7 @@ class SnowForegroundService : Service() {
 
     private fun handleDisconnect() {
         // 1. Cancel observers first so that DISCONNECTED state does NOT trigger updateNotification()
+        peerHostManager.disableHostMode()
         stateObserverJob?.cancel()
         stateObserverJob = null
         discoveryObserverJob?.cancel()
@@ -296,6 +301,7 @@ class SnowForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        peerHostManager.disableHostMode()
         stateObserverJob?.cancel()
         stateObserverJob = null
         discoveryObserverJob?.cancel()

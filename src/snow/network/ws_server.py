@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import hashlib
+import json
 import logging
 from pathlib import Path
 import secrets
@@ -124,6 +125,7 @@ class SnowWebSocketServer:
         self.http_transfer_server: Any = None
         if not self.node_registry:
             self.node_registry = getattr(core_server, "node_registry", None)
+        self.session_router = getattr(core_server, "session_router", None) if core_server else None
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -612,6 +614,10 @@ class SnowWebSocketServer:
                 await self._handle_desktop_file_stage_download(client, message, data, session, ctx)
             elif action == "manifest_update":
                 await self._handle_manifest_update(client, message, data, session)
+            elif action == "mesh_list_peers":
+                await self._handle_mesh_list_peers(client, message, data, session)
+            elif action == "peer_relay_request":
+                await self._handle_peer_relay_request(client, message, data, session)
             else:
                 logger.warning("Rejected unsupported action '%s' from client [%s]",
                                action, client.connection_id)
@@ -669,6 +675,276 @@ class SnowWebSocketServer:
         )
         await client.websocket.send(response.to_json())
         logger.info("Processed live capability manifest update for device [%s]", device_id)
+
+    async def _handle_mesh_list_peers(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle request to list known mesh peers, redacting all sensitive credentials."""
+        if session is None or not session.device_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Session not authenticated.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        peers_list: list[dict[str, Any]] = []
+
+        if self.node_registry is not None:
+            nodes = self.node_registry.list_nodes()
+            for node in nodes:
+                peers_list.append({
+                    "device_id": node.device_id,
+                    "device_name": node.device_name,
+                    "device_type": node.platform,
+                    "reachability_state": str(node.reachability_state.value if hasattr(node.reachability_state, "value") else node.reachability_state),
+                    "reachability_profile": str(node.reachability_profile.value if hasattr(node.reachability_profile, "value") else node.reachability_profile),
+                    "supported_capabilities": list(node.supported_capabilities),
+                })
+        else:
+            paired = self.db_manager.list_paired_devices()
+            for rec in paired:
+                peers_list.append({
+                    "device_id": rec.device_id,
+                    "device_name": rec.device_name,
+                    "device_type": getattr(rec, "platform", "android"),
+                    "reachability_state": "LAN_DISCOVERABLE",
+                    "reachability_profile": getattr(rec, "reachability_profile", "ACTIVE_SESSION_PEER"),
+                    "supported_capabilities": [],
+                })
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "mesh_list_peers",
+                "data": {
+                    "peers": peers_list,
+                    "count": len(peers_list),
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_peer_relay_request(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle an authenticated peer relay request to forward an action across the mesh."""
+        if session is None or not session.device_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Session not authenticated.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        caller_device_id = session.device_id
+
+        # Check payload size (64KB max)
+        try:
+            raw_len = len(json.dumps(data, ensure_ascii=True))
+            if raw_len > 65536:
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD,
+                    message=f"Relay payload exceeds maximum limit of 64KB ({raw_len} bytes).",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+        except Exception:
+            pass
+
+        target_device_id = data.get("target_device_id")
+        relay_action = data.get("action")
+        relay_data = data.get("data") or {}
+        hop_limit = data.get("hop_limit", 3)
+        visited_nodes = list(data.get("visited_nodes", []))
+
+        if not target_device_id or not relay_action:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_REQUEST,
+                message="Peer relay requires 'target_device_id' and 'action'.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        # Payload size boundary check (64KB boundary limit)
+        raw_payload_len = len(json.dumps(relay_data)) if relay_data else 0
+        if raw_payload_len > 65536:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Relay payload exceeds 64KB boundary limit.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        # Strip caller-supplied authority overrides
+        if isinstance(relay_data, dict):
+            relay_data = dict(relay_data)
+            relay_data.pop("principal", None)
+            relay_data.pop("trust_tier", None)
+            relay_data.pop("execution_principal", None)
+
+        local_id = self.device_identity.device_id
+
+        # Loop prevention: check if this host is already in visited nodes
+        if local_id in visited_nodes:
+            logger.warning(
+                "Routing loop detected in peer relay! Host [%s] already in visited nodes: %s",
+                local_id,
+                visited_nodes,
+            )
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=f"Routing loop detected: host '{local_id}' already visited.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        # Hop limit enforcement
+        try:
+            hop_limit = int(hop_limit)
+        except (ValueError, TypeError):
+            hop_limit = 3
+
+        if hop_limit <= 0:
+            logger.warning("Hop limit exceeded in peer relay to [%s]", target_device_id)
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Hop limit exceeded during peer relay.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        visited_nodes.append(local_id)
+        next_hop_limit = hop_limit - 1
+
+        # Case 1: Target is this local node!
+        if target_device_id == local_id:
+            cap = ACTION_TO_CAPABILITY.get(relay_action)
+            relay_ctx = ExecutionContext(
+                principal=ExecutionPrincipal.AI_MCP,
+                origin=f"relay:{caller_device_id}",
+            )
+            if cap and not self.capability_policy.is_authorized(caller_device_id, cap, ctx=relay_ctx):
+                logger.warning(
+                    "Relay authorization denied: Device [%s] lacks capability '%s' for action '%s'",
+                    caller_device_id,
+                    cap,
+                    relay_action,
+                )
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.UNAUTHORIZED,
+                    message=f"Capability '{cap}' is not authorized for device '{caller_device_id}'.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+
+            try:
+                req = CapabilityRequest(action=relay_action, params=relay_data)
+                res = await self.capability_engine.execute(req, ctx=relay_ctx)
+                resp = SnowMessage.create_response(
+                    correlation_id=message.id,
+                    payload={
+                        "status": "success" if res.success else (res.status or "error"),
+                        "action": "peer_relay_request",
+                        "data": res.data,
+                        "error": res.error,
+                        "relayed_by": local_id,
+                        "target_device_id": local_id,
+                    },
+                )
+                await client.websocket.send(resp.to_json())
+                return
+            except Exception as local_exc:
+                err_resp = SnowMessage.create_error(
+                    code=ErrorCode.INTERNAL_ERROR,
+                    message=f"Local execution error during relay: {local_exc}",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(err_resp.to_json())
+                return
+
+        # Case 2: Target is another node in mesh
+        router = getattr(self, "session_router", None) or getattr(self.core_server, "session_router", None)
+        if router is not None and hasattr(router, "route_request"):
+            relay_ctx = ExecutionContext(
+                principal=ExecutionPrincipal.AI_MCP,
+                origin=f"relay:{caller_device_id}",
+            )
+            route_res = await router.route_request(
+                action=relay_action,
+                target=target_device_id,
+                data=relay_data,
+                ctx=relay_ctx,
+            )
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={
+                    "status": "success" if route_res.get("success") else route_res.get("status", "error"),
+                    "action": "peer_relay_request",
+                    "data": route_res.get("data"),
+                    "error": route_res.get("error"),
+                    "relayed_by": local_id,
+                    "target_device_id": target_device_id,
+                },
+            )
+            await client.websocket.send(resp.to_json())
+            return
+        else:
+            target_session = self.session_manager.get_session_by_device(target_device_id)
+            if target_session and target_session.connection_id:
+                target_conn = self.connection_manager.get(target_session.connection_id)
+                if target_conn and target_conn.is_active:
+                    try:
+                        target_resp = await self.send_request(
+                            connection_id=target_session.connection_id,
+                            action=relay_action,
+                            payload=relay_data,
+                            timeout=25.0,
+                        )
+                        resp = SnowMessage.create_response(
+                            correlation_id=message.id,
+                            payload={
+                                "status": "success",
+                                "action": "peer_relay_request",
+                                "data": target_resp.payload,
+                                "relayed_by": local_id,
+                                "target_device_id": target_device_id,
+                            },
+                        )
+                        await client.websocket.send(resp.to_json())
+                        return
+                    except Exception as fwd_exc:
+                        err_resp = SnowMessage.create_error(
+                            code=ErrorCode.DEVICE_NOT_FOUND,
+                            message=f"Failed forwarding relay request to [{target_device_id}]: {fwd_exc}",
+                            correlation_id=message.id,
+                        )
+                        await client.websocket.send(err_resp.to_json())
+                        return
+
+            err_resp = SnowMessage.create_error(
+                code=ErrorCode.DEVICE_NOT_FOUND,
+                message=f"Target device '{target_device_id}' is unreachable for relay.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err_resp.to_json())
 
     async def _handle_auth_request(
         self, client, message: SnowMessage, data: dict[str, Any]

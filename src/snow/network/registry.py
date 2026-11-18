@@ -60,6 +60,7 @@ class NodeRegistry:
         self._active_sessions: dict[str, dict[str, Any]] = {}  # device_id -> session info
         self._discovered_candidates: dict[str, dict[str, Any]] = {}  # device_id -> candidate info
         self._manifest_cache: dict[str, CapabilityManifest] = {}  # device_id -> manifest
+        self._registered_nodes: dict[str, DeviceNode] = {}  # device_id -> explicit DeviceNode
 
         # Register local node
         self.local_node = DeviceNode(
@@ -223,6 +224,13 @@ class NodeRegistry:
     # Node Queries & Reachability Synthesis
     # =========================================================================
 
+    def register_node(self, node: DeviceNode) -> None:
+        """Explicitly register or update a node in the registry."""
+        with self._lock:
+            self._registered_nodes[node.device_id] = node
+            if node.capabilities:
+                self._manifest_cache[node.device_id] = node.capabilities
+
     def get_node(self, device_id: str) -> Optional[DeviceNode]:
         """Synthesize and return the current state of a node by device_id."""
         with self._lock:
@@ -230,13 +238,17 @@ class NodeRegistry:
             if device_id == self.local_identity.device_id:
                 return self.local_node
 
-            # 2. Check SQLite paired records (authoritative pairing and trust source)
+            # 2. Check explicitly registered nodes
+            if device_id in self._registered_nodes:
+                return self._registered_nodes[device_id]
+
+            # 3. Check SQLite paired records (authoritative pairing and trust source)
             paired_record = self.db_manager.get_paired_device(device_id)
 
-            # 3. Check active session
+            # 4. Check active session
             active_session = self._active_sessions.get(device_id)
 
-            # 4. Check discovery candidate
+            # 5. Check discovery candidate
             discovery = self._discovered_candidates.get(device_id)
             if not discovery and self.discovery_service:
                 # Check underlying discovery service if available
@@ -356,6 +368,10 @@ class NodeRegistry:
 
             # 4. Discovered candidates
             for dev_id in self._discovered_candidates.keys():
+                known_ids.add(dev_id)
+
+            # 5. Explicitly registered nodes
+            for dev_id in self._registered_nodes.keys():
                 known_ids.add(dev_id)
 
             nodes: list[DeviceNode] = []

@@ -348,6 +348,63 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["response_manifest_update_success.json"] = resp_manifest_update.to_json()
 
+    # --- Phase 16 Symmetric Mesh Protocol Fixtures ---
+    # 23e. Valid mesh_list_peers request
+    req_mesh_list = SnowMessage.create_request(
+        action="mesh_list_peers",
+        data={},
+    )
+    valid_fixtures["request_mesh_list_peers.json"] = req_mesh_list.to_json()
+
+    # 23f. Valid mesh_list_peers response
+    resp_mesh_list = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "mesh_list_peers",
+            "data": {
+                "peers": [
+                    {
+                        "device_id": str(uuid.uuid4()),
+                        "device_name": "Peer Node Alpha",
+                        "device_type": "windows",
+                        "reachability_state": "CONNECTED_SESSION",
+                        "reachability_profile": "PERSISTENT_DAEMON",
+                        "supported_capabilities": ["desktop.status", "desktop.clipboard.read"],
+                    }
+                ],
+                "count": 1,
+            },
+        },
+    )
+    valid_fixtures["response_mesh_list_peers_success.json"] = resp_mesh_list.to_json()
+
+    # 23g. Valid peer_relay_request
+    req_peer_relay = SnowMessage.create_request(
+        action="peer_relay_request",
+        data={
+            "target_device_id": str(uuid.uuid4()),
+            "action": "battery_status",
+            "data": {},
+            "hop_limit": 2,
+            "visited_nodes": [str(uuid.uuid4())],
+        },
+    )
+    valid_fixtures["request_peer_relay.json"] = req_peer_relay.to_json()
+
+    # 23h. Valid peer_relay response
+    resp_peer_relay = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "peer_relay_request",
+            "data": {"level": 88, "is_charging": True},
+            "relayed_by": str(uuid.uuid4()),
+            "target_device_id": str(uuid.uuid4()),
+        },
+    )
+    valid_fixtures["response_peer_relay_success.json"] = resp_peer_relay.to_json()
+
     # --- Phase 3 File Transfer Protocol Fixtures ---
     # 24. Valid file_transfer_offer request
     req_offer = SnowMessage.create_request(

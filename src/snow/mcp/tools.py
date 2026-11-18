@@ -317,17 +317,25 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
     @server.tool(
         name="snow_sync_clipboard",
         description=(
-            "Synchronize clipboard between Windows laptop and Android phone. "
-            "Directions: 'laptop_to_phone' pushes Windows clipboard to Android. "
-            "'phone_to_laptop' pulls clipboard from Android to Windows (requires SNOW Android app "
-            "to be active in the foreground with user authorization)."
+            "Synchronize clipboard across participating mesh devices (Windows, Android, peer nodes). "
+            "Supports explicit source_device and target_device selection (Laptop A -> Laptop B, "
+            "Phone A -> Phone B, Laptop -> Phone, Phone -> Laptop), falling back to direction "
+            "('laptop_to_phone' or 'phone_to_laptop') and device_id when omitted."
         ),
     )
     async def snow_sync_clipboard(
-        direction: str = "laptop_to_phone", device_id: str = ""
+        direction: str = "laptop_to_phone",
+        device_id: str = "",
+        source_device: str = "",
+        target_device: str = "",
     ) -> str:
-        """Synchronize clipboard between laptop and phone."""
-        result = await bridge.sync_clipboard(direction=direction, device_id=device_id)
+        """Synchronize clipboard between devices."""
+        result = await bridge.sync_clipboard(
+            direction=direction,
+            device_id=device_id,
+            source_device=source_device,
+            target_device=target_device,
+        )
         return json.dumps(result, indent=2)
 
     # =========================================================================
@@ -442,8 +450,9 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
     @server.tool(
         name="snow_transfer_file",
         description=(
-            "Unified cross-device file transfer tool. Coordinates file transfers between Windows "
-            "and a remote Android phone or peer device. Direction must be 'to_device' or 'from_device'."
+            "Unified cross-device file transfer tool. Coordinates file transfers between Windows, "
+            "remote Android phones, or peer devices. Direction must be 'to_device' or 'from_device' "
+            "when source_device is omitted, or explicit source_device and target_device may be provided."
         ),
     )
     async def snow_transfer_file(
@@ -451,6 +460,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         destination_path: str = "",
         direction: str = "to_device",
         target_device: str = "",
+        source_device: str = "",
     ) -> str:
         """Transfer file between devices."""
         result = await bridge.transfer_file(
@@ -458,6 +468,7 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
             destination_path=destination_path,
             direction=direction,
             target_device=target_device,
+            source_device=source_device,
         )
         if not result.get("success", False):
             return json.dumps({

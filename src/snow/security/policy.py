@@ -35,6 +35,8 @@ CAPABILITY_DESKTOP_CLIPBOARD_WRITE = "desktop.clipboard.write"
 CAPABILITY_DESKTOP_FILES_LIST = "desktop.files.list"
 CAPABILITY_DESKTOP_FILES_DOWNLOAD = "desktop.files.download"
 CAPABILITY_FILE_TRANSFER = "file.transfer"
+CAPABILITY_MESH_LIST_PEERS = "mesh.list_peers"
+CAPABILITY_PEER_RELAY = "mesh.peer_relay"
 
 # Default capabilities granted to newly paired devices
 # NOTE: CAPABILITY_DESKTOP_EXEC is strictly EXCLUDED by default!
@@ -46,6 +48,12 @@ DEFAULT_PAIRED_CAPABILITIES: set[str] = {
     CAPABILITY_DESKTOP_FILES_LIST,
     CAPABILITY_DESKTOP_FILES_DOWNLOAD,
     CAPABILITY_FILE_TRANSFER,
+    CAPABILITY_MESH_LIST_PEERS,
+    CAPABILITY_PEER_RELAY,
+    # Canonical manifest aliases
+    "desktop.file.list",
+    "desktop.apps.launch",
+    "desktop.file.transfer",
 }
 
 # Mapping from incoming protocol actions to capability identifiers
@@ -61,6 +69,8 @@ ACTION_TO_CAPABILITY: dict[str, str] = {
     "file_list_transfers": CAPABILITY_FILE_TRANSFER,
     "file_transfer_status": CAPABILITY_FILE_TRANSFER,
     "file_transfer_cancel": CAPABILITY_FILE_TRANSFER,
+    "mesh_list_peers": CAPABILITY_MESH_LIST_PEERS,
+    "peer_relay_request": CAPABILITY_PEER_RELAY,
 }
 
 

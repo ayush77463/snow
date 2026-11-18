@@ -1441,4 +1441,41 @@ class MainActivity : AppCompatActivity() {
             binding.tvLog.text = filtered.joinToString("\n")
         }
     }
+
+    /**
+     * Enable foreground peer host mode on the bound service.
+     */
+    fun enablePeerHostMode(port: Int = 8767): Boolean {
+        val s = service ?: return false
+        val tStorage = SharedPreferencesTokenStorage(applicationContext)
+        val success = s.peerHostManager.enableHostMode(
+            port = port,
+            tokenStorage = tStorage,
+            dispatcher = s.capabilityDispatcher,
+            localDeviceId = identity.deviceId,
+            manifestProvider = { org.snow.network.DeviceNode.buildAndroidManifest(applicationContext).toMap() }
+        )
+        if (success) {
+            appendLog("Android Foreground Peer Host Mode enabled on port $port")
+            s.updateManifest()
+        }
+        return success
+    }
+
+    /**
+     * Disable foreground peer host mode on the bound service.
+     */
+    fun disablePeerHostMode() {
+        val s = service ?: return
+        s.peerHostManager.disableHostMode()
+        appendLog("Android Foreground Peer Host Mode disabled")
+        s.updateManifest()
+    }
+
+    /**
+     * Check if foreground peer host mode is actively listening.
+     */
+    fun isPeerHostModeActive(): Boolean {
+        return service?.peerHostManager?.isHostModeActive() == true
+    }
 }

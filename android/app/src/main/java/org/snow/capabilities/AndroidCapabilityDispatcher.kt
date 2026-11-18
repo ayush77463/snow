@@ -89,8 +89,8 @@ class AndroidCapabilityDispatcher(
     suspend fun dispatch(
         action: String,
         data: Map<String, Any?>?,
-        serverHost: String,
-        defaultTransferPort: Int
+        serverHost: String = "127.0.0.1",
+        defaultTransferPort: Int = 8766
     ): Pair<Map<String, Any?>?, SnowError?> {
         SafeLog.i(TAG, "Dispatching capability request action='$action'")
 

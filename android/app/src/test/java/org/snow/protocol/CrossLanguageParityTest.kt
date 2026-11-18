@@ -363,6 +363,63 @@ class CrossLanguageParityTest {
             )
             valid["response_manifest_update_success.json"] = JsonSerialization.toJson(respManifestUpdate)
 
+            // --- Phase 16 Symmetric Mesh Protocol Fixtures ---
+            // 23e. Valid mesh_list_peers request
+            val reqMeshList = SnowMessage.createRequest(
+                "mesh_list_peers",
+                emptyMap()
+            )
+            valid["request_mesh_list_peers.json"] = JsonSerialization.toJson(reqMeshList)
+
+            // 23f. Valid mesh_list_peers response
+            val respMeshList = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "mesh_list_peers",
+                    "data" to mapOf(
+                        "peers" to listOf(
+                            mapOf(
+                                "device_id" to UUID.randomUUID().toString(),
+                                "device_name" to "Peer Node Alpha",
+                                "device_type" to "windows",
+                                "reachability_state" to "CONNECTED_SESSION",
+                                "reachability_profile" to "PERSISTENT_DAEMON",
+                                "supported_capabilities" to listOf("desktop.status", "desktop.clipboard.read")
+                            )
+                        ),
+                        "count" to 1
+                    )
+                )
+            )
+            valid["response_mesh_list_peers_success.json"] = JsonSerialization.toJson(respMeshList)
+
+            // 23g. Valid peer_relay_request
+            val reqPeerRelay = SnowMessage.createRequest(
+                "peer_relay_request",
+                mapOf(
+                    "target_device_id" to UUID.randomUUID().toString(),
+                    "action" to "battery_status",
+                    "data" to emptyMap<String, Any?>(),
+                    "hop_limit" to 2,
+                    "visited_nodes" to listOf(UUID.randomUUID().toString())
+                )
+            )
+            valid["request_peer_relay.json"] = JsonSerialization.toJson(reqPeerRelay)
+
+            // 23h. Valid peer_relay response
+            val respPeerRelay = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "peer_relay_request",
+                    "data" to mapOf("level" to 88, "is_charging" to true),
+                    "relayed_by" to UUID.randomUUID().toString(),
+                    "target_device_id" to UUID.randomUUID().toString()
+                )
+            )
+            valid["response_peer_relay_success.json"] = JsonSerialization.toJson(respPeerRelay)
+
             // --- Phase 3 File Transfer Protocol Fixtures ---
             // 24. Valid file_transfer_offer request
             val reqOffer = SnowMessage.createRequest(

@@ -559,15 +559,150 @@ class SnowMcpBridge:
         )
 
     async def sync_clipboard(
-        self, direction: str = "laptop_to_phone", device_id: str = ""
+        self,
+        direction: str = "laptop_to_phone",
+        device_id: str = "",
+        source_device: str = "",
+        target_device: str = "",
     ) -> dict[str, Any]:
-        """Synchronize clipboard between Windows laptop and Android phone.
+        """Synchronize clipboard across participating mesh devices (Windows, Android, peer nodes).
 
-        Directions:
-        - laptop_to_phone: Reads Windows clipboard and pushes content to Android phone.
-        - phone_to_laptop: Requests clipboard from Android phone and writes to Windows clipboard.
-          Requires SNOW Android application to be active in the foreground with user authorization.
+        Supports explicit source_device and target_device selection (Laptop A -> Laptop B,
+        Phone A -> Phone B, Laptop -> Phone, Phone -> Laptop), falling back to direction
+        and device_id when omitted.
         """
+        # If source_device or target_device is specified, use multi-device selection
+        if source_device or target_device:
+            local_names = {"local", "localhost", "me", "this", "local_desktop"}
+
+            # Determine source
+            src_clean = (source_device or "").strip()
+            src_is_local = (not src_clean) or (src_clean.lower() in local_names)
+            src_id = "local_desktop" if src_is_local else None
+            if not src_is_local:
+                src_id, src_err = await self.resolve_target(src_clean)
+                if not src_id:
+                    return src_err or {
+                        "success": False,
+                        "status": "DEVICE_NOT_FOUND",
+                        "error": f"Source device '{src_clean}' not found or unreachable.",
+                    }
+
+            # Determine target
+            tgt_clean = (target_device or "").strip()
+            tgt_is_local = (not tgt_clean) or (tgt_clean.lower() in local_names)
+            tgt_id = "local_desktop" if tgt_is_local else None
+            if not tgt_is_local:
+                tgt_id, tgt_err = await self.resolve_target(tgt_clean)
+                if not tgt_id:
+                    return tgt_err or {
+                        "success": False,
+                        "status": "DEVICE_NOT_FOUND",
+                        "error": f"Target device '{tgt_clean}' not found or unreachable.",
+                    }
+
+            if src_id == tgt_id:
+                return {
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Source and target devices cannot be the same device.",
+                }
+
+            # 1. Read clipboard from source
+            clip_text = ""
+            if src_is_local:
+                clip_res = await self.windows_clipboard_get()
+                if not clip_res.get("success"):
+                    return {
+                        "success": False,
+                        "status": "CLIPBOARD_READ_FAILED",
+                        "source_device": src_id,
+                        "target_device": tgt_id,
+                        "error": f"Failed reading local Windows clipboard: {clip_res.get('error')}",
+                    }
+                clip_text = clip_res.get("data", {}).get("text", "")
+            else:
+                pull_res = await self.send_device_request(src_id, "desktop_clipboard_get", {})
+                if not pull_res.get("success"):
+                    pull_res = await self.send_device_request(src_id, "clipboard_pull", {})
+                if not pull_res.get("success"):
+                    return {
+                        "success": False,
+                        "status": pull_res.get("status", "CLIPBOARD_PULL_FAILED"),
+                        "source_device": src_id,
+                        "target_device": tgt_id,
+                        "error": f"Failed retrieving clipboard from source device [{src_id}]: {pull_res.get('error')}",
+                    }
+                data = pull_res.get("data") or {}
+                clip_text = data.get("text", "")
+
+            if not clip_text:
+                return {
+                    "success": True,
+                    "status": "EMPTY_CLIPBOARD",
+                    "source_device": src_id,
+                    "target_device": tgt_id,
+                    "message": "Source clipboard is empty; nothing to synchronize.",
+                    "characters_synced": 0,
+                    "skipped_duplicate": False,
+                }
+
+            # Check SHA-256 idempotency cache scoped by (src_id, tgt_id)
+            payload_sha256 = hashlib.sha256(clip_text.encode("utf-8")).hexdigest()
+            cache_key = (src_id, tgt_id)
+
+            async with self._clipboard_sync_lock:
+                if self._clipboard_sync_hashes.get(cache_key) == payload_sha256:
+                    return {
+                        "success": True,
+                        "status": "ALREADY_IN_SYNC",
+                        "source_device": src_id,
+                        "target_device": tgt_id,
+                        "skipped_duplicate": True,
+                        "sha256": payload_sha256,
+                        "characters_synced": 0,
+                        "message": "Clipboard content is already identical; synchronization skipped.",
+                    }
+
+            # 2. Write clipboard to target
+            if tgt_is_local:
+                set_res = await self.windows_clipboard_set(text=clip_text)
+                if not set_res.get("success"):
+                    return {
+                        "success": False,
+                        "status": "WINDOWS_CLIPBOARD_WRITE_FAILED",
+                        "source_device": src_id,
+                        "target_device": tgt_id,
+                        "error": f"Failed writing to local Windows clipboard: {set_res.get('error')}",
+                    }
+            else:
+                push_res = await self.send_device_request(tgt_id, "desktop_clipboard_set", {"text": clip_text})
+                if not push_res.get("success"):
+                    push_res = await self.send_device_request(tgt_id, "clipboard_push", {"text": clip_text})
+                if not push_res.get("success"):
+                    return {
+                        "success": False,
+                        "status": push_res.get("status", "SYNC_FAILED"),
+                        "source_device": src_id,
+                        "target_device": tgt_id,
+                        "error": f"Failed pushing clipboard to target device [{tgt_id}]: {push_res.get('error')}",
+                    }
+
+            async with self._clipboard_sync_lock:
+                self._clipboard_sync_hashes[cache_key] = payload_sha256
+
+            return {
+                "success": True,
+                "status": "SUCCESS",
+                "source_device": src_id,
+                "target_device": tgt_id,
+                "skipped_duplicate": False,
+                "sha256": payload_sha256,
+                "characters_synced": len(clip_text),
+                "message": f"Successfully synchronized {len(clip_text)} characters from '{src_id}' to '{tgt_id}'.",
+            }
+
+        # Fallback to classic 2-node direction mode
         clean_dir = (direction or "").strip().lower()
 
         if clean_dir == "laptop_to_phone":
@@ -719,15 +854,63 @@ class SnowMcpBridge:
         destination_path: str = "",
         direction: str = "to_device",
         target_device: str = "",
+        source_device: str = "",
     ) -> dict[str, Any]:
-        """Unified cross-device file transfer between Windows and connected peers/phones.
+        """Unified cross-device file transfer between Windows, Android, and mesh peer devices."""
+        local_names = {"local", "localhost", "me", "this", "local_desktop"}
+        if source_device:
+            src_clean = source_device.strip()
+            src_is_local = src_clean.lower() in local_names
+            tgt_clean = (target_device or "").strip()
+            tgt_is_local = (not tgt_clean) or (tgt_clean.lower() in local_names)
 
-        Args:
-            source_path: Local path (for to_device) or remote filename (for from_device).
-            destination_path: Optional destination name/path.
-            direction: 'to_device' or 'from_device'.
-            target_device: Optional target device ID, name, or substring.
-        """
+            if src_is_local and not tgt_is_local:
+                return await self.transfer_file(
+                    source_path=source_path,
+                    destination_path=destination_path,
+                    direction="to_device",
+                    target_device=tgt_clean,
+                )
+            elif not src_is_local and tgt_is_local:
+                return await self.transfer_file(
+                    source_path=source_path,
+                    destination_path=destination_path,
+                    direction="from_device",
+                    target_device=src_clean,
+                )
+            elif not src_is_local and not tgt_is_local:
+                src_id, s_err = await self.resolve_target(src_clean)
+                if not src_id:
+                    return s_err or {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"Source '{src_clean}' not found."}
+                tgt_id, t_err = await self.resolve_target(tgt_clean)
+                if not tgt_id:
+                    return t_err or {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"Target '{tgt_clean}' not found."}
+
+                recv_res = await self.android_file_receive(file_name=source_path, device_id=src_id)
+                if not recv_res.get("success"):
+                    return {
+                        "success": False,
+                        "status": recv_res.get("status", "TRANSFER_FAILED"),
+                        "error": f"Failed receiving file from source [{src_id}]: {recv_res.get('error')}",
+                    }
+                downloaded_file = (recv_res.get("data") or {}).get("destination_path") or source_path
+                send_res = await self.android_file_send(file_path=downloaded_file, device_id=tgt_id)
+                return {
+                    "success": send_res.get("success", False),
+                    "status": send_res.get("status", "TRANSFER_FAILED"),
+                    "source_device": src_id,
+                    "target_device": tgt_id,
+                    "data": send_res.get("data"),
+                    "error": send_res.get("error"),
+                }
+            else:
+                return {
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Source and target devices cannot both be local Windows desktop.",
+                }
+
+        # Classic 2-device mode
         clean_dir = (direction or "").strip().lower()
         if clean_dir not in ("to_device", "from_device"):
             return {
@@ -748,6 +931,63 @@ class SnowMcpBridge:
             return await self.android_file_send(file_path=source_path, device_id=target_id)
         else:
             return await self.android_file_receive(file_name=source_path, device_id=target_id)
+
+    async def mesh_list_peers(self, device_id: str = "") -> dict[str, Any]:
+        """Discover connected and paired peers across the SNOW mesh."""
+        if not device_id:
+            res = await self.list_devices()
+            if not res.get("success"):
+                return res
+            devices = (res.get("data") or {}).get("devices", [])
+            peers = [
+                {
+                    "device_id": d.get("device_id"),
+                    "device_name": d.get("device_name"),
+                    "device_type": d.get("platform") or d.get("device_type", "unknown"),
+                    "reachability_state": d.get("reachability_state", "CONNECTED_SESSION" if d.get("is_connected") else "LAN_DISCOVERABLE"),
+                    "reachability_profile": d.get("reachability_profile", "ACTIVE_SESSION_PEER"),
+                    "supported_capabilities": d.get("capabilities", []),
+                }
+                for d in devices
+            ]
+            return {
+                "success": True,
+                "status": "SUCCESS",
+                "data": {"peers": peers, "count": len(peers)},
+            }
+        else:
+            target_id, err = await self.resolve_target(device_id)
+            if not target_id:
+                return err or {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' not found."}
+            return await self.send_device_request(target_id, "mesh_list_peers", {})
+
+    async def peer_relay_request(
+        self,
+        target_device: str,
+        action: str,
+        data: Optional[dict[str, Any]] = None,
+        hop_limit: int = 3,
+        intermediary_device: str = "",
+    ) -> dict[str, Any]:
+        """Relay an authorized capability request across the mesh via an intermediate peer."""
+        target_id, err = await self.resolve_target(target_device)
+        if not target_id:
+            return err or {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"Target '{target_device}' not found."}
+
+        relay_payload = {
+            "target_device_id": target_id,
+            "action": action,
+            "data": data or {},
+            "hop_limit": hop_limit,
+            "visited_nodes": [],
+        }
+        if intermediary_device:
+            inter_id, ierr = await self.resolve_target(intermediary_device)
+            if not inter_id:
+                return ierr or {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"Intermediary '{intermediary_device}' not found."}
+            return await self.send_device_request(inter_id, "peer_relay_request", relay_payload)
+        else:
+            return await self.send_device_request(target_id, action, data or {})
 
     async def mesh_connect_peer(
         self,

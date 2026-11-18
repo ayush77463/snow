@@ -997,13 +997,26 @@ Phase 16 transforms SNOW from a PC-centric hub into a symmetric peer-to-peer mes
 - Enable peer-to-peer capability invocation across any paired node pair.
 - Implement symmetric pairing and mutual capability negotiation.
 
+### Deliverables
+- `AndroidPeerHostServer.kt` & `AndroidPeerHostManager.kt`: Foreground peer host server on port 8767 accepting authenticated TCP connections with strict token validation and capability dispatch.
+- `SessionRouter` Tier 2 & Tier 3.5: Support for `ReachabilityProfile.FOREGROUND_HOST` and authenticated peer relay routing (`mesh.peer_relay`) with loop prevention and hop limit enforcement.
+- Multi-Device MCP Operations: Extended `snow_sync_clipboard` (supporting source/target device selection and per-pair SHA-256 deduplication) and `snow_transfer_file` (supporting explicit source and target nodes).
+- `mesh_list_peers`: Authenticated peer capability discovery with strict credential and token redaction.
+- Cross-Language Parity: Added 4 bidirectional wire fixtures for mesh listing and relay, verified across 196 fixtures (100% PASS).
+- Unit Test Suites: 14 Python unit tests (`test_phase_16_symmetric_mesh.py`) and 8 Android JVM unit tests (`AndroidPeerHostTest.kt`).
+
 ### Dependencies
 - Phase 15 Android hardening and Phase 13 capability manifests.
 
 ### Acceptance Criteria
-- [ ] Android device can accept incoming connections from paired peers in foreground Host Mode.
-- [ ] Windows-to-Windows and Android-to-Android capability exchange verified.
-- [ ] Consistent security policy and principal isolation enforced across all mesh topologies.
+- [x] Android device can accept incoming connections from paired peers in foreground Host Mode (verified via `AndroidPeerHostServer` and `AndroidPeerHostTest` lifecycle, auth, and capability dispatch tests).
+- [x] Windows-to-Windows and Android-to-Android capability exchange verified (verified via `SessionRouter`, Windows capability manifests, bidirectional aliases, and foreground host direct dial).
+- [x] Consistent security policy and principal isolation enforced across all mesh topologies (verified anti-spoofing stripping caller authority overrides, enforcing 64KB boundary limits, loop detection, and denying unpermitted execution).
+
+#### Viva Concept Check
+- **What is the difference between a hub-and-spoke and symmetric mesh topology?** In hub-and-spoke, all traffic flows through a central coordinator (PC); if the PC is offline, peripheral devices cannot communicate. In a symmetric mesh, nodes can act as both clients and servers (e.g., Android Foreground Host Mode), invoking capabilities directly or relaying requests across paired nodes.
+- **Why must peer relay enforce hop limits and loop detection?** Without loop detection (tracking `visited_nodes`) and a decrementing hop counter (TTL), routing cycles could cause infinite message amplification and resource exhaustion across mesh peers.
+- **Why is principal isolation critical in relayed mesh operations?** When Peer A relays a request through Coordinator B to Node C, Peer A must never inherit Coordinator B's local owner authority; the execution principal must remain strictly bounded (`AI_MCP` / `PEER`) and any caller-supplied privilege escalation headers must be stripped.
 
 ---
 

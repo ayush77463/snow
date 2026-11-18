@@ -39,6 +39,15 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "windows_terminal": "desktop.exec",
     "windows_terminal_exec": "desktop.exec",
     "desktop_exec": "desktop.exec",
+    "desktop_status": "desktop.status",
+    "desktop_battery": "desktop.battery",
+    "desktop_clipboard_get": "desktop.clipboard.read",
+    "desktop_clipboard_set": "desktop.clipboard.write",
+    "desktop_file_list": "desktop.file.list",
+    "desktop_file_stage_download": "desktop.file.transfer",
+    "desktop_app_launch": "desktop.apps.launch",
+    "mesh_list_peers": "mesh.list_peers",
+    "peer_relay_request": "mesh.peer_relay",
     "android_battery": "android.battery.get",
     "android_clipboard_get": "android.clipboard.get",
     "android_clipboard_set": "android.clipboard.set",
@@ -81,7 +90,21 @@ class SessionRouter:
 
         # Active outbound peer client sessions: device_id -> SnowPeerClient
         self._outbound_clients: dict[str, SnowPeerClient] = {}
+        # Outbound peer tokens for direct dials: device_id -> token
+        self._peer_tokens: dict[str, str] = {}
         self._lock = asyncio.Lock()
+
+    def register_peer_token(self, device_id: str, token: str) -> None:
+        """Register an authentication token for outbound direct dials to a peer."""
+        self._peer_tokens[device_id] = token
+
+    def get_peer_token(self, device_id: str) -> str:
+        """Retrieve the outbound authentication token for a peer."""
+        return self._peer_tokens.get(device_id, "")
+
+    def register_outbound_client(self, device_id: str, client: SnowPeerClient) -> None:
+        """Register an active outbound SnowPeerClient."""
+        self._outbound_clients[device_id] = client
 
     async def route_request(
         self,
@@ -183,10 +206,10 @@ class SessionRouter:
             )
 
         # =====================================================================
-        # Tier 2: Outbound Direct Connection (for PERSISTENT_DAEMON peers)
+        # Tier 2: Outbound Direct Connection (for PERSISTENT_DAEMON or FOREGROUND_HOST peers)
         # =====================================================================
-        # For targets that listen on inbound ports (Windows desktop core / server nodes)
-        if node.reachability_profile == ReachabilityProfile.PERSISTENT_DAEMON:
+        # For targets that listen on inbound ports (Windows desktop core / server nodes / Android host)
+        if node.reachability_profile in (ReachabilityProfile.PERSISTENT_DAEMON, ReachabilityProfile.FOREGROUND_HOST):
             attempted_transports.append("outbound_direct")
             dial_host = node.host
             dial_port = node.wss_port or 8765
@@ -257,6 +280,19 @@ class SessionRouter:
                 return await self._dispatch_over_inbound_wss(
                     reconnected_session.connection_id, action, clean_data, timeout, node, attempted_transports
                 )
+
+        # =====================================================================
+        # Tier 3.5: Authenticated Peer Relay
+        # =====================================================================
+        relay_res = await self._attempt_peer_relay(
+            node=node,
+            action=action,
+            clean_data=clean_data,
+            timeout=timeout,
+            attempted_transports=attempted_transports,
+        )
+        if relay_res is not None:
+            return relay_res
 
         # =====================================================================
         # Tier 4: Structured Failure
@@ -461,11 +497,12 @@ class SessionRouter:
         )
 
         try:
-            # We don't possess the client's plaintext token; auth requires token or PIN.
-            # In peer mesh, if a shared auth token or session ticket exists:
-            # Check if auth succeeds
+            # Look up registered or cached outbound auth token
+            dial_token = self.get_peer_token(node.device_id)
+
             conn_res: PeerConnectionResult = await client.connect(
-                timeout=self.direct_dial_timeout
+                auth_token=dial_token,
+                timeout=self.direct_dial_timeout,
             )
 
             if not conn_res.success:
@@ -500,3 +537,80 @@ class SessionRouter:
             except Exception:
                 pass
             return None
+
+    async def _attempt_peer_relay(
+        self,
+        node: DeviceNode,
+        action: str,
+        clean_data: dict[str, Any],
+        timeout: float,
+        attempted_transports: list[str],
+    ) -> Optional[dict[str, Any]]:
+        """Attempt to route request through an active intermediate peer (Tier 3.5)."""
+        # 1. Check active outbound clients
+        for peer_id, client in list(self._outbound_clients.items()):
+            if peer_id == node.device_id or not client.is_connected:
+                continue
+            attempted_transports.append(f"relay_outbound:{peer_id}")
+            try:
+                relay_msg = SnowMessage.create_request(
+                    action="peer_relay_request",
+                    payload={
+                        "target_device_id": node.device_id,
+                        "action": action,
+                        "data": clean_data,
+                        "hop_limit": 2,
+                        "visited_nodes": [],
+                    },
+                )
+                resp = await client.send_message(relay_msg, timeout=timeout)
+                if resp.type == MessageType.RESPONSE and resp.payload and resp.payload.get("status") == "success":
+                    node.reachability_state = ReachabilityState.ONLINE_ROUTED
+                    return {
+                        "success": True,
+                        "status": "SUCCESS",
+                        "data": (resp.payload.get("data") or {}).get("data") or resp.payload.get("data"),
+                        "target_device_id": node.device_id,
+                        "attempted_transports": attempted_transports,
+                        "relayed_by": peer_id,
+                    }
+            except Exception as exc:
+                logger.debug("Relay attempt via outbound [%s] failed: %s", peer_id, exc)
+
+        # 2. Check active inbound sessions
+        if self.ws_server is not None:
+            active_sessions = self.ws_server.session_manager.list_active_sessions()
+            for sess in active_sessions:
+                if sess.device_id == node.device_id or not sess.connection_id:
+                    continue
+                conn = self.ws_server.connection_manager.get(sess.connection_id)
+                if not conn or not conn.is_active:
+                    continue
+                attempted_transports.append(f"relay_inbound:{sess.device_id}")
+                try:
+                    relay_resp = await self.ws_server.send_request(
+                        connection_id=sess.connection_id,
+                        action="peer_relay_request",
+                        payload={
+                            "target_device_id": node.device_id,
+                            "action": action,
+                            "data": clean_data,
+                            "hop_limit": 2,
+                            "visited_nodes": [],
+                        },
+                        timeout=timeout,
+                    )
+                    if relay_resp.type == MessageType.RESPONSE and relay_resp.payload and relay_resp.payload.get("status") == "success":
+                        node.reachability_state = ReachabilityState.ONLINE_ROUTED
+                        return {
+                            "success": True,
+                            "status": "SUCCESS",
+                            "data": (relay_resp.payload.get("data") or {}).get("data") or relay_resp.payload.get("data"),
+                            "target_device_id": node.device_id,
+                            "attempted_transports": attempted_transports,
+                            "relayed_by": sess.device_id,
+                        }
+                except Exception as exc:
+                    logger.debug("Relay attempt via inbound [%s] failed: %s", sess.device_id, exc)
+
+        return None

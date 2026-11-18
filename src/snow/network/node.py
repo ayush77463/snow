@@ -39,6 +39,7 @@ class ReachabilityState(StrEnum):
     CONNECTED_SESSION = "CONNECTED_SESSION"      # Active authenticated WSS connection (< 50ms)
     LAN_DISCOVERABLE = "LAN_DISCOVERABLE"        # Discovered via UDP beacon, socket not yet open
     LAST_KNOWN_IP_DIRECT = "LAST_KNOWN_IP_DIRECT"# Socket closed, last-known IP cached
+    ONLINE_ROUTED = "ONLINE_ROUTED"              # Reachable through an authenticated peer relay node
     UNREACHABLE_OFFLINE = "UNREACHABLE_OFFLINE"  # No socket and no beacon received for > 30s
 
     # Architectural aliases from docs/ARCHITECTURE_V2.md
@@ -83,6 +84,18 @@ ANDROID_CAPABILITIES: set[str] = {
 }
 
 
+# Capability aliases to ensure complete interoperability between protocol conventions
+CAPABILITY_ALIASES: dict[str, str] = {
+    "desktop.files.list": "desktop.file.list",
+    "desktop.file.list": "desktop.files.list",
+    "desktop.app_launch": "desktop.apps.launch",
+    "desktop.apps.launch": "desktop.app_launch",
+    "desktop.files.download": "desktop.file.transfer",
+    "desktop.file.transfer": "desktop.files.download",
+    "file.transfer": "desktop.file.transfer",
+}
+
+
 @dataclass
 class CapabilityManifest:
     """Advertised capability and permission manifest for a participating device."""
@@ -93,10 +106,16 @@ class CapabilityManifest:
     classifications: dict[str, str] = field(default_factory=dict)
 
     def supports_capability(self, capability: str) -> bool:
-        """Return True if the capability is explicitly advertised."""
+        """Return True if the capability (or its alias) is explicitly advertised."""
         if not capability or not isinstance(capability, str):
             return False
-        return capability.strip() in self.supported_capabilities
+        clean = capability.strip()
+        if clean in self.supported_capabilities:
+            return True
+        alias = CAPABILITY_ALIASES.get(clean)
+        if alias and alias in self.supported_capabilities:
+            return True
+        return False
 
     def get_permission_state(self, capability: str) -> str:
         """Return the permission state for a capability (default: UNKNOWN)."""
