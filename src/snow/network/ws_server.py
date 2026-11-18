@@ -3,23 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import hashlib
 import logging
 from pathlib import Path
 import secrets
 import ssl
+import sys
 from typing import Any, Optional
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from snow.capabilities.windows import (
+    WindowsAppLauncher,
+    WindowsClipboardManager,
+    WindowsFileManager,
+    WindowsProcessMonitor,
+    WindowsTelemetry,
+    WindowsTerminalExecutor,
+)
 from snow.core.config import CoreConfig
 from snow.network.connection_manager import ConnectionManager
 from snow.protocol.constants import ErrorCode, MessageType
 from snow.protocol.models import SnowMessage
 from snow.protocol.validator import ProtocolValidationError, validate_raw_message
+from snow.security.context import ExecutionContext, ExecutionPrincipal
 from snow.security.db import DatabaseManager, hash_token
 from snow.security.identity import DeviceIdentity, load_or_create_device_identity
 from snow.security.pairing import PairingManager, PairingOutcome
+from snow.security.policy import ACTION_TO_CAPABILITY, PeerCapabilityPolicy
 from snow.security.session import SessionManager
 from snow.security.tls import (
     DEFAULT_CERT_FILE,
@@ -54,6 +67,7 @@ class SnowWebSocketServer:
         session_manager: Optional[SessionManager] = None,
         transfer_manager: Optional[TransferManager] = None,
         storage_manager: Optional[TransferStorageManager] = None,
+        core_server: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.connection_manager = connection_manager or ConnectionManager()
@@ -63,6 +77,30 @@ class SnowWebSocketServer:
         self.session_manager = session_manager or SessionManager()
         self.transfer_manager = transfer_manager or TransferManager()
         self.storage_manager = storage_manager or TransferStorageManager(root_dir=self.config.transfer_root)
+        self.core_server: Any = core_server
+        self.windows_telemetry = (
+            getattr(core_server, "windows_telemetry", None) if core_server else None
+        ) or WindowsTelemetry()
+        self.windows_processes = (
+            getattr(core_server, "windows_processes", None) if core_server else None
+        ) or WindowsProcessMonitor()
+        roots = [self.config.transfer_root] if self.config.transfer_root else None
+        self.windows_files = (
+            getattr(core_server, "windows_files", None) if core_server else None
+        ) or WindowsFileManager(allowed_roots=roots)
+        self.windows_apps = (
+            getattr(core_server, "windows_apps", None) if core_server else None
+        ) or WindowsAppLauncher()
+        self.windows_terminal = (
+            getattr(core_server, "windows_terminal", None) if core_server else None
+        ) or WindowsTerminalExecutor()
+        self.windows_clipboard = (
+            getattr(core_server, "windows_clipboard", None) if core_server else None
+        ) or WindowsClipboardManager()
+        self.capability_policy: PeerCapabilityPolicy = (
+            getattr(core_server, "capability_policy", None)
+            or PeerCapabilityPolicy()
+        )
         self.http_transfer_server: Any = None
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
@@ -406,7 +444,89 @@ class SnowWebSocketServer:
                     await client.websocket.send(error_response.to_json())
                     return
 
+                # 1. Identity validation: verify caller device is still paired and not revoked
+                paired_dev = self.db_manager.get_paired_device(session.device_id)
+                if not paired_dev:
+                    logger.warning(
+                        "Rejected action '%s' for device [%s]: device is not paired or has been revoked.",
+                        action,
+                        session.device_id,
+                    )
+                    self.session_manager.revoke_session(session.session_id)
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.UNAUTHORIZED,
+                        message="Device identity is no longer paired or has been revoked.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+
+                # 2. Prevent forged request-body device_id: caller cannot impersonate another device
+                body_device_id = data.get("device_id")
+                if body_device_id and body_device_id != session.device_id:
+                    logger.warning(
+                        "Security violation: Client [%s] authenticated as [%s] sent forged body device_id [%s] for action '%s'",
+                        client.connection_id,
+                        session.device_id,
+                        body_device_id,
+                        action,
+                    )
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.UNAUTHORIZED,
+                        message="Request body device_id does not match authenticated session identity.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+
+                # 3. Derive ExecutionPrincipal and construct immutable ExecutionContext
+                paired_record = self.db_manager.get_paired_device(session.device_id)
+                is_owner = (
+                    paired_record is not None
+                    and getattr(paired_record, "trust_tier", "peer") == "owner"
+                )
+                principal = (
+                    ExecutionPrincipal.OWNER_MANUAL if is_owner else ExecutionPrincipal.AI_MCP
+                )
+
+                # Anti-spoofing: Strip any caller-supplied execution authority fields
+                data.pop("principal", None)
+                data.pop("trust_tier", None)
+                data.pop("execution_principal", None)
+
+                ctx = ExecutionContext(
+                    principal=principal,
+                    device_id=session.device_id,
+                    session_id=session.session_id,
+                    origin="wss",
+                )
+
+                # 4. Peer capability authorization check before dispatch
+                capability = ACTION_TO_CAPABILITY.get(action)
+                if capability is not None:
+                    if not self.capability_policy.is_authorized(session.device_id, capability, ctx=ctx):
+                        logger.warning(
+                            "Authorization denied: Device [%s] lacks capability '%s' for action '%s'",
+                            session.device_id,
+                            capability,
+                            action,
+                        )
+                        error_response = SnowMessage.create_error(
+                            code=ErrorCode.UNAUTHORIZED,
+                            message=f"Capability '{capability}' is not authorized for device '{session.device_id}'.",
+                            correlation_id=message.id,
+                        )
+                        await client.websocket.send(error_response.to_json())
+                        return
+
                 self.session_manager.touch_session(session.session_id)
+            else:
+                ctx = ExecutionContext(
+                    principal=ExecutionPrincipal.AI_MCP,
+                    device_id=None,
+                    session_id=None,
+                    origin="wss_unauthenticated",
+                )
 
             if action == "ping":
                 logger.debug("Handling 'ping' action from client [%s]", client.connection_id)
@@ -423,6 +543,20 @@ class SnowWebSocketServer:
                 await self._handle_file_transfer_status(client, message, data, session)
             elif action == "file_transfer_cancel":
                 await self._handle_file_transfer_cancel(client, message, data, session)
+            elif action == "desktop_status":
+                await self._handle_desktop_status(client, message, data, session, ctx)
+            elif action == "desktop_exec":
+                await self._handle_desktop_exec(client, message, data, session, ctx)
+            elif action == "desktop_app_launch":
+                await self._handle_desktop_app_launch(client, message, data, session, ctx)
+            elif action == "desktop_clipboard_get":
+                await self._handle_desktop_clipboard_get(client, message, data, session, ctx)
+            elif action == "desktop_clipboard_set":
+                await self._handle_desktop_clipboard_set(client, message, data, session, ctx)
+            elif action == "desktop_file_list":
+                await self._handle_desktop_file_list(client, message, data, session, ctx)
+            elif action == "desktop_file_stage_download":
+                await self._handle_desktop_file_stage_download(client, message, data, session, ctx)
             else:
                 logger.warning("Rejected unsupported action '%s' from client [%s]",
                                action, client.connection_id)
@@ -547,10 +681,18 @@ class SnowWebSocketServer:
                         self.db_manager.delete_paired_device(client_device_id)
                         self.session_manager.revoke_device_sessions(client_device_id)
 
+                    configured_owner = getattr(self.config, "primary_owner_device_id", None)
+                    if configured_owner is not None:
+                        is_primary_owner = (client_device_id == configured_owner)
+                        assigned_tier = "owner" if is_primary_owner else "peer"
+                    else:
+                        assigned_tier = getattr(result, "assigned_trust_tier", "peer")
+
                     self.db_manager.insert_paired_device(
                         device_id=client_device_id,
                         device_name=client_device_name,
                         auth_token_hash=token_hash,
+                        trust_tier=assigned_tier,
                     )
                     self.db_manager.log_audit_event(
                         event_type="PAIR_SUCCESS",
@@ -912,6 +1054,370 @@ class SnowWebSocketServer:
                 "data": {
                     "transfer_id": transfer_id,
                     "cancelled": cancelled,
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_desktop_status(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle request for desktop telemetry and battery status."""
+        try:
+            sys_info = await self.windows_telemetry.get_system_telemetry()
+            battery_info = await self.windows_telemetry.get_battery_info()
+            cpu_data = sys_info.get("cpu", {})
+            mem_data = sys_info.get("memory", {})
+
+            response = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={
+                    "status": "success",
+                    "action": "desktop_status",
+                    "data": {
+                        "hostname": sys_info.get("hostname", ""),
+                        "cpu_percent": cpu_data.get("utilization_percent", 0.0),
+                        "memory_percent": mem_data.get("percent", 0.0),
+                        "memory_total_mb": mem_data.get("total_mb", 0.0),
+                        "memory_used_mb": mem_data.get("used_mb", 0.0),
+                        "battery": battery_info,
+                        "uptime_seconds": sys_info.get("uptime_seconds", 0.0),
+                        "os_name": sys_info.get("os_name", ""),
+                        "os_version": sys_info.get("os_version", ""),
+                    },
+                },
+            )
+            await client.websocket.send(response.to_json())
+        except Exception as exc:
+            logger.error("Error retrieving desktop status: %s", exc)
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=f"Failed retrieving desktop telemetry: {exc}",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+
+    async def _handle_desktop_exec(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle execution of a terminal command with security policies."""
+        if not data.get("confirmed"):
+            logger.warning(
+                "Rejected unconfirmed desktop_exec request from client [%s]",
+                client.connection_id,
+            )
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Execution requires explicit user confirmation.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        command = data.get("command")
+        if not command or not isinstance(command, str) or not command.strip():
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="command must be a non-empty string.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        timeout = 30.0
+        if "timeout" in data:
+            try:
+                timeout = max(1.0, min(float(data["timeout"]), 60.0))
+            except (ValueError, TypeError):
+                timeout = 30.0
+
+        cwd = data.get("cwd")
+        result = await self.windows_terminal.execute_command(
+            command=command.strip(), cwd=cwd, timeout=timeout, ctx=ctx
+        )
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success" if result.get("success") else "error",
+                "action": "desktop_exec",
+                "error": result.get("error") if not result.get("success") else None,
+                "data": {
+                    "command": command,
+                    "stdout": result.get("stdout", ""),
+                    "stderr": result.get("stderr", ""),
+                    "exit_code": result.get("exit_code", -1),
+                    "truncated": result.get("truncated", False),
+                    "duration_seconds": result.get("duration_seconds", 0.0),
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_desktop_app_launch(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle request to launch an allowlisted Windows app or lock workstation."""
+        app_name = data.get("app_name")
+        if not app_name or not isinstance(app_name, str):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="app_name must be a non-empty string.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        canonical = app_name.strip().lower()
+        if canonical == "lock_screen":
+            success = True
+            msg = "Workstation locked successfully."
+            if sys.platform == "win32":
+                try:
+                    res = ctypes.windll.user32.LockWorkStation()
+                    success = bool(res != 0)
+                    if not success:
+                        msg = "LockWorkStation returned 0."
+                except Exception as exc:
+                    success = False
+                    msg = str(exc)
+
+            response = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={
+                    "status": "success" if success else "error",
+                    "action": "desktop_app_launch",
+                    "data": {
+                        "app_name": "lock_screen",
+                        "status": "SUCCESS" if success else "FAILED",
+                        "message": msg,
+                    },
+                },
+            )
+            await client.websocket.send(response.to_json())
+            return
+
+        result = await self.windows_apps.launch_app(canonical, ctx=ctx)
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success" if result.get("success") else "error",
+                "action": "desktop_app_launch",
+                "error": result.get("error") if not result.get("success") else None,
+                "data": result,
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_desktop_clipboard_get(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle request to read Windows clipboard text."""
+        result = await self.windows_clipboard.get_clipboard()
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success" if result.get("success") else "error",
+                "action": "desktop_clipboard_get",
+                "error": result.get("error") if not result.get("success") else None,
+                "data": {
+                    "text": result.get("text", ""),
+                    "length": result.get("length", 0),
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_desktop_clipboard_set(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle request to write text to Windows clipboard."""
+        text = data.get("text")
+        if text is None or not isinstance(text, str):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="text must be a string.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        if len(text.encode("utf-8")) > 65536:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Clipboard text exceeds 64 KiB limit.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        result = await self.windows_clipboard.set_clipboard(text)
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success" if result.get("success") else "error",
+                "action": "desktop_clipboard_set",
+                "error": result.get("error") if not result.get("success") else None,
+                "data": result,
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_desktop_file_list(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle request to list files in an approved desktop directory."""
+        rel_path = data.get("path") or data.get("relative_path") or ""
+        limit = 50
+        if "limit" in data:
+            try:
+                limit = int(data["limit"])
+            except (ValueError, TypeError):
+                limit = 50
+
+        result = await self.windows_files.list_files(directory_path=rel_path, limit=limit, ctx=ctx)
+        if not result.get("success"):
+            status_code = result.get("status", "")
+            if status_code == "OS_PERMISSION_DENIED":
+                err_code = ErrorCode.UNAUTHORIZED
+            elif "PATH_NOT_ALLOWED" in status_code:
+                err_code = ErrorCode.UNAUTHORIZED
+            else:
+                err_code = ErrorCode.FILE_NOT_FOUND
+            error_response = SnowMessage.create_error(
+                code=err_code,
+                message=result.get("error", "Directory listing failed."),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "desktop_file_list",
+                "data": {
+                    "directory": result.get("directory", ""),
+                    "parent": result.get("parent"),
+                    "drives": result.get("drives", []),
+                    "count": result.get("count", 0),
+                    "files": result.get("items", []),
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_desktop_file_stage_download(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Stage a local desktop file for authenticated HTTPS download."""
+        req_path = data.get("file_path") or data.get("path")
+        if not req_path or not isinstance(req_path, str):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="file_path must be a non-empty string.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        safe_file, err_status = self.windows_files.resolve_safe_path(req_path, must_exist=True, ctx=ctx)
+        if err_status or safe_file is None or not safe_file.is_file():
+            err_code = (
+                ErrorCode.UNAUTHORIZED
+                if err_status == "PATH_NOT_ALLOWED"
+                else ErrorCode.FILE_NOT_FOUND
+            )
+            error_response = SnowMessage.create_error(
+                code=err_code,
+                message=f"File not found or access denied: '{req_path}' ({err_status or 'NOT_A_FILE'}).",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        try:
+            hasher = hashlib.sha256()
+            with open(safe_file, "rb") as f:
+                while chunk := f.read(65536):
+                    hasher.update(chunk)
+            sha256_digest = hasher.hexdigest()
+            file_size = safe_file.stat().st_size
+        except Exception as exc:
+            logger.error("Error reading file for download staging [%s]: %s", safe_file, exc)
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=f"Failed reading staged file: {exc}",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        device_id = session.device_id if session else "anonymous"
+        record = self.transfer_manager.create_transfer(
+            device_id=device_id,
+            file_name=safe_file.name,
+            file_size=file_size,
+            sha256=sha256_digest,
+            direction=TransferDirection.DOWNLOAD,
+            file_path=str(safe_file),
+        )
+
+        bound_port = (
+            self.http_transfer_server.bound_port
+            if self.http_transfer_server
+            else self.config.transfer_port
+        )
+        transfer_url = f"/api/v1/transfers/download/{record.transfer_id}"
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "desktop_file_stage_download",
+                "data": {
+                    "transfer_id": record.transfer_id,
+                    "file_name": safe_file.name,
+                    "file_size": file_size,
+                    "sha256": sha256_digest,
+                    "transfer_port": bound_port,
+                    "transfer_url": transfer_url,
                 },
             },
         )

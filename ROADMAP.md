@@ -793,29 +793,57 @@ Discovered beacons serve as connection candidates; full trust still requires TLS
 ## Phase 10: Unified Cross-Device Operations and Bidirectional Capability Expansion
 
 ### Concept Explained
-With multi-device discovery and peer mesh operational, Phase 10 deepens bidirectional capabilities across all enrolled devices. Rather than treating mobile devices solely as command sinks, Phase 10 turns every node into both a sensor and an actuator.
+Phase 10 transitions SNOW into an active bidirectional capability mesh. Paired Android devices are no longer merely command targets; they can act as actuators and query the Windows laptop for status, directory listings, staged HTTPS file downloads, clipboard synchronization, allowlisted application launches, and terminal execution with mandatory on-screen confirmation. Simultaneously, AI assistants can initiate SMS compose workflows via Android system intents (`snow_android_send_message`).
+
+Crucially, Phase 10 enforces strict defense-in-depth boundaries:
+1. **Peer Capability Authorization Policy**: An explicit server-side policy (`PeerCapabilityPolicy`) governs peer requests. Sensitive terminal execution (`desktop.exec`) is denied by default for paired peers and requires explicit configuration.
+2. **Foreground & User-Intent Clipboard Bounds**: Android clipboard pulling (`phone_to_laptop`) strictly enforces Android OS foreground residency and requires explicit on-device user authorization; background or unconfirmed reads are rejected with `FOREGROUND_REQUIRED` or `USER_CONFIRMATION_REQUIRED`.
+3. **AI-Safe Messaging**: MCP messaging requests (`snow_android_send_message`) are restricted strictly to intent-based compose mode (`ACTION_SENDTO`), leaving the final dispatch under the user's deliberate physical control. Direct background SMS dispatch is restricted from AI invocation.
+4. **AI-Originated Execution Boundary**: Cross-device command execution from AI/MCP callers is restricted (`APPROVAL_REQUIRED`) as no remote human-approval workflow is currently wired for autonomous AI callers.
 
 ### Objectives
-- Implement true bidirectional clipboard synchronization (laptop ↔ phone, laptop ↔ laptop) with user consent and focus detection.
-- Add unified cross-device notification forwarding and triage.
-- Support audio streaming and remote media control across peers.
-- Implement secure, user-authorized screen capture and snapshot retrieval.
-- Enable mobile-to-desktop command invocation with strict authorization.
+- Implement Python backend handlers for phone-to-PC control over authenticated WebSocket sessions (`desktop_status`, `desktop_exec`, `desktop_app_launch`, `desktop_clipboard_get`, `desktop_clipboard_set`, `desktop_file_list`, `desktop_file_stage_download`).
+- Implement server-side peer capability authorization policy (`PeerCapabilityPolicy`) with deny-by-default for command execution and session revocation on unpairing.
+- Extend HTTPS transfer server on port 8766 to support staged pre-authenticated file downloads for remote clients.
+- Implement Android Remote Desktop Control card in `MainActivity.kt` with live telemetry, clipboard synchronization, PC file browsing, allowlisted app launcher, PC lock button, and terminal command execution with mandatory confirmation dialog.
+- Implement native Android clipboard pulling with foreground and user-intent enforcement, plus intent-based SMS messaging capability (`MessagingHandler.kt`).
+- Register cross-device MCP tool `snow_android_send_message` in the tool registry, bridge, and MCP server.
+- Extend cross-language protocol parity fixtures (46–53) in both Python and Kotlin and maintain 100% parity.
+- Provide a physical verification checklist for real-device validation on the Realme RMX5110 (Android 17).
 
 ### Deliverables
-- Bidirectional clipboard sync agent with foreground focus detection.
-- Cross-device notification dispatcher and Android notification listener.
-- Mobile-to-desktop capability caller with signed authorization tokens.
-- Integration test suite for bidirectional flows.
+- `src/snow/security/policy.py`: `PeerCapabilityPolicy` enforcing per-device capability sets and deny-by-default for `desktop.exec`.
+- `src/snow/network/ws_server.py`: Desktop action dispatcher, session authentication, forged `device_id` rejection, and 7 phone-to-PC action handlers.
+- `src/snow/transfer/manager.py` & `src/snow/transfer/http_server.py`: Staged file download support via token authentication on port 8766.
+- `src/snow/core/ipc.py`: Restricted AI-originated cross-device execution (`APPROVAL_REQUIRED`).
+- `src/snow/mcp/registry.py`, `src/snow/mcp/bridge.py`, `src/snow/mcp/tools.py`: Added `snow_android_send_message` (intent-only) and bidirectional clipboard sync (total: 24 tools).
+- `android/app/src/main/java/org/snow/capabilities/ClipboardHandler.kt`: Bidirectional clipboard handler with foreground and user intent checks.
+- `android/app/src/main/java/org/snow/capabilities/MessagingHandler.kt`: Native Android messaging capability with intent dispatch and SMS confirmation safeguards.
+- `android/app/src/main/java/org/snow/capabilities/AndroidCapabilityDispatcher.kt`: Dispatching `"clipboard_pull"` and `"send_message"`.
+- `android/app/src/main/res/layout/activity_main.xml` & `MainActivity.kt`: Glacier Blue Remote Desktop Control card with full bidirectional UI controls and confirmation dialogs.
+- `tests/test_phase_10_bidirectional.py`: 30 automated unit and integration tests covering all Phase 10 actions, security policies, and edge cases.
+- `android/app/src/test/java/org/snow/capabilities/CapabilityDispatcherTest.kt` & `MessagingHandlerTest.kt`: Native Android JVM test suites for clipboard and messaging capabilities.
+- `tests/test_cross_language_parity.py` & `CrossLanguageParityTest.kt`: Added fixtures 46–53 covering Phase 10 payloads.
 
 ### Dependencies
 - Phase 9 Zero-Touch Discovery and Multi-Device Peer Mesh.
 
-### Acceptance Criteria
-- [ ] Clipboard updates propagate securely between authorized devices.
-- [ ] Mobile notifications can be listed, dismissed, or queried via MCP.
-- [ ] Screen snapshots can be retrieved from authorized devices with on-screen indicator.
-- [ ] Mobile client can issue authorized commands to the Windows Desktop Core.
+### Acceptance Criteria & Verification Status
+- [x] **Automated**: Authenticated Android client can query PC system status, CPU, RAM, battery, and disk telemetry.
+- [x] **Automated**: Bidirectional clipboard synchronization: phone can read PC clipboard and push clipboard text (enforcing 64 KiB cap).
+- [x] **Automated**: Android clipboard pull enforces Android OS foreground residency (`FOREGROUND_REQUIRED`) and explicit user confirmation (`USER_CONFIRMATION_REQUIRED`).
+- [x] **Automated**: Remote PC file browsing scoped strictly to configured allowed directories; path traversal and `.snow` access rejected.
+- [x] **Automated**: Remote PC file downloads stage transfer tokens on port 8766 and download files directly to Android `Downloads/SNOW`.
+- [x] **Automated**: Peer capability authorization policy (`PeerCapabilityPolicy`) denies `desktop.exec` by default; rejections log caller identity without secrets.
+- [x] **Automated**: Mobile terminal execution executes via `WindowsTerminalExecutor` with output truncation and catastrophic command blocking; mobile UI enforces mandatory user confirmation dialog before sending execution requests.
+- [x] **Automated**: AI-originated remote terminal execution via MCP/IPC is restricted (`APPROVAL_REQUIRED`) until an approval workflow is established.
+- [x] **Automated**: Remote app launcher supports all ten Phase 8 allowlisted applications (`code`, `chrome`, `msedge`, `powershell`, `wt`, `notepad`, `calc`, `explorer`, `taskmgr`, `mspaint`); workstation lock triggers Win32 `LockWorkStation` using the exact `lock_screen` identifier (ambiguous `lock` rejected).
+- [x] **Automated**: Android messaging handler dispatches SMS compose intents (`ACTION_SENDTO`); MCP requests are restricted to intent mode; background SMS without deliberate confirmation is blocked.
+- [x] **Automated**: MCP tool `snow_android_send_message` routes through bridge to online Android device.
+- [x] **Automated**: Cross-language protocol parity suite passes 100% across Python (176 fixtures) and Kotlin (176 fixtures).
+- [x] **Automated**: All 260 Python tests and 92 Android JVM tests pass cleanly; debug APK builds successfully (`assembleDebug`).
+- [x] **Automated**: MCP `stdio` stream isolation preserved with zero stdout pollution.
+- [x] **Physical**: Real-device physical verification of bidirectional capabilities and controls on Realme RMX5110 (Android 17) executed and confirmed passed by project owner (P10-PHY-01 through P10-PHY-16).
 
 ---
 

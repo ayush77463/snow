@@ -33,6 +33,7 @@ import uuid
 
 from snow.core.config import CoreConfig
 from snow.protocol.models import MessageType
+from snow.security import ExecutionContext, ExecutionPrincipal
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +367,12 @@ class SnowIpcServer:
             }, False
 
         # 4. Handle operations
+        # Anti-spoofing: All IPC callers are strictly stamped with AI_MCP principal
+        payload.pop("principal", None)
+        payload.pop("trust_tier", None)
+        payload.pop("execution_principal", None)
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+
         if op == "ping":
             return {
                 "version": IPC_PROTOCOL_VERSION,
@@ -449,7 +456,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "windows_launch_app":
-            res = await self._handle_windows_launch_app(payload)
+            res = await self._handle_windows_launch_app(payload, ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -460,7 +467,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "windows_file_read":
-            res = await self._handle_windows_file_read(payload)
+            res = await self._handle_windows_file_read(payload, ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -471,7 +478,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "windows_file_write":
-            res = await self._handle_windows_file_write(payload)
+            res = await self._handle_windows_file_write(payload, ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -482,7 +489,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "windows_file_list":
-            res = await self._handle_windows_file_list(payload)
+            res = await self._handle_windows_file_list(payload, ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -493,7 +500,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "windows_file_search":
-            res = await self._handle_windows_file_search(payload)
+            res = await self._handle_windows_file_search(payload, ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -504,7 +511,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "windows_terminal_exec":
-            res = await self._handle_windows_terminal_exec(payload)
+            res = await self._handle_windows_terminal_exec(payload, ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -682,6 +689,17 @@ class SnowIpcServer:
                 "error": "Missing or non-string 'action'.",
             }
 
+        if action == "desktop_exec":
+            logger.warning(
+                "Rejected AI-originated desktop_exec to device [%s]: no human approval path exists for AI callers.",
+                device_id,
+            )
+            return {
+                "success": False,
+                "status": "APPROVAL_REQUIRED",
+                "error": "AI-originated remote terminal execution is restricted; requires a human-in-the-loop approval workflow.",
+            }
+
         cs = self.core_server
 
         # 1. Verify device is paired
@@ -832,7 +850,7 @@ class SnowIpcServer:
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed querying processes: {exc}"}
 
-    async def _handle_windows_launch_app(self, payload: dict) -> dict:
+    async def _handle_windows_launch_app(self, payload: dict, ctx: ExecutionContext) -> dict:
         """Launch an allowlisted Windows desktop app via Core."""
         launcher = getattr(self.core_server, "windows_apps", None)
         if not launcher:
@@ -843,7 +861,7 @@ class SnowIpcServer:
             }
         app_name = payload.get("app_name", "")
         try:
-            res = await launcher.launch_app(app_name=app_name)
+            res = await launcher.launch_app(app_name=app_name, ctx=ctx)
             return {
                 "success": res.get("success", False),
                 "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
@@ -853,7 +871,7 @@ class SnowIpcServer:
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed launching application: {exc}"}
 
-    async def _handle_windows_file_read(self, payload: dict) -> dict:
+    async def _handle_windows_file_read(self, payload: dict, ctx: ExecutionContext) -> dict:
         """Read a scoped text file via Core."""
         fm = getattr(self.core_server, "windows_files", None)
         if not fm:
@@ -865,7 +883,7 @@ class SnowIpcServer:
         file_path = payload.get("file_path", "")
         max_bytes = payload.get("max_bytes", 256 * 1024)
         try:
-            res = await fm.read_file(file_path=file_path, max_bytes=max_bytes)
+            res = await fm.read_file(file_path=file_path, max_bytes=max_bytes, ctx=ctx)
             return {
                 "success": res.get("success", False),
                 "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
@@ -875,7 +893,7 @@ class SnowIpcServer:
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed reading file: {exc}"}
 
-    async def _handle_windows_file_write(self, payload: dict) -> dict:
+    async def _handle_windows_file_write(self, payload: dict, ctx: ExecutionContext) -> dict:
         """Write a scoped text file atomically via Core."""
         fm = getattr(self.core_server, "windows_files", None)
         if not fm:
@@ -894,6 +912,7 @@ class SnowIpcServer:
                 content=content,
                 overwrite=overwrite,
                 max_bytes=max_bytes,
+                ctx=ctx,
             )
             return {
                 "success": res.get("success", False),
@@ -904,7 +923,7 @@ class SnowIpcServer:
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed writing file: {exc}"}
 
-    async def _handle_windows_file_list(self, payload: dict) -> dict:
+    async def _handle_windows_file_list(self, payload: dict, ctx: ExecutionContext) -> dict:
         """List contents of a scoped directory via Core."""
         fm = getattr(self.core_server, "windows_files", None)
         if not fm:
@@ -916,7 +935,7 @@ class SnowIpcServer:
         directory_path = payload.get("directory_path", "")
         limit = payload.get("limit", 50)
         try:
-            res = await fm.list_files(directory_path=directory_path, limit=limit)
+            res = await fm.list_files(directory_path=directory_path, limit=limit, ctx=ctx)
             return {
                 "success": res.get("success", False),
                 "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
@@ -926,7 +945,7 @@ class SnowIpcServer:
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed listing files: {exc}"}
 
-    async def _handle_windows_file_search(self, payload: dict) -> dict:
+    async def _handle_windows_file_search(self, payload: dict, ctx: ExecutionContext) -> dict:
         """Search files recursively within approved roots via Core."""
         fm = getattr(self.core_server, "windows_files", None)
         if not fm:
@@ -939,7 +958,7 @@ class SnowIpcServer:
         root_path = payload.get("root_path", "")
         limit = payload.get("limit", 50)
         try:
-            res = await fm.search_files(query=query, root_path=root_path, limit=limit)
+            res = await fm.search_files(query=query, root_path=root_path, limit=limit, ctx=ctx)
             return {
                 "success": res.get("success", False),
                 "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
@@ -949,7 +968,7 @@ class SnowIpcServer:
         except Exception as exc:
             return {"success": False, "status": "ERROR", "error": f"Failed searching files: {exc}"}
 
-    async def _handle_windows_terminal_exec(self, payload: dict) -> dict:
+    async def _handle_windows_terminal_exec(self, payload: dict, ctx: ExecutionContext) -> dict:
         """Execute a controlled shell command via Core."""
         term = getattr(self.core_server, "windows_terminal", None)
         if not term:
@@ -962,7 +981,7 @@ class SnowIpcServer:
         cwd = payload.get("cwd")
         timeout = float(payload.get("timeout") or 30.0)
         try:
-            res = await term.execute_command(command=command, cwd=cwd, timeout=timeout)
+            res = await term.execute_command(command=command, cwd=cwd, timeout=timeout, ctx=ctx)
             return {
                 "success": res.get("success", False),
                 "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),

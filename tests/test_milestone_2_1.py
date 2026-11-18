@@ -16,6 +16,7 @@ from snow.network.connection_manager import ConnectionManager
 from snow.network.ws_server import SnowWebSocketServer
 from snow.protocol.constants import ErrorCode, MessageType, PROTOCOL_VERSION
 from snow.protocol.models import SnowMessage
+from snow.security.db import DatabaseManager
 from snow.security.identity import (
     DeviceIdentity,
     is_valid_uuidv4,
@@ -279,12 +280,14 @@ class TestPairingOverWebSocket(unittest.IsolatedAsyncioTestCase):
 
         self.config = CoreConfig(bind_host="127.0.0.1", port=test_port, tls_enabled=False)
         self.conn_mgr = ConnectionManager()
+        self.db_manager = DatabaseManager(db_path=self.data_dir / "test_devices.db")
 
         self.server = SnowWebSocketServer(
             config=self.config,
             connection_manager=self.conn_mgr,
             pairing_manager=self.pairing_manager,
             device_identity=self.device_identity,
+            db_manager=self.db_manager,
         )
         await self.server.start()
         self.port = self.server.bound_port

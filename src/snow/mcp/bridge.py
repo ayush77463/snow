@@ -43,6 +43,7 @@ from snow.core.ipc import (
 )
 from snow.daemon import CoreDaemonManager
 from snow.mcp.registry import ToolCategory, get_tool_category, is_local_windows_tool
+from snow.security import ExecutionContext, ExecutionPrincipal
 
 logger = logging.getLogger(__name__)
 
@@ -390,20 +391,22 @@ class SnowMcpBridge:
 
     async def windows_launch_app(self, app_name: str) -> dict[str, Any]:
         """Launch an allowlisted Windows desktop app via Core IPC or in-process."""
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_launch_app",
             {"app_name": app_name},
-            lambda: self.local_apps.launch_app(app_name=app_name),
+            lambda: self.local_apps.launch_app(app_name=app_name, ctx=ctx),
         )
 
     async def windows_file_read(
         self, file_path: str, max_bytes: int = 256 * 1024
     ) -> dict[str, Any]:
         """Read a scoped text file via Core IPC or in-process."""
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_file_read",
             {"file_path": file_path, "max_bytes": max_bytes},
-            lambda: self.local_files.read_file(file_path=file_path, max_bytes=max_bytes),
+            lambda: self.local_files.read_file(file_path=file_path, max_bytes=max_bytes, ctx=ctx),
         )
 
     async def windows_file_write(
@@ -414,6 +417,7 @@ class SnowMcpBridge:
         max_bytes: int = 256 * 1024,
     ) -> dict[str, Any]:
         """Write a scoped text file atomically via Core IPC or in-process."""
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_file_write",
             {
@@ -427,6 +431,7 @@ class SnowMcpBridge:
                 content=content,
                 overwrite=overwrite,
                 max_bytes=max_bytes,
+                ctx=ctx,
             ),
         )
 
@@ -434,20 +439,22 @@ class SnowMcpBridge:
         self, directory_path: str = "", limit: int = 50
     ) -> dict[str, Any]:
         """List contents of a scoped directory via Core IPC or in-process."""
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_file_list",
             {"directory_path": directory_path, "limit": limit},
-            lambda: self.local_files.list_files(directory_path=directory_path, limit=limit),
+            lambda: self.local_files.list_files(directory_path=directory_path, limit=limit, ctx=ctx),
         )
 
     async def windows_file_search(
         self, query: str, root_path: str = "", limit: int = 50
     ) -> dict[str, Any]:
         """Search files recursively via Core IPC or in-process."""
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_file_search",
             {"query": query, "root_path": root_path, "limit": limit},
-            lambda: self.local_files.search_files(query=query, root_path=root_path, limit=limit),
+            lambda: self.local_files.search_files(query=query, root_path=root_path, limit=limit, ctx=ctx),
         )
 
     async def windows_terminal_exec(
@@ -457,10 +464,11 @@ class SnowMcpBridge:
         timeout: float = 30.0,
     ) -> dict[str, Any]:
         """Execute a shell command via Core IPC or in-process."""
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_terminal_exec",
             {"command": command, "cwd": cwd, "timeout": timeout},
-            lambda: self.local_terminal.execute_command(command=command, cwd=cwd, timeout=timeout),
+            lambda: self.local_terminal.execute_command(command=command, cwd=cwd, timeout=timeout, ctx=ctx),
         )
 
     async def windows_clipboard_get(self) -> dict[str, Any]:
@@ -551,6 +559,47 @@ class SnowMcpBridge:
             timeout=60.0,
         )
 
+    async def android_send_message(
+        self,
+        recipient: str,
+        message: str,
+        mode: str = "intent",
+        device_id: str = "",
+    ) -> dict[str, Any]:
+        """Send an SMS or compose a message on the paired Android phone.
+
+        Safety Policy:
+        - intent: Opens the SMS compose app on phone with recipient and message pre-filled.
+          Final dispatch remains under deliberate user control.
+        - sms: Direct background SMS dispatch is restricted for AI/MCP requests to prevent
+          unauthorized communication. Use mode='intent' instead.
+        """
+        clean_mode = (mode or "").strip().lower()
+        if clean_mode == "sms":
+            return {
+                "success": False,
+                "status": "SMS_DISPATCH_RESTRICTED",
+                "error": (
+                    "Direct background SMS dispatch is restricted for AI/MCP requests to prevent "
+                    "unauthorized communication. Use mode='intent' to open the messaging composer "
+                    "with pre-filled content, leaving dispatch under the user's explicit control."
+                ),
+            }
+
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {
+                "success": False,
+                "status": "DEVICE_OFFLINE",
+                "error": "No connected Android device found.",
+            }
+        return await self.send_device_request(
+            device_id=target_id,
+            action="send_message",
+            data={"recipient": recipient, "message": message, "mode": "intent"},
+            timeout=30.0,
+        )
+
     async def sync_clipboard(
         self, direction: str = "laptop_to_phone", device_id: str = ""
     ) -> dict[str, Any]:
@@ -558,8 +607,8 @@ class SnowMcpBridge:
 
         Directions:
         - laptop_to_phone: Reads Windows clipboard and pushes content to Android phone.
-        - phone_to_laptop: Reports unsupported status due to Android OS background
-          clipboard restrictions and write-only client architecture.
+        - phone_to_laptop: Requests clipboard from Android phone and writes to Windows clipboard.
+          Requires SNOW Android application to be active in the foreground with user authorization.
         """
         clean_dir = (direction or "").strip().lower()
 
@@ -603,18 +652,53 @@ class SnowMcpBridge:
             }
 
         elif clean_dir == "phone_to_laptop":
-            # Inspect Android capabilities: Android OS blocks background clipboard reading
-            # and our Android client runtime is strictly write-only.
+            target_id = device_id or await self._resolve_target_device_id()
+            if not target_id:
+                return {
+                    "success": False,
+                    "status": "DEVICE_OFFLINE",
+                    "direction": "phone_to_laptop",
+                    "error": "No connected Android device found.",
+                }
+
+            # 1. Request clipboard pull from Android device
+            pull_res = await self.send_device_request(target_id, "clipboard_pull", {})
+            if not pull_res.get("success"):
+                err_status = pull_res.get("status", "CLIPBOARD_PULL_FAILED")
+                err_msg = pull_res.get("error") or "Failed retrieving clipboard from Android."
+                return {
+                    "success": False,
+                    "status": err_status,
+                    "direction": "phone_to_laptop",
+                    "error": f"Failed pulling clipboard from Android: {err_msg}",
+                }
+
+            data = pull_res.get("data") or {}
+            clip_text = data.get("text", "")
+            if not clip_text:
+                return {
+                    "success": False,
+                    "status": "EMPTY_CLIPBOARD",
+                    "direction": "phone_to_laptop",
+                    "error": "Android clipboard returned no text content.",
+                }
+
+            # 2. Write to Windows clipboard
+            set_res = await self.windows_clipboard_set(text=clip_text)
+            if not set_res.get("success"):
+                return {
+                    "success": False,
+                    "status": "WINDOWS_CLIPBOARD_WRITE_FAILED",
+                    "direction": "phone_to_laptop",
+                    "error": f"Failed writing Android clipboard content to Windows: {set_res.get('error')}",
+                }
+
             return {
-                "success": False,
-                "status": "UNSUPPORTED_DIRECTION",
+                "success": True,
+                "status": "SUCCESS",
                 "direction": "phone_to_laptop",
-                "error": (
-                    "Clipboard sync from phone_to_laptop is not currently supported. "
-                    "The Android client runtime enforces a write-only clipboard security policy "
-                    "(ClipboardHandler is strictly push-only), and Android 10+ (API 29+) prevents "
-                    "background services from reading clipboard contents without active IME focus."
-                ),
+                "characters_synced": len(clip_text),
+                "message": f"Successfully synchronized {len(clip_text)} characters from Android to Windows.",
             }
         else:
             return {

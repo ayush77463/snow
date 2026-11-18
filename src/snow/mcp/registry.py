@@ -58,6 +58,7 @@ TOOL_REGISTRY: dict[str, ToolCategory] = {
     "snow_android_file_receive": ToolCategory.CROSS_DEVICE,
     "snow_transfer_file": ToolCategory.CROSS_DEVICE,
     "snow_mesh_connect_peer": ToolCategory.CROSS_DEVICE,
+    "snow_android_send_message": ToolCategory.CROSS_DEVICE,
 }
 
 

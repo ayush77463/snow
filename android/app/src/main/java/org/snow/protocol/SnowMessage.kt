@@ -15,6 +15,9 @@ data class SnowMessage(
     val payload: Map<String, Any?>? = null,
     val error: SnowError? = null
 ) {
+    val isSuccess: Boolean
+        get() = type == MessageType.RESPONSE && error == null
+
     companion object {
         fun currentIsoTimestamp(): String {
             return Instant.now().toString()

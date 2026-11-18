@@ -361,10 +361,13 @@ class SnowHttpTransferServer:
         if not record:
             return web.json_response({"error": "Transfer not found or not owned by device."}, status=404)
 
-        try:
-            file_path = self.storage_manager.resolve_destination_path(record.file_name)
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=400)
+        if record.file_path and Path(record.file_path).exists() and Path(record.file_path).is_file():
+            file_path = Path(record.file_path)
+        else:
+            try:
+                file_path = self.storage_manager.resolve_destination_path(record.file_name)
+            except Exception as exc:
+                return web.json_response({"error": str(exc)}, status=400)
 
         if not file_path.exists() or not file_path.is_file():
             return web.json_response({"error": "File does not exist on server storage."}, status=404)

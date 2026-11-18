@@ -12,13 +12,20 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.OpenableColumns
+import android.app.Dialog
 import android.view.Gravity
+import android.view.LayoutInflater
 import android.view.View
+import android.view.ViewGroup
+import android.view.Window
 import android.view.inputmethod.InputMethodManager
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.content.ContextCompat
@@ -26,6 +33,9 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import java.util.Locale
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -44,6 +54,7 @@ import org.snow.security.SharedPreferencesTokenStorage
 import org.snow.service.SnowForegroundService
 import org.snow.transfer.FileTransferClient
 import org.snow.transfer.FileTransferClient.TransferResult
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -132,6 +143,17 @@ class MainActivity : AppCompatActivity() {
                 renderDiscoveredPeers(peers)
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        org.snow.capabilities.ClipboardHandler.isAppInForeground = true
+    }
+
+    override fun onPause() {
+        super.onPause()
+        org.snow.capabilities.ClipboardHandler.isAppInForeground = false
+        org.snow.capabilities.ClipboardHandler.isUserIntentGranted = false
     }
 
     override fun onStop() {
@@ -319,6 +341,8 @@ class MainActivity : AppCompatActivity() {
             }
             appendLog("Requested fresh pairing PIN on desktop console...")
         }
+
+        setupRemoteDesktopListeners()
     }
 
     private fun setupFilterPills() {
@@ -671,6 +695,7 @@ class MainActivity : AppCompatActivity() {
                 pairingFlow.resetSubmitting()
             }
         }
+        updateRemoteDesktopUi()
     }
 
     private fun updatePairingUi(state: PairingState) {
@@ -767,6 +792,613 @@ class MainActivity : AppCompatActivity() {
                 binding.btnPair.isEnabled = isConnected
                 binding.btnRequestPin.isEnabled = isConnected
                 appendLog("Pairing error: ${state.message}")
+            }
+        }
+        updateRemoteDesktopUi()
+    }
+
+    private fun updateRemoteDesktopUi() {
+        val isConnected = service?.client?.connectionState?.value == ConnectionState.CONNECTED
+        val isPaired = pairingFlow.state.value is PairingState.Paired
+        binding.cardRemoteDesktop.visibility = if (isConnected && isPaired) View.VISIBLE else View.GONE
+    }
+
+    private fun setupRemoteDesktopListeners() {
+        binding.btnPcStatus.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Not connected to PC", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            binding.tvPcStatusInfo.text = "Querying PC telemetry..."
+            client.sendRequest("desktop_status") { response ->
+                runOnUiThread {
+                    if (response.isSuccess) {
+                        val data = response.payload?.get("data") as? Map<*, *>
+                        val host = data?.get("hostname") ?: "PC"
+                        val cpu = data?.get("cpu_percent") ?: 0.0
+                        val mem = data?.get("memory_percent") ?: 0.0
+                        val uptime = (data?.get("uptime_seconds") as? Number)?.toLong() ?: 0L
+                        val battery = data?.get("battery") as? Map<*, *>
+                        val batPct = battery?.get("percent")
+                        val batStr = if (batPct != null) "$batPct%" else "AC / N/A"
+
+                        val info = "Host: $host | CPU: $cpu% | RAM: $mem% | Battery: $batStr | Uptime: ${uptime}s"
+                        binding.tvPcStatusInfo.text = info
+                        appendLog("PC Status: $info")
+                    } else {
+                        val err = response.error?.message ?: "Failed querying PC status."
+                        binding.tvPcStatusInfo.text = "Error: $err"
+                        appendLog("PC Status error: $err")
+                    }
+                }
+            }
+        }
+
+        binding.btnClipboardPhoneToPc.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Not connected to PC", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val clip = clipboard.primaryClip
+            val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).text?.toString() else null
+            if (text.isNullOrEmpty()) {
+                Toast.makeText(this, "Phone clipboard is empty", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            binding.tvClipboardStatus.visibility = View.VISIBLE
+            binding.tvClipboardStatus.text = "Pushing to PC clipboard..."
+            client.sendRequest("desktop_clipboard_set", mapOf("text" to text)) { resp ->
+                runOnUiThread {
+                    if (resp.isSuccess) {
+                        binding.tvClipboardStatus.text = "Pushed ${text.length} chars to PC clipboard."
+                        appendLog("Phone → PC clipboard synced (${text.length} chars)")
+                    } else {
+                        val err = resp.error?.message ?: "Failed setting PC clipboard."
+                        binding.tvClipboardStatus.text = "Error: $err"
+                        appendLog("Clipboard Push error: $err")
+                    }
+                }
+            }
+        }
+
+        binding.btnClipboardPcToPhone.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Not connected to PC", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            binding.tvClipboardStatus.visibility = View.VISIBLE
+            binding.tvClipboardStatus.text = "Fetching PC clipboard..."
+            client.sendRequest("desktop_clipboard_get") { resp ->
+                runOnUiThread {
+                    if (resp.isSuccess) {
+                        val data = resp.payload?.get("data") as? Map<*, *>
+                        val text = data?.get("text") as? String ?: ""
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        val clip = android.content.ClipData.newPlainText("SNOW PC Clipboard", text)
+                        clipboard.setPrimaryClip(clip)
+                        binding.tvClipboardStatus.text = "Copied ${text.length} chars from PC to phone."
+                        appendLog("PC → Phone clipboard synced (${text.length} chars)")
+                    } else {
+                        val err = resp.error?.message ?: "Failed getting PC clipboard."
+                        binding.tvClipboardStatus.text = "Error: $err"
+                        appendLog("Clipboard Get error: $err")
+                    }
+                }
+            }
+        }
+
+        binding.btnBrowsePcFiles.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Not connected to PC", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            openPcFileBrowserDialog(client)
+        }
+
+        binding.btnLaunchApp.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Not connected to PC", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val apps = arrayOf("notepad", "calc", "code", "explorer", "taskmgr", "mspaint", "chrome", "msedge", "wt", "powershell")
+            AlertDialog.Builder(this)
+                .setTitle("Launch Allowlisted PC App")
+                .setItems(apps) { _, which ->
+                    val chosen = apps[which]
+                    appendLog("Launching PC app '$chosen'...")
+                    client.sendRequest("desktop_app_launch", mapOf("app_name" to chosen)) { resp ->
+                        runOnUiThread {
+                            if (resp.isSuccess) {
+                                Toast.makeText(this, "Launched $chosen on PC", Toast.LENGTH_SHORT).show()
+                                appendLog("PC app '$chosen' launched successfully.")
+                            } else {
+                                val err = resp.error?.message ?: "Launch failed."
+                                Toast.makeText(this, "Launch failed: $err", Toast.LENGTH_SHORT).show()
+                                appendLog("App launch error: $err")
+                            }
+                        }
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
+        binding.btnLockPc.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Not connected to PC", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            AlertDialog.Builder(this)
+                .setTitle("Lock PC Screen?")
+                .setMessage("Are you sure you want to lock the Windows PC workstation?")
+                .setPositiveButton("Lock PC") { _, _ ->
+                    client.sendRequest("desktop_app_launch", mapOf("app_name" to "lock_screen")) { resp ->
+                        runOnUiThread {
+                            if (resp.isSuccess) {
+                                Toast.makeText(this, "PC locked successfully", Toast.LENGTH_SHORT).show()
+                                appendLog("PC workstation locked.")
+                            } else {
+                                val err = resp.error?.message ?: "Failed locking PC."
+                                Toast.makeText(this, "Lock failed: $err", Toast.LENGTH_SHORT).show()
+                                appendLog("Lock PC error: $err")
+                            }
+                        }
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
+        binding.btnRunCommand.setOnClickListener {
+            val client = service?.client
+            if (client == null || client.connectionState.value != ConnectionState.CONNECTED) {
+                Toast.makeText(this, "Not connected to PC", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val cmd = binding.editPcCommand.text?.toString()?.trim() ?: ""
+            if (cmd.isEmpty()) {
+                Toast.makeText(this, "Enter a command to execute", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            dismissKeyboard()
+            confirmAndExecutePcCommand(cmd, client)
+        }
+    }
+
+    private fun confirmAndExecutePcCommand(command: String, client: org.snow.network.SnowWebSocketClient) {
+        AlertDialog.Builder(this)
+            .setTitle("Execute PC Terminal Command?")
+            .setMessage("The following command will run on your PC:\n\n$command\n\nProceed with execution?")
+            .setPositiveButton("Execute") { _, _ ->
+                binding.tvCommandOutput.visibility = View.VISIBLE
+                binding.tvCommandOutput.text = "Executing: $command..."
+                appendLog("Running PC command: $command")
+                client.sendRequest("desktop_exec", mapOf("command" to command, "confirmed" to true)) { resp ->
+                    runOnUiThread {
+                        if (resp.isSuccess) {
+                            val data = resp.payload?.get("data") as? Map<*, *>
+                            val stdout = (data?.get("stdout") as? String) ?: ""
+                            val stderr = (data?.get("stderr") as? String) ?: ""
+                            val exitCode = data?.get("exit_code") ?: 0
+                            val payloadError = resp.payload?.get("error") as? String
+
+                            val output = buildString {
+                                if (stdout.isNotBlank()) append(stdout)
+                                if (stderr.isNotBlank()) {
+                                    if (isNotEmpty()) append("\n[stderr]\n")
+                                    append(stderr)
+                                }
+                                if (isEmpty()) {
+                                    if (payloadError != null) {
+                                        append("$payloadError (Exit code: $exitCode)")
+                                    } else {
+                                        append("(No output, exit code: $exitCode)")
+                                    }
+                                } else if (exitCode != 0 && exitCode != -1) {
+                                    append("\n(Exit code: $exitCode)")
+                                }
+                            }
+                            binding.tvCommandOutput.text = output
+                            appendLog("PC command completed (exit code $exitCode)")
+                        } else {
+                            val err = resp.error?.message ?: "Execution failed."
+                            binding.tvCommandOutput.text = "Error: $err"
+                            appendLog("PC command error: $err")
+                        }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    data class PcFileItem(
+        val name: String,
+        val type: String,
+        val sizeBytes: Long,
+        val modifiedAt: String?
+    )
+
+    private fun openPcFileBrowserDialog(client: org.snow.network.SnowWebSocketClient) {
+        val dialog = Dialog(this)
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dialog.setContentView(R.layout.dialog_pc_file_browser)
+        dialog.window?.setLayout(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            (resources.displayMetrics.heightPixels * 0.90).toInt()
+        )
+        dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+
+        val tvDeviceStatus = dialog.findViewById<TextView>(R.id.tvDeviceStatus)
+        val btnClose = dialog.findViewById<View>(R.id.btnCloseBrowser)
+        val layoutDrives = dialog.findViewById<LinearLayout>(R.id.layoutDrives)
+        val btnNavUp = dialog.findViewById<View>(R.id.btnNavUp)
+        val tvCurrentPath = dialog.findViewById<TextView>(R.id.tvCurrentPath)
+        val btnNavManual = dialog.findViewById<View>(R.id.btnNavManual)
+        val btnNavRefresh = dialog.findViewById<View>(R.id.btnNavRefresh)
+        val rvFileList = dialog.findViewById<RecyclerView>(R.id.rvFileList)
+        val progressLoading = dialog.findViewById<ProgressBar>(R.id.progressLoading)
+        val layoutError = dialog.findViewById<LinearLayout>(R.id.layoutError)
+        val tvErrorMessage = dialog.findViewById<TextView>(R.id.tvErrorMessage)
+        val btnRetry = dialog.findViewById<View>(R.id.btnRetry)
+        val tvEmptyState = dialog.findViewById<TextView>(R.id.tvEmptyState)
+        val tvFooterSummary = dialog.findViewById<TextView>(R.id.tvFooterSummary)
+
+        tvDeviceStatus.text = "Host: ${client.currentTargetHost} • Connected"
+        btnClose.setOnClickListener { dialog.dismiss() }
+
+        var currentPath: String = ""
+        var parentPath: String? = null
+        var requestSeq: Long = 0L
+
+        lateinit var loadDirectory: (String) -> Unit
+
+        val adapter = PcFileAdapter { item ->
+            if (item.type == "directory") {
+                val nextPath = if (currentPath.endsWith("\\") || currentPath.endsWith("/")) {
+                    "$currentPath${item.name}"
+                } else {
+                    "$currentPath\\${item.name}"
+                }
+                loadDirectory(nextPath)
+            } else {
+                val fullFilePath = if (currentPath.endsWith("\\") || currentPath.endsWith("/")) {
+                    "$currentPath${item.name}"
+                } else {
+                    "$currentPath\\${item.name}"
+                }
+                confirmAndDownloadPcFile(fullFilePath, item.name, item.sizeBytes, client)
+            }
+        }
+
+        rvFileList.layoutManager = LinearLayoutManager(this)
+        rvFileList.adapter = adapter
+
+        loadDirectory = { targetPath ->
+            val seq = ++requestSeq
+            progressLoading.visibility = View.VISIBLE
+            layoutError.visibility = View.GONE
+            tvEmptyState.visibility = View.GONE
+            // Only hide file list if we don't already have an active directory displayed
+            if (currentPath.isEmpty()) {
+                rvFileList.visibility = View.GONE
+                tvCurrentPath.text = if (targetPath.isEmpty()) "(loading...)" else targetPath
+            }
+
+            val reqPayload = if (targetPath.isNotEmpty()) mapOf("path" to targetPath) else emptyMap<String, Any>()
+            appendLog("Listing PC files: ${if (targetPath.isEmpty()) "(root)" else targetPath}")
+
+            client.sendRequest("desktop_file_list", reqPayload) { resp ->
+                runOnUiThread {
+                    if (seq != requestSeq) return@runOnUiThread
+                    progressLoading.visibility = View.GONE
+                    if (resp.isSuccess) {
+                        val data = resp.payload?.get("data") as? Map<*, *>
+                        val dir = (data?.get("directory") as? String) ?: targetPath
+                        val parent = data?.get("parent") as? String
+                        @Suppress("UNCHECKED_CAST")
+                        val drives = (data?.get("drives") as? List<Map<*, *>>) ?: emptyList()
+                        @Suppress("UNCHECKED_CAST")
+                        val filesRaw = (data?.get("files") as? List<Map<String, Any?>>) ?: emptyList()
+
+                        currentPath = dir
+                        parentPath = parent
+                        tvCurrentPath.text = dir
+
+                        btnNavUp.isEnabled = (parent != null)
+                        btnNavUp.alpha = if (parent != null) 1.0f else 0.35f
+
+                        renderDriveChips(layoutDrives, drives, dir) { chosenDrive ->
+                            loadDirectory(chosenDrive)
+                        }
+
+                        val fileItems = filesRaw.map { f ->
+                            PcFileItem(
+                                name = (f["name"] as? String) ?: "unknown",
+                                type = (f["type"] as? String) ?: "file",
+                                sizeBytes = (f["size_bytes"] as? Number)?.toLong() ?: 0L,
+                                modifiedAt = f["modified_at"] as? String
+                            )
+                        }
+
+                        if (fileItems.isEmpty()) {
+                            tvEmptyState.visibility = View.VISIBLE
+                            rvFileList.visibility = View.GONE
+                            tvFooterSummary.text = "0 items"
+                        } else {
+                            tvEmptyState.visibility = View.GONE
+                            rvFileList.visibility = View.VISIBLE
+                            adapter.submitList(fileItems)
+                            val folderCount = fileItems.count { it.type == "directory" }
+                            val fileCount = fileItems.size - folderCount
+                            tvFooterSummary.text = "${fileItems.size} items ($folderCount folders, $fileCount files)"
+                        }
+                    } else {
+                        val err = resp.error?.message ?: "Failed loading directory."
+                        appendLog("PC file list error: $err")
+                        if (currentPath.isNotEmpty()) {
+                            // Preserve existing valid directory listing and inform owner
+                            tvCurrentPath.text = currentPath
+                            Toast.makeText(this, "Browse failed: $err", Toast.LENGTH_LONG).show()
+                            tvFooterSummary.text = "Path error: $err"
+                            rvFileList.visibility = View.VISIBLE
+                        } else {
+                            layoutError.visibility = View.VISIBLE
+                            tvErrorMessage.text = err
+                            rvFileList.visibility = View.GONE
+                            tvFooterSummary.text = "Error"
+                        }
+                    }
+                }
+            }
+        }
+
+        btnNavUp.setOnClickListener {
+            parentPath?.let { loadDirectory(it) }
+        }
+
+        btnNavRefresh.setOnClickListener {
+            loadDirectory(currentPath)
+        }
+
+        btnRetry.setOnClickListener {
+            loadDirectory(currentPath)
+        }
+
+        btnNavManual.setOnClickListener {
+            val input = android.widget.EditText(this).apply {
+                setText(currentPath)
+                setSelection(text.length)
+                setSingleLine(true)
+            }
+            AlertDialog.Builder(this)
+                .setTitle("Enter PC Path")
+                .setView(input)
+                .setPositiveButton("Navigate") { _, _ ->
+                    val entered = input.text.toString().trim()
+                    if (entered.isNotEmpty()) {
+                        loadDirectory(entered)
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
+        dialog.show()
+        loadDirectory("")
+    }
+
+    private fun renderDriveChips(
+        container: LinearLayout,
+        drives: List<Map<*, *>>,
+        currentDir: String,
+        onDriveSelected: (String) -> Unit
+    ) {
+        container.removeAllViews()
+        val driveList = if (drives.isNotEmpty()) {
+            drives
+        } else {
+            listOf(mapOf("drive" to "C:\\"), mapOf("drive" to "D:\\"))
+        }
+
+        for (d in driveList) {
+            val drivePath = (d["drive"] as? String) ?: continue
+            val freeBytes = (d["free_bytes"] as? Number)?.toLong()
+            val totalBytes = (d["total_bytes"] as? Number)?.toLong()
+            val label = if (freeBytes != null && totalBytes != null && totalBytes > 0) {
+                "$drivePath ${formatFileSize(freeBytes)} free / ${formatFileSize(totalBytes)}"
+            } else if (freeBytes != null && freeBytes > 0) {
+                "$drivePath (${formatFileSize(freeBytes)} free)"
+            } else {
+                drivePath
+            }
+
+            val isSelected = currentDir.startsWith(drivePath, ignoreCase = true)
+
+            val tvChip = TextView(this).apply {
+                text = label
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(if (isSelected) ContextCompat.getColor(context, R.color.primary_blue) else ContextCompat.getColor(context, R.color.primary_text))
+                setBackgroundResource(R.drawable.bg_drive_chip)
+                if (isSelected) {
+                    setBackgroundColor(ContextCompat.getColor(context, R.color.soft_blue_surface))
+                }
+                setPadding(32, 16, 32, 16)
+                val params = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    setMargins(8, 0, 8, 0)
+                }
+                layoutParams = params
+                setOnClickListener { onDriveSelected(drivePath) }
+            }
+            container.addView(tvChip)
+        }
+    }
+
+    private fun confirmAndDownloadPcFile(
+        fullPath: String,
+        fileName: String,
+        fileSizeBytes: Long,
+        client: org.snow.network.SnowWebSocketClient
+    ) {
+        val sizeStr = formatFileSize(fileSizeBytes)
+        AlertDialog.Builder(this)
+            .setTitle("Download File?")
+            .setMessage("Do you want to download this file from your PC?\n\nFile: $fileName\nSize: $sizeStr\nPC Path: $fullPath\n\nDestination:\nDownloads/SNOW/$fileName")
+            .setPositiveButton("Download") { _, _ ->
+                appendLog("Staging download for PC file '$fullPath'...")
+                client.sendRequest("desktop_file_stage_download", mapOf("file_path" to fullPath)) { resp ->
+                    runOnUiThread {
+                        if (resp.isSuccess) {
+                            val data = resp.payload?.get("data") as? Map<*, *>
+                            val tid = data?.get("transfer_id") as? String ?: ""
+                            val fn = data?.get("file_name") as? String ?: fileName
+                            val sha = data?.get("sha256") as? String ?: ""
+                            val port = (data?.get("transfer_port") as? Number)?.toInt() ?: 8766
+                            if (tid.isNotEmpty() && sha.isNotEmpty()) {
+                                downloadPcFile(tid, fn, sha, port)
+                            } else {
+                                Toast.makeText(this, "Staging response missing transfer details", Toast.LENGTH_SHORT).show()
+                            }
+                        } else {
+                            val err = resp.error?.message ?: "Staging failed."
+                            Toast.makeText(this, "Stage download failed: $err", Toast.LENGTH_SHORT).show()
+                            appendLog("Stage download error: $err")
+                        }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    class PcFileAdapter(
+        private val onItemClick: (PcFileItem) -> Unit
+    ) : RecyclerView.Adapter<PcFileAdapter.ViewHolder>() {
+
+        private val items = mutableListOf<PcFileItem>()
+
+        fun submitList(newItems: List<PcFileItem>) {
+            items.clear()
+            items.addAll(newItems)
+            notifyDataSetChanged()
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
+            val view = LayoutInflater.from(parent.context).inflate(R.layout.item_pc_file, parent, false)
+            return ViewHolder(view)
+        }
+
+        override fun onBindViewHolder(holder: ViewHolder, position: Int) {
+            holder.bind(items[position], onItemClick)
+        }
+
+        override fun getItemCount(): Int = items.size
+
+        class ViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+            private val imgIcon: ImageView = itemView.findViewById(R.id.imgFileIcon)
+            private val tvName: TextView = itemView.findViewById(R.id.tvFileName)
+            private val tvMeta: TextView = itemView.findViewById(R.id.tvFileMeta)
+            private val imgAction: ImageView = itemView.findViewById(R.id.imgActionIcon)
+
+            fun bind(item: PcFileItem, onClick: (PcFileItem) -> Unit) {
+                tvName.text = item.name
+                if (item.type == "directory") {
+                    imgIcon.setImageResource(R.drawable.ic_pc_folder)
+                    tvMeta.text = "Folder"
+                    imgAction.setImageResource(R.drawable.ic_pc_arrow_up)
+                    imgAction.rotation = 90f
+                    imgAction.alpha = 0.4f
+                } else {
+                    imgIcon.setImageResource(R.drawable.ic_pc_file)
+                    val sizeStr = formatFileSize(item.sizeBytes)
+                    val dateStr = formatIsoDate(item.modifiedAt)
+                    tvMeta.text = if (dateStr.isNotEmpty()) "$sizeStr • $dateStr" else sizeStr
+                    imgAction.setImageResource(R.drawable.ic_pc_download)
+                    imgAction.rotation = 0f
+                    imgAction.alpha = 1.0f
+                }
+                itemView.setOnClickListener { onClick(item) }
+            }
+        }
+    }
+
+    companion object {
+        fun formatFileSize(bytes: Long): String {
+            if (bytes <= 0) return "0 B"
+            if (bytes < 1024) return "$bytes B"
+            val kb = bytes / 1024.0
+            if (kb < 1024) return String.format(Locale.US, "%.1f KB", kb)
+            val mb = kb / 1024.0
+            if (mb < 1024) return String.format(Locale.US, "%.1f MB", mb)
+            val gb = mb / 1024.0
+            return String.format(Locale.US, "%.2f GB", gb)
+        }
+
+        fun formatIsoDate(iso: String?): String {
+            if (iso.isNullOrEmpty()) return ""
+            return try {
+                val parsed = java.time.OffsetDateTime.parse(iso)
+                val formatter = java.time.format.DateTimeFormatter.ofPattern("MMM dd, yyyy HH:mm", Locale.US)
+                parsed.format(formatter)
+            } catch (e: Exception) {
+                iso.take(10)
+            }
+        }
+    }
+
+    private fun downloadPcFile(transferId: String, fileName: String, sha256: String, transferPort: Int) {
+        val currentService = service ?: return
+        val host = currentService.client.currentTargetHost
+        val downloadsDir = File(getExternalFilesDir(null) ?: filesDir, "Downloads/SNOW").apply { mkdirs() }
+        val destFile = File(downloadsDir, fileName)
+
+        binding.cardTransferProgress.visibility = View.VISIBLE
+        binding.txtTransferFileName.text = "Downloading: $fileName"
+        binding.progressTransfer.progress = 0
+
+        lifecycleScope.launch {
+            val result = currentService.transferClient.downloadFile(
+                serverHost = host,
+                transferPort = transferPort,
+                transferId = transferId,
+                destinationFile = destFile,
+                expectedSha256 = sha256,
+                resume = true
+            ) { progress ->
+                runOnUiThread {
+                    binding.progressTransfer.progress = progress.percent
+                    binding.txtTransferPercent.text = "${progress.percent}%"
+                    binding.txtTransferDetails.text = "${progress.bytesTransferred} / ${progress.totalBytes} bytes"
+                }
+            }
+
+            runOnUiThread {
+                binding.cardTransferProgress.visibility = View.GONE
+                when (result) {
+                    is FileTransferClient.TransferResult.Success -> {
+                        Toast.makeText(this@MainActivity, "Downloaded: $fileName", Toast.LENGTH_LONG).show()
+                        appendLog("Downloaded PC file '$fileName' successfully to ${destFile.absolutePath}")
+                    }
+                    is FileTransferClient.TransferResult.Error -> {
+                        Toast.makeText(this@MainActivity, "Download failed: ${result.message}", Toast.LENGTH_LONG).show()
+                        appendLog("File download error: ${result.message}")
+                    }
+                    is FileTransferClient.TransferResult.Duplicate -> {
+                        Toast.makeText(this@MainActivity, "File already exists: $fileName", Toast.LENGTH_SHORT).show()
+                        appendLog("File already up-to-date: $fileName")
+                    }
+                }
             }
         }
     }

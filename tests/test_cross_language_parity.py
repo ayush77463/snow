@@ -486,6 +486,186 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["response_file_receive_request.json"] = resp_file_recv.to_json()
 
+    # --- Phase 10 Bidirectional Control Fixtures ---
+    # 46. Valid desktop_status request and response
+    req_status = SnowMessage.create_request(action="desktop_status")
+    valid_fixtures["request_desktop_status.json"] = req_status.to_json()
+
+    resp_status = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "desktop_status",
+            "data": {
+                "hostname": "SNOW-LAPTOP",
+                "cpu_percent": 14.5,
+                "memory_percent": 42.0,
+                "memory_total_mb": 16384.0,
+                "memory_used_mb": 6881.0,
+                "battery": {"available": True, "percent": 95.0, "power_plugged": True},
+                "uptime_seconds": 3600.0,
+            },
+        },
+    )
+    valid_fixtures["response_desktop_status.json"] = resp_status.to_json()
+
+    # 47. Valid desktop_exec request and response
+    req_exec = SnowMessage.create_request(
+        action="desktop_exec",
+        data={"command": "python --version", "timeout": 15.0},
+    )
+    valid_fixtures["request_desktop_exec.json"] = req_exec.to_json()
+
+    resp_exec = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "desktop_exec",
+            "data": {
+                "command": "python --version",
+                "stdout": "Python 3.13.15\n",
+                "stderr": "",
+                "exit_code": 0,
+                "truncated": False,
+                "duration_seconds": 0.08,
+            },
+        },
+    )
+    valid_fixtures["response_desktop_exec.json"] = resp_exec.to_json()
+
+    # 48. Valid desktop_app_launch request and response
+    req_app = SnowMessage.create_request(
+        action="desktop_app_launch",
+        data={"app_name": "notepad"},
+    )
+    valid_fixtures["request_desktop_app_launch.json"] = req_app.to_json()
+
+    resp_app = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "desktop_app_launch",
+            "data": {
+                "success": True,
+                "status": "SUCCESS",
+                "app_name": "notepad",
+                "pid": 12345,
+                "message": "Successfully launched notepad (PID 12345).",
+            },
+        },
+    )
+    valid_fixtures["response_desktop_app_launch.json"] = resp_app.to_json()
+
+    # 49. Valid desktop_clipboard_get request and response
+    req_clip_get = SnowMessage.create_request(action="desktop_clipboard_get")
+    valid_fixtures["request_desktop_clipboard_get.json"] = req_clip_get.to_json()
+
+    resp_clip_get = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "desktop_clipboard_get",
+            "data": {
+                "text": "Cross-device synced text ❄️",
+                "length": 28,
+            },
+        },
+    )
+    valid_fixtures["response_desktop_clipboard_get.json"] = resp_clip_get.to_json()
+
+    # 50. Valid desktop_clipboard_set request and response
+    req_clip_set = SnowMessage.create_request(
+        action="desktop_clipboard_set",
+        data={"text": "New clipboard text from Phone"},
+    )
+    valid_fixtures["request_desktop_clipboard_set.json"] = req_clip_set.to_json()
+
+    resp_clip_set = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "desktop_clipboard_set",
+            "data": {
+                "success": True,
+                "status": "SUCCESS",
+                "length": 30,
+            },
+        },
+    )
+    valid_fixtures["response_desktop_clipboard_set.json"] = resp_clip_set.to_json()
+
+    # 51. Valid desktop_file_list request and response
+    req_file_list = SnowMessage.create_request(
+        action="desktop_file_list",
+        data={"path": "Documents", "limit": 20},
+    )
+    valid_fixtures["request_desktop_file_list.json"] = req_file_list.to_json()
+
+    resp_file_list = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "desktop_file_list",
+            "data": {
+                "directory": "Documents",
+                "count": 2,
+                "files": [
+                    {"name": "report.pdf", "type": "file", "size_bytes": 10240, "modified_at": "2026-11-17T08:00:00Z"},
+                    {"name": "Projects", "type": "directory", "size_bytes": 0, "modified_at": "2026-11-17T08:00:00Z"},
+                ],
+            },
+        },
+    )
+    valid_fixtures["response_desktop_file_list.json"] = resp_file_list.to_json()
+
+    # 52. Valid desktop_file_stage_download request and response
+    req_stage = SnowMessage.create_request(
+        action="desktop_file_stage_download",
+        data={"file_path": "report.pdf"},
+    )
+    valid_fixtures["request_desktop_file_stage_download.json"] = req_stage.to_json()
+
+    resp_stage = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "desktop_file_stage_download",
+            "data": {
+                "transfer_id": str(uuid.uuid4()),
+                "file_name": "report.pdf",
+                "file_size": 10240,
+                "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                "transfer_port": 8766,
+                "transfer_url": "/api/v1/transfers/download/test-tid-10",
+            },
+        },
+    )
+    valid_fixtures["response_desktop_file_stage_download.json"] = resp_stage.to_json()
+
+    # 53. Valid send_message request and response
+    req_msg = SnowMessage.create_request(
+        action="send_message",
+        data={"recipient": "+1234567890", "message": "Emergency alert", "mode": "intent"},
+    )
+    valid_fixtures["request_send_message.json"] = req_msg.to_json()
+
+    resp_msg = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "send_message",
+            "data": {
+                "status": "success",
+                "action": "send_message",
+                "mode": "intent",
+                "recipient": "+1234567890",
+                "result": "INTENT_LAUNCHED",
+                "message": "Messaging composer intent launched on device.",
+            },
+        },
+    )
+    valid_fixtures["response_send_message.json"] = resp_msg.to_json()
+
     # --- Negative / Invalid Fixtures ---
     # 1. Malformed JSON
     invalid_fixtures["invalid_malformed_json.json"] = (

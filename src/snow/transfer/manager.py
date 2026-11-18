@@ -40,6 +40,7 @@ class TransferRecord:
     current_offset: int = 0
     status: TransferState = TransferState.QUEUED
     error_message: Optional[str] = None
+    file_path: Optional[str] = None
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -58,6 +59,7 @@ class TransferRecord:
             "current_offset": self.current_offset,
             "status": self.status.value,
             "error_message": self.error_message,
+            "file_path": self.file_path,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -77,6 +79,7 @@ class TransferManager:
         sha256: str,
         direction: TransferDirection = TransferDirection.UPLOAD,
         transfer_id: Optional[str] = None,
+        file_path: Optional[str] = None,
     ) -> TransferRecord:
         """Register a new transfer session for a verified device."""
         if not device_id or not isinstance(device_id, str):
@@ -96,6 +99,7 @@ class TransferManager:
             sha256=sha256.strip().lower(),
             current_offset=0,
             status=TransferState.QUEUED,
+            file_path=file_path,
         )
         self._transfers[tid] = record
         logger.info(

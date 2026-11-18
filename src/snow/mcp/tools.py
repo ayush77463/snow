@@ -49,6 +49,8 @@ ALL_TOOL_NAMES: List[str] = [
     # Mesh and Unified Transfer (Phase 9)
     "snow_transfer_file",
     "snow_mesh_connect_peer",
+    # Android Messaging (Phase 10)
+    "snow_android_send_message",
 ]
 
 
@@ -317,7 +319,8 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         description=(
             "Synchronize clipboard between Windows laptop and Android phone. "
             "Directions: 'laptop_to_phone' pushes Windows clipboard to Android. "
-            "'phone_to_laptop' reports unsupported due to Android OS background restrictions."
+            "'phone_to_laptop' pulls clipboard from Android to Windows (requires SNOW Android app "
+            "to be active in the foreground with user authorization)."
         ),
     )
     async def snow_sync_clipboard(
@@ -488,5 +491,34 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "success": False,
                 "status": result.get("status", "ERROR"),
                 "error": result.get("error", f"Peer connection to {host}:{port} failed."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_android_send_message",
+        description=(
+            "Open the SMS compose interface on paired Android phone with prefilled recipient "
+            "and message. The final dispatch remains under deliberate user control on the device. "
+            "Direct background SMS dispatch is restricted for AI safety."
+        ),
+    )
+    async def snow_android_send_message(
+        recipient: str,
+        message: str,
+        mode: str = "intent",
+        device_id: str = "",
+    ) -> str:
+        """Compose SMS on paired Android phone via system intent."""
+        result = await bridge.android_send_message(
+            recipient=recipient,
+            message=message,
+            mode=mode,
+            device_id=device_id,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed preparing message for '{recipient}'."),
             }, indent=2)
         return json.dumps(result.get("data", {}) or result, indent=2)

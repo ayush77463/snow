@@ -55,6 +55,7 @@ class CoreConfig:
     discovery_enabled: bool = True
     beacon_interval: float = 3.0
     device_connect_grace_period: float = 6.0
+    primary_owner_device_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration invariants upon instantiation."""
@@ -444,6 +445,10 @@ class CoreConfig:
         else:
             device_connect_grace_period = 6.0
 
+        # Parse SNOW_PRIMARY_OWNER_DEVICE
+        raw_owner_dev = os.getenv("SNOW_PRIMARY_OWNER_DEVICE")
+        primary_owner_device_id = raw_owner_dev.strip() if raw_owner_dev and raw_owner_dev.strip() else None
+
         return cls(
             app_name=app_name,
             version="0.1.0",
@@ -468,4 +473,5 @@ class CoreConfig:
             discovery_enabled=discovery_enabled,
             beacon_interval=beacon_interval,
             device_connect_grace_period=device_connect_grace_period,
+            primary_owner_device_id=primary_owner_device_id,
         )

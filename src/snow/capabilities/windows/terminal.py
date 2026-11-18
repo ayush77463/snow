@@ -26,6 +26,8 @@ import shlex
 import time
 from typing import Any, Dict, List, Optional, Set
 
+from snow.security.context import ExecutionContext, ExecutionPrincipal
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
@@ -65,30 +67,41 @@ class WindowsTerminalExecutor:
     def __init__(self, policy: Optional[TerminalSecurityPolicy] = None) -> None:
         self.policy = policy or TerminalSecurityPolicy()
 
-    def validate_command(self, command: str) -> Optional[str]:
+    def validate_command(
+        self, command: str, ctx: Optional[ExecutionContext] = None
+    ) -> Optional[str]:
         """Validate command against security policies.
 
         Returns an error string if rejected, or None if permitted.
+        OWNER_MANUAL principal bypasses the AI catastrophic regex blocklist.
         """
+        ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="default")
+
         if not command or not isinstance(command, str) or not command.strip():
             return "Command must be a non-empty string."
 
         if not self.policy.allow_execution:
             return "Terminal execution is disabled by configuration policy."
 
-        if self.policy.block_catastrophic:
-            cleaned = command.strip()
-            for pattern in CATASTROPHIC_PATTERNS:
-                if pattern.search(cleaned):
-                    return (
-                        f"Command rejected by security policy: matches forbidden "
-                        f"destructive pattern ({pattern.pattern})."
-                    )
+        # Apply catastrophic blocklist to AI_MCP callers only
+        if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+            if self.policy.block_catastrophic:
+                cleaned = command.strip()
+                for pattern in CATASTROPHIC_PATTERNS:
+                    if pattern.search(cleaned):
+                        return (
+                            f"Command rejected by security policy: matches forbidden "
+                            f"destructive pattern ({pattern.pattern})."
+                        )
 
         return None
 
-    def validate_cwd(self, cwd: Optional[str | Path]) -> tuple[Optional[Path], Optional[str]]:
+    def validate_cwd(
+        self, cwd: Optional[str | Path], ctx: Optional[ExecutionContext] = None
+    ) -> tuple[Optional[Path], Optional[str]]:
         """Validate and resolve requested working directory."""
+        ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="default")
+
         if cwd is None or cwd == "":
             return Path.cwd().resolve(), None
 
@@ -103,17 +116,19 @@ class WindowsTerminalExecutor:
         if not resolved.is_dir():
             return None, f"Working directory is not a directory: '{cwd}'"
 
-        if self.policy.allowed_working_directories:
-            permitted = False
-            for allowed_root in self.policy.allowed_working_directories:
-                try:
-                    if resolved == allowed_root or resolved.is_relative_to(allowed_root):
-                        permitted = True
-                        break
-                except Exception:
-                    continue
-            if not permitted:
-                return None, f"Working directory '{cwd}' is not within authorized roots."
+        # OWNER_MANUAL can use any valid existing directory on the host
+        if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+            if self.policy.allowed_working_directories:
+                permitted = False
+                for allowed_root in self.policy.allowed_working_directories:
+                    try:
+                        if resolved == allowed_root or resolved.is_relative_to(allowed_root):
+                            permitted = True
+                            break
+                    except Exception:
+                        continue
+                if not permitted:
+                    return None, f"Working directory '{cwd}' is not within authorized roots."
 
         return resolved, None
 
@@ -122,6 +137,7 @@ class WindowsTerminalExecutor:
         command: str,
         cwd: Optional[str | Path] = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        ctx: Optional[ExecutionContext] = None,
     ) -> dict[str, Any]:
         """Execute a shell command asynchronously with bounds on time and buffer output.
 
@@ -129,12 +145,15 @@ class WindowsTerminalExecutor:
             command: The command line string to execute.
             cwd: Working directory (defaults to current directory).
             timeout: Maximum execution time in seconds (bounded to policy max).
+            ctx: Immutable execution context (defaults to AI_MCP).
 
         Returns:
             Structured dictionary with exit code, stdout, stderr, and truncation flags.
         """
+        ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="default")
+
         # 1. Validate command
-        validation_err = self.validate_command(command)
+        validation_err = self.validate_command(command, ctx=ctx)
         if validation_err:
             return {
                 "success": False,
@@ -152,7 +171,7 @@ class WindowsTerminalExecutor:
             }
 
         # 2. Validate cwd
-        resolved_cwd, cwd_err = self.validate_cwd(cwd)
+        resolved_cwd, cwd_err = self.validate_cwd(cwd, ctx=ctx)
         if cwd_err:
             return {
                 "success": False,
@@ -199,6 +218,24 @@ class WindowsTerminalExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+        except (PermissionError, OSError) as exc:
+            elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
+            is_perm = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5
+            status = "OS_PERMISSION_DENIED" if is_perm else "SPAWN_FAILED"
+            return {
+                "success": False,
+                "status": status,
+                "error": f"OS permission denied: {exc}" if is_perm else f"Failed to spawn subprocess: {exc}",
+                "command": command,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "timed_out": False,
+                "execution_time_ms": elapsed_ms,
+                "working_directory": str(resolved_cwd),
+            }
         except Exception as exc:
             elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
             return {

@@ -359,8 +359,9 @@ class TestUnifiedFileTransferAndMeshTools(unittest.IsolatedAsyncioTestCase):
         register_all_tools(self.server, self.bridge)
 
     def test_all_23_tools_registered_and_categorized(self) -> None:
-        """Verify all 23 tools are registered, unique, and present in TOOL_REGISTRY."""
-        self.assertEqual(len(ALL_TOOL_NAMES), 23)
+        """Verify all tools are registered, unique, and present in TOOL_REGISTRY."""
+        self.assertEqual(len(ALL_TOOL_NAMES), len(TOOL_REGISTRY))
+        self.assertGreaterEqual(len(ALL_TOOL_NAMES), 23)
         self.assertIn("snow_transfer_file", ALL_TOOL_NAMES)
         self.assertIn("snow_mesh_connect_peer", ALL_TOOL_NAMES)
 

@@ -27,7 +27,9 @@ import uuid
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_FILENAME = "snow_devices.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+VALID_TRUST_TIERS = ("owner", "peer")
 
 
 def current_utc_timestamp() -> str:
@@ -49,6 +51,7 @@ class PairedDeviceRecord:
     pairing_timestamp: str
     last_seen_timestamp: str
     auth_token_hash: str
+    trust_tier: str = "peer"
 
 
 @dataclass(frozen=True)
@@ -128,12 +131,25 @@ class DatabaseManager:
                         device_name TEXT NOT NULL,
                         pairing_timestamp TEXT NOT NULL,
                         last_seen_timestamp TEXT NOT NULL,
-                        auth_token_hash TEXT UNIQUE NOT NULL
+                        auth_token_hash TEXT UNIQUE NOT NULL,
+                        trust_tier TEXT NOT NULL DEFAULT 'peer'
                     );
                 """)
                 conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_paired_devices_token_hash
                     ON paired_devices(auth_token_hash);
+                """)
+
+                # Schema migration for existing tables created under version 1
+                cursor = conn.execute("PRAGMA table_info(paired_devices);")
+                columns = [row["name"] for row in cursor.fetchall()]
+                if "trust_tier" not in columns:
+                    logger.info("Migrating paired_devices table: adding trust_tier column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN trust_tier TEXT NOT NULL DEFAULT 'peer';")
+
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_paired_devices_trust_tier
+                    ON paired_devices(trust_tier);
                 """)
 
                 # Security audit log table (intentionally independent of paired_devices foreign key
@@ -165,6 +181,7 @@ class DatabaseManager:
         auth_token_hash: str,
         pairing_timestamp: Optional[str] = None,
         last_seen_timestamp: Optional[str] = None,
+        trust_tier: str = "peer",
     ) -> PairedDeviceRecord:
         """Insert a newly paired device record.
 
@@ -174,24 +191,37 @@ class DatabaseManager:
             auth_token_hash: SHA-256 hexadecimal digest of the authorization token.
             pairing_timestamp: Optional UTC ISO-8601 timestamp (defaults to now).
             last_seen_timestamp: Optional UTC ISO-8601 timestamp (defaults to now).
+            trust_tier: Authorization tier ('owner' or 'peer', defaults to 'peer').
 
         Returns:
             The created PairedDeviceRecord.
 
         Raises:
+            ValueError: If trust_tier is not 'owner' or 'peer'.
             sqlite3.IntegrityError: If device_id or auth_token_hash is not unique.
         """
+        if trust_tier not in VALID_TRUST_TIERS:
+            raise ValueError(
+                f"Invalid trust_tier '{trust_tier}'. Must be one of: {', '.join(VALID_TRUST_TIERS)}"
+            )
+
         now = current_utc_timestamp()
         p_time = pairing_timestamp or now
         ls_time = last_seen_timestamp or now
 
         query = """
             INSERT INTO paired_devices (
-                device_id, device_name, pairing_timestamp, last_seen_timestamp, auth_token_hash
-            ) VALUES (?, ?, ?, ?, ?);
+                device_id, device_name, pairing_timestamp, last_seen_timestamp, auth_token_hash, trust_tier
+            ) VALUES (?, ?, ?, ?, ?, ?);
         """
         with self._get_connection() as conn:
-            conn.execute(query, (device_id, device_name, p_time, ls_time, auth_token_hash))
+            if trust_tier == "owner":
+                # Enforce single primary owner invariant by demoting other owners
+                conn.execute(
+                    "UPDATE paired_devices SET trust_tier = 'peer' WHERE trust_tier = 'owner' AND device_id != ?;",
+                    (device_id,),
+                )
+            conn.execute(query, (device_id, device_name, p_time, ls_time, auth_token_hash, trust_tier))
 
         return PairedDeviceRecord(
             device_id=device_id,
@@ -199,6 +229,7 @@ class DatabaseManager:
             pairing_timestamp=p_time,
             last_seen_timestamp=ls_time,
             auth_token_hash=auth_token_hash,
+            trust_tier=trust_tier,
         )
 
     def get_paired_device(self, device_id: str) -> Optional[PairedDeviceRecord]:
@@ -208,12 +239,14 @@ class DatabaseManager:
             cursor = conn.execute(query, (device_id,))
             row = cursor.fetchone()
             if row:
+                tier = row["trust_tier"] if "trust_tier" in row.keys() else "peer"
                 return PairedDeviceRecord(
                     device_id=row["device_id"],
                     device_name=row["device_name"],
                     pairing_timestamp=row["pairing_timestamp"],
                     last_seen_timestamp=row["last_seen_timestamp"],
                     auth_token_hash=row["auth_token_hash"],
+                    trust_tier=tier,
                 )
         return None
 
@@ -224,12 +257,14 @@ class DatabaseManager:
             cursor = conn.execute(query, (token_hash,))
             row = cursor.fetchone()
             if row:
+                tier = row["trust_tier"] if "trust_tier" in row.keys() else "peer"
                 return PairedDeviceRecord(
                     device_id=row["device_id"],
                     device_name=row["device_name"],
                     pairing_timestamp=row["pairing_timestamp"],
                     last_seen_timestamp=row["last_seen_timestamp"],
                     auth_token_hash=row["auth_token_hash"],
+                    trust_tier=tier,
                 )
         return None
 
@@ -240,6 +275,7 @@ class DatabaseManager:
         with self._get_connection() as conn:
             cursor = conn.execute(query)
             for row in cursor.fetchall():
+                tier = row["trust_tier"] if "trust_tier" in row.keys() else "peer"
                 devices.append(
                     PairedDeviceRecord(
                         device_id=row["device_id"],
@@ -247,9 +283,65 @@ class DatabaseManager:
                         pairing_timestamp=row["pairing_timestamp"],
                         last_seen_timestamp=row["last_seen_timestamp"],
                         auth_token_hash=row["auth_token_hash"],
+                        trust_tier=tier,
                     )
                 )
         return devices
+
+    def update_device_trust_tier(self, device_id: str, trust_tier: str) -> bool:
+        """Update the trust tier for a registered paired device.
+
+        Args:
+            device_id: UUID of the paired device.
+            trust_tier: New trust tier ('owner' or 'peer').
+
+        Returns:
+            True if updated, False if device not found.
+
+        Raises:
+            ValueError: If trust_tier is not 'owner' or 'peer'.
+        """
+        if trust_tier not in VALID_TRUST_TIERS:
+            raise ValueError(
+                f"Invalid trust_tier '{trust_tier}'. Must be one of: {', '.join(VALID_TRUST_TIERS)}"
+            )
+
+        query = "UPDATE paired_devices SET trust_tier = ? WHERE device_id = ?;"
+        with self._get_connection() as conn:
+            if trust_tier == "owner":
+                # Enforce single primary owner invariant by demoting other owners
+                conn.execute(
+                    "UPDATE paired_devices SET trust_tier = 'peer' WHERE trust_tier = 'owner' AND device_id != ?;",
+                    (device_id,),
+                )
+            cursor = conn.execute(query, (trust_tier, device_id))
+            updated = cursor.rowcount > 0
+
+        if updated:
+            self.log_audit_event(
+                event_type="TRUST_TIER_UPDATED",
+                device_id=device_id,
+                details={"trust_tier": trust_tier},
+            )
+            logger.info("Updated device [%s] trust tier to '%s'", device_id, trust_tier)
+        return updated
+
+    def get_owner_device(self) -> Optional[PairedDeviceRecord]:
+        """Retrieve the primary owner device record if one has been provisioned."""
+        query = "SELECT * FROM paired_devices WHERE trust_tier = 'owner' LIMIT 1;"
+        with self._get_connection() as conn:
+            cursor = conn.execute(query)
+            row = cursor.fetchone()
+            if row:
+                return PairedDeviceRecord(
+                    device_id=row["device_id"],
+                    device_name=row["device_name"],
+                    pairing_timestamp=row["pairing_timestamp"],
+                    last_seen_timestamp=row["last_seen_timestamp"],
+                    auth_token_hash=row["auth_token_hash"],
+                    trust_tier=row["trust_tier"],
+                )
+        return None
 
     def update_last_seen(self, device_id: str, last_seen_timestamp: Optional[str] = None) -> bool:
         """Update the last-seen timestamp for an active paired device."""

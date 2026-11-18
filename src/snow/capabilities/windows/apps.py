@@ -20,6 +20,8 @@ import subprocess
 from typing import Any, Dict, List, Optional
 import urllib.parse
 
+from snow.security.context import ExecutionContext, ExecutionPrincipal
+
 logger = logging.getLogger(__name__)
 
 SYSTEM_ROOT = Path(os.environ.get("SystemRoot", r"C:\Windows"))
@@ -105,15 +107,20 @@ class WindowsAppLauncher:
 
         return None
 
-    def launch_app_sync(self, app_name: str) -> dict[str, Any]:
+    def launch_app_sync(
+        self, app_name: str, ctx: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
         """Synchronously validate alias and launch the application with shell=False.
 
         Args:
-            app_name: Allowlisted application alias (e.g. 'notepad', 'calc', 'code').
+            app_name: Allowlisted application alias or owner custom executable path.
+            ctx: Immutable execution context (defaults to AI_MCP).
 
         Returns:
             Structured dictionary indicating launch outcome, PID, and status.
         """
+        ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="default")
+
         if not app_name or not isinstance(app_name, str):
             return {
                 "success": False,
@@ -128,28 +135,48 @@ class WindowsAppLauncher:
         if canonical_alias.endswith(".exe"):
             canonical_alias = canonical_alias[:-4]
 
-        # Check against strict allowlist
-        if canonical_alias not in self._allowlist:
-            return {
-                "success": False,
-                "status": "APP_NOT_ALLOWED",
-                "error": (
-                    f"Application '{app_name}' is not authorized. "
-                    f"Allowed applications: {', '.join(self.allowed_apps)}."
-                ),
-            }
+        target_path: Optional[Path] = None
 
-        # Resolve executable candidate
-        target_path = self._resolve_app_executable(canonical_alias)
-        if target_path is None:
-            return {
-                "success": False,
-                "status": "APP_NOT_FOUND",
-                "error": (
-                    f"Application '{canonical_alias}' is allowlisted but its executable "
-                    f"was not found on this Windows system."
-                ),
-            }
+        # 1. Check against strict allowlist first
+        if canonical_alias in self._allowlist:
+            target_path = self._resolve_app_executable(canonical_alias)
+            if target_path is None:
+                return {
+                    "success": False,
+                    "status": "APP_NOT_FOUND",
+                    "error": (
+                        f"Application '{canonical_alias}' is allowlisted but its executable "
+                        f"was not found on this Windows system."
+                    ),
+                }
+        else:
+            # 2. If not allowlisted, check if OWNER_MANUAL supplied a valid custom executable
+            if ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
+                try:
+                    candidate = Path(app_name.strip()).resolve()
+                    if candidate.is_file() and candidate.suffix.lower() == ".exe":
+                        target_path = candidate
+                    else:
+                        return {
+                            "success": False,
+                            "status": "APP_NOT_FOUND",
+                            "error": f"Custom executable path not found or invalid: '{app_name}'.",
+                        }
+                except Exception as exc:
+                    return {
+                        "success": False,
+                        "status": "INVALID_PATH",
+                        "error": f"Invalid custom executable path syntax: {exc}",
+                    }
+            else:
+                return {
+                    "success": False,
+                    "status": "APP_NOT_ALLOWED",
+                    "error": (
+                        f"Application '{app_name}' is not authorized. "
+                        f"Allowed applications: {', '.join(self.allowed_apps)}."
+                    ),
+                }
 
         try:
             # Launch via subprocess.Popen with shell=False and no user arguments
@@ -162,10 +189,11 @@ class WindowsAppLauncher:
                 close_fds=True,
             )
             logger.info(
-                "Launched allowlisted app '%s' [pid=%d, path=%s]",
+                "Launched app '%s' [pid=%d, path=%s, principal=%s]",
                 canonical_alias,
                 proc.pid,
                 target_path,
+                ctx.principal,
             )
             return {
                 "success": True,
@@ -175,12 +203,14 @@ class WindowsAppLauncher:
                 "executable": str(target_path),
                 "message": f"Successfully launched {canonical_alias} (PID {proc.pid}).",
             }
-        except OSError as osc_err:
+        except (PermissionError, OSError) as osc_err:
+            is_perm = isinstance(osc_err, PermissionError) or getattr(osc_err, "winerror", None) == 5
+            status = "OS_PERMISSION_DENIED" if is_perm else "APP_LAUNCH_FAILED"
             logger.warning("OS error launching '%s': %s", canonical_alias, osc_err)
             return {
                 "success": False,
-                "status": "APP_LAUNCH_FAILED",
-                "error": f"OS error launching '{canonical_alias}': {osc_err}",
+                "status": status,
+                "error": f"OS permission denied: {osc_err}" if is_perm else f"OS error launching '{canonical_alias}': {osc_err}",
             }
         except Exception as exc:
             logger.error("Unexpected error launching '%s': %s", canonical_alias, exc, exc_info=True)
@@ -190,19 +220,17 @@ class WindowsAppLauncher:
                 "error": f"Failed launching '{canonical_alias}': {exc}",
             }
 
-    async def launch_app(self, app_name: str) -> dict[str, Any]:
+    async def launch_app(
+        self, app_name: str, ctx: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
         """Asynchronously launch allowlisted application on a worker thread."""
-        return await asyncio.to_thread(self.launch_app_sync, app_name)
+        return await asyncio.to_thread(self.launch_app_sync, app_name, ctx)
 
-    def open_target_sync(self, target: str) -> dict[str, Any]:
-        """Open an authorized URL (http/https) or non-executable user document.
-
-        Args:
-            target: A web URL or valid document file path.
-
-        Returns:
-            Structured dictionary indicating opening outcome.
-        """
+    def open_target_sync(
+        self, target: str, ctx: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
+        """Open an authorized URL (http/https) or non-executable user document."""
+        ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="default")
         if not target or not isinstance(target, str):
             return {
                 "success": False,
@@ -306,6 +334,8 @@ class WindowsAppLauncher:
                 "error": f"Failed opening file: {exc}",
             }
 
-    async def open_target(self, target: str) -> dict[str, Any]:
+    async def open_target(
+        self, target: str, ctx: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
         """Asynchronously open authorized target on a worker thread."""
-        return await asyncio.to_thread(self.open_target_sync, target)
+        return await asyncio.to_thread(self.open_target_sync, target, ctx)

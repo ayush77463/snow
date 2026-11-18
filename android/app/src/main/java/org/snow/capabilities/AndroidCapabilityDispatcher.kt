@@ -23,6 +23,7 @@ class AndroidCapabilityDispatcher(
     val clipboardHandler = ClipboardHandler(context)
     val appLauncherHandler = AppLauncherHandler(context)
     val fileHandler = AndroidFileHandler(context, transferClientProvider)
+    val messagingHandler = MessagingHandler(context)
 
     suspend fun dispatch(
         action: String,
@@ -52,6 +53,20 @@ class AndroidCapabilityDispatcher(
                     Pair(res, null)
                 } else {
                     Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = res["error"] as? String ?: "Clipboard push failed"))
+                }
+            }
+            "clipboard_pull" -> {
+                val res = clipboardHandler.pullClipboard()
+                if (res["status"] == "success") {
+                    Pair(res, null)
+                } else {
+                    val errType = res["error"] as? String ?: "CLIPBOARD_PULL_FAILED"
+                    val code = when (errType) {
+                        "FOREGROUND_REQUIRED", "USER_CONFIRMATION_REQUIRED" -> ErrorCode.UNAUTHORIZED
+                        else -> ErrorCode.INVALID_PAYLOAD
+                    }
+                    val msg = res["message"] as? String ?: errType
+                    Pair(null, SnowError(code = code, message = "$errType: $msg"))
                 }
             }
             "list_apps" -> {
@@ -86,6 +101,21 @@ class AndroidCapabilityDispatcher(
                     Pair(res, null)
                 } else {
                     Pair(null, SnowError(code = ErrorCode.FILE_NOT_FOUND, message = res["error"] as? String ?: "File send failed"))
+                }
+            }
+            "send_message" -> {
+                val recipient = data?.get("recipient") as? String
+                val message = data?.get("message") as? String
+                val mode = (data?.get("mode") as? String) ?: MessagingHandler.MODE_INTENT
+                val userConfirmed = (data?.get("user_confirmed") as? Boolean) ?: false
+                val res = messagingHandler.sendMessage(recipient, message, mode, userConfirmed)
+                if (res["status"] == "success") {
+                    Pair(res, null)
+                } else {
+                    val err = res["error"] as? String ?: "SEND_FAILED"
+                    val isPerm = err in setOf("PERMISSION_REQUIRED", "USER_CONFIRMATION_REQUIRED")
+                    val code = if (isPerm) ErrorCode.UNAUTHORIZED else ErrorCode.INVALID_PAYLOAD
+                    Pair(null, SnowError(code = code, message = "$err: ${res["message"] ?: "Send message failed"}"))
                 }
             }
             else -> {

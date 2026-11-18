@@ -84,6 +84,60 @@ class CapabilityDispatcherTest {
     }
 
     @Test
+    fun testClipboardPullForegroundAndUserIntentRestrictions() = runBlocking {
+        val dummyContext = object : android.content.ContextWrapper(null) {}
+        val handler = ClipboardHandler(dummyContext)
+
+        // 1. App in background -> FOREGROUND_REQUIRED
+        ClipboardHandler.isAppInForeground = false
+        ClipboardHandler.isUserIntentGranted = true
+        val resBg = handler.pullClipboard()
+        assertEquals("error", resBg["status"])
+        assertEquals("FOREGROUND_REQUIRED", resBg["error"])
+
+        // 2. App in foreground but no user confirmation -> USER_CONFIRMATION_REQUIRED
+        ClipboardHandler.isAppInForeground = true
+        ClipboardHandler.isUserIntentGranted = false
+        val resNoIntent = handler.pullClipboard()
+        assertEquals("error", resNoIntent["status"])
+        assertEquals("USER_CONFIRMATION_REQUIRED", resNoIntent["error"])
+    }
+
+    @Test
+    fun testCapabilityDispatcherDispatchesClipboardPull() = runBlocking {
+        val dummyContext = object : android.content.ContextWrapper(null) {}
+        val dispatcher = AndroidCapabilityDispatcher(dummyContext, transferClientProvider = { null })
+
+        // Backgrounded -> UNAUTHORIZED / FOREGROUND_REQUIRED
+        ClipboardHandler.isAppInForeground = false
+        ClipboardHandler.isUserIntentGranted = true
+        val (resBg, errBg) = dispatcher.dispatch(
+            action = "clipboard_pull",
+            data = null,
+            serverHost = "127.0.0.1",
+            defaultTransferPort = 8766
+        )
+        assertNull(resBg)
+        assertNotNull(errBg)
+        assertEquals(ErrorCode.UNAUTHORIZED, errBg?.code)
+        assertTrue(errBg?.message?.contains("FOREGROUND_REQUIRED") == true)
+
+        // Foregrounded but unconfirmed -> UNAUTHORIZED / USER_CONFIRMATION_REQUIRED
+        ClipboardHandler.isAppInForeground = true
+        ClipboardHandler.isUserIntentGranted = false
+        val (resNoIntent, errNoIntent) = dispatcher.dispatch(
+            action = "clipboard_pull",
+            data = null,
+            serverHost = "127.0.0.1",
+            defaultTransferPort = 8766
+        )
+        assertNull(resNoIntent)
+        assertNotNull(errNoIntent)
+        assertEquals(ErrorCode.UNAUTHORIZED, errNoIntent?.code)
+        assertTrue(errNoIntent?.message?.contains("USER_CONFIRMATION_REQUIRED") == true)
+    }
+
+    @Test
     fun testAppLauncherPackageValidation() = runBlocking {
         val dummyContext = object : android.content.ContextWrapper(null) {}
         val handler = AppLauncherHandler(dummyContext)

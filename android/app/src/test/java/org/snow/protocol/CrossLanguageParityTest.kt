@@ -499,6 +499,186 @@ class CrossLanguageParityTest {
             )
             valid["response_file_receive_request.json"] = JsonSerialization.toJson(respFileRecv)
 
+            // --- Phase 10 Bidirectional Control Fixtures ---
+            // 46. Valid desktop_status request and response
+            val reqDesktopStatus = SnowMessage.createRequest("desktop_status")
+            valid["request_desktop_status.json"] = JsonSerialization.toJson(reqDesktopStatus)
+
+            val respDesktopStatus = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "desktop_status",
+                    "data" to mapOf(
+                        "hostname" to "SNOW-LAPTOP",
+                        "cpu_percent" to 14.5,
+                        "memory_percent" to 42.0,
+                        "memory_total_mb" to 16384.0,
+                        "memory_used_mb" to 6881.0,
+                        "battery" to mapOf("available" to true, "percent" to 95.0, "power_plugged" to true),
+                        "uptime_seconds" to 3600.0
+                    )
+                )
+            )
+            valid["response_desktop_status.json"] = JsonSerialization.toJson(respDesktopStatus)
+
+            // 47. Valid desktop_exec request and response
+            val reqExec = SnowMessage.createRequest(
+                "desktop_exec",
+                mapOf("command" to "python --version", "timeout" to 15.0)
+            )
+            valid["request_desktop_exec.json"] = JsonSerialization.toJson(reqExec)
+
+            val respExec = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "desktop_exec",
+                    "data" to mapOf(
+                        "command" to "python --version",
+                        "stdout" to "Python 3.13.15\n",
+                        "stderr" to "",
+                        "exit_code" to 0,
+                        "truncated" to false,
+                        "duration_seconds" to 0.08
+                    )
+                )
+            )
+            valid["response_desktop_exec.json"] = JsonSerialization.toJson(respExec)
+
+            // 48. Valid desktop_app_launch request and response
+            val reqApp = SnowMessage.createRequest(
+                "desktop_app_launch",
+                mapOf("app_name" to "notepad")
+            )
+            valid["request_desktop_app_launch.json"] = JsonSerialization.toJson(reqApp)
+
+            val respApp = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "desktop_app_launch",
+                    "data" to mapOf(
+                        "success" to true,
+                        "status" to "SUCCESS",
+                        "app_name" to "notepad",
+                        "pid" to 12345,
+                        "message" to "Successfully launched notepad (PID 12345)."
+                    )
+                )
+            )
+            valid["response_desktop_app_launch.json"] = JsonSerialization.toJson(respApp)
+
+            // 49. Valid desktop_clipboard_get request and response
+            val reqClipGet = SnowMessage.createRequest("desktop_clipboard_get")
+            valid["request_desktop_clipboard_get.json"] = JsonSerialization.toJson(reqClipGet)
+
+            val respClipGet = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "desktop_clipboard_get",
+                    "data" to mapOf(
+                        "text" to "Cross-device synced text ❄️",
+                        "length" to 28
+                    )
+                )
+            )
+            valid["response_desktop_clipboard_get.json"] = JsonSerialization.toJson(respClipGet)
+
+            // 50. Valid desktop_clipboard_set request and response
+            val reqClipSet = SnowMessage.createRequest(
+                "desktop_clipboard_set",
+                mapOf("text" to "New clipboard text from Phone")
+            )
+            valid["request_desktop_clipboard_set.json"] = JsonSerialization.toJson(reqClipSet)
+
+            val respClipSet = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "desktop_clipboard_set",
+                    "data" to mapOf(
+                        "success" to true,
+                        "status" to "SUCCESS",
+                        "length" to 30
+                    )
+                )
+            )
+            valid["response_desktop_clipboard_set.json"] = JsonSerialization.toJson(respClipSet)
+
+            // 51. Valid desktop_file_list request and response
+            val reqFileList = SnowMessage.createRequest(
+                "desktop_file_list",
+                mapOf("path" to "Documents", "limit" to 20)
+            )
+            valid["request_desktop_file_list.json"] = JsonSerialization.toJson(reqFileList)
+
+            val respFileList = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "desktop_file_list",
+                    "data" to mapOf(
+                        "directory" to "Documents",
+                        "count" to 2,
+                        "files" to listOf(
+                            mapOf("name" to "report.pdf", "type" to "file", "size_bytes" to 10240, "modified_at" to "2026-11-17T08:00:00Z"),
+                            mapOf("name" to "Projects", "type" to "directory", "size_bytes" to 0, "modified_at" to "2026-11-17T08:00:00Z")
+                        )
+                    )
+                )
+            )
+            valid["response_desktop_file_list.json"] = JsonSerialization.toJson(respFileList)
+
+            // 52. Valid desktop_file_stage_download request and response
+            val reqStage = SnowMessage.createRequest(
+                "desktop_file_stage_download",
+                mapOf("file_path" to "report.pdf")
+            )
+            valid["request_desktop_file_stage_download.json"] = JsonSerialization.toJson(reqStage)
+
+            val respStage = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "desktop_file_stage_download",
+                    "data" to mapOf(
+                        "transfer_id" to UUID.randomUUID().toString(),
+                        "file_name" to "report.pdf",
+                        "file_size" to 10240,
+                        "sha256" to "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+                        "transfer_port" to 8766,
+                        "transfer_url" to "/api/v1/transfers/download/test-tid-10"
+                    )
+                )
+            )
+            valid["response_desktop_file_stage_download.json"] = JsonSerialization.toJson(respStage)
+
+            // 53. Valid send_message request and response
+            val reqMsg = SnowMessage.createRequest(
+                "send_message",
+                mapOf("recipient" to "+1234567890", "message" to "Emergency alert", "mode" to "intent")
+            )
+            valid["request_send_message.json"] = JsonSerialization.toJson(reqMsg)
+
+            val respMsg = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "send_message",
+                    "data" to mapOf(
+                        "status" to "success",
+                        "action" to "send_message",
+                        "mode" to "intent",
+                        "recipient" to "+1234567890",
+                        "result" to "INTENT_LAUNCHED",
+                        "message" to "Messaging composer intent launched on device."
+                    )
+                )
+            )
+            valid["response_send_message.json"] = JsonSerialization.toJson(respMsg)
+
             for ((filename, content) in valid) {
                 File(ktToPyValid, filename).writeText(content, Charsets.UTF_8)
             }

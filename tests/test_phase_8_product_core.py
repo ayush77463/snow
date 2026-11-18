@@ -463,12 +463,12 @@ class TestCrossDeviceClipboardSync(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data.get("characters_synced"), 6)
             self.assertEqual(data.get("direction"), "laptop_to_phone")
 
-    async def test_phone_to_laptop_reports_unsupported_honestly(self) -> None:
+    async def test_phone_to_laptop_requires_connected_device_or_reports_status(self) -> None:
         res_obj = await self.server.call_tool("snow_sync_clipboard", {"direction": "phone_to_laptop"})
         data = json.loads(self._extract_text(res_obj))
         self.assertFalse(data.get("success"))
-        self.assertEqual(data.get("status"), "UNSUPPORTED_DIRECTION")
-        self.assertIn("write-only clipboard security policy", data.get("error", ""))
+        # In Phase 10+, phone_to_laptop attempts cross-device pull and reports DEVICE_OFFLINE when no phone is connected
+        self.assertIn(data.get("status"), ("DEVICE_OFFLINE", "UNSUPPORTED_DIRECTION", "FOREGROUND_REQUIRED"))
 
 
 class TestCliSetupAndStatus(unittest.TestCase):

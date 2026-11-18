@@ -46,4 +46,16 @@
     <string name="filter_diagnostics">Diagnostics</string>
     <string name="btn_clear_log">Clear</string>
     <string name="empty_activity">No activity recorded yet.</string>
+
+    <!-- Remote Desktop Control (Phase 10) -->
+    <string name="title_remote_desktop">Remote Desktop Control</string>
+    <string name="subtitle_remote_desktop">Authenticated Phone → PC Capability Bridge</string>
+    <string name="btn_pc_status">Query PC Status</string>
+    <string name="btn_clipboard_to_pc">Phone → PC</string>
+    <string name="btn_clipboard_from_pc">PC → Phone</string>
+    <string name="btn_browse_pc_files">Browse PC Files</string>
+    <string name="btn_launch_app">Launch App</string>
+    <string name="btn_lock_pc">Lock PC</string>
+    <string name="btn_run_command">Run Command</string>
+    <string name="hint_pc_command">e.g. dir, python --version, hostname</string>
 </resources>

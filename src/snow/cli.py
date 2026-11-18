@@ -193,6 +193,50 @@ def run_daemon_stop() -> int:
         return 1
 
 
+def run_peer_trust(device_id: str, tier: str) -> int:
+    """Configure trust tier for a paired device."""
+    from snow.security.db import DatabaseManager
+    clean_id = device_id.strip()
+    clean_tier = tier.strip().lower()
+
+    if clean_tier not in ("owner", "peer"):
+        print(f"[-] Invalid tier '{tier}'. Must be 'owner' or 'peer'.")
+        return 1
+
+    db = DatabaseManager()
+    device = db.get_paired_device(clean_id)
+    if not device:
+        print(f"[-] Device [{clean_id}] is not registered as a paired device.")
+        return 1
+
+    success = db.update_device_trust_tier(clean_id, clean_tier)
+    if success:
+        print(f"[+] Successfully updated device [{clean_id}] ({device.device_name}) trust tier to '{clean_tier}'.")
+        return 0
+    else:
+        print(f"[-] Failed to update trust tier for device [{clean_id}].")
+        return 1
+
+
+def run_peer_list() -> int:
+    """List paired peer devices and their trust tiers."""
+    from snow.security.db import DatabaseManager
+    db = DatabaseManager()
+    devices = db.list_paired_devices()
+    print("=" * 65)
+    print(f"SNOW Paired Devices ({len(devices)} registered)")
+    print("=" * 65)
+    if not devices:
+        print("  No devices paired.")
+    for d in devices:
+        print(f"  - [{d.device_id}] {d.device_name}")
+        print(f"      Trust Tier:  {d.trust_tier.upper()}")
+        print(f"      Paired At:   {d.pairing_timestamp}")
+        print(f"      Last Seen:   {d.last_seen_timestamp}")
+    print("=" * 65)
+    return 0
+
+
 def main(args: Optional[list[str]] = None) -> int:
     """CLI entry point for the 'snow' command."""
     parser = argparse.ArgumentParser(
@@ -223,6 +267,14 @@ def main(args: Optional[list[str]] = None) -> int:
     start_parser.add_argument("--daemon", action="store_true", default=True)
     subparsers.add_parser("stop", help="Alias for daemon stop")
 
+    # peer
+    peer_parser = subparsers.add_parser("peer", help="Manage paired peer devices and trust tiers")
+    peer_sub = peer_parser.add_subparsers(dest="peer_action", help="Peer action")
+    peer_sub.add_parser("list", help="List paired devices and their trust tiers")
+    peer_trust = peer_sub.add_parser("trust", help="Configure trust tier for a paired device")
+    peer_trust.add_argument("device_id", help="Device ID (UUID) of the paired device")
+    peer_trust.add_argument("--tier", choices=["owner", "peer"], required=True, help="Trust tier (owner or peer)")
+
     parsed = parser.parse_args(args)
 
     if parsed.command == "setup":
@@ -236,6 +288,14 @@ def main(args: Optional[list[str]] = None) -> int:
             return run_daemon_stop()
         else:
             daemon_parser.print_help()
+            return 1
+    elif parsed.command == "peer":
+        if parsed.peer_action == "trust":
+            return run_peer_trust(parsed.device_id, parsed.tier)
+        elif parsed.peer_action == "list":
+            return run_peer_list()
+        else:
+            peer_parser.print_help()
             return 1
     elif parsed.command == "start":
         return run_daemon_start()

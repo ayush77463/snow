@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 from typing import List, Optional
 
 from snow.capabilities.windows import (
@@ -18,6 +20,7 @@ from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
 from snow.network.connection_manager import ConnectionManager
 from snow.network.discovery import SnowDiscoveryService
 from snow.network.ws_server import SnowWebSocketServer
+from snow.security.policy import PeerCapabilityPolicy
 from snow.transfer.http_server import SnowHttpTransferServer
 from snow.transfer.manager import TransferManager
 from snow.transfer.storage import TransferStorageManager
@@ -54,6 +57,17 @@ class SnowCoreServer:
         self.windows_apps = WindowsAppLauncher()
         self.windows_terminal = WindowsTerminalExecutor()
         self.windows_clipboard = WindowsClipboardManager()
+        data_dir = os.environ.get("SNOW_DATA_DIR")
+        base_dir = Path(data_dir).resolve() if data_dir else Path.home() / ".snow"
+        self.capability_policy = PeerCapabilityPolicy(policy_file=base_dir / "peer_policy.json")
+        self.ws_server.core_server = self
+        self.ws_server.windows_telemetry = self.windows_telemetry
+        self.ws_server.windows_processes = self.windows_processes
+        self.ws_server.windows_files = self.windows_files
+        self.ws_server.windows_apps = self.windows_apps
+        self.ws_server.windows_terminal = self.windows_terminal
+        self.ws_server.windows_clipboard = self.windows_clipboard
+        self.ws_server.capability_policy = self.capability_policy
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
         self.discovery_service: Optional[SnowDiscoveryService] = None
 

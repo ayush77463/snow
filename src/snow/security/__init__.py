@@ -1,5 +1,6 @@
 """Security, identity, pairing, TLS, and persistence facilities for SNOW."""
 
+from snow.security.context import ExecutionContext, ExecutionPrincipal
 from snow.security.db import (
     AuditEventRecord,
     DatabaseManager,
@@ -8,6 +9,19 @@ from snow.security.db import (
 )
 from snow.security.identity import DeviceIdentity, load_or_create_device_identity
 from snow.security.pairing import PairingManager, PairingOutcome, VerificationResult
+from snow.security.policy import (
+    ACTION_TO_CAPABILITY,
+    CAPABILITY_DESKTOP_APP_LAUNCH,
+    CAPABILITY_DESKTOP_CLIPBOARD_READ,
+    CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    CAPABILITY_DESKTOP_EXEC,
+    CAPABILITY_DESKTOP_FILES_DOWNLOAD,
+    CAPABILITY_DESKTOP_FILES_LIST,
+    CAPABILITY_DESKTOP_STATUS,
+    CAPABILITY_FILE_TRANSFER,
+    DEFAULT_PAIRED_CAPABILITIES,
+    PeerCapabilityPolicy,
+)
 from snow.security.session import SessionManager, SessionRecord
 from snow.security.tls import (
     CertificateInfo,
@@ -25,9 +39,12 @@ __all__ = [
     "CertificateInfo",
     "DatabaseManager",
     "DeviceIdentity",
+    "ExecutionContext",
+    "ExecutionPrincipal",
     "PairedDeviceRecord",
     "PairingManager",
     "PairingOutcome",
+    "PeerCapabilityPolicy",
     "SessionManager",
     "SessionRecord",
     "VerificationResult",
