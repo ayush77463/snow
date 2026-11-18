@@ -22,6 +22,7 @@ from snow.network.connection_manager import ConnectionManager
 from snow.network.discovery import SnowDiscoveryService
 from snow.network.registry import NodeRegistry
 from snow.network.ws_server import SnowWebSocketServer
+from snow.security.db import DatabaseManager
 from snow.security.policy import PeerCapabilityPolicy
 from snow.transfer.http_server import SnowHttpTransferServer
 from snow.transfer.manager import TransferManager
@@ -37,7 +38,11 @@ class SnowCoreServer:
     enumeration, WebSocket server hosting, and graceful shutdown.
     """
 
-    def __init__(self, config: Optional[CoreConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[CoreConfig] = None,
+        db_manager: Optional[DatabaseManager] = None,
+    ) -> None:
         self.config = config or CoreConfig.from_env()
         self._is_running = False
         self._shutdown_event = asyncio.Event()
@@ -50,6 +55,7 @@ class SnowCoreServer:
             connection_manager=self.connection_manager,
             transfer_manager=self.transfer_manager,
             storage_manager=self.storage_manager,
+            db_manager=db_manager,
         )
         self.http_transfer_server: Optional[SnowHttpTransferServer] = None
         self.windows_telemetry = WindowsTelemetry()

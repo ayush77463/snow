@@ -45,6 +45,7 @@ from snow.core.ipc import SnowIpcServer
 from snow.core.server import SnowCoreServer
 from snow.mcp.bridge import SnowMcpBridge
 from snow.network.ws_server import SnowWebSocketServer
+from snow.security.db import DatabaseManager
 from snow.protocol.constants import ErrorCode
 from snow.protocol.models import SnowMessage
 from snow.security.context import ExecutionContext, ExecutionPrincipal
@@ -384,15 +385,23 @@ class TestUnifiedDispatch(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.mkdtemp(prefix="snow_test_unified_")
+        self._prev_env = os.environ.get("SNOW_DATA_DIR")
+        os.environ["SNOW_DATA_DIR"] = self.temp_dir
+        self.db_path = Path(self.temp_dir) / "test_devices.db"
+        self.db = DatabaseManager(self.db_path)
         self.config = CoreConfig(
             port=59997,
             transfer_port=59996,
             ipc_port=59995,
             transfer_root=self.temp_dir,
         )
-        self.server = SnowCoreServer(config=self.config)
+        self.server = SnowCoreServer(config=self.config, db_manager=self.db)
 
     async def asyncTearDown(self) -> None:
+        if self._prev_env is not None:
+            os.environ["SNOW_DATA_DIR"] = self._prev_env
+        else:
+            os.environ.pop("SNOW_DATA_DIR", None)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_core_server_initializes_shared_capability_engine(self) -> None:

@@ -389,6 +389,7 @@ class CapabilityEngine:
                 else:
                     logger.warning("Invalid or expired confirmation ticket from [%s]", ctx.device_id)
                     confirmed = False
+                    confirmation_ticket = None
 
             res = await self.terminal.execute_command(
                 command=command.strip(),

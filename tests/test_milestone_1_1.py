@@ -16,10 +16,13 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
 from snow.core.config import CoreConfig
+from snow.security.db import DatabaseManager
 from snow.core.network import (
     NetworkInterfaceInfo,
     _detect_via_socket_fallback,
@@ -225,9 +228,22 @@ class TestCoreConfig(unittest.TestCase):
 class TestSnowCoreServerLifecycle(unittest.TestCase):
     """Validate async server lifecycle, idempotence, and clean state transitions."""
 
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="snow_test_m11_")
+        self._prev_env = os.environ.get("SNOW_DATA_DIR")
+        os.environ["SNOW_DATA_DIR"] = self.temp_dir.name
+        self.test_db = DatabaseManager(Path(self.temp_dir.name) / "test_devices.db")
+
+    def tearDown(self) -> None:
+        if self._prev_env is not None:
+            os.environ["SNOW_DATA_DIR"] = self._prev_env
+        else:
+            os.environ.pop("SNOW_DATA_DIR", None)
+        self.temp_dir.cleanup()
+
     def _create_test_server(self) -> SnowCoreServer:
         config = CoreConfig(bind_host="127.0.0.1", port=_get_free_port(), tls_enabled=False)
-        return SnowCoreServer(config=config)
+        return SnowCoreServer(config=config, db_manager=self.test_db)
 
     def test_server_startup_and_shutdown(self):
         """Verify start(), is_running, and stop() in an asyncio loop."""

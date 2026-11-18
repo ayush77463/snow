@@ -432,7 +432,7 @@ class TestCrossDeviceClipboardSync(unittest.IsolatedAsyncioTestCase):
     """Test clipboard synchronization tool routing and honest limitations."""
 
     async def asyncSetUp(self) -> None:
-        self.bridge = SnowMcpBridge(host="127.0.0.1", port=59996, secret="sec")
+        self.bridge = SnowMcpBridge(host="127.0.0.1", port=59996, secret="sec", auto_start_core=False)
         self.server = create_snow_mcp_server(bridge=self.bridge)
 
     def _extract_text(self, res_obj: Any) -> str:
@@ -464,11 +464,16 @@ class TestCrossDeviceClipboardSync(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data.get("direction"), "laptop_to_phone")
 
     async def test_phone_to_laptop_requires_connected_device_or_reports_status(self) -> None:
-        res_obj = await self.server.call_tool("snow_sync_clipboard", {"direction": "phone_to_laptop"})
-        data = json.loads(self._extract_text(res_obj))
-        self.assertFalse(data.get("success"))
-        # In Phase 10+, phone_to_laptop attempts cross-device pull and reports DEVICE_OFFLINE when no phone is connected
-        self.assertIn(data.get("status"), ("DEVICE_OFFLINE", "UNSUPPORTED_DIRECTION", "FOREGROUND_REQUIRED"))
+        with patch.object(
+            self.bridge.daemon_manager,
+            "ensure_core_running",
+            AsyncMock(return_value={"success": False, "status": "CORE_OFFLINE"}),
+        ):
+            res_obj = await self.server.call_tool("snow_sync_clipboard", {"direction": "phone_to_laptop"})
+            data = json.loads(self._extract_text(res_obj))
+            self.assertFalse(data.get("success"))
+            # In Phase 10+, phone_to_laptop attempts cross-device pull and reports DEVICE_OFFLINE when no phone is connected
+            self.assertIn(data.get("status"), ("DEVICE_OFFLINE", "UNSUPPORTED_DIRECTION", "FOREGROUND_REQUIRED", "CORE_OFFLINE"))
 
 
 class TestCliSetupAndStatus(unittest.TestCase):
