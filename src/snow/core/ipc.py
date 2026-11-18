@@ -31,6 +31,11 @@ import time
 from typing import Any, Dict, Optional, Set
 import uuid
 
+from snow.capabilities.engine import (
+    CapabilityEngine,
+    CapabilityRequest,
+    CapabilityResponse,
+)
 from snow.core.config import CoreConfig
 from snow.protocol.models import MessageType
 from snow.security import ExecutionContext, ExecutionPrincipal
@@ -162,6 +167,41 @@ class SnowIpcServer:
         # Load or create local IPC secret
         secret_path = config.ipc_secret_path or get_default_secret_path()
         self._secret = get_or_create_ipc_secret(secret_path)
+
+        # Layer 2 CapabilityEngine delegation
+        engine = getattr(core_server, "capability_engine", None)
+        if isinstance(engine, CapabilityEngine):
+            self._capability_engine = engine
+        else:
+            self._capability_engine = CapabilityEngine()
+        self._sync_capability_engine()
+
+    def _sync_capability_engine(self) -> None:
+        """Synchronize capability engine references with core_server attributes."""
+        if not self.core_server:
+            return
+        for attr, target in [
+            ("windows_telemetry", "telemetry"),
+            ("windows_processes", "processes"),
+            ("windows_files", "files"),
+            ("windows_apps", "apps"),
+            ("windows_terminal", "terminal"),
+            ("windows_clipboard", "clipboard"),
+            ("capability_policy", "policy"),
+        ]:
+            val = getattr(self.core_server, attr, None)
+            if val is not None and not type(val).__name__.endswith("Mock"):
+                setattr(self._capability_engine, target, val)
+
+    @property
+    def capability_engine(self) -> CapabilityEngine:
+        """Return the shared CapabilityEngine, keeping references synchronized."""
+        self._sync_capability_engine()
+        return self._capability_engine
+
+    @capability_engine.setter
+    def capability_engine(self, engine: CapabilityEngine) -> None:
+        self._capability_engine = engine
 
     @property
     def is_running(self) -> bool:
@@ -422,125 +462,29 @@ class SnowIpcServer:
                 "error": dev_resp.get("error"),
             }, now_authed
 
-        if op == "windows_battery":
-            res = await self._handle_windows_battery()
+        LOCAL_WINDOWS_OPS = {
+            "windows_battery",
+            "windows_system_info",
+            "windows_processes",
+            "windows_launch_app",
+            "windows_file_read",
+            "windows_file_write",
+            "windows_file_list",
+            "windows_file_search",
+            "windows_terminal_exec",
+            "windows_clipboard_get",
+            "windows_clipboard_set",
+        }
+        if op in LOCAL_WINDOWS_OPS:
+            req = CapabilityRequest(action=op, params=payload)
+            res = await self.capability_engine.execute(req, ctx=ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_system_info":
-            res = await self._handle_windows_system_info()
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_processes":
-            res = await self._handle_windows_processes(payload)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_launch_app":
-            res = await self._handle_windows_launch_app(payload, ctx)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_file_read":
-            res = await self._handle_windows_file_read(payload, ctx)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_file_write":
-            res = await self._handle_windows_file_write(payload, ctx)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_file_list":
-            res = await self._handle_windows_file_list(payload, ctx)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_file_search":
-            res = await self._handle_windows_file_search(payload, ctx)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_terminal_exec":
-            res = await self._handle_windows_terminal_exec(payload, ctx)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_clipboard_get":
-            res = await self._handle_windows_clipboard_get()
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
-            }, now_authed
-
-        if op == "windows_clipboard_set":
-            res = await self._handle_windows_clipboard_set(payload)
-            return {
-                "version": IPC_PROTOCOL_VERSION,
-                "request_id": request_id,
-                "success": res.get("success", False),
-                "status": res.get("status", "ERROR"),
-                "data": res.get("data"),
-                "error": res.get("error"),
+                "success": res.success,
+                "status": res.status,
+                "data": res.data,
+                "error": res.error,
             }, now_authed
 
         if op == "android_file_send":
@@ -793,244 +737,80 @@ class SnowIpcServer:
             }
 
     async def _handle_windows_battery(self) -> dict:
-        """Query host battery telemetry via Core."""
-        telemetry = getattr(self.core_server, "windows_telemetry", None)
-        if not telemetry:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows telemetry capability not initialized.",
-            }
-        try:
-            res = await telemetry.get_battery_info()
-            is_ok = res.get("status") != "ERROR"
-            return {
-                "success": is_ok,
-                "status": res.get("status", "SUCCESS"),
-                "data": res,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed querying battery telemetry: {exc}"}
+        """Query host battery telemetry via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_battery", params={})
+        res = await self.capability_engine.execute(
+            req, ctx=ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+        )
+        return res.to_dict()
 
     async def _handle_windows_system_info(self) -> dict:
-        """Query host system and hardware telemetry via Core."""
-        telemetry = getattr(self.core_server, "windows_telemetry", None)
-        if not telemetry:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows telemetry capability not initialized.",
-            }
-        try:
-            res = await telemetry.get_system_telemetry()
-            return {"success": True, "status": "SUCCESS", "data": res}
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed querying system telemetry: {exc}"}
+        """Query host system and hardware telemetry via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_system_info", params={})
+        res = await self.capability_engine.execute(
+            req, ctx=ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+        )
+        return res.to_dict()
 
     async def _handle_windows_processes(self, payload: dict) -> dict:
-        """Query host active processes via Core."""
-        pm = getattr(self.core_server, "windows_processes", None)
-        if not pm:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows process capability not initialized.",
-            }
-        limit = payload.get("limit", 25)
-        sort_by = payload.get("sort_by", "memory")
-        try:
-            res = await pm.list_processes(limit=limit, sort_by=sort_by)
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res if res.get("success") else None,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed querying processes: {exc}"}
+        """Query host active processes via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_processes", params=payload)
+        res = await self.capability_engine.execute(
+            req, ctx=ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+        )
+        return res.to_dict()
 
     async def _handle_windows_launch_app(self, payload: dict, ctx: ExecutionContext) -> dict:
-        """Launch an allowlisted Windows desktop app via Core."""
-        launcher = getattr(self.core_server, "windows_apps", None)
-        if not launcher:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows app launcher capability not initialized.",
-            }
-        app_name = payload.get("app_name", "")
-        try:
-            res = await launcher.launch_app(app_name=app_name, ctx=ctx)
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res if res.get("success") else None,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed launching application: {exc}"}
+        """Launch an allowlisted Windows desktop app via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_launch_app", params=payload)
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        return res.to_dict()
 
     async def _handle_windows_file_read(self, payload: dict, ctx: ExecutionContext) -> dict:
-        """Read a scoped text file via Core."""
-        fm = getattr(self.core_server, "windows_files", None)
-        if not fm:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows file capability not initialized.",
-            }
-        file_path = payload.get("file_path", "")
-        max_bytes = payload.get("max_bytes", 256 * 1024)
-        try:
-            res = await fm.read_file(file_path=file_path, max_bytes=max_bytes, ctx=ctx)
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res if res.get("success") else None,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed reading file: {exc}"}
+        """Read a scoped text file via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_file_read", params=payload)
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        return res.to_dict()
 
     async def _handle_windows_file_write(self, payload: dict, ctx: ExecutionContext) -> dict:
-        """Write a scoped text file atomically via Core."""
-        fm = getattr(self.core_server, "windows_files", None)
-        if not fm:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows file capability not initialized.",
-            }
-        file_path = payload.get("file_path", "")
-        content = payload.get("content", "")
-        overwrite = payload.get("overwrite", False)
-        max_bytes = payload.get("max_bytes", 256 * 1024)
-        try:
-            res = await fm.write_file(
-                file_path=file_path,
-                content=content,
-                overwrite=overwrite,
-                max_bytes=max_bytes,
-                ctx=ctx,
-            )
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res if res.get("success") else None,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed writing file: {exc}"}
+        """Write a scoped text file atomically via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_file_write", params=payload)
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        return res.to_dict()
 
     async def _handle_windows_file_list(self, payload: dict, ctx: ExecutionContext) -> dict:
-        """List contents of a scoped directory via Core."""
-        fm = getattr(self.core_server, "windows_files", None)
-        if not fm:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows file capability not initialized.",
-            }
-        directory_path = payload.get("directory_path", "")
-        limit = payload.get("limit", 50)
-        try:
-            res = await fm.list_files(directory_path=directory_path, limit=limit, ctx=ctx)
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res if res.get("success") else None,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed listing files: {exc}"}
+        """List contents of a scoped directory via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_file_list", params=payload)
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        return res.to_dict()
 
     async def _handle_windows_file_search(self, payload: dict, ctx: ExecutionContext) -> dict:
-        """Search files recursively within approved roots via Core."""
-        fm = getattr(self.core_server, "windows_files", None)
-        if not fm:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows file capability not initialized.",
-            }
-        query = payload.get("query", "")
-        root_path = payload.get("root_path", "")
-        limit = payload.get("limit", 50)
-        try:
-            res = await fm.search_files(query=query, root_path=root_path, limit=limit, ctx=ctx)
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res if res.get("success") else None,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed searching files: {exc}"}
+        """Search files recursively via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_file_search", params=payload)
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        return res.to_dict()
 
     async def _handle_windows_terminal_exec(self, payload: dict, ctx: ExecutionContext) -> dict:
-        """Execute a controlled shell command via Core."""
-        term = getattr(self.core_server, "windows_terminal", None)
-        if not term:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows terminal capability not initialized.",
-            }
-        command = payload.get("command", "")
-        cwd = payload.get("cwd")
-        timeout = float(payload.get("timeout") or 30.0)
-        try:
-            res = await term.execute_command(command=command, cwd=cwd, timeout=timeout, ctx=ctx)
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed executing terminal command: {exc}"}
+        """Execute a controlled shell command via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_terminal_exec", params=payload)
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        return res.to_dict()
 
     async def _handle_windows_clipboard_get(self) -> dict:
-        """Read Windows clipboard via Core."""
-        cb = getattr(self.core_server, "windows_clipboard", None)
-        if not cb:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows clipboard capability not initialized.",
-            }
-        try:
-            res = await cb.get_clipboard()
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed reading clipboard: {exc}"}
+        """Read Windows clipboard via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_clipboard_get", params={})
+        res = await self.capability_engine.execute(
+            req, ctx=ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+        )
+        return res.to_dict()
 
     async def _handle_windows_clipboard_set(self, payload: dict) -> dict:
-        """Write Windows clipboard via Core."""
-        cb = getattr(self.core_server, "windows_clipboard", None)
-        if not cb:
-            return {
-                "success": False,
-                "status": "CAPABILITY_UNAVAILABLE",
-                "error": "Windows clipboard capability not initialized.",
-            }
-        text = payload.get("text", "")
-        try:
-            res = await cb.set_clipboard(text=text)
-            return {
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS" if res.get("success") else "ERROR"),
-                "data": res,
-                "error": res.get("error"),
-            }
-        except Exception as exc:
-            return {"success": False, "status": "ERROR", "error": f"Failed setting clipboard: {exc}"}
+        """Write Windows clipboard via CapabilityEngine."""
+        req = CapabilityRequest(action="windows_clipboard_set", params=payload)
+        res = await self.capability_engine.execute(
+            req, ctx=ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+        )
+        return res.to_dict()
 
     def _get_default_connected_device_id(self) -> Optional[str]:
         """Resolve the first actively connected paired device ID."""

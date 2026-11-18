@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+from snow.capabilities.engine import CapabilityEngine
 from snow.capabilities.windows import (
     WindowsAppLauncher,
     WindowsClipboardManager,
@@ -60,6 +61,15 @@ class SnowCoreServer:
         data_dir = os.environ.get("SNOW_DATA_DIR")
         base_dir = Path(data_dir).resolve() if data_dir else Path.home() / ".snow"
         self.capability_policy = PeerCapabilityPolicy(policy_file=base_dir / "peer_policy.json")
+        self.capability_engine = CapabilityEngine(
+            telemetry=self.windows_telemetry,
+            processes=self.windows_processes,
+            files=self.windows_files,
+            apps=self.windows_apps,
+            terminal=self.windows_terminal,
+            clipboard=self.windows_clipboard,
+            policy=self.capability_policy,
+        )
         self.ws_server.core_server = self
         self.ws_server.windows_telemetry = self.windows_telemetry
         self.ws_server.windows_processes = self.windows_processes
@@ -68,7 +78,9 @@ class SnowCoreServer:
         self.ws_server.windows_terminal = self.windows_terminal
         self.ws_server.windows_clipboard = self.windows_clipboard
         self.ws_server.capability_policy = self.capability_policy
+        self.ws_server.capability_engine = self.capability_engine
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
+        self.ipc_server.capability_engine = self.capability_engine
         self.discovery_service: Optional[SnowDiscoveryService] = None
 
     @property

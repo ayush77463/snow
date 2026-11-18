@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import uuid
 
+from snow.capabilities.engine import CapabilityEngine, CapabilityRequest, CapabilityResponse
 from snow.capabilities.windows.apps import WindowsAppLauncher
 from snow.capabilities.windows.clipboard import WindowsClipboardManager
 from snow.capabilities.windows.files import WindowsFileManager
@@ -153,13 +154,14 @@ class SnowMcpBridge:
         self._explicit_secret = secret
         self.secret_path = Path(secret_path) if secret_path else get_default_secret_path()
 
-        # In-process Windows capability instances
-        self.local_telemetry = WindowsTelemetry()
-        self.local_processes = WindowsProcessMonitor()
-        self.local_files = WindowsFileManager(allowed_roots=allowed_roots)
-        self.local_apps = WindowsAppLauncher()
-        self.local_terminal = WindowsTerminalExecutor()
-        self.local_clipboard = WindowsClipboardManager()
+        # In-process CapabilityEngine for local Windows execution
+        self.capability_engine = CapabilityEngine(allowed_roots=allowed_roots)
+        self.local_telemetry = self.capability_engine.telemetry
+        self.local_processes = self.capability_engine.processes
+        self.local_files = self.capability_engine.files
+        self.local_apps = self.capability_engine.apps
+        self.local_terminal = self.capability_engine.terminal
+        self.local_clipboard = self.capability_engine.clipboard
 
         # Daemon lifecycle manager for cross-device requests
         self.daemon_manager = CoreDaemonManager(host=self.host, port=self.port)
@@ -331,33 +333,23 @@ class SnowMcpBridge:
         return await self.call_cross_device("device_request", payload=payload, timeout=timeout + 5.0)
 
     async def _execute_local_or_ipc(
-        self, op: str, payload: Optional[dict[str, Any]], local_coro_fn: Any
+        self, op: str, payload: Optional[dict[str, Any]] = None
     ) -> dict[str, Any]:
         """Dual-path execution for local Windows tools.
 
         If Core IPC is online and reachable, leverages Core IPC.
-        If Core is offline or unavailable, executes in-process directly without error.
+        If Core is offline or unavailable, executes in-process directly via CapabilityEngine.
         """
         if await self.daemon_manager.is_ipc_ready(timeout=0.05):
             ipc_res = await self.call(op, payload=payload, timeout=5.0)
             if ipc_res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
                 return ipc_res
 
-        # In-process execution fallback
-        res = await local_coro_fn()
-        # Normalize in-process result
-        if "data" in res and "success" in res:
-            return res
-        is_success = res.get("success", True) if isinstance(res, dict) else True
-        if isinstance(res, dict) and "status" in res and res.get("status") in ("ERROR", "PATH_NOT_ALLOWED", "APP_NOT_ALLOWED", "INVALID_ARGUMENT", "FILE_NOT_FOUND", "FILE_ALREADY_EXISTS", "POLICY_DENIED"):
-            is_success = False
-
-        return {
-            "success": is_success,
-            "status": res.get("status", "SUCCESS" if is_success else "ERROR") if isinstance(res, dict) else "SUCCESS",
-            "data": res if is_success else None,
-            "error": res.get("error") if isinstance(res, dict) else None,
-        }
+        # In-process execution via shared CapabilityEngine (stamped as AI_MCP)
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
+        req = CapabilityRequest(action=op, params=payload or {})
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        return res.to_dict()
 
     # =========================================================================
     # Local Windows Tools (Standalone In-Process with IPC Fallback / Dual-Path)
@@ -365,48 +357,32 @@ class SnowMcpBridge:
 
     async def windows_battery(self) -> dict[str, Any]:
         """Query host battery telemetry via Core IPC or in-process."""
-        return await self._execute_local_or_ipc(
-            "windows_battery",
-            {},
-            self.local_telemetry.get_battery_info,
-        )
+        return await self._execute_local_or_ipc("windows_battery", {})
 
     async def windows_system_info(self) -> dict[str, Any]:
         """Query host system and hardware telemetry via Core IPC or in-process."""
-        return await self._execute_local_or_ipc(
-            "windows_system_info",
-            {},
-            self.local_telemetry.get_system_telemetry,
-        )
+        return await self._execute_local_or_ipc("windows_system_info", {})
 
     async def windows_processes(
         self, limit: int = 25, sort_by: str = "memory"
     ) -> dict[str, Any]:
         """Query host active processes via Core IPC or in-process."""
         return await self._execute_local_or_ipc(
-            "windows_processes",
-            {"limit": limit, "sort_by": sort_by},
-            lambda: self.local_processes.list_processes(limit=limit, sort_by=sort_by),
+            "windows_processes", {"limit": limit, "sort_by": sort_by}
         )
 
     async def windows_launch_app(self, app_name: str) -> dict[str, Any]:
         """Launch an allowlisted Windows desktop app via Core IPC or in-process."""
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
-            "windows_launch_app",
-            {"app_name": app_name},
-            lambda: self.local_apps.launch_app(app_name=app_name, ctx=ctx),
+            "windows_launch_app", {"app_name": app_name}
         )
 
     async def windows_file_read(
         self, file_path: str, max_bytes: int = 256 * 1024
     ) -> dict[str, Any]:
         """Read a scoped text file via Core IPC or in-process."""
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
-            "windows_file_read",
-            {"file_path": file_path, "max_bytes": max_bytes},
-            lambda: self.local_files.read_file(file_path=file_path, max_bytes=max_bytes, ctx=ctx),
+            "windows_file_read", {"file_path": file_path, "max_bytes": max_bytes}
         )
 
     async def windows_file_write(
@@ -417,7 +393,6 @@ class SnowMcpBridge:
         max_bytes: int = 256 * 1024,
     ) -> dict[str, Any]:
         """Write a scoped text file atomically via Core IPC or in-process."""
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_file_write",
             {
@@ -426,35 +401,23 @@ class SnowMcpBridge:
                 "overwrite": overwrite,
                 "max_bytes": max_bytes,
             },
-            lambda: self.local_files.write_file(
-                file_path=file_path,
-                content=content,
-                overwrite=overwrite,
-                max_bytes=max_bytes,
-                ctx=ctx,
-            ),
         )
 
     async def windows_file_list(
         self, directory_path: str = "", limit: int = 50
     ) -> dict[str, Any]:
         """List contents of a scoped directory via Core IPC or in-process."""
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
-            "windows_file_list",
-            {"directory_path": directory_path, "limit": limit},
-            lambda: self.local_files.list_files(directory_path=directory_path, limit=limit, ctx=ctx),
+            "windows_file_list", {"directory_path": directory_path, "limit": limit}
         )
 
     async def windows_file_search(
         self, query: str, root_path: str = "", limit: int = 50
     ) -> dict[str, Any]:
         """Search files recursively via Core IPC or in-process."""
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_file_search",
             {"query": query, "root_path": root_path, "limit": limit},
-            lambda: self.local_files.search_files(query=query, root_path=root_path, limit=limit, ctx=ctx),
         )
 
     async def windows_terminal_exec(
@@ -464,28 +427,18 @@ class SnowMcpBridge:
         timeout: float = 30.0,
     ) -> dict[str, Any]:
         """Execute a shell command via Core IPC or in-process."""
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         return await self._execute_local_or_ipc(
             "windows_terminal_exec",
             {"command": command, "cwd": cwd, "timeout": timeout},
-            lambda: self.local_terminal.execute_command(command=command, cwd=cwd, timeout=timeout, ctx=ctx),
         )
 
     async def windows_clipboard_get(self) -> dict[str, Any]:
         """Read text from Windows clipboard via Core IPC or in-process."""
-        return await self._execute_local_or_ipc(
-            "windows_clipboard_get",
-            {},
-            self.local_clipboard.get_clipboard,
-        )
+        return await self._execute_local_or_ipc("windows_clipboard_get", {})
 
     async def windows_clipboard_set(self, text: str) -> dict[str, Any]:
         """Write text to Windows clipboard via Core IPC or in-process."""
-        return await self._execute_local_or_ipc(
-            "windows_clipboard_set",
-            {"text": text},
-            lambda: self.local_clipboard.set_clipboard(text=text),
-        )
+        return await self._execute_local_or_ipc("windows_clipboard_set", {"text": text})
 
     # =========================================================================
     # Android Tools (Cross-Device via Core IPC)

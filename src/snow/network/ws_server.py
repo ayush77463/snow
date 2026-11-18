@@ -23,6 +23,11 @@ from snow.capabilities.windows import (
     WindowsTelemetry,
     WindowsTerminalExecutor,
 )
+from snow.capabilities.engine import (
+    CapabilityEngine,
+    CapabilityRequest,
+    CapabilityResponse,
+)
 from snow.core.config import CoreConfig
 from snow.network.connection_manager import ConnectionManager
 from snow.protocol.constants import ErrorCode, MessageType
@@ -101,6 +106,19 @@ class SnowWebSocketServer:
             getattr(core_server, "capability_policy", None)
             or PeerCapabilityPolicy()
         )
+        engine = getattr(core_server, "capability_engine", None) if core_server else None
+        if isinstance(engine, CapabilityEngine):
+            self._capability_engine = engine
+        else:
+            self._capability_engine = CapabilityEngine(
+                telemetry=self.windows_telemetry,
+                processes=self.windows_processes,
+                files=self.windows_files,
+                apps=self.windows_apps,
+                terminal=self.windows_terminal,
+                clipboard=self.windows_clipboard,
+                policy=self.capability_policy,
+            )
         self.http_transfer_server: Any = None
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
@@ -110,6 +128,33 @@ class SnowWebSocketServer:
         self._ssl_context: Optional[ssl.SSLContext] = None
         self._auth_timers: dict[str, asyncio.Task] = {}
         self._pairing_in_progress: set[str] = set()
+
+    def _sync_capability_engine(self) -> None:
+        """Synchronize capability engine references with server attributes."""
+        if not hasattr(self, "_capability_engine") or self._capability_engine is None:
+            return
+        for attr, target in [
+            ("windows_telemetry", "telemetry"),
+            ("windows_processes", "processes"),
+            ("windows_files", "files"),
+            ("windows_apps", "apps"),
+            ("windows_terminal", "terminal"),
+            ("windows_clipboard", "clipboard"),
+            ("capability_policy", "policy"),
+        ]:
+            val = getattr(self, attr, None)
+            if val is not None and not type(val).__name__.endswith("Mock"):
+                setattr(self._capability_engine, target, val)
+
+    @property
+    def capability_engine(self) -> CapabilityEngine:
+        """Return the shared CapabilityEngine, keeping references synchronized."""
+        self._sync_capability_engine()
+        return self._capability_engine
+
+    @capability_engine.setter
+    def capability_engine(self, engine: CapabilityEngine) -> None:
+        self._capability_engine = engine
 
     @property
     def is_running(self) -> bool:
@@ -1067,10 +1112,15 @@ class SnowWebSocketServer:
         session,
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
-        """Handle request for desktop telemetry and battery status."""
+        """Handle request for desktop telemetry and battery status via CapabilityEngine."""
         try:
-            sys_info = await self.windows_telemetry.get_system_telemetry()
-            battery_info = await self.windows_telemetry.get_battery_info()
+            req = CapabilityRequest(action="desktop_status", params=data)
+            res = await self.capability_engine.execute(req, ctx=ctx)
+            sys_info = res.data or {}
+            battery_res = await self.capability_engine.execute(
+                CapabilityRequest(action="desktop_battery", params={}), ctx=ctx
+            )
+            battery_info = battery_res.data or {}
             cpu_data = sys_info.get("cpu", {})
             mem_data = sys_info.get("memory", {})
 
@@ -1110,7 +1160,7 @@ class SnowWebSocketServer:
         session,
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
-        """Handle execution of a terminal command with security policies."""
+        """Handle execution of a terminal command via CapabilityEngine."""
         if not data.get("confirmed"):
             logger.warning(
                 "Rejected unconfirmed desktop_exec request from client [%s]",
@@ -1134,31 +1184,24 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
-        timeout = 30.0
-        if "timeout" in data:
-            try:
-                timeout = max(1.0, min(float(data["timeout"]), 60.0))
-            except (ValueError, TypeError):
-                timeout = 30.0
+        req = CapabilityRequest(action="desktop_exec", params=data)
+        res = await self.capability_engine.execute(req, ctx=ctx)
 
-        cwd = data.get("cwd")
-        result = await self.windows_terminal.execute_command(
-            command=command.strip(), cwd=cwd, timeout=timeout, ctx=ctx
-        )
-
+        result = res.data or {}
+        command_str = command.strip()
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
-                "status": "success" if result.get("success") else "error",
+                "status": "success" if res.success else "error",
                 "action": "desktop_exec",
-                "error": result.get("error") if not result.get("success") else None,
+                "error": res.error or result.get("error"),
                 "data": {
-                    "command": command,
+                    "command": command_str,
                     "stdout": result.get("stdout", ""),
                     "stderr": result.get("stderr", ""),
-                    "exit_code": result.get("exit_code", -1),
-                    "truncated": result.get("truncated", False),
-                    "duration_seconds": result.get("duration_seconds", 0.0),
+                    "exit_code": result.get("exit_code"),
+                    "truncated": result.get("truncated", False) or result.get("stdout_truncated", False),
+                    "duration_seconds": result.get("duration_seconds", result.get("execution_time_ms", 0.0) / 1000.0),
                 },
             },
         )
@@ -1172,54 +1215,16 @@ class SnowWebSocketServer:
         session,
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
-        """Handle request to launch an allowlisted Windows app or lock workstation."""
-        app_name = data.get("app_name")
-        if not app_name or not isinstance(app_name, str):
-            error_response = SnowMessage.create_error(
-                code=ErrorCode.INVALID_PAYLOAD,
-                message="app_name must be a non-empty string.",
-                correlation_id=message.id,
-            )
-            await client.websocket.send(error_response.to_json())
-            return
-
-        canonical = app_name.strip().lower()
-        if canonical == "lock_screen":
-            success = True
-            msg = "Workstation locked successfully."
-            if sys.platform == "win32":
-                try:
-                    res = ctypes.windll.user32.LockWorkStation()
-                    success = bool(res != 0)
-                    if not success:
-                        msg = "LockWorkStation returned 0."
-                except Exception as exc:
-                    success = False
-                    msg = str(exc)
-
-            response = SnowMessage.create_response(
-                correlation_id=message.id,
-                payload={
-                    "status": "success" if success else "error",
-                    "action": "desktop_app_launch",
-                    "data": {
-                        "app_name": "lock_screen",
-                        "status": "SUCCESS" if success else "FAILED",
-                        "message": msg,
-                    },
-                },
-            )
-            await client.websocket.send(response.to_json())
-            return
-
-        result = await self.windows_apps.launch_app(canonical, ctx=ctx)
+        """Handle request to launch an allowlisted Windows app or lock workstation via CapabilityEngine."""
+        req = CapabilityRequest(action="desktop_app_launch", params=data)
+        res = await self.capability_engine.execute(req, ctx=ctx)
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
-                "status": "success" if result.get("success") else "error",
+                "status": "success" if res.success else "error",
                 "action": "desktop_app_launch",
-                "error": result.get("error") if not result.get("success") else None,
-                "data": result,
+                "error": res.error,
+                "data": res.data,
             },
         )
         await client.websocket.send(response.to_json())
@@ -1232,14 +1237,16 @@ class SnowWebSocketServer:
         session,
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
-        """Handle request to read Windows clipboard text."""
-        result = await self.windows_clipboard.get_clipboard()
+        """Handle request to read Windows clipboard text via CapabilityEngine."""
+        req = CapabilityRequest(action="desktop_clipboard_get", params=data)
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        result = res.data or {}
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
-                "status": "success" if result.get("success") else "error",
+                "status": "success" if res.success else "error",
                 "action": "desktop_clipboard_get",
-                "error": result.get("error") if not result.get("success") else None,
+                "error": res.error,
                 "data": {
                     "text": result.get("text", ""),
                     "length": result.get("length", 0),
@@ -1256,7 +1263,7 @@ class SnowWebSocketServer:
         session,
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
-        """Handle request to write text to Windows clipboard."""
+        """Handle request to write text to Windows clipboard via CapabilityEngine."""
         text = data.get("text")
         if text is None or not isinstance(text, str):
             error_response = SnowMessage.create_error(
@@ -1276,14 +1283,15 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
-        result = await self.windows_clipboard.set_clipboard(text)
+        req = CapabilityRequest(action="desktop_clipboard_set", params=data)
+        res = await self.capability_engine.execute(req, ctx=ctx)
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
-                "status": "success" if result.get("success") else "error",
+                "status": "success" if res.success else "error",
                 "action": "desktop_clipboard_set",
-                "error": result.get("error") if not result.get("success") else None,
-                "data": result,
+                "error": res.error,
+                "data": res.data,
             },
         )
         await client.websocket.send(response.to_json())
@@ -1296,7 +1304,7 @@ class SnowWebSocketServer:
         session,
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
-        """Handle request to list files in an approved desktop directory."""
+        """Handle request to list files in an approved desktop directory via CapabilityEngine."""
         rel_path = data.get("path") or data.get("relative_path") or ""
         limit = 50
         if "limit" in data:
@@ -1305,23 +1313,26 @@ class SnowWebSocketServer:
             except (ValueError, TypeError):
                 limit = 50
 
-        result = await self.windows_files.list_files(directory_path=rel_path, limit=limit, ctx=ctx)
-        if not result.get("success"):
-            status_code = result.get("status", "")
-            if status_code == "OS_PERMISSION_DENIED":
-                err_code = ErrorCode.UNAUTHORIZED
-            elif "PATH_NOT_ALLOWED" in status_code:
+        req = CapabilityRequest(
+            action="desktop_file_list",
+            params={"directory_path": rel_path, "limit": limit},
+        )
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        if not res.success:
+            status_code = res.status
+            if status_code in ("OS_PERMISSION_DENIED", "UNAUTHORIZED") or "PATH_NOT_ALLOWED" in status_code:
                 err_code = ErrorCode.UNAUTHORIZED
             else:
                 err_code = ErrorCode.FILE_NOT_FOUND
             error_response = SnowMessage.create_error(
                 code=err_code,
-                message=result.get("error", "Directory listing failed."),
+                message=res.error or "Directory listing failed.",
                 correlation_id=message.id,
             )
             await client.websocket.send(error_response.to_json())
             return
 
+        result = res.data or {}
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={

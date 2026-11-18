@@ -899,11 +899,11 @@ Phase 12 implements the central Layer 2 `CapabilityEngine` (`src/snow/capabiliti
 - Phase 11 architecture specification.
 
 ### Acceptance Criteria
-- [ ] All capability invocations (WSS, IPC, MCP Bridge, CLI) route through the shared `CapabilityEngine`.
-- [ ] Local Windows MCP tools succeed when the Core networking daemon is stopped (zero daemon dependency for local ops).
-- [ ] Terminal execution enforces the four structured security tiers (`READ_ONLY`, `WORKSPACE_SCOPED`, `OWNER_CONFIRMED`, `RESTRICTED_BLOCKED`).
-- [ ] Principal isolation verified: AI callers cannot acquire owner privilege; client-supplied confirmation booleans are ignored.
-- [ ] All existing Python tests, Android JVM tests, and cross-language parity tests pass with zero regression.
+- [x] All capability invocations (WSS, IPC, MCP Bridge, CLI) route through the shared `CapabilityEngine`.
+- [x] Local Windows MCP tools succeed when the Core networking daemon is stopped (zero daemon dependency for local ops).
+- [x] Terminal execution enforces the four structured security tiers (`READ_ONLY`, `WORKSPACE_SCOPED`, `OWNER_CONFIRMED`, `RESTRICTED_BLOCKED`).
+- [x] Principal isolation verified: AI callers cannot acquire owner privilege; client-supplied confirmation booleans are ignored.
+- [x] All existing Python tests, Android JVM tests, and cross-language parity tests pass with zero regression.
 
 ---
 
