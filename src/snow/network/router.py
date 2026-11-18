@@ -1,0 +1,443 @@
+"""Layer 3 SessionRouter for SNOW V2.
+
+Coordinates NodeRegistry, SnowWebSocketServer, SnowPeerClient, and SnowDiscoveryService
+to establish on-demand transport sessions and route capability requests across heterogeneous peers.
+
+Routing Tiers:
+- Step 1: Pre-flight target and capability resolution (immediate failure on invalid target/capability).
+- Tier 1: Active session routing (inbound WSS or outbound SnowPeerClient).
+- Tier 2: Outbound direct connection (for PERSISTENT_DAEMON peers with known LAN/cached endpoint).
+- Tier 3: Android active-session peer recovery (targeted wake burst + broadcast, awaiting inbound WSS).
+- Tier 4: Structured failure (DEVICE_UNREACHABLE with full diagnostic payload).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from snow.capabilities.engine import CapabilityEngine, ExecutionContext, ExecutionPrincipal
+from snow.network.discovery import SnowDiscoveryService
+from snow.network.node import (
+    DeviceNode,
+    ReachabilityProfile,
+    ReachabilityState,
+)
+from snow.network.peer_client import PeerConnectionResult, SnowPeerClient
+from snow.network.registry import NodeRegistry
+from snow.network.ws_server import ACTION_TO_CAPABILITY, SnowWebSocketServer
+from snow.protocol.models import MessageType, SnowMessage
+from snow.security.db import DatabaseManager
+
+logger = logging.getLogger(__name__)
+
+# Complete mapping from capability actions to required capability identifiers for pre-flight resolution
+ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
+    **ACTION_TO_CAPABILITY,
+    "windows_terminal": "desktop.exec",
+    "windows_terminal_exec": "desktop.exec",
+    "desktop_exec": "desktop.exec",
+    "android_battery": "android.battery.get",
+    "android_clipboard_get": "android.clipboard.get",
+    "android_clipboard_set": "android.clipboard.set",
+    "android_notification": "android.notification.post",
+    "android_sms_send": "android.telephony.sms",
+    "android_torch": "android.hardware.flashlight",
+    "android_device_info": "android.telemetry.get",
+}
+
+
+class SessionRouter:
+    """Layer 3 unified cross-device routing and session lifecycle coordinator."""
+
+    def __init__(
+        self,
+        node_registry: NodeRegistry,
+        ws_server: Optional[SnowWebSocketServer] = None,
+        discovery_service: Optional[SnowDiscoveryService] = None,
+        capability_engine: Optional[CapabilityEngine] = None,
+        db_manager: Optional[DatabaseManager] = None,
+        direct_dial_timeout: float = 2.5,
+        wake_grace_period: float = 6.0,
+    ) -> None:
+        self.node_registry = node_registry
+        self.ws_server = ws_server
+        self.discovery_service = discovery_service
+        self.capability_engine = capability_engine
+        self.db_manager = db_manager or (node_registry.db_manager if node_registry else DatabaseManager())
+        self.direct_dial_timeout = direct_dial_timeout
+        self.wake_grace_period = wake_grace_period
+
+        # Active outbound peer client sessions: device_id -> SnowPeerClient
+        self._outbound_clients: dict[str, SnowPeerClient] = {}
+        self._lock = asyncio.Lock()
+
+    async def route_request(
+        self,
+        action: str,
+        target: Optional[str] = None,
+        data: Optional[dict[str, Any]] = None,
+        required_capability: Optional[str] = None,
+        ctx: Optional[ExecutionContext] = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Resolve target, establish transport session if needed, and dispatch capability action.
+
+        Args:
+            action: Capability action identifier (e.g. 'android_battery', 'file_transfer_offer').
+            target: Query string for device resolution (UUID, name, prefix, or None for default).
+            data: Payload dictionary for the request.
+            required_capability: Explicit capability string, or derived from action if omitted.
+            ctx: Immutable execution context (defaults to AI_MCP for cross-device calls).
+            timeout: Dispatch response timeout in seconds.
+
+        Returns:
+            Structured dictionary with success, status, data/error, and routing diagnostics.
+        """
+        # Ensure immutable execution context; remote cross-device requests default to AI_MCP
+        effective_ctx = ctx or ExecutionContext(
+            principal=ExecutionPrincipal.AI_MCP,
+            origin="router_dispatch",
+        )
+
+        attempted_transports: list[str] = []
+
+        # =====================================================================
+        # Step 1: Pre-flight Capability and Target Resolution
+        # =====================================================================
+        # Immediate validation: fail fast without any network delays or wake bursts
+        req_cap = required_capability or ROUTER_ACTION_TO_CAPABILITY.get(action)
+        node, resolve_err = self.node_registry.resolve_target(target, required_capability=req_cap)
+
+        if resolve_err:
+            logger.warning(
+                "Router pre-flight rejected for target query '%s' and action '%s': %s",
+                target,
+                action,
+                resolve_err,
+            )
+            return {
+                "success": False,
+                "status": resolve_err,
+                "error": f"Target resolution failed: {resolve_err}",
+                "target_device_id": None,
+                "attempted_transports": [],
+                "last_reachability_state": None,
+                "last_known_endpoint": None,
+            }
+
+        assert node is not None
+        device_id = node.device_id
+        target_name = node.device_name
+        last_state = str(node.reachability_state)
+        last_endpoint = f"{node.host}:{node.wss_port}" if node.host else None
+
+        # Clean payload: strip caller-supplied authority overrides
+        clean_data = dict(data) if isinstance(data, dict) else {}
+        clean_data.pop("principal", None)
+        clean_data.pop("trust_tier", None)
+        clean_data.pop("execution_principal", None)
+
+        # =====================================================================
+        # Tier 1: Active Session Routing
+        # =====================================================================
+        # Check 1A: Inbound active WebSocket session
+        if self.ws_server is not None:
+            session = self.ws_server.session_manager.get_session_by_device(device_id)
+            if session and session.connection_id:
+                conn = self.ws_server.connection_manager.get(session.connection_id)
+                if conn and conn.is_active:
+                    attempted_transports.append("active_inbound_wss")
+                    logger.debug(
+                        "Router Tier 1: Dispatching '%s' to [%s] via active inbound WSS session [%s]",
+                        action,
+                        device_id,
+                        session.session_id,
+                    )
+                    return await self._dispatch_over_inbound_wss(
+                        session.connection_id, action, clean_data, timeout, node, attempted_transports
+                    )
+
+        # Check 1B: Active outbound peer client session
+        outbound_client = self._outbound_clients.get(device_id)
+        if outbound_client is not None and outbound_client.is_connected:
+            attempted_transports.append("active_outbound_peer")
+            logger.debug(
+                "Router Tier 1: Dispatching '%s' to [%s] via active outbound peer connection",
+                action,
+                device_id,
+            )
+            return await self._dispatch_over_peer_client(
+                outbound_client, action, clean_data, timeout, node, attempted_transports
+            )
+
+        # =====================================================================
+        # Tier 2: Outbound Direct Connection (for PERSISTENT_DAEMON peers)
+        # =====================================================================
+        # For targets that listen on inbound ports (Windows desktop core / server nodes)
+        if node.reachability_profile == ReachabilityProfile.PERSISTENT_DAEMON:
+            attempted_transports.append("outbound_direct")
+            dial_host = node.host
+            dial_port = node.wss_port or 8765
+
+            if dial_host:
+                logger.info(
+                    "Router Tier 2: Outbound dialing [%s] at %s:%d (profile=%s)...",
+                    device_id,
+                    dial_host,
+                    dial_port,
+                    node.reachability_profile,
+                )
+                direct_res = await self._attempt_outbound_direct_dial(
+                    node=node,
+                    host=dial_host,
+                    port=dial_port,
+                    action=action,
+                    clean_data=clean_data,
+                    timeout=timeout,
+                    attempted_transports=attempted_transports,
+                )
+                if direct_res is not None:
+                    return direct_res
+            else:
+                logger.debug("Router Tier 2 skipped: No known IP endpoint for [%s]", device_id)
+
+        # =====================================================================
+        # Tier 3: Android Active-Session Peer Recovery
+        # =====================================================================
+        # For Android peers whose connection was terminated or dormant
+        if node.reachability_profile == ReachabilityProfile.ACTIVE_SESSION_PEER:
+            attempted_transports.append("android_wake_and_await")
+            logger.info(
+                "Router Tier 3: Attempting wake-and-await for Android peer [%s] (grace_period=%.1fs)...",
+                device_id,
+                self.wake_grace_period,
+            )
+
+            # 3A: Send discovery wake beacons (unicast if last known host is available + broadcast)
+            if self.discovery_service is not None and self.discovery_service.is_running:
+                try:
+                    await self.discovery_service.send_wake_burst(device_id)
+                except Exception as wake_exc:
+                    logger.debug("Failed sending wake burst to [%s]: %s", device_id, wake_exc)
+
+            # 3B: Await authenticated reconnection within bounded grace period
+            start_wait = time.time()
+            reconnected_session = None
+
+            while time.time() - start_wait < self.wake_grace_period:
+                await asyncio.sleep(0.2)
+                if self.ws_server is not None:
+                    sess = self.ws_server.session_manager.get_session_by_device(device_id)
+                    if sess and sess.connection_id:
+                        conn = self.ws_server.connection_manager.get(sess.connection_id)
+                        if conn and conn.is_active:
+                            reconnected_session = sess
+                            break
+
+            if reconnected_session and reconnected_session.connection_id:
+                elapsed = time.time() - start_wait
+                logger.info(
+                    "Router Tier 3: Android peer [%s] reconnected successfully after %.2fs. Dispatching '%s'...",
+                    device_id,
+                    elapsed,
+                    action,
+                )
+                return await self._dispatch_over_inbound_wss(
+                    reconnected_session.connection_id, action, clean_data, timeout, node, attempted_transports
+                )
+
+        # =====================================================================
+        # Tier 4: Structured Failure
+        # =====================================================================
+        logger.warning(
+            "Router Tier 4: All transport attempts exhausted for device [%s] (%s). Transports attempted: %s",
+            device_id,
+            target_name,
+            attempted_transports,
+        )
+        return {
+            "success": False,
+            "status": "DEVICE_UNREACHABLE",
+            "error": f"Device '{device_id}' ({target_name}) is unreachable across all attempted transports.",
+            "attempted_transports": attempted_transports,
+            "last_reachability_state": last_state,
+            "target_device_id": device_id,
+            "last_known_endpoint": last_endpoint,
+        }
+
+    # =========================================================================
+    # Internal Dispatch & Transport Helpers
+    # =========================================================================
+
+    async def _dispatch_over_inbound_wss(
+        self,
+        connection_id: str,
+        action: str,
+        data: dict[str, Any],
+        timeout: float,
+        node: DeviceNode,
+        attempted_transports: list[str],
+    ) -> dict[str, Any]:
+        """Dispatch a request over an established inbound WebSocket connection."""
+        if not self.ws_server:
+            return {
+                "success": False,
+                "status": "SERVER_ERROR",
+                "error": "SnowWebSocketServer is not available for dispatch.",
+                "target_device_id": node.device_id,
+                "attempted_transports": attempted_transports,
+            }
+
+        try:
+            response = await self.ws_server.send_request(
+                connection_id=connection_id,
+                action=action,
+                payload=data,
+                timeout=timeout,
+            )
+
+            is_ok = response.type == MessageType.RESPONSE and (
+                response.payload is None or response.payload.get("status") != "error"
+            )
+            err_msg = None
+            if response.error:
+                err_msg = response.error.get("message") if isinstance(response.error, dict) else str(response.error)
+            elif not is_ok and response.payload:
+                err_msg = response.payload.get("message") or response.payload.get("error")
+
+            return {
+                "success": is_ok,
+                "status": "SUCCESS" if is_ok else "DEVICE_ERROR",
+                "data": response.payload,
+                "error": err_msg,
+                "target_device_id": node.device_id,
+                "attempted_transports": attempted_transports,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "status": "TIMEOUT",
+                "error": f"Device '{node.device_id}' timed out after {timeout:.1f}s waiting for '{action}' response.",
+                "target_device_id": node.device_id,
+                "attempted_transports": attempted_transports,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "TRANSPORT_ERROR",
+                "error": f"Failed dispatching to device '{node.device_id}': {exc}",
+                "target_device_id": node.device_id,
+                "attempted_transports": attempted_transports,
+            }
+
+    async def _dispatch_over_peer_client(
+        self,
+        client: SnowPeerClient,
+        action: str,
+        data: dict[str, Any],
+        timeout: float,
+        node: DeviceNode,
+        attempted_transports: list[str],
+    ) -> dict[str, Any]:
+        """Dispatch a request over an active outbound SnowPeerClient connection."""
+        try:
+            req = SnowMessage.create_request(action=action, data=data)
+            response = await client.send_message(req, timeout=timeout)
+
+            is_ok = response.type == MessageType.RESPONSE and (
+                response.payload is None or response.payload.get("status") != "error"
+            )
+            err_msg = None
+            if response.error:
+                err_msg = response.error.get("message") if isinstance(response.error, dict) else str(response.error)
+            elif not is_ok and response.payload:
+                err_msg = response.payload.get("message") or response.payload.get("error")
+
+            return {
+                "success": is_ok,
+                "status": "SUCCESS" if is_ok else "DEVICE_ERROR",
+                "data": response.payload,
+                "error": err_msg,
+                "target_device_id": node.device_id,
+                "attempted_transports": attempted_transports,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "TRANSPORT_ERROR",
+                "error": f"Outbound peer dispatch error: {exc}",
+                "target_device_id": node.device_id,
+                "attempted_transports": attempted_transports,
+            }
+
+    async def _attempt_outbound_direct_dial(
+        self,
+        node: DeviceNode,
+        host: str,
+        port: int,
+        action: str,
+        clean_data: dict[str, Any],
+        timeout: float,
+        attempted_transports: list[str],
+    ) -> Optional[dict[str, Any]]:
+        """Attempt outbound direct connection, authentication, and execution with a peer."""
+        # Retrieve pairing token from DB
+        paired_rec = self.db_manager.get_paired_device(node.device_id)
+        if not paired_rec:
+            logger.debug("Cannot direct dial [%s]: not in paired devices database", node.device_id)
+            return None
+
+        # Look up expected certificate fingerprint if known
+        expected_fp = getattr(paired_rec, "cert_fingerprint", None) or ""
+
+        # Create peer client with bounded dial timeout
+        client = SnowPeerClient(
+            host=host,
+            port=port,
+            expected_fingerprint=expected_fp if expected_fp else None,
+            use_tls=True,
+        )
+
+        try:
+            # We don't possess the client's plaintext token; auth requires token or PIN.
+            # In peer mesh, if a shared auth token or session ticket exists:
+            # Check if auth succeeds
+            conn_res: PeerConnectionResult = await client.connect(
+                timeout=self.direct_dial_timeout
+            )
+
+            if not conn_res.success:
+                logger.debug("Direct dial to %s:%d failed: %s", host, port, conn_res.error)
+                return None
+
+            # Verify peer identity matches expected device_id
+            if conn_res.remote_device_id and conn_res.remote_device_id != node.device_id:
+                logger.warning(
+                    "Identity mismatch on direct dial! Expected [%s], got [%s]. Aborting.",
+                    node.device_id,
+                    conn_res.remote_device_id,
+                )
+                await client.close()
+                return None
+
+            # Register authenticated outbound session
+            async with self._lock:
+                self._outbound_clients[node.device_id] = client
+
+            # Update DB endpoint only after successful verified connection
+            self.db_manager.update_device_endpoint(node.device_id, host, port)
+
+            # Dispatch request
+            return await self._dispatch_over_peer_client(
+                client, action, clean_data, timeout, node, attempted_transports
+            )
+        except Exception as dial_exc:
+            logger.debug("Outbound direct dial exception for [%s]: %s", node.device_id, dial_exc)
+            try:
+                await client.close()
+            except Exception:
+                pass
+            return None

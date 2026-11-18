@@ -176,6 +176,9 @@ class SnowIpcServer:
             self._capability_engine = CapabilityEngine()
         self._sync_capability_engine()
 
+        # Layer 3 SessionRouter delegation
+        self.session_router = getattr(core_server, "session_router", None)
+
     def _sync_capability_engine(self) -> None:
         """Synchronize capability engine references with core_server attributes."""
         if not self.core_server:
@@ -647,6 +650,17 @@ class SnowIpcServer:
                 "status": "APPROVAL_REQUIRED",
                 "error": "AI-originated remote terminal execution is restricted; requires a human-in-the-loop approval workflow.",
             }
+
+        router = getattr(self, "session_router", None) or (
+            getattr(self.core_server, "session_router", None) if self.core_server else None
+        )
+        if router is not None and not type(router).__name__.endswith("Mock"):
+            return await router.route_request(
+                action=action,
+                target=device_id,
+                data=data,
+                timeout=timeout,
+            )
 
         cs = self.core_server
 

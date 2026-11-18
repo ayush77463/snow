@@ -148,6 +148,53 @@ class SnowWebSocketClient(
         initiateConnection()
     }
 
+    /**
+     * Update target endpoint dynamically (e.g. from LAN discovery beacon).
+     *
+     * Triggers immediate reconnection if host/port changed or if in RECONNECTING/DISCONNECTED
+     * state without creating connection storms.
+     *
+     * @return True if a reconnection or connection attempt was initiated; False if no-op.
+     */
+    @Synchronized
+    fun updateTargetEndpoint(host: String, port: Int = Constants.DEFAULT_PORT): Boolean {
+        val cleanHost = host.trim()
+        if (cleanHost.isBlank()) return false
+
+        val endpointChanged = cleanHost != targetHost || port != targetPort
+        val currentState = _connectionState.value
+
+        if (endpointChanged) {
+            log("Target endpoint changed from $targetHost:$targetPort to $cleanHost:$port. Initiating reconnect...")
+            targetHost = cleanHost
+            targetPort = port
+            userInitiatedDisconnect.set(false)
+            backoffPolicy.reset()
+            reconnectJob?.cancel()
+            reconnectJob = null
+            disconnectInternal()
+            initiateConnection()
+            return true
+        }
+
+        // Endpoint is identical. Avoid reconnect storms if already CONNECTED or CONNECTING.
+        if (currentState == ConnectionState.CONNECTED || currentState == ConnectionState.CONNECTING) {
+            return false
+        }
+
+        // If RECONNECTING or DISCONNECTED (and not explicitly user-stopped), fast-reconnect.
+        if (!userInitiatedDisconnect.get()) {
+            log("Target endpoint confirmed ($cleanHost:$port) while state=$currentState. Accelerating reconnect...")
+            backoffPolicy.reset()
+            reconnectJob?.cancel()
+            reconnectJob = null
+            initiateConnection()
+            return true
+        }
+
+        return false
+    }
+
     private fun buildOkHttpClient(): OkHttpClient {
         val builder = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)

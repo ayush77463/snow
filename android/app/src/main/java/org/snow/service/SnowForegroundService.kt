@@ -22,7 +22,9 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import org.snow.R
 import org.snow.capabilities.AndroidCapabilityDispatcher
+import org.snow.network.AuthState
 import org.snow.network.ConnectionState
+import org.snow.network.DiscoveryManager
 import org.snow.network.SnowWebSocketClient
 import org.snow.protocol.Constants
 import org.snow.security.DeviceIdentity
@@ -38,6 +40,8 @@ class SnowForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var stateObserverJob: Job? = null
+    private var discoveryObserverJob: Job? = null
+    private var authObserverJob: Job? = null
 
     val client: SnowWebSocketClient by lazy {
         val identity = DeviceIdentity.getOrCreate(applicationContext)
@@ -48,6 +52,15 @@ class SnowForegroundService : Service() {
             tokenStorage = tokenStorage,
             identity = identity,
             useTls = true
+        )
+    }
+
+    val discoveryManager: DiscoveryManager by lazy {
+        val certPinStorage = EncryptedCertPinStorage(applicationContext)
+        val tokenStorage = SharedPreferencesTokenStorage(applicationContext)
+        DiscoveryManager(
+            certPinStorage = certPinStorage,
+            tokenStorage = tokenStorage
         )
     }
 
@@ -111,7 +124,10 @@ class SnowForegroundService : Service() {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                 )
 
+                discoveryManager.startListening()
                 startObservingState()
+                startObservingDiscovery()
+                startObservingAuth()
                 client.connect(host, port)
             }
             ACTION_DISCONNECT -> {
@@ -158,22 +174,60 @@ class SnowForegroundService : Service() {
         }
     }
 
+    private fun startObservingDiscovery() {
+        discoveryObserverJob?.cancel()
+        discoveryObserverJob = serviceScope.launch {
+            discoveryManager.peers.collectLatest { _ ->
+                val candidate = discoveryManager.getCandidateForPairedDesktop()
+                if (candidate != null) {
+                    client.updateTargetEndpoint(candidate.ipAddress, candidate.port)
+                }
+            }
+        }
+    }
+
+    private fun startObservingAuth() {
+        authObserverJob?.cancel()
+        authObserverJob = serviceScope.launch {
+            client.authState.collectLatest { auth ->
+                if (auth is AuthState.Authenticated) {
+                    val host = client.currentTargetHost
+                    val port = client.currentTargetPort
+                    if (host.isNotBlank()) {
+                        val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+                        prefs.edit()
+                            .putString(PREF_SAVED_HOST, host)
+                            .putInt(PREF_SAVED_PORT, port)
+                            .apply()
+                    }
+                }
+            }
+        }
+    }
+
     private fun handleDisconnect() {
-        // 1. Cancel the state observer first so that DISCONNECTED state does NOT trigger updateNotification()
+        // 1. Cancel observers first so that DISCONNECTED state does NOT trigger updateNotification()
         stateObserverJob?.cancel()
         stateObserverJob = null
+        discoveryObserverJob?.cancel()
+        discoveryObserverJob = null
+        authObserverJob?.cancel()
+        authObserverJob = null
 
-        // 2. Disconnect the WebSocket client (sends clean 1000 close frame)
+        // 2. Stop discovery listener
+        discoveryManager.stopListening()
+
+        // 3. Disconnect the WebSocket client (sends clean 1000 close frame)
         client.disconnect()
 
-        // 3. Remove foreground service status and remove the notification
+        // 4. Remove foreground service status and remove the notification
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
 
-        // 4. Explicitly cancel the notification to ensure OEM notification managers clear it immediately
+        // 5. Explicitly cancel the notification to ensure OEM notification managers clear it immediately
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.cancel(NOTIFICATION_ID)
 
-        // 5. Stop the service
+        // 6. Stop the service
         stopSelf()
     }
 
@@ -232,6 +286,11 @@ class SnowForegroundService : Service() {
         super.onDestroy()
         stateObserverJob?.cancel()
         stateObserverJob = null
+        discoveryObserverJob?.cancel()
+        discoveryObserverJob = null
+        authObserverJob?.cancel()
+        authObserverJob = null
+        discoveryManager.stopListening()
         client.disconnect()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -240,6 +299,10 @@ class SnowForegroundService : Service() {
     }
 
     companion object {
+        const val PREFS_ENDPOINT = "snow_endpoint_prefs"
+        const val PREF_SAVED_HOST = "saved_host"
+        const val PREF_SAVED_PORT = "saved_port"
+
         const val CHANNEL_ID = "snow_connection_channel"
         const val NOTIFICATION_ID = 1001
 

@@ -934,21 +934,30 @@ Phase 13 establishes the unified Layer 3 `NodeRegistry`, consolidating active WS
 ## Phase 14: Multi-Transport Reachability State Machine & Automatic On-Demand Session Routing
 
 ### Concept Explained
-Phase 14 delivers full dynamic network resilience. Devices seamlessly transition across the four reachability states (`ONLINE_DIRECT`, `ONLINE_ROUTED`, `DORMANT_REACHABLE`, `OFFLINE`) without endpoint hardcoding. When a laptop or phone changes networks (hotspot, home Wi-Fi, campus LAN), the system detects interface transitions, invalidates stale addresses, and rebinds connections automatically.
+Phase 14 delivers full dynamic network resilience and unified capability routing. It establishes the Layer 3 `SessionRouter` coordinating multi-transport escalation across active sessions, direct dials, and on-demand recovery, while enabling Android dynamic endpoint self-healing without endpoint hardcoding.
 
 ### Objectives
-- Implement reachability state machine with automated state transitions and timeouts.
-- Implement dynamic interface detection via `psutil` and Android `ConnectivityManager` callbacks.
-- Eliminate stale IP lockups; support automatic re-discovery within 10 seconds of network switch.
-- Support on-demand session routing when direct IP path is blocked.
+- Implement Layer 3 `SessionRouter` with automated 4-tier reachability escalation and timeouts.
+- Capability-aware target pre-flight resolution (instant fast-fail without network delays).
+- Active inbound WSS and outbound peer client session routing (Tier 1).
+- Bounded outbound direct dialing for persistent daemon peers with TLS & identity verification (Tier 2).
+- Android active-session peer wake burst and bounded grace period recovery (Tier 3).
+- Structured failure diagnostics (`DEVICE_UNREACHABLE`) with transport attempt records (Tier 4).
+- Android automatic endpoint self-healing (`updateTargetEndpoint`) with connection-storm prevention.
 
 ### Dependencies
-- Phase 13 `NodeRegistry` and `DeviceNode` protocol.
+- Phase 13 `NodeRegistry` and `DeviceNode` capability manifest protocol.
 
 ### Acceptance Criteria
-- [ ] Network transitions (Wi-Fi to hotspot) recover connectivity without manual IP entry.
-- [ ] Stale endpoints automatically pruned after TTL expiry.
-- [ ] Zero endpoint hardcoding verified across all connection paths.
+- [x] Multi-transport `SessionRouter` coordinating `NodeRegistry`, `SnowWebSocketServer`, and `SnowPeerClient` (`src/snow/network/router.py`).
+- [x] Capability-aware target pre-flight resolution (`resolve_target` fast-fails on `NO_DEVICES_PAIRED`, `DEVICE_REQUIRED`, `DEVICE_NOT_FOUND`, `AMBIGUOUS_DEVICE`, `CAPABILITY_NOT_SUPPORTED`).
+- [x] Tier 1 active inbound WSS and outbound peer client dispatch implemented and verified.
+- [x] Tier 2 bounded outbound direct dialing for `PERSISTENT_DAEMON` peers with identity verification and endpoint caching.
+- [x] Tier 3 Android active-session peer wake-and-await recovery with targeted/broadcast bursts and grace period.
+- [x] Tier 4 structured `DEVICE_UNREACHABLE` diagnostics reporting attempted transports, target ID, and last known endpoint.
+- [x] Android dynamic endpoint self-healing in `SnowWebSocketClient` and `SnowForegroundService` after valid discovery.
+- [x] Connection-storm prevention: no redundant reconnect loops when already connected/connecting.
+- [x] Automated regression suites: 15 Python unit tests (`tests/test_phase_14_session_router.py`) and 8 Android JVM unit tests (`EndpointSelfHealingTest.kt`) passing.
 
 ---
 

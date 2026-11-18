@@ -10,6 +10,7 @@ from snow.network.node import (
     build_windows_manifest,
 )
 from snow.network.registry import NodeRegistry
+from snow.network.router import SessionRouter
 from snow.network.ws_server import SnowWebSocketServer
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "NodeRegistry",
     "ReachabilityProfile",
     "ReachabilityState",
+    "SessionRouter",
     "SnowWebSocketServer",
     "build_windows_manifest",
 ]

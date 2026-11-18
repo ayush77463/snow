@@ -89,9 +89,22 @@ class SnowCoreServer:
         )
         self.ws_server.node_registry = self.node_registry
         self.capability_engine.node_registry = self.node_registry
+
+        from snow.network.router import SessionRouter
+
+        self.session_router = SessionRouter(
+            node_registry=self.node_registry,
+            ws_server=self.ws_server,
+            discovery_service=None,
+            capability_engine=self.capability_engine,
+            db_manager=self.db_manager,
+            wake_grace_period=getattr(self.config, "device_connect_grace_period", 6.0),
+        )
+
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
         self.ipc_server.capability_engine = self.capability_engine
         self.ipc_server.node_registry = self.node_registry
+        self.ipc_server.session_router = self.session_router
         self.discovery_service: Optional[SnowDiscoveryService] = None
 
     @property
@@ -197,6 +210,8 @@ class SnowCoreServer:
                 paired_device_checker=_check_paired,
             )
             await self.discovery_service.start()
+            self.node_registry.discovery_service = self.discovery_service
+            self.session_router.discovery_service = self.discovery_service
 
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port

@@ -214,13 +214,16 @@ class DiscoveryManager(
     }
 
     /**
-     * Check if an active discovered peer matches the saved desktop certificate fingerprint.
+     * Check if an active discovered peer matches the saved desktop certificate fingerprint or deviceId.
      */
-    fun getCandidateForPairedDesktop(): DiscoveredPeer? {
-        val pinnedFp = certPinStorage?.getPinnedFingerprint() ?: return null
-        val normalizedPin = pinnedFp.replace(":", "").lowercase()
+    fun getCandidateForPairedDesktop(pairedDeviceId: String? = null): DiscoveredPeer? {
+        val pinnedFp = certPinStorage?.getPinnedFingerprint()
+        val normalizedPin = pinnedFp?.replace(":", "")?.lowercase()
         return peerMap.values.firstOrNull { peer ->
-            !peer.isStale && peer.certFingerprint.replace(":", "").lowercase() == normalizedPin
+            if (peer.isStale) return@firstOrNull false
+            val fpMatch = !normalizedPin.isNullOrBlank() && peer.certFingerprint.replace(":", "").lowercase() == normalizedPin
+            val idMatch = !pairedDeviceId.isNullOrBlank() && peer.deviceId == pairedDeviceId
+            fpMatch || idMatch
         }
     }
 
