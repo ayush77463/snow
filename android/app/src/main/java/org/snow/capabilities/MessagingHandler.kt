@@ -65,11 +65,13 @@ class MessagingHandler(private val context: Context) {
                 if (!userConfirmed) {
                     SafeLog.w(TAG, "Direct SMS rejected: missing explicit on-device user confirmation.")
                     return@withContext mapOf(
+                        "success" to false,
                         "status" to "error",
                         "action" to "send_message",
                         "mode" to MODE_SMS,
                         "error" to "USER_CONFIRMATION_REQUIRED",
-                        "message" to "Direct SMS dispatch requires explicit on-device user confirmation. Use 'intent' mode for AI-originated requests."
+                        "message" to "Direct SMS dispatch requires explicit on-device user confirmation. Use 'intent' mode for AI-originated requests.",
+                        "remediation_hint" to "Confirm SMS dispatch intent on the Android device."
                     )
                 }
                 sendViaSms(cleanRecipient, message)
@@ -84,38 +86,78 @@ class MessagingHandler(private val context: Context) {
     }
 
     private fun sendViaIntent(recipient: String, message: String): Map<String, Any?> {
-        return try {
-            val uri = Uri.parse("smsto:${Uri.encode(recipient)}")
-            val intent = Intent(Intent.ACTION_SENDTO, uri).apply {
-                putExtra("sms_body", message)
-                putExtra(Intent.EXTRA_TEXT, message)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        val uri = Uri.parse("smsto:${Uri.encode(recipient)}")
+        val intent = Intent(Intent.ACTION_SENDTO, uri).apply {
+            putExtra("sms_body", message)
+            putExtra(Intent.EXTRA_TEXT, message)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+
+        val inForeground = ClipboardHandler.isAppInForeground
+        if (inForeground) {
+            return try {
+                context.startActivity(intent)
+                SafeLog.i(TAG, "Launched messaging compose intent in foreground for recipient '$recipient'.")
+                mapOf(
+                    "success" to true,
+                    "status" to "success",
+                    "delivery_mode" to "DIRECT_FOREGROUND",
+                    "action" to "send_message",
+                    "mode" to MODE_INTENT,
+                    "recipient" to recipient,
+                    "result" to "INTENT_LAUNCHED",
+                    "message" to "Messaging composer intent launched in foreground; user confirmation required to send."
+                )
+            } catch (e: ActivityNotFoundException) {
+                SafeLog.w(TAG, "No messaging application available for smsto intent: ${e.message}")
+                mapOf(
+                    "success" to false,
+                    "status" to "error",
+                    "action" to "send_message",
+                    "error" to "NO_MESSAGING_APP",
+                    "message" to "No messaging application available to handle smsto URI."
+                )
+            } catch (e: Exception) {
+                SafeLog.e(TAG, "Failed launching messaging intent: ${e.message}")
+                mapOf(
+                    "success" to false,
+                    "status" to "error",
+                    "action" to "send_message",
+                    "error" to "INTENT_FAILED",
+                    "message" to "Failed launching messaging intent: ${e.message}"
+                )
             }
-            context.startActivity(intent)
-            SafeLog.i(TAG, "Launched messaging compose intent for recipient '$recipient'.")
-            mapOf(
-                "status" to "success",
+        } else {
+            // Android 17 background launch restriction: post notification with PendingIntent
+            if (ActionNotificationHelper.canPostNotifications(context)) {
+                val posted = ActionNotificationHelper.postActionNotification(
+                    context = context,
+                    title = "SNOW: Tap to open message compose",
+                    content = "Tap to review and compose message in your messaging app.",
+                    intent = intent
+                )
+
+                if (posted) {
+                    SafeLog.i(TAG, "Posted action notification for background messaging compose intent.")
+                    return mapOf(
+                        "success" to true,
+                        "status" to "success",
+                        "delivery_mode" to "NOTIFICATION_TAP_REQUIRED",
+                        "action" to "send_message",
+                        "mode" to MODE_INTENT,
+                        "recipient" to recipient,
+                        "message" to "Application is in background. Tap the notification on your phone to review and send the message."
+                    )
+                }
+            }
+
+            SafeLog.w(TAG, "Background messaging compose rejected: notifications disabled or unavailable.")
+            return mapOf(
+                "success" to false,
+                "status" to "FOREGROUND_REQUIRED",
                 "action" to "send_message",
-                "mode" to MODE_INTENT,
-                "recipient" to recipient,
-                "result" to "INTENT_LAUNCHED",
-                "message" to "Messaging composer intent launched on device; user confirmation required to send."
-            )
-        } catch (e: ActivityNotFoundException) {
-            SafeLog.w(TAG, "No messaging application available for smsto intent: ${e.message}")
-            mapOf(
-                "status" to "error",
-                "action" to "send_message",
-                "error" to "NO_MESSAGING_APP",
-                "message" to "No messaging application available to handle smsto URI."
-            )
-        } catch (e: Exception) {
-            SafeLog.e(TAG, "Failed launching messaging intent: ${e.message}")
-            mapOf(
-                "status" to "error",
-                "action" to "send_message",
-                "error" to "INTENT_FAILED",
-                "message" to "Failed launching messaging intent: ${e.message}"
+                "error" to "Background messaging compose requires notification permission to deliver tap action.",
+                "remediation_hint" to "Open SNOW on your phone or grant Notification permission in Android Settings to compose messages."
             )
         }
     }

@@ -147,6 +147,39 @@ class NodeRegistry:
                 )
             return node
 
+    def on_manifest_updated(
+        self,
+        device_id: str,
+        manifest_data: Any,
+    ) -> Optional[DeviceNode]:
+        """Update live capability manifest for a connected node without altering trust boundaries."""
+        with self._lock:
+            # 1. Parse and validate capability manifest
+            manifest: Optional[CapabilityManifest] = None
+            if isinstance(manifest_data, CapabilityManifest):
+                manifest = manifest_data
+            elif isinstance(manifest_data, dict):
+                manifest = CapabilityManifest.from_dict(manifest_data)
+            elif isinstance(manifest_data, str):
+                manifest = CapabilityManifest.from_json(manifest_data)
+
+            if not manifest:
+                logger.warning("Empty or invalid manifest update received for device [%s]", device_id)
+                return self.get_node(device_id)
+
+            self._manifest_cache[device_id] = manifest
+            try:
+                self.db_manager.update_device_manifest(device_id, manifest.to_json())
+            except Exception as exc:
+                logger.debug("Failed caching updated manifest to DB for device [%s]: %s", device_id, exc)
+
+            if device_id in self._active_sessions:
+                self._active_sessions[device_id]["last_seen"] = time.time()
+
+            logger.info("Updated capability manifest for device [%s] (capabilities: %d)",
+                        device_id, len(manifest.supported_capabilities))
+            return self.get_node(device_id)
+
     def on_session_disconnected(self, device_id: str) -> None:
         """Update runtime reachability when an active session terminates."""
         with self._lock:

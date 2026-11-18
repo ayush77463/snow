@@ -345,6 +345,29 @@ class SnowWebSocketClient(
         return currentWs.send(json)
     }
 
+    /**
+     * Send a live capability manifest update to the desktop core.
+     */
+    fun sendManifestUpdate(
+        manifest: CapabilityManifest,
+        onResponse: ((SnowMessage) -> Unit)? = null
+    ) {
+        val devId = identity?.deviceId
+        if (devId.isNullOrBlank()) {
+            log("Cannot send manifest update: device identity missing")
+            return
+        }
+        val manifestMap = manifest.toMap()
+        sendRequest(
+            action = "manifest_update",
+            data = mapOf(
+                "device_id" to devId,
+                "manifest" to manifestMap
+            ),
+            onResponse = onResponse
+        )
+    }
+
     private fun scheduleReconnection() {
         if (userInitiatedDisconnect.get()) return
 

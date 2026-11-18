@@ -108,6 +108,18 @@ class SnowForegroundService : Service() {
         }
     }
 
+    /**
+     * Build live capability manifest reflecting current runtime/foreground state
+     * and transmit over active authenticated WSS session.
+     */
+    fun updateManifest() {
+        if (client.connectionState.value == org.snow.network.ConnectionState.CONNECTED &&
+            client.authState.value is org.snow.network.AuthState.Authenticated) {
+            val liveManifest = org.snow.network.DeviceNode.buildAndroidManifest(applicationContext)
+            client.sendManifestUpdate(liveManifest)
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CONNECT -> {

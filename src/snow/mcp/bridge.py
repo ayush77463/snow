@@ -22,6 +22,7 @@ SECURITY INVARIANTS:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -165,6 +166,10 @@ class SnowMcpBridge:
 
         # Daemon lifecycle manager for cross-device requests
         self.daemon_manager = CoreDaemonManager(host=self.host, port=self.port)
+
+        # Idempotent clipboard sync state: (device_id, direction) -> last_synced_sha256
+        self._clipboard_sync_hashes: dict[tuple[str, str], str] = {}
+        self._clipboard_sync_lock = asyncio.Lock()
 
     def _get_secret(self) -> Optional[str]:
         """Resolve the IPC authentication secret."""
@@ -566,6 +571,8 @@ class SnowMcpBridge:
         clean_dir = (direction or "").strip().lower()
 
         if clean_dir == "laptop_to_phone":
+            target_id = device_id or await self._resolve_target_device_id() or "local_or_default"
+
             # 1. Read Windows clipboard
             clip_res = await self.windows_clipboard_get()
             if not clip_res.get("success"):
@@ -584,7 +591,23 @@ class SnowMcpBridge:
                     "direction": "laptop_to_phone",
                     "message": "Windows clipboard is empty; nothing to synchronize.",
                     "characters_synced": 0,
+                    "skipped_duplicate": False,
                 }
+
+            payload_sha256 = hashlib.sha256(clip_text.encode("utf-8")).hexdigest()
+            cache_key = (target_id, clean_dir)
+
+            async with self._clipboard_sync_lock:
+                if self._clipboard_sync_hashes.get(cache_key) == payload_sha256:
+                    return {
+                        "success": True,
+                        "status": "ALREADY_IN_SYNC",
+                        "direction": "laptop_to_phone",
+                        "skipped_duplicate": True,
+                        "sha256": payload_sha256,
+                        "characters_synced": 0,
+                        "message": "Clipboard content is already identical; synchronization skipped.",
+                    }
 
             # 2. Push to Android clipboard via Core
             push_res = await self.android_clipboard_push(text=clip_text, device_id=device_id)
@@ -596,10 +619,15 @@ class SnowMcpBridge:
                     "error": f"Failed syncing to Android: {push_res.get('error')}",
                 }
 
+            async with self._clipboard_sync_lock:
+                self._clipboard_sync_hashes[cache_key] = payload_sha256
+
             return {
                 "success": True,
                 "status": "SUCCESS",
                 "direction": "laptop_to_phone",
+                "skipped_duplicate": False,
+                "sha256": payload_sha256,
                 "characters_synced": len(clip_text),
                 "message": f"Successfully synchronized {len(clip_text)} characters from Windows to Android.",
             }
@@ -619,12 +647,16 @@ class SnowMcpBridge:
             if not pull_res.get("success"):
                 err_status = pull_res.get("status", "CLIPBOARD_PULL_FAILED")
                 err_msg = pull_res.get("error") or "Failed retrieving clipboard from Android."
-                return {
+                remediation_hint = (pull_res.get("data") or {}).get("remediation_hint") or pull_res.get("remediation_hint")
+                ret = {
                     "success": False,
                     "status": err_status,
                     "direction": "phone_to_laptop",
                     "error": f"Failed pulling clipboard from Android: {err_msg}",
                 }
+                if remediation_hint:
+                    ret["remediation_hint"] = remediation_hint
+                return ret
 
             data = pull_res.get("data") or {}
             clip_text = data.get("text", "")
@@ -636,6 +668,21 @@ class SnowMcpBridge:
                     "error": "Android clipboard returned no text content.",
                 }
 
+            payload_sha256 = hashlib.sha256(clip_text.encode("utf-8")).hexdigest()
+            cache_key = (target_id, clean_dir)
+
+            async with self._clipboard_sync_lock:
+                if self._clipboard_sync_hashes.get(cache_key) == payload_sha256:
+                    return {
+                        "success": True,
+                        "status": "ALREADY_IN_SYNC",
+                        "direction": "phone_to_laptop",
+                        "skipped_duplicate": True,
+                        "sha256": payload_sha256,
+                        "characters_synced": 0,
+                        "message": "Clipboard content is already identical; synchronization skipped.",
+                    }
+
             # 2. Write to Windows clipboard
             set_res = await self.windows_clipboard_set(text=clip_text)
             if not set_res.get("success"):
@@ -646,10 +693,15 @@ class SnowMcpBridge:
                     "error": f"Failed writing Android clipboard content to Windows: {set_res.get('error')}",
                 }
 
+            async with self._clipboard_sync_lock:
+                self._clipboard_sync_hashes[cache_key] = payload_sha256
+
             return {
                 "success": True,
                 "status": "SUCCESS",
                 "direction": "phone_to_laptop",
+                "skipped_duplicate": False,
+                "sha256": payload_sha256,
                 "characters_synced": len(clip_text),
                 "message": f"Successfully synchronized {len(clip_text)} characters from Android to Windows.",
             }

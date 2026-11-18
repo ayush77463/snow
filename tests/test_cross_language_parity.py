@@ -326,6 +326,28 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["response_auth_success_with_manifest.json"] = resp_auth_manifest.to_json()
 
+    # --- Phase 15 Live Manifest Update Protocol Fixtures ---
+    # 23c. Valid manifest_update request
+    req_manifest_update = SnowMessage.create_request(
+        action="manifest_update",
+        data={
+            "device_id": str(uuid.uuid4()),
+            "manifest": sample_manifest,
+        },
+    )
+    valid_fixtures["request_manifest_update.json"] = req_manifest_update.to_json()
+
+    # 23d. Valid manifest_update response
+    resp_manifest_update = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "message": "Capability manifest updated successfully.",
+            "device_id": str(uuid.uuid4()),
+        },
+    )
+    valid_fixtures["response_manifest_update_success.json"] = resp_manifest_update.to_json()
+
     # --- Phase 3 File Transfer Protocol Fixtures ---
     # 24. Valid file_transfer_offer request
     req_offer = SnowMessage.create_request(

@@ -148,12 +148,14 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         org.snow.capabilities.ClipboardHandler.isAppInForeground = true
+        service?.updateManifest()
     }
 
     override fun onPause() {
         super.onPause()
         org.snow.capabilities.ClipboardHandler.isAppInForeground = false
         org.snow.capabilities.ClipboardHandler.isUserIntentGranted = false
+        service?.updateManifest()
     }
 
     override fun onStop() {

@@ -46,6 +46,15 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "android_sms_send": "android.telephony.sms",
     "android_torch": "android.hardware.flashlight",
     "android_device_info": "android.telemetry.get",
+    "file_send_request": "android.files.transfer",
+    "file_receive_request": "android.files.transfer",
+    "clipboard_pull": "android.clipboard.get",
+    "clipboard_push": "android.clipboard.set",
+    "battery_status": "android.telemetry.get",
+    "ring_phone": "android.telemetry.get",
+    "list_apps": "android.apps.list",
+    "launch_app": "android.apps.launch",
+    "send_message": "android.messaging.send_intent",
 }
 
 
@@ -300,7 +309,17 @@ class SessionRouter:
             )
 
             is_ok = response.type == MessageType.RESPONSE and (
-                response.payload is None or response.payload.get("status") != "error"
+                response.payload is None or (
+                    response.payload.get("status") not in (
+                        "error",
+                        "FOREGROUND_REQUIRED",
+                        "UNSUPPORTED_MODE",
+                        "PERMISSION_DENIED",
+                        "RUNTIME_PERMISSION_REQUIRED",
+                        "USER_CONFIRMATION_REQUIRED",
+                    )
+                    and response.payload.get("success") is not False
+                )
             )
             err_msg = None
             if response.error:
@@ -308,9 +327,24 @@ class SessionRouter:
             elif not is_ok and response.payload:
                 err_msg = response.payload.get("message") or response.payload.get("error")
 
+            payload_status = response.payload.get("status") if (response.payload and isinstance(response.payload, dict)) else None
+            err_code = response.error.get("code") if (response.error and isinstance(response.error, dict)) else None
+
+            if not is_ok:
+                if payload_status and payload_status != "error":
+                    status_val = payload_status
+                elif err_msg and "FOREGROUND_REQUIRED" in err_msg:
+                    status_val = "FOREGROUND_REQUIRED"
+                elif err_code and err_code != "INTERNAL_ERROR":
+                    status_val = err_code
+                else:
+                    status_val = "DEVICE_ERROR"
+            else:
+                status_val = "SUCCESS"
+
             return {
                 "success": is_ok,
-                "status": "SUCCESS" if is_ok else "DEVICE_ERROR",
+                "status": status_val,
                 "data": response.payload,
                 "error": err_msg,
                 "target_device_id": node.device_id,
@@ -348,7 +382,17 @@ class SessionRouter:
             response = await client.send_message(req, timeout=timeout)
 
             is_ok = response.type == MessageType.RESPONSE and (
-                response.payload is None or response.payload.get("status") != "error"
+                response.payload is None or (
+                    response.payload.get("status") not in (
+                        "error",
+                        "FOREGROUND_REQUIRED",
+                        "UNSUPPORTED_MODE",
+                        "PERMISSION_DENIED",
+                        "RUNTIME_PERMISSION_REQUIRED",
+                        "USER_CONFIRMATION_REQUIRED",
+                    )
+                    and response.payload.get("success") is not False
+                )
             )
             err_msg = None
             if response.error:
@@ -356,9 +400,24 @@ class SessionRouter:
             elif not is_ok and response.payload:
                 err_msg = response.payload.get("message") or response.payload.get("error")
 
+            payload_status = response.payload.get("status") if (response.payload and isinstance(response.payload, dict)) else None
+            err_code = response.error.get("code") if (response.error and isinstance(response.error, dict)) else None
+
+            if not is_ok:
+                if payload_status and payload_status != "error":
+                    status_val = payload_status
+                elif err_msg and "FOREGROUND_REQUIRED" in err_msg:
+                    status_val = "FOREGROUND_REQUIRED"
+                elif err_code and err_code != "INTERNAL_ERROR":
+                    status_val = err_code
+                else:
+                    status_val = "DEVICE_ERROR"
+            else:
+                status_val = "SUCCESS"
+
             return {
                 "success": is_ok,
-                "status": "SUCCESS" if is_ok else "DEVICE_ERROR",
+                "status": status_val,
                 "data": response.payload,
                 "error": err_msg,
                 "target_device_id": node.device_id,

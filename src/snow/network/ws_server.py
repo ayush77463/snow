@@ -73,6 +73,7 @@ class SnowWebSocketServer:
         transfer_manager: Optional[TransferManager] = None,
         storage_manager: Optional[TransferStorageManager] = None,
         core_server: Optional[Any] = None,
+        node_registry: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.connection_manager = connection_manager or ConnectionManager()
@@ -83,6 +84,7 @@ class SnowWebSocketServer:
         self.transfer_manager = transfer_manager or TransferManager()
         self.storage_manager = storage_manager or TransferStorageManager(root_dir=self.config.transfer_root)
         self.core_server: Any = core_server
+        self.node_registry: Any = node_registry or getattr(core_server, "node_registry", None)
         self.windows_telemetry = (
             getattr(core_server, "windows_telemetry", None) if core_server else None
         ) or WindowsTelemetry()
@@ -120,7 +122,8 @@ class SnowWebSocketServer:
                 policy=self.capability_policy,
             )
         self.http_transfer_server: Any = None
-        self.node_registry: Any = getattr(core_server, "node_registry", None)
+        if not self.node_registry:
+            self.node_registry = getattr(core_server, "node_registry", None)
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -607,6 +610,8 @@ class SnowWebSocketServer:
                 await self._handle_desktop_file_list(client, message, data, session, ctx)
             elif action == "desktop_file_stage_download":
                 await self._handle_desktop_file_stage_download(client, message, data, session, ctx)
+            elif action == "manifest_update":
+                await self._handle_manifest_update(client, message, data, session)
             else:
                 logger.warning("Rejected unsupported action '%s' from client [%s]",
                                action, client.connection_id)
@@ -616,6 +621,54 @@ class SnowWebSocketServer:
                     correlation_id=message.id,
                 )
                 await client.websocket.send(error_response.to_json())
+
+    async def _handle_manifest_update(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle capability manifest updates from an authenticated peer."""
+        if session is None or not session.device_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Session not authenticated.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        device_id = session.device_id
+        manifest_data = data.get("manifest")
+        if not manifest_data or not isinstance(manifest_data, (dict, str)):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Missing or invalid 'manifest' in manifest_update payload.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        # Anti-spoofing check: strip any authority overrides in manifest_data if dict
+        if isinstance(manifest_data, dict):
+            manifest_data.pop("principal", None)
+            manifest_data.pop("trust_tier", None)
+            manifest_data.pop("execution_principal", None)
+
+        if self.node_registry:
+            self.node_registry.on_manifest_updated(device_id, manifest_data)
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "message": "Capability manifest updated successfully.",
+                "device_id": device_id,
+            },
+        )
+        await client.websocket.send(response.to_json())
+        logger.info("Processed live capability manifest update for device [%s]", device_id)
 
     async def _handle_auth_request(
         self, client, message: SnowMessage, data: dict[str, Any]

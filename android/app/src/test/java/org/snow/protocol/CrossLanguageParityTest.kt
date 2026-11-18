@@ -341,6 +341,28 @@ class CrossLanguageParityTest {
             )
             valid["response_auth_success_with_manifest.json"] = JsonSerialization.toJson(respAuthManifest)
 
+            // --- Phase 15 Live Manifest Update Protocol Fixtures ---
+            // 23c. Valid manifest_update request
+            val reqManifestUpdate = SnowMessage.createRequest(
+                "manifest_update",
+                mapOf(
+                    "device_id" to UUID.randomUUID().toString(),
+                    "manifest" to sampleManifest
+                )
+            )
+            valid["request_manifest_update.json"] = JsonSerialization.toJson(reqManifestUpdate)
+
+            // 23d. Valid manifest_update response
+            val respManifestUpdate = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "message" to "Capability manifest updated successfully.",
+                    "device_id" to UUID.randomUUID().toString()
+                )
+            )
+            valid["response_manifest_update_success.json"] = JsonSerialization.toJson(respManifestUpdate)
+
             // --- Phase 3 File Transfer Protocol Fixtures ---
             // 24. Valid file_transfer_offer request
             val reqOffer = SnowMessage.createRequest(

@@ -88,31 +88,75 @@ class AppLauncherHandler(private val context: Context) {
 
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
-        try {
-            context.startActivity(launchIntent)
-            SafeLog.i(TAG, "Successfully launched application '$cleanPackage'")
+        val inForeground = ClipboardHandler.isAppInForeground
+        if (inForeground) {
+            try {
+                context.startActivity(launchIntent)
+                SafeLog.i(TAG, "Successfully launched application '$cleanPackage' directly in foreground.")
+                return@withContext mapOf(
+                    "success" to true,
+                    "status" to "success",
+                    "delivery_mode" to "DIRECT_FOREGROUND",
+                    "package_name" to cleanPackage,
+                    "message" to "Successfully launched application '$cleanPackage'."
+                )
+            } catch (e: ActivityNotFoundException) {
+                SafeLog.w(TAG, "ActivityNotFoundException launching '$cleanPackage': ${e.message}")
+                return@withContext mapOf(
+                    "success" to false,
+                    "status" to "error",
+                    "error" to "Application '$cleanPackage' activity not found."
+                )
+            } catch (e: SecurityException) {
+                SafeLog.w(TAG, "SecurityException launching '$cleanPackage': ${e.message}")
+                return@withContext mapOf(
+                    "success" to false,
+                    "status" to "PERMISSION_DENIED",
+                    "error" to "Permission denied launching '$cleanPackage': ${e.message}",
+                    "remediation_hint" to "Check application permissions in Android Settings."
+                )
+            } catch (e: Exception) {
+                SafeLog.e(TAG, "Unexpected error launching '$cleanPackage': ${e.message}", e)
+                return@withContext mapOf(
+                    "success" to false,
+                    "status" to "error",
+                    "error" to "Failed launching '$cleanPackage': ${e.message}"
+                )
+            }
+        } else {
+            // Android 17 background activity launch restriction: require user tap via notification
+            if (ActionNotificationHelper.canPostNotifications(context)) {
+                val label = try {
+                    pm.getApplicationLabel(pm.getApplicationInfo(cleanPackage, 0)).toString()
+                } catch (_: Exception) {
+                    cleanPackage
+                }
+
+                val posted = ActionNotificationHelper.postActionNotification(
+                    context = context,
+                    title = "SNOW: Tap to open $label",
+                    content = "Tap to open application on this device.",
+                    intent = launchIntent
+                )
+
+                if (posted) {
+                    SafeLog.i(TAG, "Posted action notification for background launch of '$cleanPackage'.")
+                    return@withContext mapOf(
+                        "success" to true,
+                        "status" to "success",
+                        "delivery_mode" to "NOTIFICATION_TAP_REQUIRED",
+                        "package_name" to cleanPackage,
+                        "message" to "Application is in background. Tap the notification on your phone to open '$label'."
+                    )
+                }
+            }
+
+            SafeLog.w(TAG, "Background launch rejected for '$cleanPackage': notifications disabled or unavailable.")
             return@withContext mapOf(
-                "status" to "success",
-                "package_name" to cleanPackage,
-                "message" to "Successfully launched application '$cleanPackage'."
-            )
-        } catch (e: ActivityNotFoundException) {
-            SafeLog.w(TAG, "ActivityNotFoundException launching '$cleanPackage': ${e.message}")
-            return@withContext mapOf(
-                "status" to "error",
-                "error" to "Application '$cleanPackage' activity not found."
-            )
-        } catch (e: SecurityException) {
-            SafeLog.w(TAG, "SecurityException launching '$cleanPackage': ${e.message}")
-            return@withContext mapOf(
-                "status" to "error",
-                "error" to "Permission denied launching '$cleanPackage': ${e.message}"
-            )
-        } catch (e: Exception) {
-            SafeLog.e(TAG, "Unexpected error launching '$cleanPackage': ${e.message}", e)
-            return@withContext mapOf(
-                "status" to "error",
-                "error" to "Failed launching '$cleanPackage': ${e.message}"
+                "success" to false,
+                "status" to "FOREGROUND_REQUIRED",
+                "error" to "Background activity launch restricted by Android OS. Notification permission is required to deliver tap action.",
+                "remediation_hint" to "Open SNOW on your phone or grant Notification permission in Android Settings to launch applications."
             )
         }
     }

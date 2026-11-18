@@ -654,7 +654,12 @@ class SnowIpcServer:
         router = getattr(self, "session_router", None) or (
             getattr(self.core_server, "session_router", None) if self.core_server else None
         )
-        if router is not None and not type(router).__name__.endswith("Mock"):
+        has_real_router = router is not None and (
+            type(router).__name__ == "SessionRouter"
+            or getattr(router, "_is_router_mock", False) is True
+            or (not type(router).__name__.endswith("Mock") and hasattr(router, "route_request"))
+        )
+        if has_real_router:
             return await router.route_request(
                 action=action,
                 target=device_id,
@@ -860,14 +865,6 @@ class SnowIpcServer:
         if not paired:
             return {"success": False, "status": "DEVICE_NOT_PAIRED", "error": f"Device '{device_id}' is not paired."}
 
-        session = cs.session_manager.get_session_by_device(device_id)
-        if not session or not session.connection_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
-
-        conn = cs.connection_manager.get(session.connection_id)
-        if not conn or not conn.is_active:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
-
         # Resolve safe path
         safe_path, err = cs.windows_files.resolve_safe_path(file_path_raw, must_exist=True)
         if err or not safe_path or not safe_path.is_file():
@@ -880,12 +877,38 @@ class SnowIpcServer:
                 hasher.update(chunk)
         file_sha256 = hasher.hexdigest()
 
+        from snow.transfer.manager import TransferDirection, TransferState
+
+        # 1. Pre-check SHA-256 duplicate for already completed transfer
+        existing_transfers = cs.transfer_manager.list_transfers_for_device(device_id)
+        for t in existing_transfers:
+            if (
+                t.sha256 == file_sha256
+                and t.status == TransferState.COMPLETED
+                and t.direction == TransferDirection.DOWNLOAD
+            ):
+                logger.info(
+                    "File '%s' (sha256: %s) already transferred to [%s]; skipping duplicate.",
+                    safe_path.name,
+                    file_sha256[:12],
+                    device_id,
+                )
+                return {
+                    "success": True,
+                    "status": "ALREADY_EXISTS",
+                    "transfer_id": t.transfer_id,
+                    "file_name": safe_path.name,
+                    "sha256": file_sha256,
+                    "bytes_transferred": 0,
+                    "skipped_duplicate": True,
+                    "message": f"File '{safe_path.name}' with identical hash already exists on destination; transfer skipped.",
+                }
+
         # Ensure file exists at destination inside storage_manager so download handler can serve it
         dest_path = cs.storage_manager.resolve_destination_path(safe_path.name)
         if dest_path.resolve() != safe_path.resolve():
             shutil.copy2(safe_path, dest_path)
 
-        from snow.transfer.manager import TransferDirection
         record = cs.transfer_manager.create_transfer(
             device_id=device_id,
             file_name=safe_path.name,
@@ -908,6 +931,59 @@ class SnowIpcServer:
             "transfer_port": transfer_port,
         }
 
+        # 2. Prefer SessionRouter for capability-aware multi-transport dispatch
+        router = getattr(self, "session_router", None) or (
+            getattr(cs, "session_router", None) if cs else None
+        )
+        has_real_router = router is not None and (
+            type(router).__name__ == "SessionRouter"
+            or getattr(router, "_is_router_mock", False) is True
+            or (not type(router).__name__.endswith("Mock") and hasattr(router, "route_request"))
+        )
+        if has_real_router:
+            route_res = await router.route_request(
+                action="file_send_request",
+                target=device_id,
+                data=req_data,
+                timeout=timeout,
+            )
+            if route_res.get("success"):
+                cs.transfer_manager.complete_transfer(record.transfer_id)
+                return {
+                    "success": True,
+                    "status": "SUCCESS",
+                    "transfer_id": record.transfer_id,
+                    "file_name": safe_path.name,
+                    "sha256": file_sha256,
+                    "bytes_transferred": file_size,
+                    "skipped_duplicate": False,
+                    "data": route_res.get("data"),
+                }
+            else:
+                err_msg = route_res.get("error") or "Transfer failed on target device."
+                cs.transfer_manager.fail_transfer(record.transfer_id, err_msg)
+                return {
+                    "success": False,
+                    "status": route_res.get("status") or "TRANSFER_FAILED",
+                    "transfer_id": record.transfer_id,
+                    "file_name": safe_path.name,
+                    "sha256": file_sha256,
+                    "bytes_transferred": 0,
+                    "skipped_duplicate": False,
+                    "error": err_msg,
+                }
+
+        # 3. Fallback direct WebSocket dispatch
+        session = cs.session_manager.get_session_by_device(device_id)
+        if not session or not session.connection_id:
+            cs.transfer_manager.fail_transfer(record.transfer_id, "Device offline")
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
+
+        conn = cs.connection_manager.get(session.connection_id)
+        if not conn or not conn.is_active:
+            cs.transfer_manager.fail_transfer(record.transfer_id, "Device connection inactive")
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
+
         try:
             resp = await cs.ws_server.send_request(
                 connection_id=session.connection_id,
@@ -923,6 +999,11 @@ class SnowIpcServer:
                 return {
                     "success": True,
                     "status": "SUCCESS",
+                    "transfer_id": record.transfer_id,
+                    "file_name": safe_path.name,
+                    "sha256": file_sha256,
+                    "bytes_transferred": file_size,
+                    "skipped_duplicate": False,
                     "data": resp.payload,
                 }
             else:
@@ -935,6 +1016,11 @@ class SnowIpcServer:
                 return {
                     "success": False,
                     "status": "TRANSFER_FAILED",
+                    "transfer_id": record.transfer_id,
+                    "file_name": safe_path.name,
+                    "sha256": file_sha256,
+                    "bytes_transferred": 0,
+                    "skipped_duplicate": False,
                     "error": err_msg,
                 }
         except TimeoutError:
@@ -967,13 +1053,39 @@ class SnowIpcServer:
         if not paired:
             return {"success": False, "status": "DEVICE_NOT_PAIRED", "error": f"Device '{device_id}' is not paired."}
 
-        session = cs.session_manager.get_session_by_device(device_id)
-        if not session or not session.connection_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
+        from snow.transfer.manager import TransferDirection, TransferState
 
-        conn = cs.connection_manager.get(session.connection_id)
-        if not conn or not conn.is_active:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
+        # 1. Pre-check SHA-256 duplicate for already existing completed file upload
+        dest_path = cs.storage_manager.resolve_destination_path(clean_name)
+        if dest_path.exists() and dest_path.is_file():
+            existing = cs.transfer_manager.list_transfers_for_device(device_id)
+            for t in existing:
+                if (
+                    t.file_name == clean_name
+                    and t.status == TransferState.COMPLETED
+                    and t.direction == TransferDirection.UPLOAD
+                ):
+                    hasher = hashlib.sha256()
+                    with open(dest_path, "rb") as f:
+                        while chunk := f.read(65536):
+                            hasher.update(chunk)
+                    existing_sha = hasher.hexdigest()
+                    if existing_sha == t.sha256:
+                        logger.info(
+                            "File '%s' already uploaded from [%s]; skipping duplicate.",
+                            clean_name,
+                            device_id,
+                        )
+                        return {
+                            "success": True,
+                            "status": "ALREADY_EXISTS",
+                            "transfer_id": t.transfer_id,
+                            "file_name": clean_name,
+                            "sha256": existing_sha,
+                            "bytes_transferred": 0,
+                            "skipped_duplicate": True,
+                            "message": f"File '{clean_name}' already exists locally; transfer skipped.",
+                        }
 
         transfer_port = (
             cs.http_transfer_server.bound_port
@@ -985,6 +1097,49 @@ class SnowIpcServer:
             "file_name": clean_name,
             "transfer_port": transfer_port,
         }
+
+        # 2. Prefer SessionRouter for capability-aware multi-transport dispatch
+        router = getattr(self, "session_router", None) or (
+            getattr(cs, "session_router", None) if cs else None
+        )
+        has_real_router = router is not None and (
+            type(router).__name__ == "SessionRouter"
+            or getattr(router, "_is_router_mock", False) is True
+            or (not type(router).__name__.endswith("Mock") and hasattr(router, "route_request"))
+        )
+        if has_real_router:
+            route_res = await router.route_request(
+                action="file_receive_request",
+                target=device_id,
+                data=req_data,
+                timeout=timeout,
+            )
+            if route_res.get("success"):
+                return {
+                    "success": True,
+                    "status": "SUCCESS",
+                    "file_name": clean_name,
+                    "skipped_duplicate": False,
+                    "data": route_res.get("data"),
+                }
+            else:
+                err_msg = route_res.get("error") or "File receive failed on target device."
+                return {
+                    "success": False,
+                    "status": route_res.get("status") or "TRANSFER_FAILED",
+                    "file_name": clean_name,
+                    "skipped_duplicate": False,
+                    "error": err_msg,
+                }
+
+        # 3. Fallback direct WebSocket dispatch
+        session = cs.session_manager.get_session_by_device(device_id)
+        if not session or not session.connection_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
+
+        conn = cs.connection_manager.get(session.connection_id)
+        if not conn or not conn.is_active:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
 
         try:
             resp = await cs.ws_server.send_request(
@@ -1000,6 +1155,8 @@ class SnowIpcServer:
                 return {
                     "success": True,
                     "status": "SUCCESS",
+                    "file_name": clean_name,
+                    "skipped_duplicate": False,
                     "data": resp.payload,
                 }
             else:
@@ -1011,6 +1168,8 @@ class SnowIpcServer:
                 return {
                     "success": False,
                     "status": "TRANSFER_FAILED",
+                    "file_name": clean_name,
+                    "skipped_duplicate": False,
                     "error": err_msg,
                 }
         except TimeoutError:
