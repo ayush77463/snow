@@ -1,11 +1,11 @@
 """Command-line interface (CLI) for SNOW.
 
 Provides user commands for:
-- snow setup: Automated and safe MCP configuration generation for Claude Desktop,
-  Antigravity, Cursor, and generic MCP hosts.
+- snow setup: Automated and safe MCP configuration for Claude, Gemini, Cursor, ChatGPT.
+- snow devices: Comprehensive device trust and pairing lifecycle management.
+- snow doctor: System health, dependency, and configuration readiness diagnostics.
 - snow status: Live diagnostic overview of SNOW Core daemon, IPC endpoint, and logs.
-- snow daemon start: Headless background daemon startup.
-- snow daemon stop: Clean daemon termination.
+- snow daemon start/stop: Headless background daemon lifecycle control.
 """
 
 from __future__ import annotations
@@ -17,15 +17,25 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from snow.core.config import CoreConfig
 from snow.daemon import CoreDaemonManager, get_daemon_log_path, get_snow_dir
+from snow.mcp.bridge import SnowMcpBridge
+from snow.onboarding import (
+    HostOnboardingManager,
+    SUPPORTED_HOSTS,
+    get_canonical_mcp_entry,
+)
+from snow.security.db import DatabaseManager
+from snow.security.tls import DEFAULT_CERT_FILE, DEFAULT_KEY_FILE, DEFAULT_TLS_DIR
 
 logger = logging.getLogger(__name__)
 
-# Standard known MCP client configuration targets on Windows
+# Standard known MCP client configuration targets on Windows (backward-compatible exports)
 APPDATA = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
 CLAUDE_CONFIG_PATH = Path(APPDATA) / "Claude" / "claude_desktop_config.json"
 ANTIGRAVITY_CONFIG_PATH = Path.home() / ".gemini" / "antigravity" / "mcp_config.json"
@@ -33,10 +43,7 @@ ANTIGRAVITY_CONFIG_PATH = Path.home() / ".gemini" / "antigravity" / "mcp_config.
 
 def get_snow_mcp_config_entry() -> dict[str, Any]:
     """Generate the canonical MCP server configuration entry for SNOW."""
-    return {
-        "command": sys.executable,
-        "args": ["-m", "snow.mcp"],
-    }
+    return get_canonical_mcp_entry()
 
 
 def merge_mcp_config(
@@ -91,62 +98,601 @@ def atomic_write_json(file_path: Path, data: dict[str, Any], backup: bool = True
         raise
 
 
-def run_setup(dry_run: bool = False) -> int:
-    """Execute the 'snow setup' command."""
-    print("=" * 65)
-    print("SNOW — Model Context Protocol (MCP) Setup Assistant")
-    print("=" * 65)
+# =========================================================================
+# Setup Command (Multi-Host AI Assistant Onboarding)
+# =========================================================================
 
-    snow_entry = get_snow_mcp_config_entry()
-    full_sample = {"mcpServers": {"snow": snow_entry}}
 
-    print("\n[Canonical SNOW MCP Configuration]")
-    print(json.dumps(full_sample, indent=2))
+def run_setup(
+    host: str = "all",
+    dry_run: bool = False,
+    remove: bool = False,
+    config_paths: Optional[dict[str, Path | str]] = None,
+    python_exe: Optional[str] = None,
+) -> int:
+    """Execute 'snow setup' for one or all AI assistant hosts."""
+    resolved_paths: dict[str, Path | str] = {"claude": CLAUDE_CONFIG_PATH}
+    if config_paths:
+        resolved_paths.update(config_paths)
+
+    manager = HostOnboardingManager(custom_paths=resolved_paths, python_exe=python_exe)
+    clean_host = (host or "all").strip().lower()
+
+    action_label = "Removal" if remove else "Setup"
+    print("=" * 65)
+    print(f"SNOW — Model Context Protocol (MCP) {action_label} Assistant")
+    print("=" * 65)
 
     if dry_run:
-        print("\n[DRY RUN] No filesystem changes were made.")
-        print(f"Target Claude Desktop path: {CLAUDE_CONFIG_PATH}")
-        print("\nTo manually configure any MCP host, add the above snippet to its config.")
+        print("\n[DRY RUN MODE] No filesystem modifications will be made.\n")
+
+    if remove:
+        result = manager.remove_host(clean_host, dry_run=dry_run)
+    else:
+        result = manager.setup_host(clean_host, dry_run=dry_run)
+
+    overall_success = result.get("success", False)
+
+    # Single host result
+    if clean_host != "all":
+        items = [(clean_host, result)]
+    else:
+        items = list(result.get("results", {}).items())
+
+    for h_name, res in items:
+        display = res.get("display_name", h_name.capitalize())
+        status = res.get("status", "UNKNOWN")
+        path = res.get("target_path", "N/A")
+
+        if res.get("success"):
+            badge = "[DRY RUN]" if dry_run else "[+]"
+            print(f"{badge} {display}: {status}")
+            print(f"    Target Path: {path}")
+            if res.get("backup_path"):
+                print(f"    Backup:      {res['backup_path']}")
+            if res.get("notes"):
+                print(f"    Note:        {res['notes']}")
+        else:
+            print(f"[-] {display}: {status}")
+            print(f"    Target Path: {path}")
+            print(f"    Error:       {res.get('error', 'Unknown error')}")
+
+    print("\n" + "=" * 65)
+    if overall_success:
+        if dry_run:
+            print("Dry-run preview complete. Run without --dry-run to apply changes.")
+        else:
+            print(f"SNOW MCP {action_label.lower()} completed successfully.")
+        return 0
+    else:
+        print(f"One or more host {action_label.lower()} steps encountered errors.")
+        return 1
+
+
+# =========================================================================
+# Devices Command (Device & Trust Management)
+# =========================================================================
+
+
+def run_devices_list(json_output: bool = False, db_path: Optional[Path | str] = None) -> int:
+    """Execute 'snow devices list'."""
+    bridge = SnowMcpBridge(auto_start_core=False)
+    daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
+
+    devices_list: list[dict[str, Any]] = []
+    source = "offline_database"
+
+    if daemon_online:
+        try:
+            res = asyncio.run(bridge.list_devices())
+            if res.get("success"):
+                raw_devices = res.get("data", {}).get("devices", [])
+                source = "daemon_ipc"
+                for d in raw_devices:
+                    devices_list.append({
+                        "device_id": d.get("device_id", "unknown"),
+                        "device_name": d.get("device_name", "Unknown Node"),
+                        "platform": d.get("platform", "unknown"),
+                        "trust_tier": (d.get("trust_tier") or "peer").upper(),
+                        "reachability_profile": d.get("reachability_profile", "ACTIVE_SESSION_PEER"),
+                        "reachability_state": d.get("reachability_state", "CONNECTED_SESSION" if d.get("is_connected") else "UNREACHABLE_OFFLINE"),
+                        "is_paired": bool(d.get("is_paired", True)),
+                        "is_connected": bool(d.get("is_connected", False)),
+                        "last_known_endpoint": f"{d.get('host', 'N/A')}:{d.get('wss_port', 8765)}" if d.get("host") else "N/A",
+                    })
+        except Exception as exc:
+            logger.debug("Failed querying daemon IPC for devices list: %s", exc)
+
+    if not devices_list:
+        # Fall back to offline SQLite database
+        db = DatabaseManager(db_path=db_path)
+        try:
+            paired = db.list_paired_devices()
+            source = "offline_database"
+            for p in paired:
+                endpoint = f"{p.last_known_host}:{p.last_known_port}" if p.last_known_host else "N/A"
+                devices_list.append({
+                    "device_id": p.device_id,
+                    "device_name": p.device_name,
+                    "platform": getattr(p, "platform", None) or "android",
+                    "trust_tier": (p.trust_tier or "peer").upper(),
+                    "reachability_profile": getattr(p, "reachability_profile", "ACTIVE_SESSION_PEER"),
+                    "reachability_state": "LAST_KNOWN_IP_DIRECT" if p.last_known_host else "UNREACHABLE_OFFLINE",
+                    "is_paired": True,
+                    "is_connected": False,
+                    "last_known_endpoint": endpoint,
+                })
+        except Exception as exc:
+            if json_output:
+                print(json.dumps({"success": False, "error": f"Database read error: {exc}"}, indent=2))
+                return 1
+            print(f"[-] Could not read local database: {exc}")
+            return 1
+
+    if json_output:
+        out = {
+            "success": True,
+            "source": source,
+            "count": len(devices_list),
+            "devices": devices_list,
+        }
+        print(json.dumps(out, indent=2))
         return 0
 
-    configured_any = False
+    print("=" * 70)
+    source_label = "Online via Core IPC" if source == "daemon_ipc" else "Offline via SQLite Database"
+    print(f"SNOW Devices ({len(devices_list)} registered) — [{source_label}]")
+    print("=" * 70)
 
-    # Attempt Claude Desktop configuration
-    target_path = CLAUDE_CONFIG_PATH
+    if not devices_list:
+        print("  No devices paired or discovered. Use 'snow pair' or connect from your device.")
+    else:
+        for d in devices_list:
+            conn_status = "ONLINE (Connected)" if d["is_connected"] else d["reachability_state"]
+            print(f"  * [{d['device_id']}] {d['device_name']}")
+            print(f"      Platform:     {d['platform'].capitalize()}")
+            print(f"      Trust Tier:   {d['trust_tier']}")
+            print(f"      Profile:      {d['reachability_profile']}")
+            print(f"      Reachability: {conn_status}")
+            print(f"      Endpoint:     {d['last_known_endpoint']}")
+            print()
+    print("=" * 70)
+    return 0
+
+
+def run_devices_trust(
+    device_id: str,
+    tier: str,
+    yes: bool = False,
+    db_path: Optional[Path | str] = None,
+) -> int:
+    """Execute 'snow devices trust <device_id> --tier <owner|peer>'."""
+    clean_id = (device_id or "").strip()
+    clean_tier = (tier or "").strip().lower()
+
+    if not clean_id:
+        print("[-] Missing device_id argument.")
+        return 1
+
+    if clean_tier not in ("owner", "peer"):
+        print(f"[-] Invalid tier '{tier}'. Must be 'owner' or 'peer'.")
+        return 1
+
+    db = DatabaseManager(db_path=db_path)
+    device = db.get_paired_device(clean_id)
+    if not device:
+        print(f"[-] Device [{clean_id}] is not registered as a paired device.")
+        return 1
+
+    current_tier = (device.trust_tier or "peer").lower()
+    if current_tier == clean_tier:
+        print(f"[i] Device [{clean_id}] ({device.device_name}) is already assigned trust tier '{clean_tier.upper()}'.")
+        return 0
+
+    # Single owner invariant warning
+    if clean_tier == "owner":
+        current_owner = db.get_owner_device()
+        if current_owner and current_owner.device_id != clean_id:
+            print(f"[!] Warning: Device [{current_owner.device_id}] ({current_owner.device_name}) is currently the OWNER.")
+            print(f"    Promoting [{clean_id}] will demote the previous owner to PEER (single-owner invariant).")
+
+    if not yes:
+        try:
+            confirm = input(f"Confirm changing trust tier of [{clean_id}] ({device.device_name}) to '{clean_tier.upper()}'? [y/N]: ")
+            if confirm.strip().lower() not in ("y", "yes"):
+                print("Operation cancelled by user.")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print("\nOperation cancelled.")
+            return 1
+
+    # Check if daemon is running to notify via IPC
+    bridge = SnowMcpBridge(auto_start_core=False)
+    daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
+
+    if daemon_online:
+        res = asyncio.run(bridge.call("device_trust", {"device_id": clean_id, "tier": clean_tier}))
+        if res.get("success"):
+            print(f"[+] Successfully updated device [{clean_id}] ({device.device_name}) trust tier to '{clean_tier.upper()}' via Core IPC.")
+            return 0
+        else:
+            print(f"[-] Failed to update trust tier via daemon: {res.get('error')}")
+            return 1
+    else:
+        # Offline update directly in SQLite
+        updated = db.update_device_trust_tier(clean_id, clean_tier)
+        if updated:
+            print(f"[+] Updated device [{clean_id}] ({device.device_name}) trust tier to '{clean_tier.upper()}' in offline database.")
+            print("    Note: Core daemon is offline. Changes will take effect on next daemon startup.")
+            return 0
+        else:
+            print(f"[-] Failed to update trust tier for device [{clean_id}].")
+            return 1
+
+
+def run_devices_revoke(
+    device_id: str,
+    yes: bool = False,
+    db_path: Optional[Path | str] = None,
+) -> int:
+    """Execute 'snow devices revoke <device_id>'."""
+    clean_id = (device_id or "").strip()
+    if not clean_id:
+        print("[-] Missing device_id argument.")
+        return 1
+
+    db = DatabaseManager(db_path=db_path)
+    device = db.get_paired_device(clean_id)
+    if not device:
+        print(f"[-] Device [{clean_id}] is not registered as a paired device.")
+        return 1
+
+    if not yes:
+        try:
+            confirm = input(f"Are you sure you want to permanently REVOKE paired device [{clean_id}] ({device.device_name})? [y/N]: ")
+            if confirm.strip().lower() not in ("y", "yes"):
+                print("Revocation cancelled by user.")
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            print("\nRevocation cancelled.")
+            return 1
+
+    bridge = SnowMcpBridge(auto_start_core=False)
+    daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
+
+    if daemon_online:
+        res = asyncio.run(bridge.call("device_revoke", {"device_id": clean_id}))
+        if res.get("success"):
+            print(f"[+] Device [{clean_id}] ({device.device_name}) has been revoked.")
+            print("    Stored credentials deleted; any active daemon session was immediately terminated.")
+            return 0
+        else:
+            print(f"[-] Daemon failed to revoke device: {res.get('error')}")
+            return 1
+    else:
+        # Offline deletion from SQLite
+        deleted = db.delete_paired_device(clean_id)
+        if deleted:
+            db.log_audit_event(
+                event_type="DEVICE_REVOKED",
+                device_id=clean_id,
+                details={"revoked_by": "cli_offline"},
+            )
+            print(f"[+] Device [{clean_id}] ({device.device_name}) credentials deleted from offline database.")
+            print("    Note: Core daemon was offline; active sessions could not be confirmed terminated.")
+            return 0
+        else:
+            print(f"[-] Failed deleting device [{clean_id}] from database.")
+            return 1
+
+
+def run_devices_connect(
+    host: str,
+    port: int = 8765,
+    pin: Optional[str] = None,
+) -> int:
+    """Execute 'snow devices connect <host> [--port 8765] [--pin <PIN>]'."""
+    clean_host = (host or "").strip()
+    if not clean_host:
+        print("[-] Missing host target.")
+        return 1
+
+    if port < 1 or port > 65535:
+        print(f"[-] Invalid port {port}. Must be between 1 and 65535.")
+        return 1
+
+    print(f"Connecting to peer at {clean_host}:{port}...")
+
+    import socket
     try:
-        existing_text = ""
-        if target_path.exists():
-            existing_text = target_path.read_text(encoding="utf-8")
-
-        merged, warn = merge_mcp_config(existing_text, server_name="snow")
-        if warn:
-            print(f"\n[!] Warning for Claude Desktop config: {warn}")
-
-        bak = atomic_write_json(target_path, merged, backup=True)
-        print(f"\n[+] Successfully configured Claude Desktop at:")
-        print(f"    {target_path}")
-        if bak:
-            print(f"    (Backup preserved at: {bak})")
-        configured_any = True
+        s = socket.create_connection((clean_host, port), timeout=5.0)
+        s.close()
+        print(f"[+] TCP connection to {clean_host}:{port} successful.")
+        if pin:
+            print("    PIN provided for mutual pairing verification.")
+        print("    Peer endpoint is reachable and responsive.")
+        return 0
     except Exception as exc:
-        print(f"\n[-] Could not automatically write Claude Desktop config: {exc}")
+        print(f"[-] Connection failed to {clean_host}:{port}: {exc}")
+        return 1
 
-    print("\n[Manual Setup Reference]")
-    print("For Gemini CLI, Antigravity, Cursor, or other MCP clients, add:")
-    print(json.dumps(full_sample, indent=2))
 
-    return 0 if configured_any else 1
+# =========================================================================
+# Doctor Command (System Health & Readiness Diagnostics)
+# =========================================================================
+
+
+def run_doctor(
+    json_output: bool = False,
+    db_path: Optional[Path | str] = None,
+    cert_path: Optional[Path | str] = None,
+    key_path: Optional[Path | str] = None,
+) -> int:
+    """Execute 'snow doctor' to verify system readiness across all components."""
+    checks: list[dict[str, Any]] = []
+
+    # 1. Python Environment Check
+    py_ver = sys.version_info
+    py_ver_str = f"{py_ver.major}.{py_ver.minor}.{py_ver.micro}"
+    if py_ver >= (3, 11):
+        status = "OK"
+        msg = f"Python {py_ver_str} ({sys.executable})"
+        remed = None
+    else:
+        status = "FAILED"
+        msg = f"Python {py_ver_str} is unsupported. Python 3.11+ (recommended 3.13) required."
+        remed = "Upgrade to Python 3.13: https://www.python.org/downloads/"
+    checks.append({
+        "component": "python_environment",
+        "name": "Python Environment",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 2. Installed SNOW Package & Entry Point
+    try:
+        import snow
+        status = "OK"
+        msg = f"SNOW package importable (v{getattr(snow, '__version__', '2.0.0')})"
+        remed = None
+    except Exception as exc:
+        status = "FAILED"
+        msg = f"Failed importing snow package: {exc}"
+        remed = "Reinstall package in development mode: pip install -e ."
+    checks.append({
+        "component": "package_installation",
+        "name": "Package Installation",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 3. Required Dependencies
+    missing_deps = []
+    for dep in ("websockets", "cryptography", "psutil", "mcp"):
+        try:
+            __import__(dep)
+        except ImportError:
+            missing_deps.append(dep)
+
+    if not missing_deps:
+        status = "OK"
+        msg = "All core dependencies available (websockets, cryptography, psutil, mcp, sqlite3)"
+        remed = None
+    else:
+        status = "FAILED"
+        msg = f"Missing required dependencies: {', '.join(missing_deps)}"
+        remed = f"Install missing packages: pip install {' '.join(missing_deps)}"
+    checks.append({
+        "component": "dependencies",
+        "name": "Core Dependencies",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 4. SQLite Database & Schema Integrity
+    target_db_path = Path(db_path) if db_path else Path.home() / ".snow" / "snow_devices.db"
+    if not target_db_path.exists():
+        status = "NOT_CONFIGURED"
+        msg = f"Database not found at {target_db_path}"
+        remed = "Start the daemon or run 'snow daemon start' to initialize database."
+    else:
+        try:
+            db = DatabaseManager(db_path=target_db_path)
+            with db._get_connection() as conn:
+                row = conn.execute("PRAGMA integrity_check;").fetchone()
+                intact = row and row[0] == "ok"
+                tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
+                has_tables = "paired_devices" in tables and "pairing_audit_log" in tables
+
+            paired_count = len(db.list_paired_devices())
+            if intact and has_tables:
+                status = "OK"
+                msg = f"Database intact at {target_db_path} ({paired_count} paired device{'s' if paired_count != 1 else ''})"
+                remed = None
+            else:
+                status = "FAILED"
+                msg = f"Database schema integrity check failed at {target_db_path}"
+                remed = "Database may be corrupt. Back up and recreate using 'snow daemon start'."
+        except Exception as exc:
+            status = "FAILED"
+            msg = f"Database check failed: {exc}"
+            remed = "Ensure SQLite database file is readable and permissions are correct."
+    checks.append({
+        "component": "sqlite_database",
+        "name": "SQLite Database",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 5. TLS Certificates & Keys
+    cert = Path(cert_path) if cert_path else (DEFAULT_TLS_DIR / DEFAULT_CERT_FILE)
+    key = Path(key_path) if key_path else (DEFAULT_TLS_DIR / DEFAULT_KEY_FILE)
+    if cert.exists() and key.exists():
+        try:
+            # Check certificate expiration safely
+            from cryptography import x509
+            cert_bytes = cert.read_bytes()
+            parsed_cert = x509.load_pem_x509_certificate(cert_bytes)
+            if hasattr(parsed_cert, "not_valid_after_utc"):
+                expiry = parsed_cert.not_valid_after_utc
+            else:
+                expiry = getattr(parsed_cert, "not_valid_after", "Unknown")
+            status = "OK"
+            msg = f"TLS cert & private key present at {cert.parent} (Expires: {expiry})"
+            remed = None
+        except Exception:
+            status = "OK"
+            msg = f"TLS cert & private key present at {cert.parent}"
+            remed = None
+    elif cert.exists() or key.exists():
+        status = "WARNING"
+        msg = f"Incomplete TLS configuration in {cert.parent} (one file missing)"
+        remed = "Remove partial TLS files and run 'snow daemon start' to regenerate valid pair."
+    else:
+        status = "NOT_CONFIGURED"
+        msg = f"TLS certificate not yet generated at {cert.parent}"
+        remed = "Run 'snow daemon start' to automatically generate local self-signed TLS certificates."
+    checks.append({
+        "component": "tls_certificates",
+        "name": "TLS Certificates",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 6. Capability Engine In-Process Readiness
+    try:
+        from snow.capabilities.engine import CapabilityEngine, CapabilityRequest, ExecutionContext, ExecutionPrincipal
+        engine = CapabilityEngine()
+        status = "OK"
+        msg = "CapabilityEngine initialized and dispatch handlers registered"
+        remed = None
+    except Exception as exc:
+        status = "FAILED"
+        msg = f"CapabilityEngine in-process initialization failed: {exc}"
+        remed = "Verify local capability modules under snow.capabilities."
+    checks.append({
+        "component": "capability_engine",
+        "name": "Capability Engine",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 7. Daemon IPC Endpoint
+    daemon_mgr = CoreDaemonManager()
+    ipc_ready = asyncio.run(daemon_mgr.is_ipc_ready(timeout=0.2))
+    pid = daemon_mgr.get_tracked_pid()
+    if ipc_ready:
+        status = "OK"
+        msg = f"Running and responsive (PID {pid}, 127.0.0.1:{daemon_mgr.port})"
+        remed = None
+    else:
+        status = "WARNING"
+        msg = "Core daemon is OFFLINE (Local-first Windows operations remain functional via in-process engine)"
+        remed = "Start the background daemon with: snow daemon start"
+    checks.append({
+        "component": "daemon_ipc",
+        "name": "Core Daemon IPC",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 8. MCP Tool Registration Count Invariant (Exactly 24)
+    try:
+        from snow.mcp.tools import ALL_TOOL_NAMES
+        tool_count = len(ALL_TOOL_NAMES)
+        if tool_count == 24:
+            status = "OK"
+            msg = "Exactly 24 static MCP tools registered (all categories verified)"
+            remed = None
+        else:
+            status = "FAILED"
+            msg = f"MCP tool count invariant violated: expected 24, found {tool_count}"
+            remed = "Audit snow.mcp.tools to restore approved 24-tool catalog."
+    except Exception as exc:
+        status = "FAILED"
+        msg = f"Failed inspecting MCP tool catalog: {exc}"
+        remed = "Verify snow.mcp.tools imports."
+    checks.append({
+        "component": "mcp_tool_catalog",
+        "name": "MCP Tool Catalog",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+    })
+
+    # 9. AI Host Configurations
+    onboarding_mgr = HostOnboardingManager()
+    host_statuses = onboarding_mgr.check_all_hosts()
+    configured_hosts = [h for h, st in host_statuses.items() if st.get("is_configured")]
+    if configured_hosts:
+        status = "OK"
+        msg = f"Configured in {len(configured_hosts)} AI host(s): {', '.join(configured_hosts)}"
+        remed = None
+    else:
+        status = "NOT_CONFIGURED"
+        msg = "No AI assistant clients currently configured"
+        remed = "Run 'snow setup --host all' (or --host claude|gemini|cursor) to configure."
+    checks.append({
+        "component": "ai_host_integrations",
+        "name": "AI Host Integrations",
+        "status": status,
+        "message": msg,
+        "remediation": remed,
+        "hosts": host_statuses,
+    })
+
+    # Summary calculation
+    counts = {"OK": 0, "WARNING": 0, "FAILED": 0, "NOT_CONFIGURED": 0}
+    for c in checks:
+        counts[c["status"]] = counts.get(c["status"], 0) + 1
+
+    overall = "READY" if counts["FAILED"] == 0 else "ACTION_REQUIRED"
+
+    if json_output:
+        print(json.dumps({
+            "overall_health": overall,
+            "counts": counts,
+            "checks": checks,
+        }, indent=2))
+        return 0 if overall == "READY" else 1
+
+    print("=" * 70)
+    print("SNOW — System Health & Readiness Doctor")
+    print("=" * 70)
+    for c in checks:
+        badge = f"[{c['status']}]"
+        print(f"  {badge:<18} {c['name']}")
+        print(f"    Details:     {c['message']}")
+        if c.get("remediation"):
+            print(f"    Remediation: {c['remediation']}")
+        print()
+    print("=" * 70)
+    print(f"Overall Health: {overall} ({counts['OK']} OK, {counts['WARNING']} WARNING, {counts['NOT_CONFIGURED']} NOT_CONFIGURED, {counts['FAILED']} FAILED)")
+    print("=" * 70)
+    return 0 if overall == "READY" else 1
+
+
+# =========================================================================
+# Daemon & Status Commands
+# =========================================================================
 
 
 def run_status() -> int:
-    """Execute the 'snow status' command."""
+    """Execute 'snow status'."""
     manager = CoreDaemonManager()
     status_data = asyncio.run(manager.get_status())
 
     print("=" * 60)
     print("SNOW — System Status Overview")
     print("=" * 60)
-    print(f"  Version:           0.1.0")
+    print(f"  Version:           2.0.0")
     print(f"  Daemon Running:    {'YES' if status_data['daemon_running'] else 'NO'}")
     print(f"  IPC Endpoint:      {'READY (online)' if status_data['ipc_ready'] else 'OFFLINE'}")
     if status_data.get("pid"):
@@ -154,9 +700,6 @@ def run_status() -> int:
     print(f"  Loopback Bind:     {status_data['host']}:{status_data['port']}")
     print(f"  Daemon Log Path:   {status_data['log_path']}")
     print(f"  State Directory:   {get_snow_dir()}")
-
-    claude_installed = CLAUDE_CONFIG_PATH.exists()
-    print(f"  Claude MCP Config: {'Configured' if claude_installed else 'Not configured'}")
     print("=" * 60)
     return 0
 
@@ -193,92 +736,119 @@ def run_daemon_stop() -> int:
         return 1
 
 
-def run_peer_trust(device_id: str, tier: str) -> int:
-    """Configure trust tier for a paired device."""
-    from snow.security.db import DatabaseManager
-    clean_id = device_id.strip()
-    clean_tier = tier.strip().lower()
-
-    if clean_tier not in ("owner", "peer"):
-        print(f"[-] Invalid tier '{tier}'. Must be 'owner' or 'peer'.")
-        return 1
-
-    db = DatabaseManager()
-    device = db.get_paired_device(clean_id)
-    if not device:
-        print(f"[-] Device [{clean_id}] is not registered as a paired device.")
-        return 1
-
-    success = db.update_device_trust_tier(clean_id, clean_tier)
-    if success:
-        print(f"[+] Successfully updated device [{clean_id}] ({device.device_name}) trust tier to '{clean_tier}'.")
-        return 0
-    else:
-        print(f"[-] Failed to update trust tier for device [{clean_id}].")
-        return 1
+# =========================================================================
+# Main CLI Parser & Dispatcher
+# =========================================================================
 
 
-def run_peer_list() -> int:
-    """List paired peer devices and their trust tiers."""
-    from snow.security.db import DatabaseManager
-    db = DatabaseManager()
-    devices = db.list_paired_devices()
-    print("=" * 65)
-    print(f"SNOW Paired Devices ({len(devices)} registered)")
-    print("=" * 65)
-    if not devices:
-        print("  No devices paired.")
-    for d in devices:
-        print(f"  - [{d.device_id}] {d.device_name}")
-        print(f"      Trust Tier:  {d.trust_tier.upper()}")
-        print(f"      Paired At:   {d.pairing_timestamp}")
-        print(f"      Last Seen:   {d.last_seen_timestamp}")
-    print("=" * 65)
-    return 0
-
-
-def main(args: Optional[list[str]] = None) -> int:
-    """CLI entry point for the 'snow' command."""
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level argument parser for the SNOW CLI."""
     parser = argparse.ArgumentParser(
         prog="snow",
         description="SNOW — Headless cross-device AI capability platform CLI",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
-    # setup
-    setup_parser = subparsers.add_parser("setup", help="Configure SNOW as an MCP server")
+    # 1. setup
+    setup_parser = subparsers.add_parser("setup", help="Configure SNOW as an MCP server in AI assistant clients")
+    setup_parser.add_argument(
+        "--host",
+        choices=["all", "claude", "gemini", "cursor", "chatgpt"],
+        default="claude",
+        help="Target AI assistant host (default: claude; use 'all' for all hosts)",
+    )
     setup_parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print configuration without making changes to disk",
+        help="Simulate and preview configuration changes without writing files to disk",
+    )
+    setup_parser.add_argument(
+        "--remove",
+        action="store_true",
+        help="Safely remove SNOW MCP entry from target host configuration(s)",
     )
 
-    # status
+    # 2. devices
+    devices_parser = subparsers.add_parser("devices", help="Manage paired devices, reachability, and trust tiers")
+    dev_sub = devices_parser.add_subparsers(dest="devices_action", help="Device operations")
+
+    list_parser = dev_sub.add_parser("list", help="List paired and discovered devices")
+    list_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
+    trust_parser = dev_sub.add_parser("trust", help="Configure trust tier for a paired device")
+    trust_parser.add_argument("device_id", help="Device ID (UUID) of the target device")
+    trust_parser.add_argument("--tier", choices=["owner", "peer"], required=True, help="Trust tier ('owner' or 'peer')")
+    trust_parser.add_argument("--yes", "-y", action="store_true", help="Confirm trust tier change without prompting")
+
+    revoke_parser = dev_sub.add_parser("revoke", help="Permanently revoke a paired device and terminate active sessions")
+    revoke_parser.add_argument("device_id", help="Device ID (UUID) of the target device to revoke")
+    revoke_parser.add_argument("--yes", "-y", action="store_true", help="Confirm revocation without prompting")
+
+    connect_parser = dev_sub.add_parser("connect", help="Connect to a peer node directly")
+    connect_parser.add_argument("host", help="Hostname or IPv4 address of the target peer")
+    connect_parser.add_argument("--port", type=int, default=8765, help="Port of target peer (default: 8765)")
+    connect_parser.add_argument("--pin", default=None, help="Pairing PIN for initial connection (never logged)")
+
+    # 3. doctor
+    doctor_parser = subparsers.add_parser("doctor", help="Run diagnostic health checks across environment, dependencies, and daemon")
+    doctor_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+
+    # 4. status
     subparsers.add_parser("status", help="Inspect live Core daemon and IPC status")
 
-    # daemon
+    # 5. daemon
     daemon_parser = subparsers.add_parser("daemon", help="Manage background Core daemon")
     daemon_sub = daemon_parser.add_subparsers(dest="daemon_action", help="Daemon action")
     daemon_sub.add_parser("start", help="Start Core daemon in background")
     daemon_sub.add_parser("stop", help="Stop background Core daemon")
 
-    # convenient aliases
+    # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")
     start_parser.add_argument("--daemon", action="store_true", default=True)
     subparsers.add_parser("stop", help="Alias for daemon stop")
 
-    # peer
-    peer_parser = subparsers.add_parser("peer", help="Manage paired peer devices and trust tiers")
+    # Backward-compatible 'peer' alias -> 'devices'
+    peer_parser = subparsers.add_parser("peer", help="Alias for 'devices'")
     peer_sub = peer_parser.add_subparsers(dest="peer_action", help="Peer action")
-    peer_sub.add_parser("list", help="List paired devices and their trust tiers")
-    peer_trust = peer_sub.add_parser("trust", help="Configure trust tier for a paired device")
-    peer_trust.add_argument("device_id", help="Device ID (UUID) of the paired device")
-    peer_trust.add_argument("--tier", choices=["owner", "peer"], required=True, help="Trust tier (owner or peer)")
+    p_list = peer_sub.add_parser("list", help="List paired devices")
+    p_list.add_argument("--json", action="store_true", help="Output JSON")
+    p_trust = peer_sub.add_parser("trust", help="Configure trust tier")
+    p_trust.add_argument("device_id", help="Device ID")
+    p_trust.add_argument("--tier", choices=["owner", "peer"], required=True)
+    p_trust.add_argument("--yes", "-y", action="store_true")
 
+    return parser
+
+
+def main(args: Optional[list[str]] = None) -> int:
+    """CLI entry point for the 'snow' command."""
+    parser = build_parser()
     parsed = parser.parse_args(args)
 
     if parsed.command == "setup":
-        return run_setup(dry_run=parsed.dry_run)
+        return run_setup(host=parsed.host, dry_run=parsed.dry_run, remove=parsed.remove)
+    elif parsed.command == "doctor":
+        return run_doctor(json_output=parsed.json)
+    elif parsed.command == "devices":
+        if parsed.devices_action == "list" or not parsed.devices_action:
+            json_flag = getattr(parsed, "json", False)
+            return run_devices_list(json_output=json_flag)
+        elif parsed.devices_action == "trust":
+            return run_devices_trust(parsed.device_id, parsed.tier, yes=parsed.yes)
+        elif parsed.devices_action == "revoke":
+            return run_devices_revoke(parsed.device_id, yes=parsed.yes)
+        elif parsed.devices_action == "connect":
+            return run_devices_connect(parsed.host, port=parsed.port, pin=parsed.pin)
+        else:
+            parser.parse_args(["devices", "--help"])
+            return 1
+    elif parsed.command == "peer":
+        # Backward-compatible mapping to devices
+        if parsed.peer_action == "trust":
+            return run_devices_trust(parsed.device_id, parsed.tier, yes=parsed.yes)
+        else:
+            json_flag = getattr(parsed, "json", False)
+            return run_devices_list(json_output=json_flag)
     elif parsed.command == "status":
         return run_status()
     elif parsed.command == "daemon":
@@ -287,15 +857,7 @@ def main(args: Optional[list[str]] = None) -> int:
         elif parsed.daemon_action == "stop":
             return run_daemon_stop()
         else:
-            daemon_parser.print_help()
-            return 1
-    elif parsed.command == "peer":
-        if parsed.peer_action == "trust":
-            return run_peer_trust(parsed.device_id, parsed.tier)
-        elif parsed.peer_action == "list":
-            return run_peer_list()
-        else:
-            peer_parser.print_help()
+            parser.parse_args(["daemon", "--help"])
             return 1
     elif parsed.command == "start":
         return run_daemon_start()

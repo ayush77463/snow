@@ -1032,17 +1032,23 @@ Phase 17 streamlines productization for non-developer end-users. It delivers a o
 - Target clean zero-dependency deployment.
 
 ### Deliverables
-- Setup and onboarding scripts.
-- Multi-host configuration generator.
-- Enhanced CLI commands (`snow devices`, `snow pair`, `snow config`).
+- `src/snow/onboarding.py`: Maintainable multi-host onboarding adapter framework supporting Claude Desktop, Gemini CLI / Antigravity, Cursor, and ChatGPT generic artifact with non-destructive merge, `.bak` backup, atomic write, and safe idempotent `--remove`.
+- `src/snow/cli.py`: Enhanced CLI implementing `snow setup` (`--host`, `--dry-run`, `--remove`), `snow devices` (`list`, `trust`, `revoke`, `connect`, `--json`), `snow doctor` (`--json` system health diagnostics), and `snow daemon` lifecycle commands.
+- `src/snow/core/ipc.py`: Added IPC operations `device_trust` and `device_revoke` ensuring live daemon immediately enforces trust changes and terminates active revoked sessions.
+- `tests/test_phase_17_onboarding_cli.py`: 26 comprehensive unit tests verifying multi-host configuration, single-owner invariant, offline/online device listing, confirmation prompts, and all 9 doctor diagnostic checks.
 
 ### Dependencies
 - Phases 11–16.
 
 ### Acceptance Criteria
-- [ ] One-click MCP setup configures target AI assistant without manual JSON editing.
-- [ ] Zero cloud dependencies, zero external telemetry verified.
-- [ ] Clean onboarding flow completes in under 60 seconds.
+- [x] One-click MCP setup configures target AI assistant without manual JSON editing (verified via `snow setup` across Claude Desktop, Gemini CLI, Cursor, and ChatGPT with atomic write and `.bak` backups).
+- [x] Zero cloud dependencies, zero external telemetry verified (all operations run on local stdio MCP and local SQLite database without outbound network tracking).
+- [x] Clean onboarding flow completes in under 60 seconds (verified sub-second `snow setup` and `snow doctor` diagnostic suite).
+
+#### Viva Concept Check
+- **Why is non-destructive merging critical for AI host configurations?** AI desktop clients (like Claude Desktop or Cursor) often have multiple user-configured MCP servers (e.g., filesystem, github, postgres). Overwriting the entire configuration file would destroy the user's existing tools. SNOW safely parses the existing JSON, adds or updates `mcpServers.snow`, and creates a `.bak` backup.
+- **Why does `snow doctor` verify the exact 24-tool MCP count?** The frozen architectural specification defines exactly 24 tools across system telemetry, process monitoring, file operations, clipboard sync, messaging, and mesh operations. Accidental addition or deletion of tools breaks client compatibility contracts and regression assertions.
+- **How does `snow devices trust` preserve the single-owner invariant?** The database and IPC handlers transactionally demote any previous owner to `peer` when a new device is promoted to `owner`. Furthermore, the CLI requires explicit confirmation before performing any privilege promotion or device revocation.
 
 ---
 

@@ -512,6 +512,73 @@ class SnowIpcServer:
                 "error": res.get("error"),
             }, now_authed
 
+        if op == "device_trust":
+            payload_data = payload if isinstance(payload, dict) else {}
+            device_id = payload_data.get("device_id")
+            tier = payload_data.get("tier")
+            if not device_id or not tier or tier not in ("owner", "peer"):
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing or invalid 'device_id' or 'tier' ('owner'/'peer' required).",
+                }, now_authed
+            try:
+                updated = self.core_server.db_manager.update_device_trust_tier(device_id, tier)
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": updated,
+                    "status": "SUCCESS" if updated else "DEVICE_NOT_FOUND",
+                    "data": {"device_id": device_id, "tier": tier, "updated": updated},
+                    "error": None if updated else f"Device [{device_id}] not found in paired database.",
+                }, now_authed
+            except Exception as exc:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "ERROR",
+                    "error": str(exc),
+                }, now_authed
+
+        if op == "device_revoke":
+            payload_data = payload if isinstance(payload, dict) else {}
+            device_id = payload_data.get("device_id")
+            if not device_id:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing 'device_id'.",
+                }, now_authed
+
+            # 1. Terminate any active authenticated session for this device
+            session = self.core_server.session_manager.get_session_by_device(device_id)
+            if session:
+                self.core_server.session_manager.revoke_session(session.session_id)
+                logger.info("Revoked active session [%s] for device [%s]", session.session_id, device_id)
+
+            # 2. Delete paired credentials from SQLite database
+            deleted = self.core_server.db_manager.delete_paired_device(device_id)
+            if deleted:
+                self.core_server.db_manager.log_audit_event(
+                    event_type="DEVICE_REVOKED",
+                    device_id=device_id,
+                    details={"revoked_by": "cli_ipc"},
+                )
+
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": deleted,
+                "status": "SUCCESS" if deleted else "DEVICE_NOT_FOUND",
+                "data": {"device_id": device_id, "revoked": deleted},
+                "error": None if deleted else f"Device [{device_id}] not found in paired database.",
+            }, now_authed
+
         return {
             "version": IPC_PROTOCOL_VERSION,
             "request_id": request_id,
