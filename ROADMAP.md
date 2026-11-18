@@ -922,9 +922,12 @@ Phase 13 establishes the unified Layer 3 `NodeRegistry`, consolidating active WS
 - Phase 12 unified `CapabilityEngine`.
 
 ### Acceptance Criteria
-- [ ] Unified `NodeRegistry` tracks all local, connected, and discovered nodes.
-- [ ] Capability manifests dynamically advertised and queried across paired devices.
-- [ ] Device queries resolve cleanly across heterogeneous nodes without state fragmentation.
+- [x] Unified `NodeRegistry` tracks all local, connected, and discovered nodes.
+- [x] Capability manifests dynamically advertised and queried across paired devices.
+- [x] Device queries resolve cleanly across heterogeneous nodes without state fragmentation.
+- [x] Platform-independent `DeviceNode` and `CapabilityManifest` protocol with Kotlin Android counterpart.
+- [x] SQLite schema v3 migration preserving existing pairing data and caching endpoints/manifests.
+- [x] Bidirectional manifest-bearing protocol parity tests (184/184 fixtures verified).
 
 ---
 

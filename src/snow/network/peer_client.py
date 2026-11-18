@@ -20,6 +20,7 @@ from snow.protocol.constants import ErrorCode, MessageType
 from snow.protocol.models import SnowMessage
 from snow.protocol.validator import validate_raw_message
 from snow.security.identity import DeviceIdentity, load_or_create_device_identity
+from snow.network.node import CapabilityManifest, build_windows_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class PeerConnectionResult:
     session_id: Optional[str] = None
     auth_token: Optional[str] = None
     cert_fingerprint: Optional[str] = None
+    manifest: Optional[dict[str, Any]] = None
     error: Optional[str] = None
 
 
@@ -63,6 +65,7 @@ class SnowPeerClient:
         self._auth_token: Optional[str] = None
         self._remote_device_id: Optional[str] = None
         self._remote_device_name: Optional[str] = None
+        self._remote_manifest: Optional[CapabilityManifest] = None
         self._is_connected = False
 
     @property
@@ -84,6 +87,10 @@ class SnowPeerClient:
     @property
     def remote_device_name(self) -> Optional[str]:
         return self._remote_device_name
+
+    @property
+    def remote_manifest(self) -> Optional[CapabilityManifest]:
+        return self._remote_manifest
 
     @property
     def connected_fingerprint(self) -> Optional[str]:
@@ -157,6 +164,7 @@ class SnowPeerClient:
                         "pin": pin.strip(),
                         "device_id": self.identity.device_id,
                         "device_name": self.identity.device_name,
+                        "manifest": build_windows_manifest().to_dict(),
                     },
                 )
                 response = await self.send_message(pair_req, timeout=timeout)
@@ -174,6 +182,12 @@ class SnowPeerClient:
                 self._session_id = data.get("session_id")
                 self._remote_device_id = data.get("device_id")
                 self._remote_device_name = data.get("device_name")
+                raw_manifest = data.get("manifest")
+                if raw_manifest and isinstance(raw_manifest, dict):
+                    try:
+                        self._remote_manifest = CapabilityManifest.from_dict(raw_manifest)
+                    except Exception as m_err:
+                        logger.debug("Failed parsing remote manifest: %s", m_err)
 
                 return PeerConnectionResult(
                     success=True,
@@ -183,6 +197,7 @@ class SnowPeerClient:
                     session_id=self._session_id,
                     auth_token=self._auth_token,
                     cert_fingerprint=self._connected_fingerprint,
+                    manifest=raw_manifest if isinstance(raw_manifest, dict) else None,
                 )
 
             elif auth_token:
@@ -191,6 +206,7 @@ class SnowPeerClient:
                     payload={
                         "device_id": self.identity.device_id,
                         "auth_token": auth_token.strip(),
+                        "manifest": build_windows_manifest().to_dict(),
                     },
                 )
                 response = await self.send_message(auth_req, timeout=timeout)
@@ -206,6 +222,12 @@ class SnowPeerClient:
                 data = response.payload.get("data", {}) if response.payload else {}
                 self._session_id = data.get("session_id")
                 self._auth_token = auth_token
+                raw_manifest = data.get("manifest")
+                if raw_manifest and isinstance(raw_manifest, dict):
+                    try:
+                        self._remote_manifest = CapabilityManifest.from_dict(raw_manifest)
+                    except Exception as m_err:
+                        logger.debug("Failed parsing remote manifest: %s", m_err)
 
                 return PeerConnectionResult(
                     success=True,
@@ -214,6 +236,7 @@ class SnowPeerClient:
                     session_id=self._session_id,
                     auth_token=self._auth_token,
                     cert_fingerprint=self._connected_fingerprint,
+                    manifest=raw_manifest if isinstance(raw_manifest, dict) else None,
                 )
 
             else:

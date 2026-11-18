@@ -129,6 +129,7 @@ class CapabilityEngine:
         clipboard: Optional[WindowsClipboardManager] = None,
         policy: Optional[PeerCapabilityPolicy] = None,
         allowed_roots: Optional[list[Path | str]] = None,
+        node_registry: Optional[Any] = None,
     ) -> None:
         self.telemetry = telemetry or WindowsTelemetry()
         self.processes = processes or WindowsProcessMonitor()
@@ -137,6 +138,7 @@ class CapabilityEngine:
         self.terminal = terminal or WindowsTerminalExecutor()
         self.clipboard = clipboard or WindowsClipboardManager()
         self.policy = policy or PeerCapabilityPolicy()
+        self.node_registry = node_registry
 
         # Confirmation ticket registry for trusted two-step confirmation
         self._tickets: dict[str, dict[str, Any]] = {}
@@ -425,6 +427,49 @@ class CapabilityEngine:
                 status=res.get("status", "SUCCESS" if is_ok else "ERROR"),
                 data=res if is_ok else None,
                 error=res.get("error"),
+            )
+
+        # --- Device Registry Queries ---
+        if action in ("list_devices", "device_list", "devices"):
+            if self.node_registry is not None:
+                nodes = self.node_registry.list_nodes()
+                res = [node.to_summary_dict() for node in nodes]
+                return CapabilityResponse(
+                    success=True,
+                    status="SUCCESS",
+                    data={"devices": res},
+                )
+            return CapabilityResponse(
+                success=False,
+                status="REGISTRY_UNAVAILABLE",
+                error="NodeRegistry is not configured in CapabilityEngine.",
+            )
+
+        if action in ("get_device_status", "device_status"):
+            target = params.get("target") or params.get("device_id")
+            if not target:
+                return CapabilityResponse(
+                    success=False,
+                    status="INVALID_ARGUMENT",
+                    error="Target device identifier is required.",
+                )
+            if self.node_registry is not None:
+                node, err = self.node_registry.resolve_target(target)
+                if node:
+                    return CapabilityResponse(
+                        success=True,
+                        status="SUCCESS",
+                        data=node.to_dict(include_endpoints=True),
+                    )
+                return CapabilityResponse(
+                    success=False,
+                    status=err or "DEVICE_NOT_FOUND",
+                    error=f"Device resolution failed: {err}",
+                )
+            return CapabilityResponse(
+                success=False,
+                status="REGISTRY_UNAVAILABLE",
+                error="NodeRegistry is not configured in CapabilityEngine.",
             )
 
         # Unsupported Action

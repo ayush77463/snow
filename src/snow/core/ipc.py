@@ -563,6 +563,10 @@ class SnowIpcServer:
 
     def _handle_list_devices(self) -> list[dict]:
         """Compile detailed, secret-redacted paired and connected device records."""
+        if getattr(self, "node_registry", None):
+            nodes = self.node_registry.list_nodes()
+            return [node.to_summary_dict() for node in nodes]
+
         cs = self.core_server
         paired = cs.db_manager.list_paired_devices()
         results = []

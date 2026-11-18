@@ -20,6 +20,7 @@ from snow.core.ipc import SnowIpcServer
 from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
 from snow.network.connection_manager import ConnectionManager
 from snow.network.discovery import SnowDiscoveryService
+from snow.network.registry import NodeRegistry
 from snow.network.ws_server import SnowWebSocketServer
 from snow.security.policy import PeerCapabilityPolicy
 from snow.transfer.http_server import SnowHttpTransferServer
@@ -79,8 +80,18 @@ class SnowCoreServer:
         self.ws_server.windows_clipboard = self.windows_clipboard
         self.ws_server.capability_policy = self.capability_policy
         self.ws_server.capability_engine = self.capability_engine
+        self.node_registry = NodeRegistry(
+            db_manager=self.db_manager,
+            connection_manager=self.ws_server.connection_manager,
+            local_identity=self.device_identity,
+            port=self.config.port,
+            transfer_port=self.config.transfer_port,
+        )
+        self.ws_server.node_registry = self.node_registry
+        self.capability_engine.node_registry = self.node_registry
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
         self.ipc_server.capability_engine = self.capability_engine
+        self.ipc_server.node_registry = self.node_registry
         self.discovery_service: Optional[SnowDiscoveryService] = None
 
     @property

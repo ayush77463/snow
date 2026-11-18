@@ -1,5 +1,6 @@
 package org.snow.network
 
+import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -65,7 +66,8 @@ class SnowWebSocketClient(
     var identity: DeviceIdentity? = null,
     var useTls: Boolean = true,
     var onUnconfirmedFingerprint: ((String) -> Unit)? = null,
-    var onCertificateMismatch: ((String, String) -> Unit)? = null
+    var onCertificateMismatch: ((String, String) -> Unit)? = null,
+    var context: Context? = null
 ) {
     companion object {
         private const val TAG = "SnowWebSocketClient"
@@ -470,11 +472,13 @@ class SnowWebSocketClient(
 
         if (!devId.isNullOrBlank() && !token.isNullOrBlank()) {
             log("Initiating automatic authentication handshake (device_id=${devId.take(8)}...)...")
+            val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
             sendRequest(
                 action = "auth_request",
                 data = mapOf(
                     "device_id" to devId,
-                    "auth_token" to token
+                    "auth_token" to token,
+                    "manifest" to manifestMap
                 )
             ) { response ->
                 if (response.type == MessageType.RESPONSE && response.payload?.get("status") == "success") {
@@ -499,11 +503,13 @@ class SnowWebSocketClient(
             log("Connected over WSS. Device is not paired; initializing pairing on desktop...")
             if (!devId.isNullOrBlank()) {
                 // Immunize connection from handshake timeout and generate fresh PIN banner on desktop
+                val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
                 sendRequest(
                     action = "pair_request",
                     data = mapOf(
                         "device_id" to devId,
-                        "device_name" to (identity?.deviceName ?: "Android-Device")
+                        "device_name" to (identity?.deviceName ?: "Android-Device"),
+                        "manifest" to manifestMap
                     )
                 ) { response ->
                     log("Desktop core pairing initialized (status=${response.payload?.get("status")})")

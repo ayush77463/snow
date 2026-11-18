@@ -27,7 +27,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_FILENAME = "snow_devices.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 VALID_TRUST_TIERS = ("owner", "peer")
 
@@ -52,6 +52,11 @@ class PairedDeviceRecord:
     last_seen_timestamp: str
     auth_token_hash: str
     trust_tier: str = "peer"
+    platform: str = "android"
+    reachability_profile: str = "ACTIVE_SESSION_PEER"
+    last_known_host: Optional[str] = None
+    last_known_port: Optional[int] = 8765
+    capabilities_json: str = "{}"
 
 
 @dataclass(frozen=True)
@@ -132,7 +137,12 @@ class DatabaseManager:
                         pairing_timestamp TEXT NOT NULL,
                         last_seen_timestamp TEXT NOT NULL,
                         auth_token_hash TEXT UNIQUE NOT NULL,
-                        trust_tier TEXT NOT NULL DEFAULT 'peer'
+                        trust_tier TEXT NOT NULL DEFAULT 'peer',
+                        platform TEXT NOT NULL DEFAULT 'android',
+                        reachability_profile TEXT NOT NULL DEFAULT 'ACTIVE_SESSION_PEER',
+                        last_known_host TEXT,
+                        last_known_port INTEGER DEFAULT 8765,
+                        capabilities_json TEXT NOT NULL DEFAULT '{}'
                     );
                 """)
                 conn.execute("""
@@ -140,12 +150,27 @@ class DatabaseManager:
                     ON paired_devices(auth_token_hash);
                 """)
 
-                # Schema migration for existing tables created under version 1
+                # Schema migration for existing tables created under versions 1 or 2
                 cursor = conn.execute("PRAGMA table_info(paired_devices);")
                 columns = [row["name"] for row in cursor.fetchall()]
                 if "trust_tier" not in columns:
                     logger.info("Migrating paired_devices table: adding trust_tier column")
                     conn.execute("ALTER TABLE paired_devices ADD COLUMN trust_tier TEXT NOT NULL DEFAULT 'peer';")
+                if "platform" not in columns:
+                    logger.info("Migrating paired_devices table: adding platform column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN platform TEXT NOT NULL DEFAULT 'android';")
+                if "reachability_profile" not in columns:
+                    logger.info("Migrating paired_devices table: adding reachability_profile column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN reachability_profile TEXT NOT NULL DEFAULT 'ACTIVE_SESSION_PEER';")
+                if "last_known_host" not in columns:
+                    logger.info("Migrating paired_devices table: adding last_known_host column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN last_known_host TEXT;")
+                if "last_known_port" not in columns:
+                    logger.info("Migrating paired_devices table: adding last_known_port column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN last_known_port INTEGER DEFAULT 8765;")
+                if "capabilities_json" not in columns:
+                    logger.info("Migrating paired_devices table: adding capabilities_json column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{}';")
 
                 conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_paired_devices_trust_tier
@@ -174,6 +199,24 @@ class DatabaseManager:
 
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> PairedDeviceRecord:
+        """Convert a database row into an immutable PairedDeviceRecord."""
+        keys = row.keys()
+        return PairedDeviceRecord(
+            device_id=row["device_id"],
+            device_name=row["device_name"],
+            pairing_timestamp=row["pairing_timestamp"],
+            last_seen_timestamp=row["last_seen_timestamp"],
+            auth_token_hash=row["auth_token_hash"],
+            trust_tier=row["trust_tier"] if "trust_tier" in keys else "peer",
+            platform=row["platform"] if "platform" in keys else "android",
+            reachability_profile=row["reachability_profile"] if "reachability_profile" in keys else "ACTIVE_SESSION_PEER",
+            last_known_host=row["last_known_host"] if "last_known_host" in keys else None,
+            last_known_port=row["last_known_port"] if "last_known_port" in keys else 8765,
+            capabilities_json=row["capabilities_json"] if "capabilities_json" in keys else "{}",
+        )
+
     def insert_paired_device(
         self,
         device_id: str,
@@ -182,6 +225,11 @@ class DatabaseManager:
         pairing_timestamp: Optional[str] = None,
         last_seen_timestamp: Optional[str] = None,
         trust_tier: str = "peer",
+        platform: str = "android",
+        reachability_profile: str = "ACTIVE_SESSION_PEER",
+        last_known_host: Optional[str] = None,
+        last_known_port: Optional[int] = 8765,
+        capabilities_json: str = "{}",
     ) -> PairedDeviceRecord:
         """Insert a newly paired device record.
 
@@ -192,6 +240,11 @@ class DatabaseManager:
             pairing_timestamp: Optional UTC ISO-8601 timestamp (defaults to now).
             last_seen_timestamp: Optional UTC ISO-8601 timestamp (defaults to now).
             trust_tier: Authorization tier ('owner' or 'peer', defaults to 'peer').
+            platform: Platform name ('android', 'windows', etc.).
+            reachability_profile: Default profile ('ACTIVE_SESSION_PEER', 'PERSISTENT_DAEMON').
+            last_known_host: Optional IP or host.
+            last_known_port: Optional port number.
+            capabilities_json: Serialized JSON capability manifest.
 
         Returns:
             The created PairedDeviceRecord.
@@ -211,8 +264,9 @@ class DatabaseManager:
 
         query = """
             INSERT INTO paired_devices (
-                device_id, device_name, pairing_timestamp, last_seen_timestamp, auth_token_hash, trust_tier
-            ) VALUES (?, ?, ?, ?, ?, ?);
+                device_id, device_name, pairing_timestamp, last_seen_timestamp, auth_token_hash,
+                trust_tier, platform, reachability_profile, last_known_host, last_known_port, capabilities_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         with self._get_connection() as conn:
             if trust_tier == "owner":
@@ -221,7 +275,22 @@ class DatabaseManager:
                     "UPDATE paired_devices SET trust_tier = 'peer' WHERE trust_tier = 'owner' AND device_id != ?;",
                     (device_id,),
                 )
-            conn.execute(query, (device_id, device_name, p_time, ls_time, auth_token_hash, trust_tier))
+            conn.execute(
+                query,
+                (
+                    device_id,
+                    device_name,
+                    p_time,
+                    ls_time,
+                    auth_token_hash,
+                    trust_tier,
+                    platform,
+                    reachability_profile,
+                    last_known_host,
+                    last_known_port,
+                    capabilities_json,
+                ),
+            )
 
         return PairedDeviceRecord(
             device_id=device_id,
@@ -230,6 +299,11 @@ class DatabaseManager:
             last_seen_timestamp=ls_time,
             auth_token_hash=auth_token_hash,
             trust_tier=trust_tier,
+            platform=platform,
+            reachability_profile=reachability_profile,
+            last_known_host=last_known_host,
+            last_known_port=last_known_port,
+            capabilities_json=capabilities_json,
         )
 
     def get_paired_device(self, device_id: str) -> Optional[PairedDeviceRecord]:
@@ -239,15 +313,7 @@ class DatabaseManager:
             cursor = conn.execute(query, (device_id,))
             row = cursor.fetchone()
             if row:
-                tier = row["trust_tier"] if "trust_tier" in row.keys() else "peer"
-                return PairedDeviceRecord(
-                    device_id=row["device_id"],
-                    device_name=row["device_name"],
-                    pairing_timestamp=row["pairing_timestamp"],
-                    last_seen_timestamp=row["last_seen_timestamp"],
-                    auth_token_hash=row["auth_token_hash"],
-                    trust_tier=tier,
-                )
+                return self._row_to_record(row)
         return None
 
     def get_paired_device_by_token_hash(self, token_hash: str) -> Optional[PairedDeviceRecord]:
@@ -257,15 +323,7 @@ class DatabaseManager:
             cursor = conn.execute(query, (token_hash,))
             row = cursor.fetchone()
             if row:
-                tier = row["trust_tier"] if "trust_tier" in row.keys() else "peer"
-                return PairedDeviceRecord(
-                    device_id=row["device_id"],
-                    device_name=row["device_name"],
-                    pairing_timestamp=row["pairing_timestamp"],
-                    last_seen_timestamp=row["last_seen_timestamp"],
-                    auth_token_hash=row["auth_token_hash"],
-                    trust_tier=tier,
-                )
+                return self._row_to_record(row)
         return None
 
     def list_paired_devices(self) -> List[PairedDeviceRecord]:
@@ -275,18 +333,32 @@ class DatabaseManager:
         with self._get_connection() as conn:
             cursor = conn.execute(query)
             for row in cursor.fetchall():
-                tier = row["trust_tier"] if "trust_tier" in row.keys() else "peer"
-                devices.append(
-                    PairedDeviceRecord(
-                        device_id=row["device_id"],
-                        device_name=row["device_name"],
-                        pairing_timestamp=row["pairing_timestamp"],
-                        last_seen_timestamp=row["last_seen_timestamp"],
-                        auth_token_hash=row["auth_token_hash"],
-                        trust_tier=tier,
-                    )
-                )
+                devices.append(self._row_to_record(row))
         return devices
+
+    def update_device_endpoint(self, device_id: str, host: str, port: int) -> bool:
+        """Update last known host and port for a paired device."""
+        now = current_utc_timestamp()
+        query = "UPDATE paired_devices SET last_known_host = ?, last_known_port = ?, last_seen_timestamp = ? WHERE device_id = ?;"
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, (host, port, now, device_id))
+            return cursor.rowcount > 0
+
+    def update_device_manifest(self, device_id: str, capabilities_json: str) -> bool:
+        """Update the capability manifest JSON for a paired device."""
+        now = current_utc_timestamp()
+        query = "UPDATE paired_devices SET capabilities_json = ?, last_seen_timestamp = ? WHERE device_id = ?;"
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, (capabilities_json, now, device_id))
+            return cursor.rowcount > 0
+
+    def update_device_profile(self, device_id: str, platform: str, reachability_profile: str) -> bool:
+        """Update the platform and reachability profile for a paired device."""
+        now = current_utc_timestamp()
+        query = "UPDATE paired_devices SET platform = ?, reachability_profile = ?, last_seen_timestamp = ? WHERE device_id = ?;"
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, (platform, reachability_profile, now, device_id))
+            return cursor.rowcount > 0
 
     def update_device_trust_tier(self, device_id: str, trust_tier: str) -> bool:
         """Update the trust tier for a registered paired device.

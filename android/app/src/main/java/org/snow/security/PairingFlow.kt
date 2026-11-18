@@ -4,6 +4,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.snow.network.ConnectionState
+import org.snow.network.DeviceNode
 import org.snow.network.SnowWebSocketClient
 import org.snow.protocol.ErrorCode
 import org.snow.protocol.MessageType
@@ -121,10 +122,12 @@ class PairingFlow(
         onStateChanged?.invoke(PairingState.InProgress)
 
         val cleanedPin = pin.trim()
+        val manifestMap = DeviceNode.buildAndroidManifest(null).toMap()
         val requestData = mapOf(
             "device_id" to identity.deviceId,
             "device_name" to identity.deviceName,
-            "pin" to cleanedPin
+            "pin" to cleanedPin,
+            "manifest" to manifestMap
         )
 
         client.sendRequest(
@@ -161,9 +164,11 @@ class PairingFlow(
             return false
         }
 
+        val manifestMap = DeviceNode.buildAndroidManifest(null).toMap()
         val requestData = mapOf(
             "device_id" to identity.deviceId,
-            "device_name" to identity.deviceName
+            "device_name" to identity.deviceName,
+            "manifest" to manifestMap
         )
 
         client.sendRequest(

@@ -120,6 +120,7 @@ class SnowWebSocketServer:
                 policy=self.capability_policy,
             )
         self.http_transfer_server: Any = None
+        self.node_registry: Any = getattr(core_server, "node_registry", None)
         self._server: Optional[Server] = None
         self._reaper_task: Optional[asyncio.Task] = None
         self._is_running = False
@@ -141,6 +142,7 @@ class SnowWebSocketServer:
             ("windows_terminal", "terminal"),
             ("windows_clipboard", "clipboard"),
             ("capability_policy", "policy"),
+            ("node_registry", "node_registry"),
         ]:
             val = getattr(self, attr, None)
             if val is not None and not type(val).__name__.endswith("Mock"):
@@ -319,6 +321,9 @@ class SnowWebSocketServer:
             if timer and not timer.done():
                 timer.cancel()
             self._pairing_in_progress.discard(client.connection_id)
+            session = self.session_manager.get_session_by_connection(client.connection_id)
+            if session and getattr(self, "node_registry", None):
+                self.node_registry.on_session_disconnected(session.device_id)
             self.session_manager.cleanup_connection(client.connection_id)
             self.connection_manager.unregister(client.connection_id)
             for req_id, (cid, fut) in list(self._pending_requests.items()):
@@ -686,6 +691,24 @@ class SnowWebSocketServer:
             client.connection_id,
         )
 
+        # Update node registry if present
+        manifest_data = data.get("manifest") or data.get("capabilities")
+        if getattr(self, "node_registry", None):
+            client_host = client.remote_address[0] if client.remote_address and isinstance(client.remote_address, tuple) else "127.0.0.1"
+            client_port = client.remote_address[1] if client.remote_address and isinstance(client.remote_address, tuple) else 8765
+            try:
+                self.node_registry.on_session_authenticated(
+                    device_id=device_id,
+                    connection_id=client.connection_id,
+                    host=client_host,
+                    port=client_port,
+                    manifest_data=manifest_data,
+                )
+            except Exception as reg_err:
+                logger.debug("Failed notifying node registry of auth: %s", reg_err)
+
+        from snow.network.node import build_windows_manifest
+
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
@@ -694,6 +717,7 @@ class SnowWebSocketServer:
                 "data": {
                     "device_id": device_id,
                     "session_id": session.session_id,
+                    "manifest": build_windows_manifest().to_dict(),
                 },
             },
         )
@@ -749,11 +773,27 @@ class SnowWebSocketServer:
                         connection_id=client.connection_id,
                     )
 
+                    if getattr(self, "node_registry", None):
+                        client_host = client.remote_address[0] if client.remote_address and isinstance(client.remote_address, tuple) else "127.0.0.1"
+                        client_port = client.remote_address[1] if client.remote_address and isinstance(client.remote_address, tuple) else 8765
+                        try:
+                            self.node_registry.on_session_authenticated(
+                                device_id=client_device_id,
+                                connection_id=client.connection_id,
+                                host=client_host,
+                                port=client_port,
+                                manifest_data=data.get("manifest") or data.get("capabilities"),
+                            )
+                        except Exception as reg_err:
+                            logger.debug("Failed notifying node registry of pairing auth: %s", reg_err)
+
                 # Successful pairing: clear pairing in-progress state and cancel handshake timer
                 self._pairing_in_progress.discard(client.connection_id)
                 timer = self._auth_timers.pop(client.connection_id, None)
                 if timer and not timer.done():
                     timer.cancel()
+
+                from snow.network.node import build_windows_manifest
 
                 response = SnowMessage.create_response(
                     correlation_id=message.id,
@@ -765,6 +805,7 @@ class SnowWebSocketServer:
                             "device_name": self.device_identity.device_name,
                             "session_id": result.session_id,
                             "auth_token": auth_token,
+                            "manifest": build_windows_manifest().to_dict(),
                         },
                     },
                 )

@@ -143,6 +143,41 @@ class CrossLanguageParityTest {
             )
             valid["request_pair_request.json"] = JsonSerialization.toJson(reqPair)
 
+            val sampleManifest = mapOf(
+                "manifest_version" to "2.0",
+                "supported_capabilities" to listOf(
+                    "android.apps.launch",
+                    "android.apps.list",
+                    "android.clipboard.get",
+                    "android.clipboard.set",
+                    "android.files.transfer",
+                    "android.notifications.push",
+                    "android.telemetry.get"
+                ),
+                "permission_states" to mapOf(
+                    "POST_NOTIFICATIONS" to "GRANTED",
+                    "android.telemetry.get" to "GRANTED"
+                ),
+                "classifications" to mapOf(
+                    "android.apps.launch" to "FOREGROUND_USER_INTERACTION_REQUIRED",
+                    "android.clipboard.get" to "FOREGROUND_USER_INTERACTION_REQUIRED",
+                    "android.notifications.push" to "RUNTIME_PERMISSION_REQUIRED",
+                    "android.telemetry.get" to "BACKGROUND_SAFE"
+                )
+            )
+
+            // 11b. Request pair_request with manifest (Phase 13)
+            val reqPairManifest = SnowMessage.createRequest(
+                "pair_request",
+                mapOf(
+                    "device_id" to UUID.randomUUID().toString(),
+                    "device_name" to "Test Client Device",
+                    "pin" to "123456",
+                    "manifest" to sampleManifest
+                )
+            )
+            valid["request_pair_request_with_manifest.json"] = JsonSerialization.toJson(reqPairManifest)
+
             // 12. Response pair success
             val respPair = SnowMessage.createResponse(
                 reqId,
@@ -157,6 +192,23 @@ class CrossLanguageParityTest {
                 )
             )
             valid["response_pair_success.json"] = JsonSerialization.toJson(respPair)
+
+            // 12b. Response pair success with manifest (Phase 13)
+            val respPairManifest = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "pair_request",
+                    "data" to mapOf(
+                        "session_id" to UUID.randomUUID().toString(),
+                        "device_id" to UUID.randomUUID().toString(),
+                        "device_name" to "SNOW Desktop Core",
+                        "auth_token" to "valid-token-hash-hex-sample",
+                        "manifest" to sampleManifest
+                    )
+                )
+            )
+            valid["response_pair_success_with_manifest.json"] = JsonSerialization.toJson(respPairManifest)
 
             // 13. Error INVALID_PIN
             val errInvalidPin = SnowMessage.createError(
@@ -249,6 +301,17 @@ class CrossLanguageParityTest {
             )
             valid["request_auth_request.json"] = JsonSerialization.toJson(reqAuth)
 
+            // 22b. Request auth_request with manifest (Phase 13)
+            val reqAuthManifest = SnowMessage.createRequest(
+                "auth_request",
+                mapOf(
+                    "device_id" to UUID.randomUUID().toString(),
+                    "auth_token" to "valid-auth-token-sample-secure",
+                    "manifest" to sampleManifest
+                )
+            )
+            valid["request_auth_request_with_manifest.json"] = JsonSerialization.toJson(reqAuthManifest)
+
             // 23. Valid auth_request success response
             val respAuth = SnowMessage.createResponse(
                 reqId,
@@ -262,6 +325,21 @@ class CrossLanguageParityTest {
                 )
             )
             valid["response_auth_success.json"] = JsonSerialization.toJson(respAuth)
+
+            // 23b. Response auth_request success with manifest (Phase 13)
+            val respAuthManifest = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "auth_request",
+                    "data" to mapOf(
+                        "device_id" to UUID.randomUUID().toString(),
+                        "session_id" to UUID.randomUUID().toString(),
+                        "manifest" to sampleManifest
+                    )
+                )
+            )
+            valid["response_auth_success_with_manifest.json"] = JsonSerialization.toJson(respAuthManifest)
 
             // --- Phase 3 File Transfer Protocol Fixtures ---
             // 24. Valid file_transfer_offer request

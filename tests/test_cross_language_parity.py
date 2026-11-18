@@ -128,6 +128,40 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["request_pair_request.json"] = req_pair.to_json()
 
+    # 11b. Valid pair_request request with manifest (Phase 13)
+    sample_manifest = {
+        "manifest_version": "2.0",
+        "supported_capabilities": [
+            "android.apps.launch",
+            "android.apps.list",
+            "android.clipboard.get",
+            "android.clipboard.set",
+            "android.files.transfer",
+            "android.notifications.push",
+            "android.telemetry.get",
+        ],
+        "permission_states": {
+            "POST_NOTIFICATIONS": "GRANTED",
+            "android.telemetry.get": "GRANTED",
+        },
+        "classifications": {
+            "android.apps.launch": "FOREGROUND_USER_INTERACTION_REQUIRED",
+            "android.clipboard.get": "FOREGROUND_USER_INTERACTION_REQUIRED",
+            "android.notifications.push": "RUNTIME_PERMISSION_REQUIRED",
+            "android.telemetry.get": "BACKGROUND_SAFE",
+        },
+    }
+    req_pair_manifest = SnowMessage.create_request(
+        action="pair_request",
+        data={
+            "device_id": str(uuid.uuid4()),
+            "device_name": "Test Client Device",
+            "pin": "123456",
+            "manifest": sample_manifest,
+        },
+    )
+    valid_fixtures["request_pair_request_with_manifest.json"] = req_pair_manifest.to_json()
+
     # 12. Valid pairing success response with correlation_id
     resp_pair = SnowMessage.create_response(
         correlation_id=req_id,
@@ -142,6 +176,23 @@ def generate_python_fixtures() -> tuple[int, int]:
         },
     )
     valid_fixtures["response_pair_success.json"] = resp_pair.to_json()
+
+    # 12b. Valid pairing success response with manifest (Phase 13)
+    resp_pair_manifest = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "pair_request",
+            "data": {
+                "session_id": str(uuid.uuid4()),
+                "device_id": str(uuid.uuid4()),
+                "device_name": "SNOW Desktop Core",
+                "auth_token": "valid-token-hash-hex-sample",
+                "manifest": sample_manifest,
+            },
+        },
+    )
+    valid_fixtures["response_pair_success_with_manifest.json"] = resp_pair_manifest.to_json()
 
     # 13. Error INVALID_PIN
     err_invalid_pin = SnowMessage.create_error(
@@ -235,6 +286,17 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["request_auth_request.json"] = req_auth.to_json()
 
+    # 22b. Valid auth_request request with manifest (Phase 13)
+    req_auth_manifest = SnowMessage.create_request(
+        action="auth_request",
+        data={
+            "device_id": str(uuid.uuid4()),
+            "auth_token": "valid-auth-token-sample-secure",
+            "manifest": sample_manifest,
+        },
+    )
+    valid_fixtures["request_auth_request_with_manifest.json"] = req_auth_manifest.to_json()
+
     # 23. Valid auth_request success response
     resp_auth = SnowMessage.create_response(
         correlation_id=req_id,
@@ -248,6 +310,21 @@ def generate_python_fixtures() -> tuple[int, int]:
         },
     )
     valid_fixtures["response_auth_success.json"] = resp_auth.to_json()
+
+    # 23b. Valid auth_request success response with manifest (Phase 13)
+    resp_auth_manifest = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "auth_request",
+            "data": {
+                "device_id": str(uuid.uuid4()),
+                "session_id": str(uuid.uuid4()),
+                "manifest": sample_manifest,
+            },
+        },
+    )
+    valid_fixtures["response_auth_success_with_manifest.json"] = resp_auth_manifest.to_json()
 
     # --- Phase 3 File Transfer Protocol Fixtures ---
     # 24. Valid file_transfer_offer request
