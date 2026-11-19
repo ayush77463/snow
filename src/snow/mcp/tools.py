@@ -1,7 +1,7 @@
 """Unified static MCP tool registry for SNOW.
 
 Exposes standardized MCP tools for both Windows and Android capabilities to AI assistants.
-All 21 tools are statically discoverable via list_tools, even when the Core or Android
+All 24 tools are statically discoverable via list_tools, even when the Core or Android
 device is currently offline.
 
 In Phase 8:
@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 from snow.mcp.bridge import SnowMcpBridge
 
-# Complete static catalog of the 21 SNOW tool names
+# Complete static catalog of the 24 SNOW tool names
 ALL_TOOL_NAMES: List[str] = [
     # General (Live Core)
     "snow_get_device_status",
@@ -55,7 +55,7 @@ ALL_TOOL_NAMES: List[str] = [
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 21 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 24 static MCP tools onto the provided FastMCP server instance."""
 
     # =========================================================================
     # 1. General Tools (Core Daemon via IPC)

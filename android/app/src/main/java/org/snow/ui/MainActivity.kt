@@ -1444,22 +1444,14 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Enable foreground peer host mode on the bound service.
+     * Quarantined in Phase 19A (Android client-only until Phase 20).
      */
     fun enablePeerHostMode(port: Int = 8767): Boolean {
         val s = service ?: return false
-        val tStorage = SharedPreferencesTokenStorage(applicationContext)
-        val success = s.peerHostManager.enableHostMode(
-            port = port,
-            tokenStorage = tStorage,
-            dispatcher = s.capabilityDispatcher,
-            localDeviceId = identity.deviceId,
-            manifestProvider = { org.snow.network.DeviceNode.buildAndroidManifest(applicationContext).toMap() }
-        )
-        if (success) {
-            appendLog("Android Foreground Peer Host Mode enabled on port $port")
-            s.updateManifest()
-        }
-        return success
+        appendLog("Notice: Android Foreground Peer Host Mode is quarantined in Phase 19A (client-only mode).")
+        s.peerHostManager.disableHostMode()
+        s.updateManifest()
+        return false
     }
 
     /**
@@ -1468,7 +1460,7 @@ class MainActivity : AppCompatActivity() {
     fun disablePeerHostMode() {
         val s = service ?: return
         s.peerHostManager.disableHostMode()
-        appendLog("Android Foreground Peer Host Mode disabled")
+        appendLog("Android Foreground Peer Host Mode disabled.")
         s.updateManifest()
     }
 
@@ -1476,6 +1468,6 @@ class MainActivity : AppCompatActivity() {
      * Check if foreground peer host mode is actively listening.
      */
     fun isPeerHostModeActive(): Boolean {
-        return service?.peerHostManager?.isHostModeActive() == true
+        return false
     }
 }

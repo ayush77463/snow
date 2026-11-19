@@ -8,6 +8,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -149,6 +150,61 @@ class CapabilityDispatcherTest {
         val resBlank = handler.launchApp("   ")
         assertEquals("error", resBlank["status"])
         assertEquals("Package name cannot be empty.", resBlank["error"])
+
+        // Malformed package names
+        val resMalformed1 = handler.launchApp("not_a_valid_package")
+        assertEquals("MALFORMED_PACKAGE_NAME", resMalformed1["status"])
+        val resMalformed2 = handler.launchApp("com..double.dot")
+        assertEquals("MALFORMED_PACKAGE_NAME", resMalformed2["status"])
+
+        // Unapproved package rejected by policy
+        val resUnapproved = handler.launchApp("com.unapproved.arbitrary.app")
+        assertEquals("POLICY_DENIED", resUnapproved["status"])
+        assertEquals("POLICY_DENIED", resUnapproved["error"])
+
+        // Approved package syntax passes policy check (fails at package manager lookup in unit test)
+        val resApproved = handler.launchApp("com.google.android.calculator")
+        assertEquals("error", resApproved["status"])
+        assertTrue((resApproved["error"] as String).contains("not found or is not launchable"))
+    }
+
+    @Test
+    fun testAppLauncherAllowlistCustomConfiguration() {
+        val dummyContext = object : android.content.ContextWrapper(null) {}
+        AppAllowlistPolicy.resetForTesting()
+
+        assertTrue(AppAllowlistPolicy.isValidPackageSyntax("com.example.app"))
+        assertFalse(AppAllowlistPolicy.isValidPackageSyntax("invalid-hyphen"))
+        assertFalse(AppAllowlistPolicy.isValidPackageSyntax("com..double"))
+
+        assertTrue(AppAllowlistPolicy.isAllowed(dummyContext, "com.google.android.calculator"))
+        assertFalse(AppAllowlistPolicy.isAllowed(dummyContext, "com.evil.malware"))
+
+        AppAllowlistPolicy.setCustomAllowlistForTesting(setOf("com.custom.allowed"))
+        assertTrue(AppAllowlistPolicy.isAllowed(dummyContext, "com.custom.allowed"))
+        assertFalse(AppAllowlistPolicy.isAllowed(dummyContext, "com.google.android.calculator"))
+
+        AppAllowlistPolicy.resetForTesting()
+    }
+
+    @Test
+    fun testCapabilityDispatcherDispatchesLaunchAppAllowlist() = runBlocking {
+        val dummyContext = object : android.content.ContextWrapper(null) {}
+        val dispatcher = AndroidCapabilityDispatcher(dummyContext, transferClientProvider = { null })
+
+        ClipboardHandler.isAppInForeground = true
+
+        // Unapproved package rejected with UNAUTHORIZED / POLICY_DENIED
+        val (resDenied, errDenied) = dispatcher.dispatch(
+            action = "launch_app",
+            data = mapOf("package_name" to "com.unapproved.app"),
+            serverHost = "127.0.0.1",
+            defaultTransferPort = 8766
+        )
+        assertNull(resDenied)
+        assertNotNull(errDenied)
+        assertEquals(ErrorCode.UNAUTHORIZED, errDenied?.code)
+        assertTrue(errDenied?.message?.contains("POLICY_DENIED") == true)
     }
 
     @Test

@@ -39,6 +39,20 @@ class MessagingHandlerTest {
     }
 
     @Test
+    fun testCreateComposeIntentContract() {
+        val recipient = "+1234567890"
+        val message = "Hello from SNOW test"
+
+        // Verify compile-time and runtime intent contract constants
+        assertEquals("android.intent.action.SENDTO", MessagingHandler.ACTION_COMPOSE)
+        assertEquals("smsto", MessagingHandler.SCHEME_SMSTO)
+        assertEquals("smsto:+1234567890", MessagingHandler.buildSmstoUri(recipient))
+
+        val intent = MessagingHandler.createComposeIntent(recipient, message)
+        assertNotNull(intent)
+    }
+
+    @Test
     fun testRecipientNullOrEmptyValidation() = runBlocking {
         val dummyContext = object : ContextWrapper(null) {}
         val handler = MessagingHandler(dummyContext)
@@ -75,30 +89,8 @@ class MessagingHandlerTest {
     }
 
     @Test
-    fun testSmsModeWithoutUserConfirmationReturnsError() = runBlocking {
+    fun testSmsModeDirectlyRejectedAsUnsupportedMode() = runBlocking {
         val dummyContext = object : ContextWrapper(null) {}
-        val handler = MessagingHandler(dummyContext)
-
-        val res = handler.sendMessage(
-            recipient = "+1234567890",
-            message = "Test SMS",
-            mode = "sms",
-            userConfirmed = false
-        )
-        assertEquals("error", res["status"])
-        assertEquals("USER_CONFIRMATION_REQUIRED", res["error"])
-        assertEquals("sms", res["mode"])
-        assertTrue((res["message"] as String).contains("explicit on-device user confirmation"))
-    }
-
-    @Test
-    fun testSmsModeWithConfirmationWithoutPermissionReturnsPermissionRequired() = runBlocking {
-        // Dummy context where checkPermission returns PERMISSION_DENIED (-1)
-        val dummyContext = object : ContextWrapper(null) {
-            override fun checkPermission(permission: String, pid: Int, uid: Int): Int {
-                return -1 // PERMISSION_DENIED
-            }
-        }
         val handler = MessagingHandler(dummyContext)
 
         val res = handler.sendMessage(
@@ -108,18 +100,16 @@ class MessagingHandlerTest {
             userConfirmed = true
         )
         assertEquals("error", res["status"])
-        assertEquals("PERMISSION_REQUIRED", res["error"])
+        assertEquals("UNSUPPORTED_MODE", res["error"])
         assertEquals("sms", res["mode"])
+        assertTrue((res["message"] as String).contains("Direct SMS is not supported"))
     }
 
     @Test
     fun testCapabilityDispatcherDispatchesSendMessage() = runBlocking {
-        val dummyContext = object : ContextWrapper(null) {
-            override fun checkPermission(permission: String, pid: Int, uid: Int): Int {
-                return -1 // PERMISSION_DENIED
-            }
-        }
+        val dummyContext = object : ContextWrapper(null) {}
         val dispatcher = AndroidCapabilityDispatcher(dummyContext, transferClientProvider = { null })
+        ClipboardHandler.isAppInForeground = true
 
         // 1. Invalid payload: missing recipient
         val (resInvalid, errInvalid) = dispatcher.dispatch(
@@ -132,19 +122,7 @@ class MessagingHandlerTest {
         assertNotNull(errInvalid)
         assertEquals(ErrorCode.INVALID_PAYLOAD, errInvalid?.code)
 
-        // 2. Direct SMS without user confirmation returns UNAUTHORIZED / USER_CONFIRMATION_REQUIRED
-        val (resNoConfirm, errNoConfirm) = dispatcher.dispatch(
-            action = "send_message",
-            data = mapOf("recipient" to "+1234567890", "message" to "Hello", "mode" to "sms", "user_confirmed" to false),
-            serverHost = "127.0.0.1",
-            defaultTransferPort = 8766
-        )
-        assertNull(resNoConfirm)
-        assertNotNull(errNoConfirm)
-        assertEquals(ErrorCode.UNAUTHORIZED, errNoConfirm?.code)
-        assertTrue(errNoConfirm?.message?.contains("USER_CONFIRMATION_REQUIRED") == true)
-
-        // 3. Direct SMS with confirmation but without permission returns UNAUTHORIZED / PERMISSION_REQUIRED
+        // 2. Direct SMS mode rejected via dispatcher as UNSUPPORTED_MODE
         val (resSms, errSms) = dispatcher.dispatch(
             action = "send_message",
             data = mapOf("recipient" to "+1234567890", "message" to "Hello", "mode" to "sms", "user_confirmed" to true),
@@ -154,6 +132,6 @@ class MessagingHandlerTest {
         assertNull(resSms)
         assertNotNull(errSms)
         assertEquals(ErrorCode.UNAUTHORIZED, errSms?.code)
-        assertTrue(errSms?.message?.contains("PERMISSION_REQUIRED") == true)
+        assertTrue(errSms?.message?.contains("UNSUPPORTED_MODE") == true)
     }
 }

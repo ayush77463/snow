@@ -24,7 +24,7 @@ def create_snow_mcp_server(
 ) -> FastMCP:
     """Instantiate and configure the official SNOW FastMCP server.
 
-    Registers all 16 static MCP tools and connects them to the IPC bridge.
+    Registers all 24 static MCP tools and connects them to the IPC bridge.
     Does not start any network listeners or duplicate core services.
     """
     mcp_bridge = bridge or SnowMcpBridge()
@@ -39,8 +39,8 @@ def create_snow_mcp_server(
     # Attach bridge reference
     server.bridge = mcp_bridge  # type: ignore[attr-defined]
 
-    # Register all 21 static tools
+    # Register all 24 static tools
     register_all_tools(server, mcp_bridge)
 
-    logger.debug("SNOW FastMCP server created and 21 static tools registered.")
+    logger.debug("SNOW FastMCP server created and 24 static tools registered.")
     return server

@@ -81,6 +81,7 @@ ANDROID_CAPABILITIES: set[str] = {
     "android.apps.launch",
     "android.messaging.send_intent",
     "android.files.transfer",
+    "android.ringer.ring",
 }
 
 
@@ -93,6 +94,8 @@ CAPABILITY_ALIASES: dict[str, str] = {
     "desktop.files.download": "desktop.file.transfer",
     "desktop.file.transfer": "desktop.files.download",
     "file.transfer": "desktop.file.transfer",
+    "android.ring_phone": "android.ringer.ring",
+    "android.ringer.ring": "android.ring_phone",
 }
 
 
@@ -210,6 +213,28 @@ def build_windows_manifest() -> CapabilityManifest:
     )
 
 
+def build_android_manifest() -> CapabilityManifest:
+    """Build the authoritative capability manifest for an Android client."""
+    classifications = {
+        "android.telemetry.get": CapabilityExecutionClassification.BACKGROUND_SAFE,
+        "android.notifications.push": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
+        "android.clipboard.set": CapabilityExecutionClassification.BACKGROUND_SAFE,
+        "android.clipboard.get": CapabilityExecutionClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
+        "android.apps.list": CapabilityExecutionClassification.BACKGROUND_SAFE,
+        "android.apps.launch": CapabilityExecutionClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
+        "android.messaging.send_intent": CapabilityExecutionClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
+        "android.files.transfer": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
+        "android.ringer.ring": CapabilityExecutionClassification.BACKGROUND_SAFE,
+    }
+    permission_states = {cap: "GRANTED" for cap in ANDROID_CAPABILITIES}
+    return CapabilityManifest(
+        manifest_version=MANIFEST_PROTOCOL_VERSION,
+        supported_capabilities=sorted(ANDROID_CAPABILITIES),
+        permission_states=permission_states,
+        classifications=classifications,
+    )
+
+
 @dataclass
 class DeviceNode:
     """Logical representation of a participating node in the SNOW V2 platform."""
@@ -291,3 +316,49 @@ class DeviceNode:
             "last_seen": self.last_seen_timestamp,
             "remote_address": f"{self.host}:{self.wss_port}" if self.host else None,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DeviceNode:
+        """Safely parse DeviceNode from dictionary with automatic timestamp unit normalization."""
+        ts = data.get("last_seen_timestamp", 0.0)
+        try:
+            ts_float = float(ts)
+            if ts_float > 1e11:  # epoch millis migration
+                ts_float /= 1000.0
+        except (ValueError, TypeError):
+            ts_float = 0.0
+
+        caps = None
+        if "capabilities" in data and isinstance(data["capabilities"], dict):
+            caps = CapabilityManifest.from_dict(data["capabilities"])
+
+        reach_profile = data.get("reachability_profile", ReachabilityProfile.ACTIVE_SESSION_PEER)
+        try:
+            reach_profile = ReachabilityProfile(str(reach_profile))
+        except ValueError:
+            reach_profile = ReachabilityProfile.ACTIVE_SESSION_PEER
+
+        reach_state = data.get("reachability_state", ReachabilityState.UNREACHABLE_OFFLINE)
+        try:
+            reach_state = ReachabilityState(str(reach_state))
+        except ValueError:
+            reach_state = ReachabilityState.UNREACHABLE_OFFLINE
+
+        return cls(
+            device_id=str(data.get("device_id", "")),
+            device_name=str(data.get("device_name", "")),
+            platform=str(data.get("platform", "generic")),
+            protocol_version=int(data.get("protocol_version", 1)),
+            reachability_profile=reach_profile,
+            reachability_state=reach_state,
+            host=data.get("host"),
+            wss_port=int(data.get("wss_port", 8765)),
+            transfer_port=int(data.get("transfer_port", 8766)),
+            supported_capabilities=list(data.get("supported_capabilities", [])),
+            permission_states=dict(data.get("permission_states", {})),
+            last_seen_timestamp=ts_float,
+            trust_tier=data.get("trust_tier"),
+            capabilities=caps,
+            is_authenticated=bool(data.get("is_authenticated", False)),
+            is_paired=bool(data.get("is_paired", False)),
+        )

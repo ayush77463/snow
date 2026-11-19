@@ -75,19 +75,19 @@
 
 ### Question 8: What is Trust-On-First-Use (TOFU) certificate pinning, and why is it used?
 - **Concept**: In local network environments without a public domain name, servers cannot obtain certificates from commercial Certificate Authorities (like Let's Encrypt). They use self-signed certificates.
-- **SNOW Implementation**: On startup, the Desktop Core generates a self-signed TLS certificate with a 2048-bit RSA key and computes its colon-separated SHA-256 fingerprint (e.g., `59:EC:2A...`). When Android connects, `SnowTrustManager.kt` checks the certificate:
+- **SNOW Implementation**: On startup, the Desktop Core generates a self-signed TLS certificate with a 2048-bit RSA key and computes its colon-separated SHA-256 fingerprint (e.g., `59:EC:2A...`). When Android connects, `SnowTrustManager` (in `TlsConfig.kt`) checks the certificate:
   - If unpinned: Android shows the fingerprint in a dialog. Upon user approval, it saves the fingerprint into encrypted storage.
   - On subsequent connections: Android verifies that the presented certificate exactly matches the pinned fingerprint. Any mismatch throws `CertificateMismatchException` and aborts the connection.
 - **Design Rationale**: Prevents local ARP spoofing and Man-in-the-Middle (MitM) attacks on Wi-Fi networks without relying on external centralized CAs.
-- **Source References**: `src/snow/security/tls.py`, `android/.../TlsConfig.kt`.
+- **Source References**: `src/snow/security/tls.py`, `android/app/src/main/java/org/snow/security/TlsConfig.kt`.
 
 ---
 
 ### Question 9: How does the Android Keystore protect cryptographic keys?
 - **Concept**: Software-stored keys in ordinary files can be extracted if an attacker gains root or physical access. The Android Keystore system stores cryptographic keys in hardware-isolated security modules (TEE — Trusted Execution Environment or StrongBox Keymaster).
-- **SNOW Implementation**: In `EncryptedCertPinStorage.kt`, SNOW generates an AES-256-GCM key inside `AndroidKeyStore`. The key material never leaves the secure hardware. All encryption and decryption operations execute inside the hardware security module; only ciphertext and initialization vectors (IVs) are written to `SharedPreferences`.
+- **SNOW Implementation**: In `KeyStoreManager.kt` and `TlsConfig.kt` (`EncryptedCertPinStorage`), SNOW generates an AES-256-GCM key inside `AndroidKeyStore`. The key material never leaves the secure hardware. All encryption and decryption operations execute inside the hardware security module; only ciphertext and initialization vectors (IVs) are written to `SharedPreferences`.
 - **Design Rationale**: Guarantees that even if device storage is inspected, the plaintext auth token and pinned certificate fingerprints cannot be decrypted without the hardware key.
-- **Source References**: `android/app/src/main/java/org/snow/security/EncryptedCertPinStorage.kt`.
+- **Source References**: `android/app/src/main/java/org/snow/security/KeyStoreManager.kt`, `android/app/src/main/java/org/snow/security/TlsConfig.kt`.
 
 ---
 
@@ -95,7 +95,7 @@
 - **Concept**: Cipher Block Chaining (CBC) provides confidentiality but no built-in integrity check; it requires a separate HMAC (Encrypt-then-MAC) and is vulnerable to padding oracle attacks. Galois/Counter Mode (GCM) is an Authenticated Encryption with Associated Data (AEAD) mode.
 - **SNOW Implementation**: SNOW uses AES with 128-bit authentication tags and 12-byte random IVs (`AES/GCM/NoPadding`).
 - **Design Rationale**: GCM provides both confidentiality and tamper detection simultaneously in a single cryptographic pass. If an attacker alters a single bit of the stored ciphertext, decryption fails immediately with an `AEADBadTagException`.
-- **Source References**: `android/app/src/main/java/org/snow/security/EncryptedCertPinStorage.kt`.
+- **Source References**: `android/app/src/main/java/org/snow/security/KeyStoreManager.kt`, `android/app/src/main/java/org/snow/security/TlsConfig.kt`, `android/app/src/main/java/org/snow/security/TokenStorage.kt`.
 
 ---
 
@@ -132,7 +132,7 @@
 ### Question 14: Explain the Confirmation Ticket lifecycle for terminal execution. How does SNOW prevent replay attacks?
 - **Concept**: Two-step interactive confirmation for sensitive operations.
 - **SNOW Implementation**:
-  1. Human owner initiates a Tier B command (e.g., system process query outside workspace).
+  1. Human owner initiates a Tier C command (e.g., system-wide operation requiring explicit authorization).
   2. `CapabilityEngine` intercepts the command and returns `status: "CONFIRMATION_REQUIRED"`.
   3. The engine generates a 128-bit cryptographic ticket (`secrets.token_hex(16)`) bound to the tuple `(device_id, command, expires_at)` with a 60-second TTL.
   4. When the user confirms the action, the command is executed with `confirmation_ticket: <ticket>`.
@@ -170,9 +170,9 @@
 - **Concept**: Different device classes have fundamentally different power, lifecycle, and network characteristics.
 - **SNOW Implementation**:
   - `PERSISTENT_DAEMON`: Desktop/server nodes running continuous daemons with open server ports. Reachable via Tier 2 direct dialing.
-  - `SLEEPING_CLIENT`: Battery-optimized mobile devices (Android) subject to OS sleep and Doze mode. Cannot host permanent server ports; requires Tier 3 wake hints or inbound sessions.
-  - `LAN_DIRECT`: Discovered LAN peers responsive to local UDP beacons.
-- **Design Rationale**: Treating a mobile phone like a persistent server causes connection timeouts and battery drain; treating a desktop server like a sleeping client introduces unnecessary wake delays.
+  - `ACTIVE_SESSION_PEER`: Battery-optimized mobile devices (Android) subject to OS sleep and Doze mode. Connects out to active sessions; cannot host permanent server ports.
+  - `FOREGROUND_HOST`: Explicitly user-activated foreground server mode on mobile (quarantined in Phase 19A pending Phase 20 embedded WSS server).
+- **Design Rationale**: Treating a mobile phone like a persistent server causes connection timeouts and battery drain; treating a desktop server like an ephemeral client introduces unnecessary wake delays.
 - **Source References**: `src/snow/network/node.py`, `src/snow/network/registry.py`.
 
 ---

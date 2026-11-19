@@ -1,5 +1,9 @@
 # SNOW — Architecture Specification (Frozen)
 
+> [!IMPORTANT]
+> **V1 Architecture Frozen Baseline**: This document represents the frozen V1 baseline specification as of Phases 0–7 (snow-v1 / v1.0.0, commit `f37626c`).
+> For the active multi-device mesh, capability engine, execution contract, and session routing architecture, see [docs/ARCHITECTURE_V2.md](file:///d:/Codes%202/Snow/docs/ARCHITECTURE_V2.md).
+
 > This architecture is frozen as of Phase 0 completion. Future changes require deliberate, documented architectural decisions rather than silent implementation changes.
 
 ## 1. Project Identity and Goals

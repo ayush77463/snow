@@ -20,6 +20,13 @@ class AndroidPeerHostManager {
     companion object {
         private const val TAG = "AndroidPeerHostManager"
         const val DEFAULT_HOST_PORT = 8767
+
+        /**
+         * Quarantine flag for Phase 19A.
+         * Android operates in client-only mode until a production-grade embedded WSS
+         * server is engineered and verified in Phase 20.
+         */
+        const val IS_QUARANTINED = true
     }
 
     private val isRunning = AtomicBoolean(false)
@@ -29,6 +36,7 @@ class AndroidPeerHostManager {
 
     /**
      * Enable foreground peer host mode, starting the listening server.
+     * Quarantined in Phase 19A: Always fails closed and returns false.
      */
     @Synchronized
     fun enableHostMode(
@@ -40,6 +48,15 @@ class AndroidPeerHostManager {
         peerTokenValidator: ((String) -> Boolean)? = null,
         parentScope: CoroutineScope? = null
     ): Boolean {
+        if (IS_QUARANTINED) {
+            SafeLog.w(
+                TAG,
+                "Android Foreground Peer Host Mode is quarantined in Phase 19A (client-only until Phase 20 WSS host implementation). Refusing to start TCP server."
+            )
+            disableHostMode()
+            return false
+        }
+
         if (isRunning.get() && server != null && server!!.isListening()) {
             SafeLog.i(TAG, "Foreground host mode is already active on port $activePort")
             return true
@@ -92,15 +109,19 @@ class AndroidPeerHostManager {
 
     /**
      * Return True if foreground peer host mode is actively listening.
+     * Always returns false while quarantined.
      */
     fun isHostModeActive(): Boolean {
+        if (IS_QUARANTINED) return false
         return isRunning.get() && server != null && server!!.isListening()
     }
 
     /**
      * Return the live reachability profile governed by host mode state.
+     * While quarantined, Android always advertises ACTIVE_SESSION_PEER.
      */
     fun getReachabilityProfile(): ReachabilityProfile {
+        if (IS_QUARANTINED) return ReachabilityProfile.ACTIVE_SESSION_PEER
         return if (isHostModeActive()) {
             ReachabilityProfile.FOREGROUND_HOST
         } else {

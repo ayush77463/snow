@@ -34,6 +34,7 @@ class AndroidPeerHostTest {
     private lateinit var hostManager: AndroidPeerHostManager
     private lateinit var mockTokenStorage: TokenStorage
     private lateinit var dispatcher: AndroidCapabilityDispatcher
+    private var peerHostServer: AndroidPeerHostServer? = null
     private var testPort: Int = 0
 
     class MemoryTokenStorage(private var storedToken: String? = "test-token-secret-1234") : TokenStorage {
@@ -64,14 +65,34 @@ class AndroidPeerHostTest {
     @After
     fun tearDown() {
         hostManager.disableHostMode()
+        peerHostServer?.stop()
+        peerHostServer = null
         testScope.cancel()
     }
 
+    private fun startDirectServer(
+        port: Int,
+        manifestProvider: () -> Map<String, Any?> = { emptyMap() }
+    ): AndroidPeerHostServer {
+        val s = AndroidPeerHostServer(
+            requestedPort = port,
+            tokenStorage = mockTokenStorage,
+            dispatcher = dispatcher,
+            localDeviceId = "android-node-test-1",
+            manifestProvider = manifestProvider,
+            parentScope = testScope
+        )
+        assertTrue("Direct AndroidPeerHostServer should bind", s.start())
+        peerHostServer = s
+        return s
+    }
+
     @Test
-    fun testHostModeLifecycleAndProfileTransitions() {
+    fun testHostModeLifecycleAndQuarantine() {
         assertFalse(hostManager.isHostModeActive())
         assertEquals(ReachabilityProfile.ACTIVE_SESSION_PEER, hostManager.getReachabilityProfile())
 
+        // Under Phase 19A quarantine, enableHostMode must fail closed
         val enabled = hostManager.enableHostMode(
             port = testPort,
             tokenStorage = mockTokenStorage,
@@ -81,9 +102,20 @@ class AndroidPeerHostTest {
             parentScope = testScope
         )
 
-        assertTrue(enabled)
-        assertTrue(hostManager.isHostModeActive())
-        assertEquals(ReachabilityProfile.FOREGROUND_HOST, hostManager.getReachabilityProfile())
+        assertFalse("Quarantined host manager must return false", enabled)
+        assertFalse(hostManager.isHostModeActive())
+        assertEquals(ReachabilityProfile.ACTIVE_SESSION_PEER, hostManager.getReachabilityProfile())
+
+        // Verify socket is not opened
+        var failedToConnect = false
+        try {
+            Socket("127.0.0.1", testPort).close()
+        } catch (_: ConnectException) {
+            failedToConnect = true
+        } catch (_: Exception) {
+            failedToConnect = true
+        }
+        assertTrue("Quarantined host manager must not open socket", failedToConnect)
 
         hostManager.disableHostMode()
         assertFalse(hostManager.isHostModeActive())
@@ -92,13 +124,7 @@ class AndroidPeerHostTest {
 
     @Test
     fun testPingPongOverPeerHostSocket() = runBlocking {
-        hostManager.enableHostMode(
-            port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            parentScope = testScope
-        )
+        startDirectServer(testPort)
 
         Socket("127.0.0.1", testPort).use { socket ->
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
@@ -119,13 +145,7 @@ class AndroidPeerHostTest {
 
     @Test
     fun testUnauthenticatedCapabilityRequestRejected() = runBlocking {
-        hostManager.enableHostMode(
-            port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            parentScope = testScope
-        )
+        startDirectServer(testPort)
 
         Socket("127.0.0.1", testPort).use { socket ->
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
@@ -145,13 +165,7 @@ class AndroidPeerHostTest {
 
     @Test
     fun testPairRequestCannotBypassAuthentication() = runBlocking {
-        hostManager.enableHostMode(
-            port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            parentScope = testScope
-        )
+        startDirectServer(testPort)
 
         Socket("127.0.0.1", testPort).use { socket ->
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
@@ -175,13 +189,9 @@ class AndroidPeerHostTest {
 
     @Test
     fun testAuthenticationWithValidTokenSucceeds() = runBlocking {
-        hostManager.enableHostMode(
+        startDirectServer(
             port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            manifestProvider = { mapOf("manifest_version" to "2.0") },
-            parentScope = testScope
+            manifestProvider = { mapOf("manifest_version" to "2.0") }
         )
 
         Socket("127.0.0.1", testPort).use { socket ->
@@ -210,13 +220,7 @@ class AndroidPeerHostTest {
 
     @Test
     fun testAuthenticationWithInvalidTokenRejected() = runBlocking {
-        hostManager.enableHostMode(
-            port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            parentScope = testScope
-        )
+        startDirectServer(testPort)
 
         Socket("127.0.0.1", testPort).use { socket ->
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
@@ -242,13 +246,7 @@ class AndroidPeerHostTest {
 
     @Test
     fun testAuthenticatedCapabilityExecutionThroughDispatcher() = runBlocking {
-        hostManager.enableHostMode(
-            port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            parentScope = testScope
-        )
+        startDirectServer(testPort)
 
         Socket("127.0.0.1", testPort).use { socket ->
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
@@ -281,13 +279,7 @@ class AndroidPeerHostTest {
         ClipboardHandler.isAppInForeground = false
         ClipboardHandler.isUserIntentGranted = false
 
-        hostManager.enableHostMode(
-            port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            parentScope = testScope
-        )
+        startDirectServer(testPort)
 
         Socket("127.0.0.1", testPort).use { socket ->
             val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
@@ -317,17 +309,11 @@ class AndroidPeerHostTest {
 
     @Test
     fun testStopClosesSocketCleanly() = runBlocking {
-        hostManager.enableHostMode(
-            port = testPort,
-            tokenStorage = mockTokenStorage,
-            dispatcher = dispatcher,
-            localDeviceId = "android-node-test-1",
-            parentScope = testScope
-        )
-        assertTrue(hostManager.isHostModeActive())
+        val server = startDirectServer(testPort)
+        assertTrue(server.isListening())
 
-        hostManager.disableHostMode()
-        assertFalse(hostManager.isHostModeActive())
+        server.stop()
+        assertFalse(server.isListening())
 
         var failedToConnect = false
         try {
@@ -337,6 +323,6 @@ class AndroidPeerHostTest {
         } catch (_: Exception) {
             failedToConnect = true
         }
-        assertTrue("Port should not accept connections when host mode is disabled", failedToConnect)
+        assertTrue("Port should not accept connections when server is stopped", failedToConnect)
     }
 }

@@ -161,6 +161,46 @@ class WindowsFileManager:
 
         self.allowed_roots = valid_roots
 
+    def _is_transfers_exemption(self, resolved: Path) -> bool:
+        """Check whether a resolved path qualifies for the narrow ~/.snow/transfers exemption.
+
+        INVARIANTS:
+        - Only files genuinely contained within canonical ~/.snow/transfers/ are permitted.
+        - Must NOT be within .parts/ (in-flight partial upload directory).
+        - Must NOT point to sensitive private material (server.key, ipc.secret, database, certificates).
+        - Symlink escapes pointing outside ~/.snow/transfers/ must be strictly rejected.
+        """
+        try:
+            transfers_dir = (Path.home() / ".snow" / "transfers").resolve()
+            real_target = resolved.resolve()
+
+            # The transfers root directory itself is allowed for listing
+            if real_target == transfers_dir:
+                return True
+
+            # Must be strictly relative to the transfers directory
+            if not real_target.is_relative_to(transfers_dir):
+                return False
+
+            # Explicitly forbid the in-flight .parts staging directory
+            parts_dir = (transfers_dir / ".parts").resolve()
+            if real_target == parts_dir or real_target.is_relative_to(parts_dir):
+                return False
+
+            for part in real_target.parts:
+                if part.lower().strip() == ".parts":
+                    return False
+
+            # Forbid sensitive or credential extensions / names
+            if real_target.name.lower() in FORBIDDEN_NAME_PATTERNS:
+                return False
+            if real_target.suffix.lower() in FORBIDDEN_EXTENSIONS:
+                return False
+
+            return True
+        except Exception:
+            return False
+
     def _is_forbidden_path(self, resolved: Path) -> bool:
         """Check whether a resolved path matches any forbidden location, name, or extension."""
         name_lower = resolved.name.lower()
@@ -171,6 +211,10 @@ class WindowsFileManager:
             return True
         if ext_lower in FORBIDDEN_EXTENSIONS:
             return True
+
+        # Narrowly scoped exemption for canonical ~/.snow/transfers/ directory
+        if self._is_transfers_exemption(resolved):
+            return False
 
         # Check path parts for forbidden directory names (including .snow, windows, system32, config)
         for part in resolved.parts:

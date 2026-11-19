@@ -419,6 +419,14 @@ class TestE2E3SymmetricMeshAndSessionRouter(unittest.IsolatedAsyncioTestCase):
 
     def test_preflight_resolution_timing_benchmark(self) -> None:
         """Target pre-flight resolution executes under 5.0 ms target across 100 iterations."""
+        # Warm-up phase: run 10 unmeasured iterations to prime Python bytecode, thread lock,
+        # and SQLite schema/statement caches before recording benchmark timing.
+        for _ in range(10):
+            self.registry.resolve_target(
+                self.android_id,
+                required_capability="android.battery.get",
+            )
+
         times_ms: List[float] = []
         for _ in range(100):
             t0 = time.perf_counter()

@@ -20,6 +20,7 @@ class DeviceNodeTest {
         assertTrue("Must support android.apps.launch", manifest.supportsCapability("android.apps.launch"))
         assertTrue("Must support android.notifications.push", manifest.supportsCapability("android.notifications.push"))
         assertTrue("Must support android.files.transfer", manifest.supportsCapability("android.files.transfer"))
+        assertTrue("Must support android.ringer.ring", manifest.supportsCapability("android.ringer.ring"))
 
         // Security check: must NEVER support restricted desktop capabilities or forbidden SMS
         assertFalse("Must NOT support desktop.exec", manifest.supportsCapability("desktop.exec"))
@@ -46,7 +47,12 @@ class DeviceNodeTest {
             CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
             manifest.classifications["android.apps.launch"]
         )
+        assertEquals(
+            CapabilityClassification.BACKGROUND_SAFE,
+            manifest.classifications["android.ringer.ring"]
+        )
         assertTrue(manifest.isBackgroundSafe("android.telemetry.get"))
+        assertTrue(manifest.isBackgroundSafe("android.ringer.ring"))
         assertFalse(manifest.isBackgroundSafe("android.notifications.push"))
         assertFalse(manifest.isBackgroundSafe("android.apps.launch"))
         assertFalse(manifest.isBackgroundSafe("android.clipboard.get"))
@@ -104,9 +110,10 @@ class DeviceNodeTest {
             transferPort = 8766,
             supportedCapabilities = manifest.supportedCapabilities,
             permissionStates = manifest.permissionStates,
-            lastSeenTimestamp = 1700000000L,
+            lastSeenTimestamp = 1700000000.0,
             trustTier = "owner",
             capabilities = manifest,
+            isAuthenticated = true,
             isConnected = true,
             isPaired = true
         )
@@ -115,7 +122,9 @@ class DeviceNodeTest {
         assertEquals("Ayush Phone", node.deviceName)
         assertTrue(node.isConnected)
         assertTrue(node.isPaired)
+        assertTrue(node.isAuthenticated)
         assertTrue(node.supportsCapability("android.telemetry.get"))
+        assertTrue(node.supportsCapability("android.ringer.ring"))
         assertFalse(node.supportsCapability("desktop.exec"))
 
         val map = node.toMap()
@@ -123,9 +132,37 @@ class DeviceNodeTest {
         assertEquals("Ayush Phone", map["device_name"])
         assertEquals("ACTIVE_SESSION_PEER", map["reachability_profile"])
         assertEquals("CONNECTED_SESSION", map["reachability_state"])
+        assertEquals(true, map["is_authenticated"])
         assertEquals(true, map["is_connected"])
         assertEquals(true, map["is_paired"])
+        assertEquals(1700000000.0, map["last_seen_timestamp"])
         assertNotNull(map["capabilities"])
+
+        // Roundtrip via fromMap
+        val parsed = DeviceNode.fromMap(map)
+        assertNotNull(parsed)
+        assertEquals(node.deviceId, parsed!!.deviceId)
+        assertEquals(node.deviceName, parsed.deviceName)
+        assertEquals(node.reachabilityProfile, parsed.reachabilityProfile)
+        assertEquals(node.reachabilityState, parsed.reachabilityState)
+        assertEquals(node.lastSeenTimestamp, parsed.lastSeenTimestamp, 0.001)
+        assertEquals(node.isAuthenticated, parsed.isAuthenticated)
+        assertEquals(node.isPaired, parsed.isPaired)
+
+        // Test ONLINE_ROUTED reachability state
+        val routedNode = node.copy(reachabilityState = ReachabilityState.ONLINE_ROUTED)
+        assertEquals(ReachabilityState.ONLINE_ROUTED, routedNode.reachabilityState)
+        val routedMap = routedNode.toMap()
+        assertEquals("ONLINE_ROUTED", routedMap["reachability_state"])
+        val routedParsed = DeviceNode.fromMap(routedMap)
+        assertEquals(ReachabilityState.ONLINE_ROUTED, routedParsed?.reachabilityState)
+
+        // Test epoch millis migration in fromMap
+        val legacyMillisMap = map.toMutableMap()
+        legacyMillisMap["last_seen_timestamp"] = 1700000000000L
+        val migrated = DeviceNode.fromMap(legacyMillisMap)
+        assertNotNull(migrated)
+        assertEquals(1700000000.0, migrated!!.lastSeenTimestamp, 0.001)
     }
 
     @Test

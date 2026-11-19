@@ -176,32 +176,34 @@ def run_setup(
 
 def run_devices_list(json_output: bool = False, db_path: Optional[Path | str] = None) -> int:
     """Execute 'snow devices list'."""
-    bridge = SnowMcpBridge(auto_start_core=False)
-    daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
-
     devices_list: list[dict[str, Any]] = []
     source = "offline_database"
 
-    if daemon_online:
-        try:
-            res = asyncio.run(bridge.list_devices())
-            if res.get("success"):
-                raw_devices = res.get("data", {}).get("devices", [])
-                source = "daemon_ipc"
-                for d in raw_devices:
-                    devices_list.append({
-                        "device_id": d.get("device_id", "unknown"),
-                        "device_name": d.get("device_name", "Unknown Node"),
-                        "platform": d.get("platform", "unknown"),
-                        "trust_tier": (d.get("trust_tier") or "peer").upper(),
-                        "reachability_profile": d.get("reachability_profile", "ACTIVE_SESSION_PEER"),
-                        "reachability_state": d.get("reachability_state", "CONNECTED_SESSION" if d.get("is_connected") else "UNREACHABLE_OFFLINE"),
-                        "is_paired": bool(d.get("is_paired", True)),
-                        "is_connected": bool(d.get("is_connected", False)),
-                        "last_known_endpoint": f"{d.get('host', 'N/A')}:{d.get('wss_port', 8765)}" if d.get("host") else "N/A",
-                    })
-        except Exception as exc:
-            logger.debug("Failed querying daemon IPC for devices list: %s", exc)
+    # Deterministic DB isolation: If explicit db_path is passed, always use it directly without querying live daemon
+    if db_path is None:
+        bridge = SnowMcpBridge(auto_start_core=False)
+        daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
+
+        if daemon_online:
+            try:
+                res = asyncio.run(bridge.list_devices())
+                if res.get("success"):
+                    raw_devices = res.get("data", {}).get("devices", [])
+                    source = "daemon_ipc"
+                    for d in raw_devices:
+                        devices_list.append({
+                            "device_id": d.get("device_id", "unknown"),
+                            "device_name": d.get("device_name", "Unknown Node"),
+                            "platform": d.get("platform", "unknown"),
+                            "trust_tier": (d.get("trust_tier") or "peer").upper(),
+                            "reachability_profile": d.get("reachability_profile", "ACTIVE_SESSION_PEER"),
+                            "reachability_state": d.get("reachability_state", "CONNECTED_SESSION" if d.get("is_connected") else "UNREACHABLE_OFFLINE"),
+                            "is_paired": bool(d.get("is_paired", True)),
+                            "is_connected": bool(d.get("is_connected", False)),
+                            "last_known_endpoint": f"{d.get('host', 'N/A')}:{d.get('wss_port', 8765)}" if d.get("host") else "N/A",
+                        })
+            except Exception as exc:
+                logger.debug("Failed querying daemon IPC for devices list: %s", exc)
 
     if not devices_list:
         # Fall back to offline SQLite database
@@ -306,13 +308,13 @@ def run_devices_trust(
             print("\nOperation cancelled.")
             return 1
 
-    # Check if daemon is running to notify via IPC
     bridge = SnowMcpBridge(auto_start_core=False)
     daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
 
     if daemon_online:
         res = asyncio.run(bridge.call("device_trust", {"device_id": clean_id, "tier": clean_tier}))
         if res.get("success"):
+            db.update_device_trust_tier(clean_id, clean_tier)
             print(f"[+] Successfully updated device [{clean_id}] ({device.device_name}) trust tier to '{clean_tier.upper()}' via Core IPC.")
             return 0
         else:
@@ -363,6 +365,7 @@ def run_devices_revoke(
     if daemon_online:
         res = asyncio.run(bridge.call("device_revoke", {"device_id": clean_id}))
         if res.get("success"):
+            db.delete_paired_device(clean_id)
             print(f"[+] Device [{clean_id}] ({device.device_name}) has been revoked.")
             print("    Stored credentials deleted; any active daemon session was immediately terminated.")
             return 0

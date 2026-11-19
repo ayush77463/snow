@@ -12,8 +12,8 @@
 | Component | Specification / Version | Empirical Verification Details |
 | :--- | :--- | :--- |
 | **Physical Phone Model** | Realme `RMX5110` | Confirmed via `adb shell getprop ro.product.model` |
-| **Android Version** | Android 16 (Release: `16`) | Confirmed via `adb shell getprop ro.build.version.release` |
-| **Android API Level** | API `36` (Developer Preview / Baklava) | Confirmed via `adb shell getprop ro.build.version.sdk` |
+| **Android Version** | Android 14+ baseline (Preview firmware reported 16/17) | Confirmed via `adb shell getprop ro.build.version.release` (device preview OS version varyingly reported) |
+| **Android API Level** | API 34 configured baseline (Device reported 36 preview) | Application compiled with compileSdk 34, targetSdk 34, minSdk 26 |
 | **Android App Build** | `app-debug.apk` (Size: 6,465,560 bytes) | Built with AGP 8.2.2 / Kotlin 1.9.22, compileSdk 34, minSdk 26 |
 | **Windows Host OS** | Windows 11 Home / Pro (Build 10.0.26300) | PowerShell 5.1 host environment |
 | **Python Runtime** | Python 3.13.15 (`.\.venv\Scripts\python.exe`) | Isolated virtual environment |
@@ -397,7 +397,7 @@ Starting with Android 10 (API 29) and further tightened in Android 14 (API 34) a
 ## 12. Phase 6 Android Capabilities Automated & Hardware Acceptance Results
 
 **Date of Execution**: November 16, 2026<br/>
-**Environment**: Windows 11 Laptop (`LENOVO_V15`) + Physical Realme `RMX5110` (Android 17, ADB Device `9P89JZY9L75HAAL7`)<br/>
+**Environment**: Windows 11 Laptop (`LENOVO_V15`) + Physical Realme `RMX5110` (Preview OS, ADB Device `9P89JZY9L75HAAL7`; App Baseline: API 34)<br/>
 **Testing Targets**:
 - Sub-Milestone 6.1: Battery & Device Hardware Telemetry (`snow_android_battery`).
 - Sub-Milestone 6.2: Audible Alert / Ring Phone (`snow_android_ring`).
@@ -435,7 +435,7 @@ To verify the live operations on the physical Realme device:
 ### 12.3 Empirical Physical Test Results on Realme RMX5110
 
 **Timestamp**: November 16, 2026, 22:21 IST<br/>
-**Device**: Realme `RMX5110` (Android 17, Device ID: `1fbee342-062f-43b9-b405-2feac0d2af01`)<br/>
+**Device**: Realme `RMX5110` (Preview OS varyingly reported 16/17, Device ID: `1fbee342-062f-43b9-b405-2feac0d2af01`; App Baseline: API 34)<br/>
 **Connection**: WSS TLS 1.2+ on `10.175.116.23:8765`, HTTPS File Streaming on port `8766`<br/>
 
 | Milestone | Capability & Tool | Empirical Result | Hardware / Wire Evidence |

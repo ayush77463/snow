@@ -73,7 +73,7 @@ class AndroidCapabilityDispatcher(
                         "remediation_hint" to "Confirm SMS dispatch intent on the Android device."
                     )
                 }
-                if (mode == MessagingHandler.MODE_INTENT && !ClipboardHandler.isAppInForeground && !ActionNotificationHelper.canPostNotifications(context)) {
+                if (!ClipboardHandler.isAppInForeground && !ActionNotificationHelper.canPostNotifications(context)) {
                     return mapOf(
                         "success" to false,
                         "status" to "FOREGROUND_REQUIRED",
@@ -160,7 +160,15 @@ class AndroidCapabilityDispatcher(
                 if (res["status"] == "success" || res["success"] == true) {
                     Pair(res, null)
                 } else {
-                    Pair(null, SnowError(code = ErrorCode.UNSUPPORTED_ACTION, message = res["error"] as? String ?: "App launch failed"))
+                    val status = res["status"] as? String ?: "error"
+                    val code = when (status) {
+                        "POLICY_DENIED" -> ErrorCode.UNAUTHORIZED
+                        "PERMISSION_DENIED" -> ErrorCode.UNAUTHORIZED
+                        "FOREGROUND_REQUIRED" -> ErrorCode.UNAUTHORIZED
+                        "MALFORMED_PACKAGE_NAME" -> ErrorCode.INVALID_PAYLOAD
+                        else -> ErrorCode.FILE_NOT_FOUND
+                    }
+                    Pair(null, SnowError(code = code, message = "$status: ${res["message"] ?: res["error"] ?: "App launch failed"}"))
                 }
             }
             "file_send_request" -> {

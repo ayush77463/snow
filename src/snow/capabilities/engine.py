@@ -136,6 +136,7 @@ class CapabilityEngine:
         self.files = files or WindowsFileManager(allowed_roots=allowed_roots)
         self.apps = apps or WindowsAppLauncher()
         self.terminal = terminal or WindowsTerminalExecutor()
+        self.terminal.set_ticket_validator(self.validate_confirmation_ticket)
         self.clipboard = clipboard or WindowsClipboardManager()
         self.policy = policy or PeerCapabilityPolicy()
         self.node_registry = node_registry
@@ -144,19 +145,20 @@ class CapabilityEngine:
         self._tickets: dict[str, dict[str, Any]] = {}
 
     def issue_confirmation_ticket(
-        self, device_id: str, command: str, ttl_seconds: float = 60.0
+        self, device_id: Optional[str], command: str, ttl_seconds: float = 60.0
     ) -> str:
         """Issue a server-validated single-use confirmation ticket for an owner command."""
+        target_dev = (device_id or "").strip() or "local_owner"
         ticket = secrets.token_hex(16)
         self._tickets[ticket] = {
-            "device_id": device_id,
+            "device_id": target_dev,
             "command": command.strip(),
             "expires_at": time.monotonic() + ttl_seconds,
         }
         return ticket
 
     def validate_confirmation_ticket(
-        self, ticket: str, device_id: str, command: str
+        self, ticket: str, device_id: Optional[str], command: str
     ) -> bool:
         """Validate and consume a single-use confirmation ticket."""
         if not ticket or not isinstance(ticket, str):
@@ -166,7 +168,8 @@ class CapabilityEngine:
             return False
         if time.monotonic() > rec["expires_at"]:
             return False
-        if rec["device_id"] != device_id or rec["command"] != command.strip():
+        target_dev = (device_id or "").strip() or "local_owner"
+        if rec["device_id"] != target_dev or rec["command"] != command.strip():
             return False
         return True
 
@@ -379,24 +382,13 @@ class CapabilityEngine:
                 except (ValueError, TypeError):
                     timeout = 30.0
 
-            confirmed = bool(params.get("confirmed", False))
             confirmation_ticket = params.get("confirmation_ticket")
-
-            # Validate server-issued confirmation ticket if present
-            if confirmation_ticket and ctx.device_id:
-                if self.validate_confirmation_ticket(confirmation_ticket, ctx.device_id, command):
-                    confirmed = True
-                else:
-                    logger.warning("Invalid or expired confirmation ticket from [%s]", ctx.device_id)
-                    confirmed = False
-                    confirmation_ticket = None
 
             res = await self.terminal.execute_command(
                 command=command.strip(),
                 cwd=cwd,
                 timeout=timeout,
                 ctx=ctx,
-                confirmed=confirmed,
                 confirmation_ticket=confirmation_ticket,
             )
 

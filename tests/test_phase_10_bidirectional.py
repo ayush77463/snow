@@ -749,7 +749,7 @@ class TestDualPrincipalSecurityArchitecture(unittest.IsolatedAsyncioTestCase):
             self.db_manager.update_device_trust_tier("dev-peer-2", "admin")
 
     async def test_terminal_executor_principal_isolation(self) -> None:
-        """OWNER_MANUAL bypasses catastrophic regex blocklist; AI_MCP is blocked."""
+        """Catastrophic commands are strictly blocked for both AI_MCP and OWNER_MANUAL."""
         term = WindowsTerminalExecutor()
 
         owner_ctx = ExecutionContext(principal=ExecutionPrincipal.OWNER_MANUAL, origin="wss")
@@ -760,9 +760,14 @@ class TestDualPrincipalSecurityArchitecture(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ai_res.get("success"))
         self.assertEqual(ai_res.get("status"), "POLICY_DENIED")
 
-        # OWNER_MANUAL validates regex without failure (command execution attempt is made)
+        # OWNER_MANUAL is also strictly blocked by catastrophic policy
+        owner_res = await term.execute_command("format c: /q", ctx=owner_ctx)
+        self.assertFalse(owner_res.get("success"))
+        self.assertEqual(owner_res.get("status"), "POLICY_DENIED")
+
         reason = term.validate_command("format c: /q", ctx=owner_ctx)
-        self.assertIsNone(reason)
+        self.assertIsNotNone(reason)
+        self.assertIn("destructive pattern", reason)
 
     def test_file_manager_principal_isolation(self) -> None:
         """OWNER_MANUAL can address host drives; private security material is blocked for both."""

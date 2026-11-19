@@ -21,6 +21,7 @@ enum class ReachabilityState {
     CONNECTED_SESSION,
     LAN_DISCOVERABLE,
     LAST_KNOWN_IP_DIRECT,
+    ONLINE_ROUTED,
     UNREACHABLE_OFFLINE
 }
 
@@ -114,9 +115,10 @@ data class DeviceNode(
     val transferPort: Int = 8766,
     val supportedCapabilities: List<String> = emptyList(),
     val permissionStates: Map<String, String> = emptyMap(),
-    val lastSeenTimestamp: Long = 0L,
+    val lastSeenTimestamp: Double = 0.0,
     val trustTier: String? = null,
     val capabilities: CapabilityManifest? = null,
+    val isAuthenticated: Boolean = false,
     val isConnected: Boolean = false,
     val isPaired: Boolean = false
 ) {
@@ -142,6 +144,7 @@ data class DeviceNode(
             "permission_states" to permissionStates,
             "last_seen_timestamp" to lastSeenTimestamp,
             "trust_tier" to trustTier,
+            "is_authenticated" to isAuthenticated,
             "is_connected" to isConnected,
             "is_paired" to isPaired
         )
@@ -152,6 +155,62 @@ data class DeviceNode(
     }
 
     companion object {
+        fun fromMap(data: Map<String, Any?>?): DeviceNode? {
+            if (data == null) return null
+            val id = data["device_id"] as? String ?: return null
+            val name = data["device_name"] as? String ?: return null
+            val platform = data["platform"] as? String ?: "android"
+            val protoVer = (data["protocol_version"] as? Number)?.toInt() ?: 1
+            val reachProfStr = data["reachability_profile"] as? String ?: ReachabilityProfile.ACTIVE_SESSION_PEER.name
+            val reachProf = try { ReachabilityProfile.valueOf(reachProfStr) } catch (_: Exception) { ReachabilityProfile.ACTIVE_SESSION_PEER }
+            val reachStateStr = data["reachability_state"] as? String ?: ReachabilityState.UNREACHABLE_OFFLINE.name
+            val reachState = try { ReachabilityState.valueOf(reachStateStr) } catch (_: Exception) { ReachabilityState.UNREACHABLE_OFFLINE }
+            val host = data["host"] as? String
+            val wssPort = (data["wss_port"] as? Number)?.toInt() ?: 8765
+            val transferPort = (data["transfer_port"] as? Number)?.toInt() ?: 8766
+            val capsManifest = (data["capabilities"] as? Map<*, *>)?.let {
+                @Suppress("UNCHECKED_CAST")
+                CapabilityManifest.fromMap(it as Map<String, Any?>)
+            }
+            val suppCaps = (data["supported_capabilities"] as? List<*>)?.filterIsInstance<String>() ?: emptyList()
+            val permStates = (data["permission_states"] as? Map<*, *>)?.let { raw ->
+                raw.entries.mapNotNull { (k, v) -> if (k is String && v is String) k to v else null }.toMap()
+            } ?: emptyMap()
+            val rawTs = data["last_seen_timestamp"]
+            val lastSeen = when (rawTs) {
+                is Number -> {
+                    val d = rawTs.toDouble()
+                    // Safe migration: if > 1e11, it is epoch millis -> convert to seconds
+                    if (d > 1e11) d / 1000.0 else d
+                }
+                else -> 0.0
+            }
+            val trustTier = data["trust_tier"] as? String
+            val isAuth = (data["is_authenticated"] as? Boolean) ?: false
+            val isConn = (data["is_connected"] as? Boolean) ?: false
+            val isPaired = (data["is_paired"] as? Boolean) ?: false
+
+            return DeviceNode(
+                deviceId = id,
+                deviceName = name,
+                platform = platform,
+                protocolVersion = protoVer,
+                reachabilityProfile = reachProf,
+                reachabilityState = reachState,
+                host = host,
+                wssPort = wssPort,
+                transferPort = transferPort,
+                supportedCapabilities = suppCaps,
+                permissionStates = permStates,
+                lastSeenTimestamp = lastSeen,
+                trustTier = trustTier,
+                capabilities = capsManifest,
+                isAuthenticated = isAuth,
+                isConnected = isConn,
+                isPaired = isPaired
+            )
+        }
+
         /**
          * Construct the authoritative Android capability manifest.
          * Reflects Android 17 permission matrix and actual runtime state.
@@ -165,7 +224,8 @@ data class DeviceNode(
                 "android.apps.list",
                 "android.apps.launch",
                 "android.messaging.send_intent",
-                "android.files.transfer"
+                "android.files.transfer",
+                "android.ringer.ring"
             )
 
             val classifications = mapOf(
@@ -176,7 +236,8 @@ data class DeviceNode(
                 "android.apps.list" to CapabilityClassification.BACKGROUND_SAFE,
                 "android.apps.launch" to CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
                 "android.messaging.send_intent" to CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
-                "android.files.transfer" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED
+                "android.files.transfer" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED,
+                "android.ringer.ring" to CapabilityClassification.BACKGROUND_SAFE
             )
 
             val perms = mutableMapOf<String, String>()
@@ -187,6 +248,7 @@ data class DeviceNode(
             perms["android.messaging.send_intent"] = "GRANTED"
             perms["android.files.transfer"] = "GRANTED"
             perms["android.apps.list"] = "GRANTED"
+            perms["android.ringer.ring"] = "GRANTED"
 
             // Check POST_NOTIFICATIONS permission for Android 13+ (API 33+) if context available
             if (context != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

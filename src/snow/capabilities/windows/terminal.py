@@ -26,7 +26,7 @@ from pathlib import Path
 import re
 import shlex
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from snow.security.context import ExecutionContext, ExecutionPrincipal
 
@@ -48,12 +48,12 @@ class TerminalSecurityTier(StrEnum):
 
 # Regex patterns matching catastrophic or destructive operations
 CATASTROPHIC_PATTERNS: list[re.Pattern] = [
-    # Disk / volume formatting
-    re.compile(r"\bformat\s+[a-zA-Z]:", re.IGNORECASE),
+    # Disk / volume formatting (including switches before/after drive letter)
+    re.compile(r"\bformat(\.com)?\s+.*[a-zA-Z]:", re.IGNORECASE),
     re.compile(r"\bdiskpart\b", re.IGNORECASE),
-    # Recursive deletion of root or Windows directories
-    re.compile(r"\b(del|erase|rmdir|rd)\s+.*([a-zA-Z]:\\|\bWindows\b|\bSystem32\b)", re.IGNORECASE),
-    re.compile(r"\bRemove-Item\b.*(-Recurse|-r)\b.*([a-zA-Z]:\\|\bWindows\b|\bSystem32\b)", re.IGNORECASE),
+    # Recursive deletion of root or Windows directories (both backslash and forward slash)
+    re.compile(r"\b(del|erase|rmdir|rd)\s+.*([a-zA-Z]:[\\/]|\bWindows\b|\bSystem32\b)", re.IGNORECASE),
+    re.compile(r"\bRemove-Item\b.*(-Recurse|-r)\b.*([a-zA-Z]:[\\/]|\bWindows\b|\bSystem32\b)", re.IGNORECASE),
     # Tampering with SNOW secret files or authentication material
     re.compile(r"\b(del|erase|remove-item|rm|rmdir|rd|move|ren)\b.*(\.snow|ipc\.secret|server\.key|server\.crt|snow_devices\.db)", re.IGNORECASE),
     re.compile(r"\bicacls\b.*(\.snow|ipc\.secret)", re.IGNORECASE),
@@ -152,8 +152,19 @@ class TerminalSecurityPolicy:
 class WindowsTerminalExecutor:
     """Asynchronous Windows command-line executor with output limits and 4-tier safety policy."""
 
-    def __init__(self, policy: Optional[TerminalSecurityPolicy] = None) -> None:
+    def __init__(
+        self,
+        policy: Optional[TerminalSecurityPolicy] = None,
+        ticket_validator: Optional[Callable[[str, Optional[str], str], bool]] = None,
+    ) -> None:
         self.policy = policy or TerminalSecurityPolicy()
+        self.ticket_validator = ticket_validator
+
+    def set_ticket_validator(
+        self, validator: Callable[[str, Optional[str], str], bool]
+    ) -> None:
+        """Bind a server-side single-use confirmation ticket validation callback."""
+        self.ticket_validator = validator
 
     def get_workspace_roots(self) -> list[Path]:
         """Return the combined list of authorized workspace roots."""
@@ -179,11 +190,10 @@ class WindowsTerminalExecutor:
         ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="default")
         cmd_clean = (command or "").strip()
 
-        # 1. Check catastrophic patterns (hard block for AI)
+        # 1. Check catastrophic patterns (hard block for ALL callers, including OWNER_MANUAL)
         for pattern in CATASTROPHIC_PATTERNS:
             if pattern.search(cmd_clean):
-                if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
-                    return TerminalSecurityTier.RESTRICTED_BLOCKED
+                return TerminalSecurityTier.RESTRICTED_BLOCKED
 
         # Credential tampering targeting .snow private key, database, or IPC secret is blocked for ALL
         if re.search(r"\b(del|erase|remove-item|rm|rmdir|rd|move|ren)\b.*(\.snow|ipc\.secret|server\.key|server\.crt|snow_devices\.db)", cmd_clean, re.IGNORECASE):
@@ -255,7 +265,7 @@ class WindowsTerminalExecutor:
         """Validate command against security policies.
 
         Returns an error string if rejected, or None if permitted.
-        Preserves backward compatibility: OWNER_MANUAL bypasses catastrophic regex blocklist.
+        Catastrophic and destructive commands are blocked for all principals.
         """
         ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="default")
 
@@ -265,22 +275,25 @@ class WindowsTerminalExecutor:
         if not self.policy.allow_execution:
             return "Terminal execution is disabled by configuration policy."
 
-        # Apply catastrophic blocklist to AI_MCP callers only
+        # Catastrophic destructive operations are blocked for ALL principals (including OWNER_MANUAL)
+        if self.policy.block_catastrophic:
+            cleaned = command.strip()
+            for pattern in CATASTROPHIC_PATTERNS:
+                if pattern.search(cleaned):
+                    return (
+                        f"Command rejected by security policy: matches forbidden "
+                        f"destructive pattern ({pattern.pattern})."
+                    )
+
+        # AI-specific blocklist (evasion, encoded powershell, registry manipulation)
         if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
-            if self.policy.block_catastrophic:
-                cleaned = command.strip()
-                for pattern in CATASTROPHIC_PATTERNS:
-                    if pattern.search(cleaned):
-                        return (
-                            f"Command rejected by security policy: matches forbidden "
-                            f"destructive pattern ({pattern.pattern})."
-                        )
-                for pattern in AI_BLOCKED_PATTERNS:
-                    if pattern.search(cleaned):
-                        return (
-                            f"Command rejected by security policy: matches forbidden "
-                            f"destructive or sensitive pattern ({pattern.pattern})."
-                        )
+            cleaned = command.strip()
+            for pattern in AI_BLOCKED_PATTERNS:
+                if pattern.search(cleaned):
+                    return (
+                        f"Command rejected by security policy: matches forbidden "
+                        f"destructive or sensitive pattern ({pattern.pattern})."
+                    )
 
         return None
 
@@ -380,6 +393,15 @@ class WindowsTerminalExecutor:
                 "working_directory": str(cwd or ""),
             }
 
+        # Validate server-issued confirmation ticket if provided
+        is_valid_ticket = False
+        if confirmation_ticket and self.ticket_validator:
+            is_valid_ticket = self.ticket_validator(
+                str(confirmation_ticket),
+                ctx.device_id or "local_owner",
+                command,
+            )
+
         # 4. Enforce Tier permissions
         if tier == TerminalSecurityTier.OWNER_CONFIRMED:
             # AI callers are NEVER permitted to execute OWNER_CONFIRMED commands
@@ -403,14 +425,14 @@ class WindowsTerminalExecutor:
                     "working_directory": str(resolved_cwd),
                 }
 
-            # Owner execution requires confirmation
-            is_confirmed = confirmed or bool(confirmation_ticket)
-            if not is_confirmed:
+            # Owner execution strictly requires explicit authorization via a valid confirmation ticket.
+            # A client-supplied confirmed=True or arbitrary non-empty ticket string is never sufficient.
+            if not is_valid_ticket:
                 return {
                     "success": False,
                     "status": "CONFIRMATION_REQUIRED",
                     "tier": tier.value,
-                    "error": "Execution requires explicit user confirmation.",
+                    "error": "Execution requires explicit user confirmation via a valid, single-use confirmation ticket.",
                     "command": command,
                     "exit_code": None,
                     "stdout": "",

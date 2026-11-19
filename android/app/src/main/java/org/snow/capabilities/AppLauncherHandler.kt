@@ -9,10 +9,74 @@ import kotlinx.coroutines.withContext
 import org.snow.security.SafeLog
 
 /**
+ * Policy governing application launch authorization.
+ *
+ * Enforces an explicit, user-controlled allowlist for remote AI application launches.
+ * Prevents arbitrary package launch and restricts launches to approved applications.
+ */
+object AppAllowlistPolicy {
+    private const val PREFS_NAME = "snow_app_allowlist"
+    private const val KEY_ALLOWED_PACKAGES = "allowed_packages"
+
+    val DEFAULT_ALLOWED_PACKAGES = setOf(
+        "com.google.android.calculator",
+        "com.android.calculator2",
+        "com.google.android.deskclock",
+        "com.android.deskclock",
+        "com.google.android.calendar",
+        "com.android.calendar"
+    )
+
+    private val PACKAGE_REGEX = Regex("^[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z][a-zA-Z0-9_]*)+$")
+
+    @Volatile
+    private var customAllowlist: Set<String>? = null
+
+    fun isValidPackageSyntax(packageName: String): Boolean {
+        return PACKAGE_REGEX.matches(packageName)
+    }
+
+    fun getAllowedPackages(context: Context): Set<String> {
+        customAllowlist?.let { return it }
+        return try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val saved = prefs?.getStringSet(KEY_ALLOWED_PACKAGES, null)
+            saved ?: DEFAULT_ALLOWED_PACKAGES
+        } catch (_: Exception) {
+            DEFAULT_ALLOWED_PACKAGES
+        }
+    }
+
+    fun isAllowed(context: Context, packageName: String): Boolean {
+        return getAllowedPackages(context).contains(packageName)
+    }
+
+    fun setAllowedPackages(context: Context, packages: Set<String>) {
+        try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs?.edit()?.putStringSet(KEY_ALLOWED_PACKAGES, packages)?.apply()
+        } catch (_: Exception) {
+            // Context without prefs (e.g. mock test context)
+        }
+        customAllowlist = packages
+    }
+
+    fun setCustomAllowlistForTesting(packages: Set<String>?) {
+        customAllowlist = packages
+    }
+
+    fun resetForTesting() {
+        customAllowlist = null
+    }
+}
+
+/**
  * Android application enumeration and launching capability handler.
  *
- * Implements Sub-Milestone 6.4:
+ * Implements Sub-Milestone 6.4 and Phase 19A security hardening:
  * - Lists launchable applications with package names and human-readable labels.
+ * - Enforces explicit allowlist policy on application launches (rejects unapproved packages).
+ * - Validates package identifier syntax against regex.
  * - Launches authorized apps via getLaunchIntentForPackage with FLAG_ACTIVITY_NEW_TASK.
  * - Bounded results and safe error handling without shell execution.
  */
@@ -48,7 +112,7 @@ class AppLauncherHandler(private val context: Context) {
                     }
                 }
                 .distinctBy { it["package_name"] }
-                .sortedBy { (it["label"] as? String)?.lowercase() ?: "" }
+                .sortedBy { it["label"]?.lowercase() ?: "" }
                 .take(boundedLimit)
 
             SafeLog.i(TAG, "Enumerated ${appList.size} launchable application(s).")
@@ -69,18 +133,53 @@ class AppLauncherHandler(private val context: Context) {
     suspend fun launchApp(packageName: String?): Map<String, Any?> = withContext(Dispatchers.Main) {
         if (packageName.isNullOrBlank()) {
             return@withContext mapOf(
+                "success" to false,
                 "status" to "error",
                 "error" to "Package name cannot be empty."
             )
         }
 
         val cleanPackage = packageName.trim()
-        val pm: PackageManager = context.packageManager
 
-        val launchIntent = pm.getLaunchIntentForPackage(cleanPackage)
+        // 1. Syntax validation
+        if (!AppAllowlistPolicy.isValidPackageSyntax(cleanPackage)) {
+            SafeLog.w(TAG, "Malformed package name: '$cleanPackage'")
+            return@withContext mapOf(
+                "success" to false,
+                "status" to "MALFORMED_PACKAGE_NAME",
+                "error" to "MALFORMED_PACKAGE_NAME",
+                "message" to "Package name '$cleanPackage' is malformed."
+            )
+        }
+
+        // 2. Allowlist authorization
+        if (!AppAllowlistPolicy.isAllowed(context, cleanPackage)) {
+            SafeLog.w(TAG, "Package '$cleanPackage' rejected by allowlist policy.")
+            return@withContext mapOf(
+                "success" to false,
+                "status" to "POLICY_DENIED",
+                "error" to "POLICY_DENIED",
+                "message" to "Application '$cleanPackage' is not on the user-approved allowlist for remote launch.",
+                "remediation_hint" to "Add '$cleanPackage' to the approved application allowlist in SNOW settings."
+            )
+        }
+
+        // 3. Application existence and launchability check
+        val pm: PackageManager? = try {
+            context.packageManager
+        } catch (_: Exception) {
+            null
+        }
+        val launchIntent = try {
+            pm?.getLaunchIntentForPackage(cleanPackage)
+        } catch (e: Exception) {
+            null
+        }
+
         if (launchIntent == null) {
             SafeLog.w(TAG, "No launchable activity found for package '$cleanPackage'")
             return@withContext mapOf(
+                "success" to false,
                 "status" to "error",
                 "error" to "Application '$cleanPackage' not found or is not launchable."
             )
@@ -124,10 +223,10 @@ class AppLauncherHandler(private val context: Context) {
                 )
             }
         } else {
-            // Android 17 background activity launch restriction: require user tap via notification
+            // Android background activity launch restriction: require user tap via notification
             if (ActionNotificationHelper.canPostNotifications(context)) {
                 val label = try {
-                    pm.getApplicationLabel(pm.getApplicationInfo(cleanPackage, 0)).toString()
+                    pm?.getApplicationLabel(pm.getApplicationInfo(cleanPackage, 0))?.toString() ?: cleanPackage
                 } catch (_: Exception) {
                     cleanPackage
                 }

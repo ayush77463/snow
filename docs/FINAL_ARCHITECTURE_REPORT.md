@@ -256,7 +256,7 @@ Academic rigor demands acknowledging the real constraints of the Android operati
 4. **Scoped Storage (SAF)**:
    - Direct raw filesystem access (`/sdcard/`) is prohibited on Android 11+. SNOW writes strictly to scoped storage (`Downloads/SNOW`).
 5. **Background Clipboard Privacy**:
-   - Android 10+ restricts clipboard reading to the default Input Method Editor (IME) or foreground app. SNOW supports desktop-to-phone **clipboard push**, but phone-to-desktop clipboard reading is intentionally disabled for privacy.
+   - Android 10+ restricts clipboard reading to the default Input Method Editor (IME) or foreground app. SNOW supports desktop-to-phone **clipboard push** in the background, while phone-to-desktop **clipboard pull** (`android.clipboard.get`) strictly enforces Android's execution contract: the Android application must be actively in the foreground with explicit user confirmation (`FOREGROUND_USER_INTERACTION_REQUIRED`).
 
 ---
 

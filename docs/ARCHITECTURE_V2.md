@@ -154,11 +154,11 @@ Command execution on Windows nodes is partitioned into four explicit security ti
    - For an authenticated `OWNER_MANUAL` execution context with valid explicit confirmation.
    - Permits user-level execution across valid Windows directories and drives, preserving native Windows permissions.
    - Does NOT request UAC elevation or bypass OS access controls.
-   - Confirmation must be validated by a trusted server-side mechanism; a client-supplied `confirmed=true` boolean never independently authorizes execution.
+   - Confirmation must be validated by an engine-backed ticket validator; a client-supplied `confirmed=true` boolean or arbitrary string never independently authorizes execution. Confirmation tickets are single-use, cryptographically bound, and time-bounded.
 4. **Tier D — `RESTRICTED_BLOCKED`**:
-   - Catastrophic or prohibited operations hard-blocked regardless of principal.
-   - Examples: disk formatting (`format`, `diskpart`), recursive deletion of protected system locations (`rmdir /s /q C:\Windows`, `Remove-Item -Recurse -Force C:\`), registry destruction, firewall disabling, access to `.snow` cryptographic credentials.
-   - Rejections return structured errors with status `COMMAND_BLOCKED`.
+   - Catastrophic or prohibited operations hard-blocked permanently for ALL principals (including `OWNER_MANUAL`).
+   - Examples: disk formatting (`format`, `diskpart`), recursive deletion of protected system locations (`rmdir /s /q C:\Windows`, `Remove-Item -Recurse -Force C:\`, forward-slash paths, format switches), registry destruction, firewall disabling, access to `.snow` cryptographic credentials.
+   - Rejections return structured errors with status `POLICY_DENIED`.
 
 ---
 
@@ -197,8 +197,8 @@ The Device Runtime Layer handles platform-specific OS interactions, persistence,
 - Manages TLS 1.3 certificates (`~/.snow/tls/server.crt`, `~/.snow/tls/server.key`).
 
 #### 2.4.2 Android Native Runtime
-- Implemented in modern Kotlin targeting API 35 (Android 15) with forward compatibility for Android 16 and 17 (`ACTIVE_SESSION_PEER` reachability profile).
-- **Foreground Host Mode**: Explicit foreground Host Mode when permitted by the Android OS; respects Android 17 background execution limitations.
+- Implemented in modern Kotlin targeting API 34 (Android 14) baseline with forward compatibility for Android 15 and 16 (`ACTIVE_SESSION_PEER` reachability profile).
+- **Foreground Host Mode**: Quarantined in Phase 19A (client-only mode until Phase 20 production embedded WSS server).
 - **Foreground Service**: Runs `SnowForegroundService` with foreground service type `connectedDevice` under strict Android 14+ requirements.
 - **Cryptographic Security**: Android Keystore manages hardware-backed keys. Sensitive pairing tokens are encrypted with AES-256-GCM and stored in private SharedPreferences (never plaintext).
 - **Graceful Lifecycle Management**: Handles Android Doze mode, app standby buckets, screen-off throttling, and network transitions without making false permanent connectivity claims.
@@ -212,11 +212,11 @@ Every participating device in SNOW V2 conforms to the standard `DeviceNode` data
 ```json
 {
   "node_id": "81a8c2c4-a554-4a0c-825a-c959713cf95e",
-  "name": "Realme RMX5110",
+  "name": "Pixel 8",
   "platform": "android",
-  "os_version": "Android 17 (API 35+)",
+  "os_version": "Android 14 (API 34)",
   "trust_tier": "owner",
-  "reachability_state": "ONLINE_DIRECT",
+  "reachability_state": "CONNECTED_SESSION",
   "active_endpoints": [
     "wss://10.114.119.23:8765"
   ],
@@ -230,7 +230,8 @@ Every participating device in SNOW V2 conforms to the standard `DeviceNode` data
       "android.apps.launch",
       "android.notifications.push",
       "android.messaging.send_intent",
-      "android.files.transfer"
+      "android.files.transfer",
+      "android.ringer.ring"
     ]
   },
   "last_seen_epoch": 1794940500
@@ -249,10 +250,11 @@ Android OS security updates (API 34 through 36+) introduce strict limitations on
 | `android.notifications.push` | `BACKGROUND_SAFE` | Requires `POST_NOTIFICATIONS` permission (granted at pairing). | Logs notification error; returns `PERMISSION_DENIED`. |
 | `android.clipboard.set` | `BACKGROUND_SAFE` | Foreground Service running. Updates system `ClipboardManager`. | Returns `CLIPBOARD_SET_FAILED`. |
 | `android.clipboard.get` | `FOREGROUND_USER_INTERACTION_REQUIRED` | Android 10+ restricts background clipboard reading. App must be in foreground AND user must tap UI confirmation. | Rejects with `FOREGROUND_REQUIRED` or `USER_CONFIRMATION_REQUIRED`. |
-| `android.apps.list` | `RUNTIME_PERMISSION_REQUIRED` | Requires `<queries>` launcher intent declaration in `AndroidManifest.xml` (API 30+). | Returns empty app list if query declaration missing. |
-| `android.apps.launch` | `BACKGROUND_SAFE` | Starts activity via `FLAG_ACTIVITY_NEW_TASK`. Target package must be allowlisted. | Rejects with `APP_NOT_ALLOWLISTED` or `PACKAGE_NOT_FOUND`. |
-| `android.messaging.send_intent` | `FOREGROUND_USER_INTERACTION_REQUIRED` | Dispatches `Intent(ACTION_SENDTO)`. Final send requires user tapping 'Send' in SMS app. | Fails if no SMS handling app found. |
+| `android.apps.list` | `BACKGROUND_SAFE` | Requires `<queries>` launcher intent declaration in `AndroidManifest.xml` (API 30+). | Returns empty app list if query declaration missing. |
+| `android.apps.launch` | `FOREGROUND_USER_INTERACTION_REQUIRED` | Starts activity via `FLAG_ACTIVITY_NEW_TASK`. Target package must be on user-approved allowlist. | Rejects with `POLICY_DENIED` or `APPLICATION_NOT_FOUND`. |
+| `android.messaging.send_intent` | `FOREGROUND_USER_INTERACTION_REQUIRED` | Dispatches `Intent(ACTION_SENDTO)` with `sms:` URI. Final send requires user tapping 'Send' in SMS app. Direct SMS is unsupported. | Fails if no SMS handling app found. |
 | `android.files.transfer` | `RUNTIME_PERMISSION_REQUIRED` | Transfers scoped to app-specific directory or `Environment.DIRECTORY_DOWNLOADS/SNOW`. | Rejects with `STORAGE_ACCESS_DENIED`. |
+| `android.ringer.ring` | `BACKGROUND_SAFE` | Rings phone with alarm/notification audio stream for 1-15 seconds. | Returns error if media player fails. |
 
 ---
 
