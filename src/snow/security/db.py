@@ -27,7 +27,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_FILENAME = "snow_devices.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 VALID_TRUST_TIERS = ("owner", "peer")
 
@@ -197,6 +197,33 @@ class DatabaseManager:
                     ON pairing_audit_log(timestamp);
                 """)
 
+                # Phase 21: Activity History table with secret redaction
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS activity_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT UNIQUE NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        capability TEXT,
+                        principal TEXT NOT NULL,
+                        target_device TEXT,
+                        outcome TEXT NOT NULL,
+                        details_json TEXT NOT NULL DEFAULT '{}'
+                    );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_activity_history_timestamp
+                    ON activity_history(timestamp);
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_activity_history_event_type
+                    ON activity_history(event_type);
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_activity_history_principal
+                    ON activity_history(principal);
+                """)
+
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
     @staticmethod
@@ -269,12 +296,6 @@ class DatabaseManager:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         with self._get_connection() as conn:
-            if trust_tier == "owner":
-                # Enforce single primary owner invariant by demoting other owners
-                conn.execute(
-                    "UPDATE paired_devices SET trust_tier = 'peer' WHERE trust_tier = 'owner' AND device_id != ?;",
-                    (device_id,),
-                )
             conn.execute(
                 query,
                 (
@@ -360,12 +381,16 @@ class DatabaseManager:
             cursor = conn.execute(query, (platform, reachability_profile, now, device_id))
             return cursor.rowcount > 0
 
-    def update_device_trust_tier(self, device_id: str, trust_tier: str) -> bool:
+    def update_device_trust_tier(
+        self, device_id: str, trust_tier: str, demote_existing_owners: bool = False
+    ) -> bool:
         """Update the trust tier for a registered paired device.
 
         Args:
             device_id: UUID of the paired device.
             trust_tier: New trust tier ('owner' or 'peer').
+            demote_existing_owners: Whether to demote other owner devices to peer
+                                   (preserves multi-owner personal devices by default).
 
         Returns:
             True if updated, False if device not found.
@@ -380,8 +405,8 @@ class DatabaseManager:
 
         query = "UPDATE paired_devices SET trust_tier = ? WHERE device_id = ?;"
         with self._get_connection() as conn:
-            if trust_tier == "owner":
-                # Enforce single primary owner invariant by demoting other owners
+            if trust_tier == "owner" and demote_existing_owners:
+                # Explicit single primary owner transfer requested
                 conn.execute(
                     "UPDATE paired_devices SET trust_tier = 'peer' WHERE trust_tier = 'owner' AND device_id != ?;",
                     (device_id,),
@@ -515,3 +540,122 @@ class DatabaseManager:
                     )
                 )
         return logs
+
+    def log_activity(
+        self,
+        event_type: str,
+        capability: Optional[str] = None,
+        principal: str = "AI_MCP",
+        target_device: Optional[str] = None,
+        outcome: str = "SUCCESS",
+        details: Optional[dict[str, Any]] = None,
+        timestamp: Optional[str] = None,
+    ) -> str:
+        """Record an activity event into activity_history with centralized secret redaction."""
+        eid = str(uuid.uuid4())
+        ts = timestamp or current_utc_timestamp()
+        target = target_device or "local"
+        redacted_details = redact_sensitive_data(details or {})
+        details_json = json.dumps(redacted_details, sort_keys=True, separators=(",", ":"))
+
+        query = """
+            INSERT INTO activity_history (
+                event_id, timestamp, event_type, capability, principal, target_device, outcome, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                query,
+                (eid, ts, event_type, capability, principal, target, outcome, details_json),
+            )
+        return eid
+
+    def query_activity_history(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        event_type: Optional[str] = None,
+        principal: Optional[str] = None,
+        since: Optional[str] = None,
+    ) -> List[dict[str, Any]]:
+        """Query bounded activity history in reverse chronological order."""
+        bounded_limit = max(1, min(int(limit), 200))
+        bounded_offset = max(0, int(offset))
+
+        clauses = []
+        params: list[Any] = []
+
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type.strip())
+        if principal:
+            clauses.append("principal = ?")
+            params.append(principal.strip())
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since.strip())
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"""
+            SELECT event_id, timestamp, event_type, capability, principal, target_device, outcome, details_json
+            FROM activity_history
+            {where_sql}
+            ORDER BY timestamp DESC
+            LIMIT ? OFFSET ?;
+        """
+        params.extend([bounded_limit, bounded_offset])
+
+        results = []
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, params)
+            for row in cursor.fetchall():
+                try:
+                    det = json.loads(row["details_json"])
+                except Exception:
+                    det = {}
+                results.append({
+                    "event_id": row["event_id"],
+                    "timestamp": row["timestamp"],
+                    "event_type": row["event_type"],
+                    "capability": row["capability"],
+                    "principal": row["principal"],
+                    "target_device": row["target_device"],
+                    "outcome": row["outcome"],
+                    "details": det,
+                })
+        return results
+
+
+SENSITIVE_KEY_PATTERNS = {
+    "pin",
+    "token",
+    "secret",
+    "key",
+    "password",
+    "auth",
+    "clipboard",
+    "notification_body",
+    "body",
+    "cert_fingerprint",
+    "auth_token_hash",
+}
+
+
+def redact_sensitive_data(val: Any) -> Any:
+    """Recursively scrub sensitive keys and secrets from data structures.
+
+    Guarantees raw PINs, tokens, keys, passwords, clipboard contents, and notification
+    bodies are permanently redacted before activity history storage or audit inspection.
+    """
+    if isinstance(val, dict):
+        scrubbed = {}
+        for k, v in val.items():
+            k_lower = str(k).lower()
+            if any(p in k_lower for p in SENSITIVE_KEY_PATTERNS):
+                scrubbed[k] = "[REDACTED]"
+            else:
+                scrubbed[k] = redact_sensitive_data(v)
+        return scrubbed
+    elif isinstance(val, list):
+        return [redact_sensitive_data(item) for item in val]
+    return val

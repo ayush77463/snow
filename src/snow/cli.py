@@ -314,7 +314,7 @@ def run_devices_trust(
     if daemon_online:
         res = asyncio.run(bridge.call("device_trust", {"device_id": clean_id, "tier": clean_tier}))
         if res.get("success"):
-            db.update_device_trust_tier(clean_id, clean_tier)
+            db.update_device_trust_tier(clean_id, clean_tier, demote_existing_owners=True)
             print(f"[+] Successfully updated device [{clean_id}] ({device.device_name}) trust tier to '{clean_tier.upper()}' via Core IPC.")
             return 0
         else:
@@ -322,7 +322,7 @@ def run_devices_trust(
             return 1
     else:
         # Offline update directly in SQLite
-        updated = db.update_device_trust_tier(clean_id, clean_tier)
+        updated = db.update_device_trust_tier(clean_id, clean_tier, demote_existing_owners=True)
         if updated:
             print(f"[+] Updated device [{clean_id}] ({device.device_name}) trust tier to '{clean_tier.upper()}' in offline database.")
             print("    Note: Core daemon is offline. Changes will take effect on next daemon startup.")
@@ -830,22 +830,25 @@ def run_doctor(
         "remediation": remed,
     })
 
-    # 8. MCP Tool Registration Count Invariant (Exactly 24)
+    # 8. MCP Dynamic Capability Registry and Metadata Consistency
     try:
+        from snow.mcp.registry import validate_registry, list_capabilities
         from snow.mcp.tools import ALL_TOOL_NAMES
+        is_valid, validation_errors = validate_registry()
+        capabilities = list_capabilities()
         tool_count = len(ALL_TOOL_NAMES)
-        if tool_count == 24:
+        if is_valid and tool_count >= 24:
             status = "OK"
-            msg = "Exactly 24 static MCP tools registered (all categories verified)"
+            msg = f"{tool_count} capabilities dynamically registered with verified metadata ({len(capabilities)} catalog entries)"
             remed = None
         else:
             status = "FAILED"
-            msg = f"MCP tool count invariant violated: expected 24, found {tool_count}"
-            remed = "Audit snow.mcp.tools to restore approved 24-tool catalog."
+            msg = f"Registry consistency issues: {'; '.join(validation_errors)}" if not is_valid else f"Unexpected tool count: {tool_count}"
+            remed = "Audit snow.mcp.registry capability definitions and metadata."
     except Exception as exc:
         status = "FAILED"
-        msg = f"Failed inspecting MCP tool catalog: {exc}"
-        remed = "Verify snow.mcp.tools imports."
+        msg = f"Failed inspecting MCP capability registry: {exc}"
+        remed = "Verify snow.mcp.registry imports."
     checks.append({
         "component": "mcp_tool_catalog",
         "name": "MCP Tool Catalog",
@@ -1040,6 +1043,14 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_sub.add_parser("start", help="Start Core daemon in background")
     daemon_sub.add_parser("stop", help="Stop background Core daemon")
 
+    # 8. web (Phase 21 Vanilla Web Dashboard)
+    web_parser = subparsers.add_parser("web", help="Launch local SNOW Web Dashboard (replaces Textual TUI)")
+    web_parser.add_argument("--port", type=int, default=8769, help="Dashboard port (default: 8769, loopback only)")
+    web_parser.add_argument("--no-browser", action="store_true", help="Do not automatically open default browser")
+
+    # 9. ui (Deprecated Textual TUI)
+    subparsers.add_parser("ui", help="[Deprecated] Launch interactive UI (redirects to 'snow web')")
+
     # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")
     start_parser.add_argument("--daemon", action="store_true", default=True)
@@ -1056,6 +1067,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_trust.add_argument("--yes", "-y", action="store_true")
 
     return parser
+
+
+# =========================================================================
+# Web Dashboard & Deprecated UI
+# =========================================================================
+
+
+def run_web(port: int = 8769, no_browser: bool = False) -> int:
+    """Launch the local SNOW Web Dashboard server (snow web)."""
+    from snow.web.server import run_dashboard
+    return run_dashboard(port=port, no_browser=no_browser)
+
+
+def run_ui() -> int:
+    """Launch interactive UI (deprecated in favor of 'snow web')."""
+    print("[!] Notice: 'snow ui' (Textual TUI) has been retired in favor of the lightweight SNOW Web Dashboard.", file=sys.stderr)
+    print("    Please run 'snow web' to launch the dashboard on http://127.0.0.1:8769.\n", file=sys.stderr)
+    return 0
 
 
 def main(args: Optional[list[str]] = None) -> int:
@@ -1107,6 +1136,10 @@ def main(args: Optional[list[str]] = None) -> int:
         else:
             parser.parse_args(["daemon", "--help"])
             return 1
+    elif parsed.command == "web":
+        return run_web(port=parsed.port, no_browser=parsed.no_browser)
+    elif parsed.command == "ui":
+        return run_ui()
     elif parsed.command == "start":
         return run_daemon_start()
     elif parsed.command == "stop":

@@ -176,8 +176,9 @@ class SnowIpcServer:
             self._capability_engine = CapabilityEngine()
         self._sync_capability_engine()
 
-        # Layer 3 SessionRouter delegation
+        # Layer 3 SessionRouter and NodeRegistry delegation
         self.session_router = getattr(core_server, "session_router", None)
+        self.node_registry = getattr(core_server, "node_registry", None)
 
     def _sync_capability_engine(self) -> None:
         """Synchronize capability engine references with core_server attributes."""
@@ -477,6 +478,11 @@ class SnowIpcServer:
             "windows_terminal_exec",
             "windows_clipboard_get",
             "windows_clipboard_set",
+            "media_control",
+            "windows_media_control",
+            "share_link",
+            "windows_share_link",
+            "activity_history",
         }
         if op in LOCAL_WINDOWS_OPS:
             req = CapabilityRequest(action=op, params=payload)
@@ -488,6 +494,136 @@ class SnowIpcServer:
                 "status": res.status,
                 "data": res.data,
                 "error": res.error,
+            }, now_authed
+
+        if op == "approval_list":
+            app_engine = getattr(self.capability_engine, "approval_engine", None)
+            if app_engine:
+                pending = [r.to_dict() for r in app_engine.list_pending_requests()]
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"requests": pending, "count": len(pending)},
+                }, now_authed
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": False,
+                "status": "APPROVAL_ENGINE_UNAVAILABLE",
+                "error": "Approval engine is not available.",
+            }, now_authed
+
+        if op == "approval_approve":
+            req_id_to_approve = payload.get("request_id")
+            app_engine = getattr(self.capability_engine, "approval_engine", None)
+            if app_engine and req_id_to_approve:
+                ok, msg = app_engine.approve_request(
+                    request_id=req_id_to_approve,
+                    approver_principal=ExecutionPrincipal.OWNER_MANUAL,
+                )
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": ok,
+                    "status": "APPROVED" if ok else "REJECTED",
+                    "data": {"request_id": req_id_to_approve, "status": msg},
+                    "error": None if ok else msg,
+                }, now_authed
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "Missing 'request_id' or approval engine unavailable.",
+            }, now_authed
+
+        if op == "approval_deny":
+            req_id_to_deny = payload.get("request_id")
+            app_engine = getattr(self.capability_engine, "approval_engine", None)
+            if app_engine and req_id_to_deny:
+                ok, msg = app_engine.deny_request(
+                    request_id=req_id_to_deny,
+                    approver_principal=ExecutionPrincipal.OWNER_MANUAL,
+                )
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": ok,
+                    "status": "DENIED" if ok else "REJECTED",
+                    "data": {"request_id": req_id_to_deny, "status": msg},
+                    "error": None if ok else msg,
+                }, now_authed
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "Missing 'request_id' or approval engine unavailable.",
+            }, now_authed
+
+        if op == "notifications_list":
+            dev_resp = await self._handle_device_request({
+                "device_id": payload.get("device_id"),
+                "action": "notifications_list",
+                "data": {},
+            })
+            resp_data = dev_resp.get("data")
+            if not isinstance(resp_data, dict):
+                resp_data = {"notifications": [], "count": 0}
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": resp_data,
+                "error": dev_resp.get("error"),
+            }, now_authed
+
+        if op == "notification_dismiss":
+            dev_resp = await self._handle_device_request({
+                "device_id": payload.get("device_id"),
+                "action": "notification_dismiss",
+                "data": {"key": payload.get("key")},
+            })
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": dev_resp.get("data"),
+                "error": dev_resp.get("error"),
+            }, now_authed
+
+        if op == "notification_reply":
+            dev_resp = await self._handle_device_request({
+                "device_id": payload.get("device_id"),
+                "action": "notification_reply",
+                "data": {"key": payload.get("key"), "text": payload.get("text")},
+            })
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": dev_resp.get("data"),
+                "error": dev_resp.get("error"),
+            }, now_authed
+
+        if op == "android_file_list":
+            dev_resp = await self._handle_device_request({
+                "device_id": payload.get("device_id"),
+                "action": "file_list",
+                "data": {"subpath": payload.get("subpath", "")},
+            })
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": dev_resp.get("data"),
+                "error": dev_resp.get("error"),
             }, now_authed
 
         if op == "android_file_send":
@@ -563,6 +699,12 @@ class SnowIpcServer:
 
             # 2. Delete paired credentials from SQLite database
             deleted = self.core_server.db_manager.delete_paired_device(device_id)
+            if getattr(self, "node_registry", None):
+                try:
+                    self.node_registry.remove_node(device_id)
+                except Exception as reg_err:
+                    logger.debug("Failed removing node from registry: %s", reg_err)
+
             if deleted:
                 self.core_server.db_manager.log_audit_event(
                     event_type="DEVICE_REVOKED",
@@ -579,6 +721,39 @@ class SnowIpcServer:
                 "error": None if deleted else f"Device [{device_id}] not found in paired database.",
             }, now_authed
 
+        if op == "get_pairing_state":
+            cs = self.core_server
+            ws = getattr(cs, "ws_server", None) if cs else None
+            pm = getattr(ws, "pairing_manager", None) if ws else None
+            if not ws or not pm:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "NOT_AVAILABLE",
+                    "error": "Core WebSocket server or pairing manager is not active.",
+                }, now_authed
+
+            from snow.core.network import get_active_ip_addresses
+            candidate_ips = get_active_ip_addresses()
+            cfg = getattr(cs, "config", None)
+            node_id = getattr(cfg, "node_id", "desktop-core")
+            port = getattr(cfg, "port", 8765)
+
+            pin_state = pm.get_active_pin_state(include_pin=True)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SUCCESS",
+                "data": {
+                    "ips": candidate_ips,
+                    "port": port,
+                    "node_id": node_id,
+                    **pin_state,
+                },
+            }, now_authed
+
         if op == "generate_pairing_qr":
             cs = self.core_server
             ws = getattr(cs, "ws_server", None) if cs else None
@@ -592,7 +767,9 @@ class SnowIpcServer:
                     "error": "Core WebSocket server or pairing manager is not active.",
                 }, now_authed
 
-            pin = pm.generate_pin(display_to_stderr=False)
+            payload_data = payload if isinstance(payload, dict) else {}
+            trust_tier = payload_data.get("trust_tier", "owner")
+            pin = pm.generate_pin(display_to_stderr=False, trust_tier=trust_tier)
             from snow.core.network import get_active_ip_addresses
             candidate_ips = get_active_ip_addresses()
 
@@ -624,6 +801,7 @@ class SnowIpcServer:
                     port=port,
                     cert_fingerprint=fp,
                     pin=pin,
+                    trust_tier=trust_tier,
                 )
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -756,11 +934,52 @@ class SnowIpcServer:
         timeout = float(payload.get("timeout") or 30.0)
 
         if not device_id or not isinstance(device_id, str):
-            return {
-                "success": False,
-                "status": "INVALID_ARGUMENT",
-                "error": "Missing or non-string 'device_id'.",
-            }
+            # Authoritative default device resolution via NodeRegistry or SessionManager
+            reg = getattr(self, "node_registry", None) or (
+                getattr(self.core_server, "node_registry", None) if self.core_server else None
+            )
+            if reg and hasattr(reg, "resolve_target"):
+                resolved_node, err_code = reg.resolve_target("")
+                if err_code:
+                    err_status = err_code
+                    if err_code == "NO_DEVICES_PAIRED":
+                        err_msg = "No paired Android devices found."
+                    elif err_code == "DEVICE_REQUIRED":
+                        err_msg = "Multiple devices connected. Please specify target device_id."
+                    else:
+                        err_msg = f"Device resolution failed: {err_code}"
+                    return {
+                        "success": False,
+                        "status": err_status,
+                        "error": err_msg,
+                    }
+                if resolved_node:
+                    device_id = resolved_node.device_id
+            else:
+                cs = self.core_server
+                sm = getattr(cs, "session_manager", None) if cs else None
+                if sm and hasattr(sm, "get_all_sessions"):
+                    active_sessions = sm.get_all_sessions()
+                    if len(active_sessions) == 1:
+                        device_id = list(active_sessions.values())[0].device_id
+                    elif len(active_sessions) > 1:
+                        return {
+                            "success": False,
+                            "status": "DEVICE_REQUIRED",
+                            "error": "Multiple active devices. Explicit 'device_id' required.",
+                        }
+                    else:
+                        return {
+                            "success": False,
+                            "status": "DEVICE_NOT_FOUND",
+                            "error": "No active connected device found.",
+                        }
+                else:
+                    return {
+                        "success": False,
+                        "status": "INVALID_ARGUMENT",
+                        "error": "Missing or non-string 'device_id'.",
+                    }
 
         if not action or not isinstance(action, str):
             return {
@@ -1222,10 +1441,13 @@ class SnowIpcServer:
             else cs.config.transfer_port
         )
 
+        subpath = payload.get("subpath") or ""
         req_data = {
             "file_name": clean_name,
             "transfer_port": transfer_port,
         }
+        if subpath:
+            req_data["subpath"] = subpath
 
         # 2. Prefer SessionRouter for capability-aware multi-transport dispatch
         router = getattr(self, "session_router", None) or (

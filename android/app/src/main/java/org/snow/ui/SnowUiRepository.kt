@@ -192,7 +192,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         screenshotObserver.register()
                     }
                     // Update identity-first saved device history and endpoint ring buffer
-                    recordSuccessfulConnection(host = host, port = port, sessionId = auth.sessionId)
+                    recordSuccessfulConnection(host = host, port = port, sessionId = auth.sessionId, tier = auth.trustTier)
                 } else {
                     _fileTransferClient = null
                     screenshotObserver.unregister()
@@ -370,11 +370,16 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     updatedEndpoints.add(ep)
                 }
             }
+            val effectiveTier = if (tier.equals("PEER", ignoreCase = true) && !existing.trustTier.isNullOrBlank()) {
+                existing.trustTier
+            } else {
+                tier.uppercase()
+            }
             current[existingIdx] = existing.copy(
                 host = if (cleanHost != "127.0.0.1" || existing.host.isBlank()) cleanHost else existing.host,
                 port = port,
                 lastSeen = nowStr,
-                trustTier = tier,
+                trustTier = effectiveTier,
                 certFingerprint = pinnedFp ?: existing.certFingerprint,
                 recentEndpoints = updatedEndpoints.take(5)
             )
@@ -499,12 +504,37 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 attempts++
                 val state = _connectionState.value
                 val auth = _authState.value
-                if (state == ConnectionState.CONNECTED && auth is AuthState.ConnectedUnauthenticated) {
+                if (state == ConnectionState.CONNECTED && auth is AuthState.Authenticated) {
+                    appendLog("INFO", TAG, "Device already authenticated with desktop. Onboarding complete.")
+                    recordSuccessfulConnection(targetIp, port, auth.sessionId, auth.trustTier)
+                    onComplete(true, null)
+                    return@launch
+                } else if (state == ConnectionState.CONNECTED && auth is AuthState.ConnectedUnauthenticated) {
                     appendLog("INFO", TAG, "Connection established; auto-submitting pairing PIN from QR...")
                     pairDevice(pin) { pState ->
-                        if (pState is PairingState.Paired) {
-                            recordSuccessfulConnection(targetIp, port, pState.sessionId, "OWNER")
-                            onComplete(true, null)
+                        when (pState) {
+                            is PairingState.Paired -> {
+                                appendLog("INFO", TAG, "QR pairing successful [tier=${pState.trustTier}]")
+                                recordSuccessfulConnection(targetIp, port, pState.sessionId, pState.trustTier)
+                                onComplete(true, null)
+                            }
+                            is PairingState.WrongPin -> {
+                                appendLog("ERROR", TAG, "QR pairing failed: Invalid PIN (${pState.remainingAttempts} attempts remaining)")
+                                onComplete(false, pState.message)
+                            }
+                            is PairingState.Expired -> {
+                                appendLog("ERROR", TAG, "QR pairing failed: PIN expired")
+                                onComplete(false, pState.message)
+                            }
+                            is PairingState.Locked -> {
+                                appendLog("ERROR", TAG, "QR pairing locked: Too many failed attempts")
+                                onComplete(false, pState.message)
+                            }
+                            is PairingState.Error -> {
+                                appendLog("ERROR", TAG, "QR pairing error: ${pState.message}")
+                                onComplete(false, pState.message)
+                            }
+                            else -> {}
                         }
                     }
                     return@launch

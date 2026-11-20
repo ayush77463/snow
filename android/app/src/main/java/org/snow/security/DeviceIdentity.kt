@@ -44,6 +44,7 @@ data class DeviceIdentity(
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_DEVICE_NAME = "device_name"
         const val KEY_CREATED_AT = "created_at"
+        const val SNOW_IDENTITY_SALT = "org.snow.identity.salt.v3.e67f0b5a-7b3c-4b3d-9d48-3d84f88e3649"
 
         fun isValidUuidV4(id: String?): Boolean {
             if (id.isNullOrBlank()) return false
@@ -53,6 +54,19 @@ data class DeviceIdentity(
             } catch (e: Exception) {
                 false
             }
+        }
+
+        /**
+         * Derive a deterministic, app-scoped RFC 4122 v4 UUID from Android ID.
+         */
+        fun deriveDeterministicUuidV4(androidId: String): String {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val digest = md.digest("$SNOW_IDENTITY_SALT:$androidId".toByteArray(Charsets.UTF_8))
+            val bytes = digest.copyOf(16)
+            bytes[6] = ((bytes[6].toInt() and 0x0f) or 0x40).toByte() // version 4
+            bytes[8] = ((bytes[8].toInt() and 0x3f) or 0x80).toByte() // variant 1 (RFC 4122)
+            val bb = java.nio.ByteBuffer.wrap(bytes)
+            return UUID(bb.long, bb.long).toString().lowercase()
         }
 
         private fun resolveDefaultDeviceName(customDeviceName: String?): String {
@@ -69,9 +83,14 @@ data class DeviceIdentity(
 
         /**
          * Load or generate identity using an IdentityStorage implementation.
+         * If a valid deviceId is already persisted, it is preserved without modification.
          */
         @Synchronized
-        fun getOrCreate(storage: IdentityStorage, customDeviceName: String? = null): DeviceIdentity {
+        fun getOrCreate(
+            storage: IdentityStorage,
+            customDeviceName: String? = null,
+            androidId: String? = null
+        ): DeviceIdentity {
             val storedId = storage.getString(KEY_DEVICE_ID)
             val storedName = storage.getString(KEY_DEVICE_NAME)
             val storedCreated = storage.getString(KEY_CREATED_AT)
@@ -84,8 +103,12 @@ data class DeviceIdentity(
                 )
             }
 
-            // Generate fresh UUIDv4 identity
-            val newId = UUID.randomUUID().toString()
+            // Derive deterministic UUIDv4 from Android ID if available, else random UUIDv4
+            val newId = if (!androidId.isNullOrBlank()) {
+                deriveDeterministicUuidV4(androidId)
+            } else {
+                UUID.randomUUID().toString()
+            }
             val name = resolveDefaultDeviceName(customDeviceName)
             val createdAt = SnowMessage.currentIsoTimestamp()
 
@@ -101,11 +124,19 @@ data class DeviceIdentity(
         }
 
         /**
-         * Convenience factory using Android SharedPreferences.
+         * Convenience factory using Android SharedPreferences and Settings.Secure.ANDROID_ID.
          */
         @Synchronized
         fun getOrCreate(context: Context, customDeviceName: String? = null): DeviceIdentity {
-            return getOrCreate(SharedPreferencesIdentityStorage(context), customDeviceName)
+            val androidId = try {
+                android.provider.Settings.Secure.getString(
+                    context.contentResolver,
+                    android.provider.Settings.Secure.ANDROID_ID
+                )
+            } catch (_: Throwable) {
+                null
+            }
+            return getOrCreate(SharedPreferencesIdentityStorage(context), customDeviceName, androidId)
         }
     }
 }

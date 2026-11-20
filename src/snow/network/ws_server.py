@@ -56,6 +56,29 @@ from snow.transfer.storage import TransferStorageManager
 logger = logging.getLogger(__name__)
 
 
+def parse_remote_address(addr: Any, default_port: int = 8765) -> tuple[str, int]:
+    """Parse remote address from tuple, string, or IPv6 into (host, port)."""
+    if not addr:
+        return ("127.0.0.1", default_port)
+    if isinstance(addr, tuple):
+        host = str(addr[0]) if len(addr) > 0 else "127.0.0.1"
+        port = int(addr[1]) if len(addr) > 1 and isinstance(addr[1], (int, str)) and str(addr[1]).isdigit() else default_port
+        return (host, port)
+    if isinstance(addr, str):
+        addr_str = addr.strip()
+        if addr_str.startswith("[") and "]" in addr_str:
+            host_part, _, rest = addr_str[1:].partition("]")
+            port = int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else default_port
+            return (host_part, port)
+        if ":" in addr_str and addr_str.count(":") == 1:
+            h, _, p = addr_str.partition(":")
+            if p.isdigit():
+                return (h, int(p))
+            return (h, default_port)
+        return (addr_str, default_port)
+    return ("127.0.0.1", default_port)
+
+
 class SnowWebSocketServer:
     """Asynchronous WebSocket server implementing SNOW Device Protocol v1.
 
@@ -142,6 +165,8 @@ class SnowWebSocketServer:
         self._clipboard_listener: Optional[WindowsClipboardListener] = None
         self._clipboard_watchdog_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Phase 21: Live in-memory notification cache (strictly never persisted to disk)
+        self.live_notifications: dict[str, list[dict[str, Any]]] = {}
 
     def _sync_capability_engine(self) -> None:
         """Synchronize capability engine references with server attributes."""
@@ -651,6 +676,8 @@ class SnowWebSocketServer:
                 await self._handle_desktop_clipboard_set(client, message, data, session, ctx)
             elif action == "desktop_clipboard_sync_toggle":
                 await self._handle_desktop_clipboard_sync_toggle(client, message, data, session, ctx)
+            elif action == "notification_event":
+                await self._handle_notification_event(client, message, data, session)
             elif action == "desktop_file_list":
                 await self._handle_desktop_file_list(client, message, data, session, ctx)
             elif action == "desktop_file_stage_download":
@@ -989,6 +1016,39 @@ class SnowWebSocketServer:
             )
             await client.websocket.send(err_resp.to_json())
 
+    def _determine_transport(self, client_host: str, client_declaration: Optional[str] = None) -> str:
+        """Determine authoritative transport by cross-checking client declaration with host socket.
+
+        Never trusts client assertion alone.
+        """
+        clean_host = (client_host or "").strip().lower()
+        is_loopback = clean_host in ("127.0.0.1", "::1", "localhost")
+        clean_decl = (client_declaration or "").strip().lower()
+
+        if not is_loopback:
+            # Non-loopback IP (e.g. 192.168.x.x, 10.x.x.x) is always wifi_lan
+            return "wifi_lan"
+
+        # Socket is loopback
+        if clean_decl == "usb_adb":
+            from snow.cli import find_adb_binary, get_connected_adb_devices
+            try:
+                adb_bin = find_adb_binary()
+                if adb_bin:
+                    devs = get_connected_adb_devices(adb_bin)
+                    authorized = [d for d in devs if d.get("status") == "device"]
+                    if authorized:
+                        return "usb_adb"
+            except Exception as e:
+                logger.debug("ADB verification check failed: %s", e)
+            return "loopback"
+
+        if clean_decl == "wifi_lan":
+            # Contradiction: client says wifi_lan but socket is loopback
+            return "unknown"
+
+        return "loopback"
+
     async def _handle_auth_request(
         self, client, message: SnowMessage, data: dict[str, Any]
     ) -> None:
@@ -1066,8 +1126,9 @@ class SnowWebSocketServer:
         # Update node registry if present
         manifest_data = data.get("manifest") or data.get("capabilities")
         if getattr(self, "node_registry", None):
-            client_host = client.remote_address[0] if client.remote_address and isinstance(client.remote_address, tuple) else "127.0.0.1"
-            client_port = client.remote_address[1] if client.remote_address and isinstance(client.remote_address, tuple) else 8765
+            client_host, client_port = parse_remote_address(client.remote_address)
+            client_decl = data.get("connection_mode") or data.get("transport_mode") or data.get("transport")
+            transport = self._determine_transport(client_host, client_decl)
             try:
                 self.node_registry.on_session_authenticated(
                     device_id=device_id,
@@ -1075,6 +1136,7 @@ class SnowWebSocketServer:
                     host=client_host,
                     port=client_port,
                     manifest_data=manifest_data,
+                    transport=transport,
                 )
             except Exception as reg_err:
                 logger.debug("Failed notifying node registry of auth: %s", reg_err)
@@ -1089,6 +1151,7 @@ class SnowWebSocketServer:
                 "data": {
                     "device_id": device_id,
                     "session_id": session.session_id,
+                    "trust_tier": device_record.trust_tier,
                     "manifest": build_windows_manifest().to_dict(),
                 },
             },
@@ -1146,8 +1209,9 @@ class SnowWebSocketServer:
                     )
 
                     if getattr(self, "node_registry", None):
-                        client_host = client.remote_address[0] if client.remote_address and isinstance(client.remote_address, tuple) else "127.0.0.1"
-                        client_port = client.remote_address[1] if client.remote_address and isinstance(client.remote_address, tuple) else 8765
+                        client_host, client_port = parse_remote_address(client.remote_address)
+                        client_decl = data.get("connection_mode") or data.get("transport_mode") or data.get("transport")
+                        transport = self._determine_transport(client_host, client_decl)
                         try:
                             self.node_registry.on_session_authenticated(
                                 device_id=client_device_id,
@@ -1155,6 +1219,7 @@ class SnowWebSocketServer:
                                 host=client_host,
                                 port=client_port,
                                 manifest_data=data.get("manifest") or data.get("capabilities"),
+                                transport=transport,
                             )
                         except Exception as reg_err:
                             logger.debug("Failed notifying node registry of pairing auth: %s", reg_err)
@@ -1177,6 +1242,7 @@ class SnowWebSocketServer:
                             "device_name": self.device_identity.device_name,
                             "session_id": result.session_id,
                             "auth_token": auth_token,
+                            "trust_tier": assigned_tier,
                             "manifest": build_windows_manifest().to_dict(),
                         },
                     },
@@ -1205,20 +1271,58 @@ class SnowWebSocketServer:
                 )
                 await client.websocket.send(error_response.to_json())
         else:
-            # Request to generate and display a fresh PIN on desktop stderr
-            fresh_pin = self.pairing_manager.generate_pin(display_to_stderr=True)
-            response = SnowMessage.create_response(
-                correlation_id=message.id,
-                payload={
-                    "status": "pin_displayed",
-                    "action": action,
-                    "data": {
-                        "device_id": self.device_identity.device_id,
-                        "device_name": self.device_identity.device_name,
-                        "expires_in": int(self.pairing_manager.pin_lifetime),
-                    },
-                },
+            # Client connects without PIN (initial unauthenticated handshake / requesting PIN)
+            client_device_name = data.get(
+                "device_name",
+                f"Android-{client_device_id[:8]}" if client_device_id else "Android-Device",
             )
+            self.pairing_manager.set_pending_device(client_device_id, client_device_name)
+
+            # Immunize connection from handshake timeout while pairing is in progress
+            self._pairing_in_progress.add(client.connection_id)
+            timer = self._auth_timers.pop(client.connection_id, None)
+            if timer and not timer.done():
+                timer.cancel()
+
+            if self.pairing_manager.has_active_pin:
+                # Active unexpired PIN already exists! Do NOT overwrite it.
+                logger.info(
+                    "Client [%s] connected unauthenticated; existing active PIN preserved (tier=%s, remaining=%ds)",
+                    client.connection_id,
+                    self.pairing_manager._active_trust_tier,
+                    int(self.pairing_manager.remaining_lifetime),
+                )
+                response = SnowMessage.create_response(
+                    correlation_id=message.id,
+                    payload={
+                        "status": "pin_displayed",
+                        "action": action,
+                        "data": {
+                            "device_id": self.device_identity.device_id,
+                            "device_name": self.device_identity.device_name,
+                            "has_active_pin": True,
+                            "trust_tier": self.pairing_manager._active_trust_tier,
+                            "expires_in": int(round(self.pairing_manager.remaining_lifetime)),
+                        },
+                    },
+                )
+            else:
+                # No active PIN exists on desktop. Generate a fresh PIN banner on desktop stderr
+                fresh_pin = self.pairing_manager.generate_pin(display_to_stderr=True)
+                response = SnowMessage.create_response(
+                    correlation_id=message.id,
+                    payload={
+                        "status": "pin_displayed",
+                        "action": action,
+                        "data": {
+                            "device_id": self.device_identity.device_id,
+                            "device_name": self.device_identity.device_name,
+                            "has_active_pin": True,
+                            "trust_tier": self.pairing_manager._active_trust_tier,
+                            "expires_in": int(self.pairing_manager.pin_lifetime),
+                        },
+                    },
+                )
             await client.websocket.send(response.to_json())
 
     async def _handle_unpair_request(
@@ -1602,7 +1706,7 @@ class SnowWebSocketServer:
 
         result = res.data or {}
         command_str = command.strip()
-        op_status = result.get("status", "SUCCESS" if res.success else "ERROR")
+        op_status = result.get("status") or (res.status if res.status else ("SUCCESS" if res.success else "ERROR"))
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
@@ -1868,6 +1972,43 @@ class SnowWebSocketServer:
                 "action": "desktop_clipboard_sync_toggle",
                 "enabled": enabled,
             },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_notification_event(
+        self,
+        client,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session,
+    ) -> None:
+        """Process incoming Android notification event and update in-memory cache (zero disk persistence)."""
+        dev_id = session.device_id if session else "unknown"
+        notifs = data.get("notifications")
+        if not notifs:
+            single = data.get("notification")
+            notifs = [single] if single else []
+
+        if dev_id not in self.live_notifications:
+            self.live_notifications[dev_id] = []
+
+        cache = self.live_notifications[dev_id]
+        for n in notifs:
+            if isinstance(n, dict):
+                n_copy = dict(n)
+                n_copy["device_id"] = dev_id
+                key = n_copy.get("key") or n_copy.get("id")
+                # Deduplicate by key or id
+                cache[:] = [item for item in cache if (item.get("key") or item.get("id")) != key]
+                cache.insert(0, n_copy)
+
+        # Enforce bounded in-memory limit (max 50 notifications per device)
+        if len(cache) > 50:
+            del cache[50:]
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={"status": "success", "action": "notification_event", "received_count": len(notifs)},
         )
         await client.websocket.send(response.to_json())
 

@@ -146,23 +146,67 @@ class AndroidFileHandler(
             return@withContext mapOf("status" to "error", "error" to "Invalid filename requested.")
         }
 
-        val transferDir = getTransfersDirectory()
-        val localFile = File(transferDir, safeFileName)
-
-        if (!localFile.exists() || !localFile.isFile) {
-            SafeLog.w(TAG, "Requested file '$safeFileName' not found in ${transferDir.absolutePath}")
-            return@withContext mapOf(
-                "status" to "error",
-                "error" to "File '$safeFileName' does not exist in Android SNOW transfer storage."
-            )
-        }
-
         val client = transferClientProvider()
         if (client == null) {
             return@withContext mapOf("status" to "error", "error" to "FileTransferClient not initialized.")
         }
 
-        SafeLog.i(TAG, "Uploading file '$safeFileName' (${localFile.length()} bytes) to desktop core...")
+        // 1. First resolve from user-configured SAF DocumentFile tree
+        val subpath = data["subpath"] as? String
+        val safDoc = resolveSafDocument(subpath, safeFileName)
+        if (safDoc != null && safDoc.exists() && safDoc.isFile) {
+            SafeLog.i(TAG, "Uploading SAF file '$safeFileName' (${safDoc.length()} bytes) to desktop core...")
+            val result = client.uploadUri(
+                serverHost = serverHost,
+                transferPort = transferPort,
+                uri = safDoc.uri,
+                fileName = safDoc.name ?: safeFileName,
+                fileSize = safDoc.length()
+            )
+            return@withContext when (result) {
+                is FileTransferClient.TransferResult.Success -> {
+                    SafeLog.i(TAG, "SAF upload successful: ${safDoc.name} (sha256=${result.sha256})")
+                    mapOf(
+                        "status" to "success",
+                        "transfer_id" to result.transferId,
+                        "file_name" to (safDoc.name ?: safeFileName),
+                        "bytes_uploaded" to safDoc.length(),
+                        "sha256" to result.sha256
+                    )
+                }
+                is FileTransferClient.TransferResult.Duplicate -> {
+                    mapOf(
+                        "status" to "success",
+                        "file_name" to (safDoc.name ?: safeFileName),
+                        "bytes_uploaded" to safDoc.length(),
+                        "sha256" to result.sha256,
+                        "message" to "File already exists on desktop core with matching SHA-256."
+                    )
+                }
+                is FileTransferClient.TransferResult.Error -> {
+                    SafeLog.e(TAG, "SAF upload failed: ${result.message}")
+                    mapOf(
+                        "status" to "error",
+                        "transfer_id" to result.transferId,
+                        "error" to result.message
+                    )
+                }
+            }
+        }
+
+        // 2. Documented fallback: app-specific transfers directory
+        val transferDir = getTransfersDirectory()
+        val localFile = File(transferDir, safeFileName)
+
+        if (!localFile.exists() || !localFile.isFile) {
+            SafeLog.w(TAG, "Requested file '$safeFileName' not found in SAF tree or ${transferDir.absolutePath}")
+            return@withContext mapOf(
+                "status" to "error",
+                "error" to "File '$safeFileName' does not exist in Android SAF storage or transfer directory."
+            )
+        }
+
+        SafeLog.i(TAG, "Uploading fallback file '$safeFileName' (${localFile.length()} bytes) to desktop core...")
         val result = client.uploadFile(
             serverHost = serverHost,
             transferPort = transferPort,
@@ -197,5 +241,116 @@ class AndroidFileHandler(
                 )
             }
         }
+    }
+
+    /**
+     * Enumerate files and directories within the user-configured SAF DocumentFile tree.
+     */
+    fun handleFileList(data: Map<String, Any?>?): Map<String, Any?> {
+        val safManager = org.snow.ui.files.SafFolderManager(context)
+        val treeUri = safManager.getDestinationUri()
+        if (treeUri == null) {
+            return mapOf(
+                "status" to "SAF_FOLDER_NOT_CONFIGURED",
+                "error" to "No SAF destination folder has been configured by the user.",
+                "remediation_hint" to "Open SNOW Files tab on the phone and pick a destination folder.",
+                "items" to emptyList<Any>()
+            )
+        }
+
+        val rootDoc = try {
+            androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+        } catch (e: Exception) {
+            return mapOf(
+                "status" to "error",
+                "error" to "Failed resolving SAF tree URI: ${e.message}",
+                "items" to emptyList<Any>()
+            )
+        }
+
+        if (rootDoc == null || !rootDoc.exists() || !rootDoc.canRead()) {
+            return mapOf(
+                "status" to "SAF_PERMISSION_REVOKED",
+                "error" to "Persisted SAF tree permission has expired or been revoked.",
+                "items" to emptyList<Any>()
+            )
+        }
+
+        // Navigate subpath if requested
+        val subpath = (data?.get("subpath") as? String ?: data?.get("path") as? String)?.trim()?.trim('/')
+        var targetDoc: androidx.documentfile.provider.DocumentFile = rootDoc
+        if (!subpath.isNullOrEmpty()) {
+            val segments = subpath.split('/')
+            for (segment in segments) {
+                if (segment.isBlank() || segment == ".") continue
+                if (segment == "..") {
+                    return mapOf(
+                        "status" to "error",
+                        "error" to "PATH_TRAVERSAL_DETECTED",
+                        "message" to "Relative path traversal '..' is forbidden."
+                    )
+                }
+                val child = targetDoc.findFile(segment)
+                if (child == null || !child.isDirectory) {
+                    return mapOf(
+                        "status" to "DIRECTORY_NOT_FOUND",
+                        "error" to "Subdirectory '$segment' not found in SAF tree.",
+                        "items" to emptyList<Any>()
+                    )
+                }
+                targetDoc = child
+            }
+        }
+
+        val items = mutableListOf<Map<String, Any?>>()
+        val children = targetDoc.listFiles()
+        for (child in children) {
+            items.add(mapOf(
+                "name" to (child.name ?: "unknown"),
+                "type" to if (child.isDirectory) "directory" else "file",
+                "size_bytes" to (if (child.isDirectory) 0L else child.length()),
+                "last_modified" to child.lastModified(),
+                "uri" to child.uri.toString()
+            ))
+            if (items.size >= 100) break
+        }
+
+        return mapOf(
+            "status" to "success",
+            "folder_name" to (targetDoc.name ?: safManager.getDestinationDisplayName()),
+            "subpath" to (subpath ?: ""),
+            "count" to items.size,
+            "items" to items
+        )
+    }
+
+    /**
+     * Resolve a file DocumentFile safely within the persisted SAF tree.
+     */
+    fun resolveSafDocument(subpath: String?, fileName: String): androidx.documentfile.provider.DocumentFile? {
+        val safManager = org.snow.ui.files.SafFolderManager(context)
+        val treeUri = safManager.getDestinationUri() ?: return null
+        val rootDoc = try {
+            androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
+        } catch (_: Exception) {
+            null
+        } ?: return null
+
+        if (!rootDoc.exists() || !rootDoc.canRead()) return null
+
+        var currentDoc = rootDoc
+        val cleanSubpath = subpath?.trim()?.trim('/')
+        if (!cleanSubpath.isNullOrEmpty()) {
+            val segments = cleanSubpath.split('/')
+            for (segment in segments) {
+                if (segment.isBlank() || segment == ".") continue
+                if (segment == "..") return null // Path traversal forbidden
+                val child = currentDoc.findFile(segment) ?: return null
+                if (!child.isDirectory) return null
+                currentDoc = child
+            }
+        }
+        val target = currentDoc.findFile(fileName)
+        return if (target != null && target.exists() && target.isFile) target else null
     }
 }

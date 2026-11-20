@@ -192,6 +192,59 @@
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
+        <!-- Notification Sync Access Card -->
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="16dp"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/card_surface"
+            app:strokeColor="@color/card_border"
+            app:strokeWidth="1dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:textColor="@color/primary_text"
+                    android:text="Notification Sync Access" />
+
+                <TextView
+                    android:id="@+id/tv_notification_access_status"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textSize="13sp"
+                    android:textColor="@color/secondary_text"
+                    android:text="Status: Checking..." />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textSize="12sp"
+                    android:textColor="@color/secondary_text"
+                    android:text="Permits SNOW to mirror non-sensitive incoming notifications to your paired PC. Sensitive banking, OTP, and 2FA apps are strictly excluded." />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_grant_notification_access"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="Grant Notification Access"
+                    style="@style/Widget.Material3.Button.TonalButton" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
         <!-- Trust Management Card -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"

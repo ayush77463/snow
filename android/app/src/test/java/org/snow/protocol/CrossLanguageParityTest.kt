@@ -836,6 +836,137 @@ class CrossLanguageParityTest {
             )
             valid["response_send_message.json"] = JsonSerialization.toJson(respMsg)
 
+            // --- Phase 21 Core Capabilities Protocol Fixtures ---
+            // 54. Valid file_list request and responses
+            val reqFileListP21 = SnowMessage.createRequest(
+                "file_list",
+                mapOf("subpath" to "Documents/Glacier")
+            )
+            valid["request_file_list.json"] = JsonSerialization.toJson(reqFileListP21)
+
+            val respFileListP21 = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "file_list",
+                    "data" to mapOf(
+                        "folder_name" to "Glacier",
+                        "items" to listOf(
+                            mapOf("name" to "doc.pdf", "type" to "file", "size_bytes" to 2048, "uri" to "content://doc1"),
+                            mapOf("name" to "SubDir", "type" to "directory", "size_bytes" to 0, "uri" to "content://doc2")
+                        ),
+                        "count" to 2
+                    )
+                )
+            )
+            valid["response_file_list.json"] = JsonSerialization.toJson(respFileListP21)
+
+            val respFileListSafErr = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "error",
+                    "error" to "SAF_FOLDER_NOT_CONFIGURED",
+                    "message" to "SAF directory grant missing."
+                )
+            )
+            valid["response_file_list_saf_error.json"] = JsonSerialization.toJson(respFileListSafErr)
+
+            // 55. Valid notifications_list and dismiss request and responses
+            val reqNotifList = SnowMessage.createRequest("notifications_list", emptyMap())
+            valid["request_notifications_list.json"] = JsonSerialization.toJson(reqNotifList)
+
+            val respNotifList = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "notifications_list",
+                    "data" to mapOf(
+                        "notifications" to listOf(
+                            mapOf(
+                                "key" to "notif-001",
+                                "package_name" to "org.thoughtcrime.securesms",
+                                "app_name" to "Signal",
+                                "title" to "Bob",
+                                "text" to "Meeting at 3pm",
+                                "timestamp" to 1732100000000L,
+                                "can_reply" to true
+                            )
+                        ),
+                        "count" to 1
+                    )
+                )
+            )
+            valid["response_notifications_list.json"] = JsonSerialization.toJson(respNotifList)
+
+            val reqNotifDismiss = SnowMessage.createRequest(
+                "notification_dismiss",
+                mapOf("key" to "notif-001")
+            )
+            valid["request_notification_dismiss.json"] = JsonSerialization.toJson(reqNotifDismiss)
+
+            val respNotifDismiss = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "notification_dismiss",
+                    "data" to mapOf("key" to "notif-001", "dismissed" to true)
+                )
+            )
+            valid["response_notification_dismiss.json"] = JsonSerialization.toJson(respNotifDismiss)
+
+            // 56. Valid media_control request and response
+            val reqMedia = SnowMessage.createRequest(
+                "media_control",
+                mapOf("action" to "play_pause", "target" to "android")
+            )
+            valid["request_media_control.json"] = JsonSerialization.toJson(reqMedia)
+
+            val respMedia = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "media_control",
+                    "data" to mapOf("action" to "play_pause", "target" to "android", "executed" to true)
+                )
+            )
+            valid["response_media_control.json"] = JsonSerialization.toJson(respMedia)
+
+            // 57. Valid share_link request and responses
+            val reqShareLink = SnowMessage.createRequest(
+                "share_link",
+                mapOf("url" to "https://snow.example.com", "target" to "android")
+            )
+            valid["request_share_link.json"] = JsonSerialization.toJson(reqShareLink)
+
+            val respShareLinkOpened = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "success",
+                    "action" to "share_link",
+                    "data" to mapOf(
+                        "status" to "success",
+                        "action" to "opened_browser",
+                        "url" to "https://snow.example.com"
+                    )
+                )
+            )
+            valid["response_share_link_opened.json"] = JsonSerialization.toJson(respShareLinkOpened)
+
+            val respShareLinkTap = SnowMessage.createResponse(
+                reqId,
+                mapOf(
+                    "status" to "NOTIFICATION_TAP_REQUIRED",
+                    "action" to "share_link",
+                    "data" to mapOf(
+                        "status" to "NOTIFICATION_TAP_REQUIRED",
+                        "action" to "notification_posted",
+                        "url" to "https://snow.example.com",
+                        "requires_tap" to true
+                    )
+                )
+            )
+            valid["response_share_link_notification_tap.json"] = JsonSerialization.toJson(respShareLinkTap)
+
             for ((filename, content) in valid) {
                 File(ktToPyValid, filename).writeText(content, Charsets.UTF_8)
             }
@@ -1113,6 +1244,54 @@ class CrossLanguageParityTest {
                     put("id", UUID.randomUUID().toString())
                     put("timestamp", SnowMessage.currentIsoTimestamp())
                     put("payload", JSONObject(mapOf("action" to "battery_status", "data" to "not_an_object")))
+                }.toString(),
+                ErrorCode.INVALID_PAYLOAD
+            )
+
+            // 28. Phase 21 media_control data not an object
+            invalid["invalid_request_media_control_data_not_object.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "request")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("action" to "media_control", "data" to "not_an_object")))
+                }.toString(),
+                ErrorCode.INVALID_PAYLOAD
+            )
+
+            // 29. Phase 21 share_link data not an object
+            invalid["invalid_request_share_link_data_not_object.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "request")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("action" to "share_link", "data" to 12345)))
+                }.toString(),
+                ErrorCode.INVALID_PAYLOAD
+            )
+
+            // 30. Phase 21 file_list data not an object
+            invalid["invalid_request_file_list_data_not_object.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "request")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("action" to "file_list", "data" to JSONArray(listOf("not", "an", "object")))))
+                }.toString(),
+                ErrorCode.INVALID_PAYLOAD
+            )
+
+            // 31. Phase 21 notifications_list data not an object
+            invalid["invalid_request_notifications_list_data_not_object.json"] = Pair(
+                JSONObject().apply {
+                    put("version", 1)
+                    put("type", "request")
+                    put("id", UUID.randomUUID().toString())
+                    put("timestamp", SnowMessage.currentIsoTimestamp())
+                    put("payload", JSONObject(mapOf("action" to "notifications_list", "data" to false)))
                 }.toString(),
                 ErrorCode.INVALID_PAYLOAD
             )

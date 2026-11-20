@@ -135,7 +135,7 @@ class DevicesFragment : Fragment() {
         }
 
         binding.btnRequestPin.setOnClickListener {
-            Toast.makeText(requireContext(), "Check desktop console for fresh PIN", Toast.LENGTH_SHORT).show()
+            Toast.makeText(requireContext(), "To generate a fresh PIN, click 'Generate Pairing QR' on your laptop Web Dashboard.", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -226,31 +226,36 @@ class DevicesFragment : Fragment() {
     private fun renderAuthState(auth: AuthState) {
         when (auth) {
             is AuthState.Authenticated -> {
+                binding.cardPairing.visibility = View.GONE
                 binding.tvPairingBadge.text = "PAIRED"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
                 binding.layoutPinInput.visibility = View.GONE
                 binding.layoutPairedControls.visibility = View.VISIBLE
             }
             is AuthState.ConnectedUnauthenticated -> {
-                binding.tvPairingBadge.text = "CONNECTED (ENTER PIN)"
+                binding.cardPairing.visibility = View.VISIBLE
+                binding.tvPairingBadge.text = "PAIRING REQUIRED"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connecting))
                 binding.layoutPinInput.visibility = View.VISIBLE
                 binding.layoutPairedControls.visibility = View.GONE
             }
             is AuthState.Connecting -> {
+                binding.cardPairing.visibility = View.GONE
                 binding.tvPairingBadge.text = "CONNECTING..."
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connecting))
                 binding.layoutPinInput.visibility = View.GONE
                 binding.layoutPairedControls.visibility = View.GONE
             }
             is AuthState.Disconnected -> {
+                binding.cardPairing.visibility = View.GONE
                 binding.tvPairingBadge.text = "DISCONNECTED"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
                 binding.layoutPinInput.visibility = View.GONE
                 binding.layoutPairedControls.visibility = View.GONE
             }
             is AuthState.AuthFailed -> {
-                binding.tvPairingBadge.text = "AUTH FAILED: ${auth.reason}"
+                binding.cardPairing.visibility = View.VISIBLE
+                binding.tvPairingBadge.text = "PAIRING REQUIRED"
                 binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
                 binding.layoutPinInput.visibility = View.VISIBLE
                 binding.layoutPairedControls.visibility = View.GONE

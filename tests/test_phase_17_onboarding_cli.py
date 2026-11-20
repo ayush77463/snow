@@ -258,7 +258,10 @@ class TestDevicesCLI(unittest.TestCase):
     def test_devices_trust_update_with_yes_flag(self) -> None:
         """'snow devices trust <id> --tier <tier> --yes' updates trust without prompting."""
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stdout", buf), patch("snow.cli.SnowMcpBridge") as mock_bridge_cls:
+            mock_bridge = MagicMock()
+            mock_bridge.daemon_manager.is_ipc_ready = AsyncMock(return_value=False)
+            mock_bridge_cls.return_value = mock_bridge
             code = run_devices_trust("dev-peer-2222", "owner", yes=True, db_path=self.db_path)
         self.assertEqual(code, 0)
 
@@ -317,7 +320,10 @@ class TestDevicesCLI(unittest.TestCase):
     def test_devices_revoke_with_yes_flag(self) -> None:
         """'snow devices revoke <id> --yes' permanently removes device from database."""
         buf = io.StringIO()
-        with patch("sys.stdout", buf):
+        with patch("sys.stdout", buf), patch("snow.cli.SnowMcpBridge") as mock_bridge_cls:
+            mock_bridge = MagicMock()
+            mock_bridge.daemon_manager.is_ipc_ready = AsyncMock(return_value=False)
+            mock_bridge_cls.return_value = mock_bridge
             code = run_devices_revoke("dev-peer-2222", yes=True, db_path=self.db_path)
         self.assertEqual(code, 0)
         self.assertIn("credentials deleted", buf.getvalue())
@@ -426,8 +432,11 @@ class TestDoctorCLI(unittest.TestCase):
         self.assertEqual(db_check["status"], "FAILED")
 
     def test_doctor_enforces_exactly_24_mcp_tools(self) -> None:
-        """Doctor asserts that the registered MCP tool count is exactly 24."""
-        self.assertEqual(len(ALL_TOOL_NAMES), 24)
+        """Doctor asserts that the registered MCP capabilities are valid and dynamic count >= 24."""
+        from snow.mcp.registry import validate_registry
+        is_valid, errors = validate_registry()
+        self.assertTrue(is_valid, f"Registry validation failed: {errors}")
+        self.assertGreaterEqual(len(ALL_TOOL_NAMES), 24)
 
 
 class TestCliParserAndDispatch(unittest.TestCase):

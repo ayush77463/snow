@@ -65,7 +65,16 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "list_apps": "android.apps.list",
     "launch_app": "android.apps.launch",
     "send_message": "android.messaging.send_intent",
+    "file_list": "android.files.transfer",
+    "notifications_list": "android.notifications.push",
+    "notification_dismiss": "android.notifications.push",
+    "notification_reply": "android.notifications.push",
+    "media_control": "android.ringer.ring",
+    "share_link": "android.apps.launch",
 }
+
+# Alias for backward-compatible routing lookups
+ACTION_ROUTING = ROUTER_ACTION_TO_CAPABILITY
 
 
 class SessionRouter:

@@ -1,4 +1,4 @@
-"""Tool classification registry for SNOW MCP.
+"""Tool classification and dynamic capability registry for SNOW MCP.
 
 Explicitly categorizes MCP tools into execution tiers:
 - LOCAL_WINDOWS: Capabilities that execute directly in-process against local
@@ -6,15 +6,19 @@ Explicitly categorizes MCP tools into execution tiers:
 - CROSS_DEVICE: Capabilities that coordinate cross-device state or communicate
   with the Android device, requiring the SNOW Core daemon.
 
-Unknown tools fail safely with a structured rejection rather than being routed
-to an arbitrary execution path.
+In Phase 21:
+- Replaces fixed-count static assumptions with a dynamic, metadata-rich capability registry.
+- Every capability exposes structured metadata: tier, read_only_hint, destructive_hint,
+  requires_approval, os_classification, and description.
+- Retains full backward compatibility with TOOL_REGISTRY and category helpers.
 """
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from enum import Enum
 import logging
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,51 +30,472 @@ class ToolCategory(str, Enum):
     CROSS_DEVICE = "CROSS_DEVICE"
 
 
-# Explicit static mapping of all registered SNOW MCP tools to their execution tier.
-TOOL_REGISTRY: dict[str, ToolCategory] = {
-    # -------------------------------------------------------------------------
-    # Local Windows Capabilities (In-Process Execution)
-    # -------------------------------------------------------------------------
-    "snow_windows_battery": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_system_info": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_processes": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_launch_app": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_file_read": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_file_write": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_file_list": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_file_search": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_terminal_exec": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_clipboard_get": ToolCategory.LOCAL_WINDOWS,
-    "snow_windows_clipboard_set": ToolCategory.LOCAL_WINDOWS,
+@dataclass(frozen=True)
+class CapabilityMetadata:
+    """Structured metadata defining capability execution and safety characteristics."""
 
-    # -------------------------------------------------------------------------
-    # Cross-Device / Core Daemon Capabilities (IPC Required)
-    # -------------------------------------------------------------------------
-    "snow_get_device_status": ToolCategory.CROSS_DEVICE,
-    "snow_list_devices": ToolCategory.CROSS_DEVICE,
-    "snow_sync_clipboard": ToolCategory.CROSS_DEVICE,
-    "snow_android_battery": ToolCategory.CROSS_DEVICE,
-    "snow_android_ring": ToolCategory.CROSS_DEVICE,
-    "snow_android_clipboard_push": ToolCategory.CROSS_DEVICE,
-    "snow_android_launch_app": ToolCategory.CROSS_DEVICE,
-    "snow_android_list_apps": ToolCategory.CROSS_DEVICE,
-    "snow_android_file_send": ToolCategory.CROSS_DEVICE,
-    "snow_android_file_receive": ToolCategory.CROSS_DEVICE,
-    "snow_transfer_file": ToolCategory.CROSS_DEVICE,
-    "snow_mesh_connect_peer": ToolCategory.CROSS_DEVICE,
-    "snow_android_send_message": ToolCategory.CROSS_DEVICE,
+    name: str
+    category: ToolCategory
+    tier: str
+    read_only_hint: bool
+    destructive_hint: bool
+    requires_approval: bool
+    os_classification: str  # "windows", "android", "cross_platform"
+    description: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert metadata to dictionary representation."""
+        res = asdict(self)
+        res["category"] = self.category.value
+        return res
+
+
+# Dynamic internal storage of registered capability metadata
+_CAPABILITY_REGISTRY: dict[str, CapabilityMetadata] = {}
+
+
+def register_capability(meta: CapabilityMetadata) -> None:
+    """Register or update a capability in the dynamic registry."""
+    if not meta.name or not isinstance(meta.name, str):
+        raise ValueError("Capability name must be a non-empty string.")
+    _CAPABILITY_REGISTRY[meta.name.strip()] = meta
+
+
+def get_capability_metadata(tool_name: str) -> Optional[CapabilityMetadata]:
+    """Retrieve metadata for a given capability name."""
+    if not tool_name or not isinstance(tool_name, str):
+        return None
+    return _CAPABILITY_REGISTRY.get(tool_name.strip())
+
+
+def list_capabilities() -> list[CapabilityMetadata]:
+    """Return an ordered list of all registered capabilities."""
+    return list(_CAPABILITY_REGISTRY.values())
+
+
+PROHIBITED_FABRICATED_TOOLS: set[str] = {
+    "snow_android_send_sms",
+    "snow_android_take_photo",
+    "snow_windows_file_delete",
 }
 
 
-def get_tool_category(tool_name: str) -> Optional[ToolCategory]:
-    """Retrieve the execution category for a given MCP tool name.
-
-    Returns None if the tool is unrecognized, enabling callers to enforce
-    fail-safe unknown tool handling.
-    """
-    if not tool_name or not isinstance(tool_name, str):
+def get_mcp_annotations(tool_name: str) -> Optional[Any]:
+    """Retrieve FastMCP ToolAnnotations hint object for the specified tool if available."""
+    meta = get_capability_metadata(tool_name)
+    if not meta:
         return None
-    return TOOL_REGISTRY.get(tool_name.strip())
+    try:
+        from mcp.types import ToolAnnotations
+
+        return ToolAnnotations(
+            readOnlyHint=meta.read_only_hint,
+            destructiveHint=meta.destructive_hint,
+        )
+    except Exception:
+        return None
+
+
+def validate_registry() -> tuple[bool, list[str]]:
+    """Validate registry consistency, checking for missing metadata, strict types, and prohibited names."""
+    errors: list[str] = []
+    if not _CAPABILITY_REGISTRY:
+        errors.append("Capability registry is empty.")
+
+    valid_categories = {ToolCategory.LOCAL_WINDOWS, ToolCategory.CROSS_DEVICE}
+    valid_os = {"windows", "android", "cross_platform"}
+
+    for name, meta in _CAPABILITY_REGISTRY.items():
+        if name in PROHIBITED_FABRICATED_TOOLS:
+            errors.append(f"Prohibited fabricated tool '{name}' detected in registry.")
+        if meta.name != name:
+            errors.append(f"Name mismatch for capability '{name}': metadata has '{meta.name}'")
+        if meta.category not in valid_categories:
+            errors.append(f"Capability '{name}' has invalid category '{meta.category}'")
+        if meta.os_classification not in valid_os:
+            errors.append(f"Capability '{name}' has invalid os_classification '{meta.os_classification}'")
+        if not meta.description or not meta.description.strip():
+            errors.append(f"Capability '{name}' is missing a description.")
+
+        # Strict type validations (no truthy/falsy coercion)
+        if type(meta.read_only_hint) is not bool:
+            errors.append(f"Capability '{name}': read_only_hint must be strict bool, got {type(meta.read_only_hint)}")
+        if type(meta.destructive_hint) is not bool:
+            errors.append(f"Capability '{name}': destructive_hint must be strict bool, got {type(meta.destructive_hint)}")
+        if type(meta.requires_approval) is not bool:
+            errors.append(f"Capability '{name}': requires_approval must be strict bool, got {type(meta.requires_approval)}")
+        if not isinstance(meta.tier, str) or not meta.tier.strip():
+            errors.append(f"Capability '{name}': tier must be non-empty string.")
+
+    if len(_CAPABILITY_REGISTRY) != 30:
+        errors.append(f"Expected exactly 30 registered capabilities (24 V2 baseline + 6 P1), found {len(_CAPABILITY_REGISTRY)}.")
+
+    return (len(errors) == 0, errors)
+
+
+# =============================================================================
+# Initial Capability Registrations (24 baseline + 6 Phase 21 P1 tools)
+# =============================================================================
+
+_INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
+    # -------------------------------------------------------------------------
+    # 1. Local Windows Capabilities (11 baseline tools)
+    # -------------------------------------------------------------------------
+    CapabilityMetadata(
+        name="snow_windows_battery",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Retrieve battery percentage, power line status, and battery health of the Windows laptop.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_system_info",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Retrieve Windows system hardware specifications, OS build, and CPU/RAM utilization.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_processes",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="List active Windows processes sorted by memory or CPU usage.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_launch_app",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Launch a whitelisted Windows application or lock the workstation screen.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_file_read",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Read the contents of a file within permitted Windows directory roots.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_file_write",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=False,
+        os_classification="windows",
+        description="Write text content to a file within permitted Windows directory roots.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_file_list",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="List directory contents within permitted Windows directory roots.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_file_search",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Search for files by query name within permitted Windows directory roots.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_terminal_exec",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="windows",
+        description="Execute a bounded shell command on Windows subject to policy and confirmation.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_clipboard_get",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Get text content currently residing on the Windows system clipboard.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_clipboard_set",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Copy text content to the Windows system clipboard.",
+    ),
+
+    # -------------------------------------------------------------------------
+    # 2. Cross-Device / Core Daemon Capabilities (13 baseline tools)
+    # -------------------------------------------------------------------------
+    CapabilityMetadata(
+        name="snow_get_device_status",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Retrieve the operational status of SNOW Desktop Core daemon and connected devices.",
+    ),
+    CapabilityMetadata(
+        name="snow_list_devices",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="List all known paired Android devices with connection and session status.",
+    ),
+    CapabilityMetadata(
+        name="snow_sync_clipboard",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Synchronize clipboard content between Windows and connected Android phone.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_battery",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Retrieve battery level and charging status from the connected Android phone.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_ring",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Trigger the Android device ringer or alert to help locate the phone.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_clipboard_push",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Push text directly to the Android device clipboard.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_launch_app",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Launch an authorized application on the Android device by package name.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_list_apps",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="List installed user-launchable applications on the Android device.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_file_send",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="android",
+        description="Initiate sending a file from Windows to the Android device.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_file_receive",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Request a file from the Android device to be received on Windows.",
+    ),
+    CapabilityMetadata(
+        name="snow_transfer_file",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="cross_platform",
+        description="Unified bidirectional file transfer across devices via HTTPS transfer server.",
+    ),
+    CapabilityMetadata(
+        name="snow_mesh_connect_peer",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Establish an authenticated mesh peer connection with another SNOW device node.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_send_message",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="android",
+        description="Send an SMS or compose a messaging draft on the Android device.",
+    ),
+
+    # -------------------------------------------------------------------------
+    # 3. Phase 21 P1 Capabilities (6 new tools)
+    # -------------------------------------------------------------------------
+    CapabilityMetadata(
+        name="snow_android_file_list",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="List files and directories within the Android user's persisted SAF-granted folder.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_notifications_list",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="List active in-memory non-sensitive notifications received from the Android device.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_notification_dismiss",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Dismiss an active notification on the connected Android device by notification key.",
+    ),
+    CapabilityMetadata(
+        name="snow_media_control",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Send media playback and volume control commands (play_pause, next, previous, volume_up, volume_down, mute) to Windows or Android.",
+    ),
+    CapabilityMetadata(
+        name="snow_share_link",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Safely share a validated HTTP/HTTPS URL or text note with the target device.",
+    ),
+    CapabilityMetadata(
+        name="snow_activity_history",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Query the secret-redacted audit activity log of capability executions and approval decisions.",
+    ),
+]
+
+for _meta in _INITIAL_CAPABILITIES:
+    register_capability(_meta)
+
+
+class _ToolRegistryDict(dict):
+    """Dynamic dict proxy maintaining backward compatibility with TOOL_REGISTRY."""
+
+    def __getitem__(self, key: str) -> ToolCategory:
+        meta = get_capability_metadata(key)
+        if meta:
+            return meta.category
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        meta = get_capability_metadata(key)
+        if meta:
+            return meta.category
+        return default
+
+    def __contains__(self, key: object) -> bool:
+        if isinstance(key, str):
+            return get_capability_metadata(key) is not None
+        return False
+
+    def __len__(self) -> int:
+        return len(_CAPABILITY_REGISTRY)
+
+    def keys(self):
+        return _CAPABILITY_REGISTRY.keys()
+
+    def values(self):
+        return [m.category for m in _CAPABILITY_REGISTRY.values()]
+
+    def items(self):
+        return [(m.name, m.category) for m in _CAPABILITY_REGISTRY.values()]
+
+
+# Backward-compatible TOOL_REGISTRY proxy
+TOOL_REGISTRY: dict[str, ToolCategory] = _ToolRegistryDict()
+
+
+def get_tool_category(tool_name: str) -> Optional[ToolCategory]:
+    """Retrieve the execution category for a given MCP tool name."""
+    meta = get_capability_metadata(tool_name)
+    return meta.category if meta else None
 
 
 def is_local_windows_tool(tool_name: str) -> bool:

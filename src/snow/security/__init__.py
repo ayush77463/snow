@@ -1,11 +1,18 @@
 """Security, identity, pairing, TLS, and persistence facilities for SNOW."""
 
+from snow.security.approval import (
+    ApprovalPolicyEngine,
+    ApprovalRequest,
+    ApprovalStatus,
+    compute_args_hash,
+)
 from snow.security.context import ExecutionContext, ExecutionPrincipal
 from snow.security.db import (
     AuditEventRecord,
     DatabaseManager,
     PairedDeviceRecord,
     hash_token,
+    redact_sensitive_data,
 )
 from snow.security.identity import DeviceIdentity, load_or_create_device_identity
 from snow.security.pairing import (
@@ -41,6 +48,10 @@ from snow.security.tls import (
 )
 
 __all__ = [
+    "ApprovalPolicyEngine",
+    "ApprovalRequest",
+    "ApprovalStatus",
+    "compute_args_hash",
     "AuditEventRecord",
     "CertificateInfo",
     "DatabaseManager",
@@ -65,4 +76,5 @@ __all__ = [
     "load_certificate_info",
     "load_or_create_device_identity",
     "print_tls_fingerprint_banner",
+    "redact_sensitive_data",
 ]

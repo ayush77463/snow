@@ -86,6 +86,9 @@ class PairingManager:
         self._active_pin: Optional[str] = None
         self._owner_pin: Optional[str] = None
         self._peer_pin: Optional[str] = None
+        self._active_trust_tier: str = "owner"
+        self._pending_device_id: Optional[str] = None
+        self._pending_device_name: Optional[str] = None
         self._pin_generated_at: float = 0.0
         self._failed_attempts: int = 0
         self._is_locked: bool = False
@@ -114,14 +117,70 @@ class PairingManager:
             elapsed = self.time_provider() - self._pin_generated_at
             return elapsed < self.pin_lifetime
 
-    def generate_pin(self, display_to_stderr: bool = True) -> str:
+    @property
+    def remaining_lifetime(self) -> float:
+        """Return remaining validity seconds for the current active PIN (0.0 if expired)."""
+        with self._lock:
+            if (self._active_pin is None and self._owner_pin is None and self._peer_pin is None) or self._is_locked or self._is_paired:
+                return 0.0
+            elapsed = self.time_provider() - self._pin_generated_at
+            return max(0.0, self.pin_lifetime - elapsed)
+
+    def set_pending_device(self, device_id: Optional[str], device_name: Optional[str] = None) -> None:
+        """Record an unauthenticated client waiting for pairing verification."""
+        with self._lock:
+            self._pending_device_id = device_id
+            self._pending_device_name = device_name
+
+    def clear_pending_device(self) -> None:
+        """Clear recorded pending device state."""
+        with self._lock:
+            self._pending_device_id = None
+            self._pending_device_name = None
+
+    def get_active_pin_state(self, include_pin: bool = False) -> dict[str, Any]:
+        """Compile live pairing state for dashboard and IPC consumers."""
+        with self._lock:
+            has_pin = (
+                (self._active_pin is not None or self._owner_pin is not None or self._peer_pin is not None)
+                and not self._is_locked
+                and not self._is_paired
+            )
+            rem = 0.0
+            if has_pin:
+                elapsed = self.time_provider() - self._pin_generated_at
+                if elapsed < self.pin_lifetime:
+                    rem = max(0.0, self.pin_lifetime - elapsed)
+                else:
+                    has_pin = False
+
+            state: dict[str, Any] = {
+                "has_active_pin": has_pin,
+                "trust_tier": self._active_trust_tier,
+                "remaining_seconds": int(rem),
+                "is_locked": self._is_locked,
+                "is_paired": self._is_paired,
+                "pending_device_id": self._pending_device_id,
+                "pending_device_name": self._pending_device_name,
+            }
+            if include_pin and has_pin:
+                state["pin"] = self._active_pin or self._owner_pin
+                state["owner_pin"] = self._owner_pin
+                state["peer_pin"] = self._peer_pin
+            return state
+
+    def generate_pin(self, display_to_stderr: bool = True, trust_tier: str = "owner") -> str:
         """Generate cryptographically secure 6-digit decimal PINs for Owner and Peer pairing.
 
         Resets failed attempts and starts a fresh 60-second pairing window.
         Outputs the generated PINs strictly to sys.stderr (never stdout).
 
+        Args:
+            display_to_stderr: Whether to write pairing banner to sys.stderr.
+            trust_tier: Targeted trust tier ('owner' or 'peer').
+
         Returns:
-            The primary owner PIN string for compatibility.
+            The primary active PIN string bound to the requested tier.
         """
         with self._lock:
             raw_owner = secrets.randbelow(1_000_000)
@@ -132,7 +191,9 @@ class PairingManager:
             owner_pin = f"{raw_owner:06d}"
             peer_pin = f"{raw_peer:06d}"
 
-            self._active_pin = owner_pin
+            clean_tier = "peer" if str(trust_tier).lower() == "peer" else "owner"
+            self._active_trust_tier = clean_tier
+            self._active_pin = peer_pin if clean_tier == "peer" else owner_pin
             self._owner_pin = owner_pin
             self._peer_pin = peer_pin
             self._pin_generated_at = self.time_provider()
@@ -145,7 +206,7 @@ class PairingManager:
             if display_to_stderr:
                 self._display_pin_stderr(owner_pin, peer_pin)
 
-            return owner_pin
+            return self._active_pin
 
     def _display_pin_stderr(self, owner_pin: str, peer_pin: str) -> None:
         """Display the active pairing PINs to sys.stderr."""
@@ -246,9 +307,13 @@ class PairingManager:
             # 6. Timing-safe comparison using hmac.compare_digest
             is_owner_match = bool(self._owner_pin and hmac.compare_digest(cleaned_pin, self._owner_pin))
             is_peer_match = bool(self._peer_pin and hmac.compare_digest(cleaned_pin, self._peer_pin))
-            # Fallback to _active_pin if owner_pin was not set
+            # Fallback to _active_pin if owner_pin/peer_pin not matched
             if not is_owner_match and not is_peer_match and self._active_pin:
-                is_owner_match = bool(hmac.compare_digest(cleaned_pin, self._active_pin))
+                if hmac.compare_digest(cleaned_pin, self._active_pin):
+                    if self._active_trust_tier == "peer":
+                        is_peer_match = True
+                    else:
+                        is_owner_match = True
 
             if is_owner_match or is_peer_match:
                 # SUCCESS: Immediately consume PINs to prevent reuse
@@ -257,6 +322,8 @@ class PairingManager:
                 self._active_pin = None
                 self._owner_pin = None
                 self._peer_pin = None
+                self._pending_device_id = None
+                self._pending_device_name = None
                 session_id = str(uuid.uuid4())
                 self._session_id = session_id
                 self._paired_device_id = client_device_id
@@ -309,6 +376,7 @@ def create_qr_pairing_payload(
     cert_fingerprint: str,
     pin: str,
     version: int = 1,
+    trust_tier: str = "owner",
 ) -> dict[str, Any]:
     """Construct a validated QR pairing payload for SNOW zero-friction onboarding.
 
@@ -319,7 +387,8 @@ def create_qr_pairing_payload(
       "ips": ["<candidate_ip>"],
       "port": 8765,
       "fp": "<sha256_cert_fingerprint>",
-      "pin": "<six_digit_pin>"
+      "pin": "<six_digit_pin>",
+      "tier": "owner"
     }
     """
     if version != 1:
@@ -361,6 +430,7 @@ def create_qr_pairing_payload(
     if not filtered_ips:
         raise ValueError("At least one reachable, non-loopback candidate IPv4 address is required for QR pairing.")
 
+    clean_tier = "peer" if str(trust_tier).lower() == "peer" else "owner"
     return {
         "v": 1,
         "id": clean_id,
@@ -368,6 +438,7 @@ def create_qr_pairing_payload(
         "port": port,
         "fp": raw_fp,
         "pin": clean_pin,
+        "tier": clean_tier,
     }
 
 
@@ -423,6 +494,8 @@ def validate_qr_pairing_payload(payload: dict[str, Any] | str) -> dict[str, Any]
     if not filtered_ips:
         raise ValueError("No reachable, non-loopback candidate IPv4 addresses found in QR payload.")
 
+    tier = str(payload.get("tier", "owner")).strip().lower()
+    clean_tier = "peer" if tier == "peer" else "owner"
     return {
         "v": 1,
         "id": node_id.strip(),
@@ -430,4 +503,5 @@ def validate_qr_pairing_payload(payload: dict[str, Any] | str) -> dict[str, Any]
         "port": port,
         "fp": fp,
         "pin": pin,
+        "tier": clean_tier,
     }

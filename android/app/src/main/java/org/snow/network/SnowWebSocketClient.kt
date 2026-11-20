@@ -47,7 +47,7 @@ sealed class AuthState {
     object Disconnected : AuthState()
     object Connecting : AuthState()
     object ConnectedUnauthenticated : AuthState()
-    data class Authenticated(val sessionId: String) : AuthState()
+    data class Authenticated(val sessionId: String, val trustTier: String = "peer") : AuthState()
     data class AuthFailed(val reason: String) : AuthState()
     data class FingerprintConfirmationRequired(val fingerprint: String) : AuthState()
     data class FingerprintMismatch(val pinned: String, val presented: String) : AuthState()
@@ -557,28 +557,50 @@ class SnowWebSocketClient(
         if (!devId.isNullOrBlank() && !token.isNullOrBlank()) {
             log("Initiating automatic authentication handshake (device_id=${devId.take(8)}...)...")
             val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
+            val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
             sendRequest(
                 action = "auth_request",
                 data = mapOf(
                     "device_id" to devId,
                     "auth_token" to token,
-                    "manifest" to manifestMap
+                    "manifest" to manifestMap,
+                    "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
+                    "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
                 )
             ) { response ->
                 if (response.type == MessageType.RESPONSE && response.payload?.get("status") == "success") {
                     val data = response.payload["data"] as? Map<*, *>
                     val sessionId = data?.get("session_id") as? String ?: "active"
-                    _authState.value = AuthState.Authenticated(sessionId)
-                    log("Authenticated successfully with desktop core [session=$sessionId]")
+                    val trustTier = data?.get("trust_tier") as? String ?: "peer"
+                    _authState.value = AuthState.Authenticated(sessionId, trustTier)
+                    log("Authenticated successfully with desktop core [session=$sessionId, tier=$trustTier]")
                 } else {
                     val errCode = response.error?.code ?: ErrorCode.UNAUTHORIZED
                     val errMsg = response.error?.message ?: "Authentication rejected."
                     log("Authentication failed: $errMsg (code=$errCode)")
-                    _authState.value = AuthState.AuthFailed(errMsg)
 
                     if (errCode == ErrorCode.UNAUTHORIZED || errCode == ErrorCode.DEVICE_NOT_FOUND) {
-                        log("Stored token is invalid or revoked. Clearing stale token.")
+                        log("Stored token is invalid or revoked. Clearing stale token and prompting PIN pairing...")
                         tokenStorage?.clearToken()
+                        _authState.value = AuthState.ConnectedUnauthenticated
+
+                        // Immunize connection from timeout and register unauthenticated pending pairing
+                        val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
+                        val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
+                        sendRequest(
+                            action = "pair_request",
+                            data = mapOf(
+                                "device_id" to devId,
+                                "device_name" to (identity?.deviceName ?: "Android-Device"),
+                                "manifest" to manifestMap,
+                                "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
+                                "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
+                            )
+                        ) { pairResp ->
+                            log("Desktop pairing registration updated (status=${pairResp.payload?.get("status")})")
+                        }
+                    } else {
+                        _authState.value = AuthState.AuthFailed(errMsg)
                     }
                 }
             }
@@ -586,14 +608,17 @@ class SnowWebSocketClient(
             _authState.value = AuthState.ConnectedUnauthenticated
             log("Connected over WSS. Device is not paired; initializing pairing on desktop...")
             if (!devId.isNullOrBlank()) {
-                // Immunize connection from handshake timeout and generate fresh PIN banner on desktop
+                // Immunize connection from handshake timeout and register with desktop pairing manager
                 val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
+                val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
                 sendRequest(
                     action = "pair_request",
                     data = mapOf(
                         "device_id" to devId,
                         "device_name" to (identity?.deviceName ?: "Android-Device"),
-                        "manifest" to manifestMap
+                        "manifest" to manifestMap,
+                        "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
+                        "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
                     )
                 ) { response ->
                     log("Desktop core pairing initialized (status=${response.payload?.get("status")})")

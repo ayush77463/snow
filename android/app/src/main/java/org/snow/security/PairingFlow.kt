@@ -23,7 +23,8 @@ sealed class PairingState {
         val desktopId: String,
         val desktopName: String,
         val sessionId: String,
-        val authToken: String? = null
+        val authToken: String? = null,
+        val trustTier: String = "peer"
     ) : PairingState()
 
     data class WrongPin(
@@ -123,11 +124,15 @@ class PairingFlow(
 
         val cleanedPin = pin.trim()
         val manifestMap = DeviceNode.buildAndroidManifest(null).toMap()
+        val host = client.currentTargetHost
+        val isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
         val requestData = mapOf(
             "device_id" to identity.deviceId,
             "device_name" to identity.deviceName,
             "pin" to cleanedPin,
-            "manifest" to manifestMap
+            "manifest" to manifestMap,
+            "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
+            "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
         )
 
         client.sendRequest(
@@ -165,10 +170,14 @@ class PairingFlow(
         }
 
         val manifestMap = DeviceNode.buildAndroidManifest(null).toMap()
+        val host = client.currentTargetHost
+        val isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
         val requestData = mapOf(
             "device_id" to identity.deviceId,
             "device_name" to identity.deviceName,
-            "manifest" to manifestMap
+            "manifest" to manifestMap,
+            "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
+            "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
         )
 
         client.sendRequest(
@@ -257,11 +266,12 @@ class PairingFlow(
     /**
      * Mark state as Paired upon successful automatic post-connection authentication handshake.
      */
-    fun setAuthenticated(sessionId: String, desktopName: String = "SNOW Desktop") {
+    fun setAuthenticated(sessionId: String, desktopName: String = "SNOW Desktop", trustTier: String = "peer") {
         val newState = PairingState.Paired(
             desktopId = "desktop-core",
             desktopName = desktopName,
-            sessionId = sessionId
+            sessionId = sessionId,
+            trustTier = trustTier
         )
         _state.value = newState
     }
@@ -275,6 +285,7 @@ class PairingFlow(
                 val desktopName = data?.get("device_name") as? String ?: "SNOW Desktop"
                 val sessionId = data?.get("session_id") as? String ?: "session-active"
                 val authToken = data?.get("auth_token") as? String
+                val trustTier = data?.get("trust_tier") as? String ?: "peer"
 
                 if (!authToken.isNullOrBlank()) {
                     tokenStorage?.saveToken(authToken)
@@ -284,7 +295,8 @@ class PairingFlow(
                     desktopId = desktopId,
                     desktopName = desktopName,
                     sessionId = sessionId,
-                    authToken = authToken
+                    authToken = authToken,
+                    trustTier = trustTier
                 )
             }
 

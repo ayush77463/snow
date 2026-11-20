@@ -822,6 +822,137 @@ def generate_python_fixtures() -> tuple[int, int]:
     )
     valid_fixtures["response_send_message.json"] = resp_msg.to_json()
 
+    # --- Phase 21 Core Capabilities Protocol Fixtures ---
+    # 54. Valid file_list request and responses
+    req_file_list_p21 = SnowMessage.create_request(
+        action="file_list",
+        data={"subpath": "Documents/Glacier"},
+    )
+    valid_fixtures["request_file_list.json"] = req_file_list_p21.to_json()
+
+    resp_file_list_p21 = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "file_list",
+            "data": {
+                "folder_name": "Glacier",
+                "items": [
+                    {"name": "doc.pdf", "type": "file", "size_bytes": 2048, "uri": "content://doc1"},
+                    {"name": "SubDir", "type": "directory", "size_bytes": 0, "uri": "content://doc2"},
+                ],
+                "count": 2,
+            },
+        },
+    )
+    valid_fixtures["response_file_list.json"] = resp_file_list_p21.to_json()
+
+    resp_file_list_saf_err = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "error",
+            "error": "SAF_FOLDER_NOT_CONFIGURED",
+            "message": "SAF directory grant missing.",
+        },
+    )
+    valid_fixtures["response_file_list_saf_error.json"] = resp_file_list_saf_err.to_json()
+
+    # 55. Valid notifications_list and dismiss request and responses
+    req_notif_list = SnowMessage.create_request(action="notifications_list", data={})
+    valid_fixtures["request_notifications_list.json"] = req_notif_list.to_json()
+
+    resp_notif_list = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "notifications_list",
+            "data": {
+                "notifications": [
+                    {
+                        "key": "notif-001",
+                        "package_name": "org.thoughtcrime.securesms",
+                        "app_name": "Signal",
+                        "title": "Bob",
+                        "text": "Meeting at 3pm",
+                        "timestamp": 1732100000000,
+                        "can_reply": True,
+                    }
+                ],
+                "count": 1,
+            },
+        },
+    )
+    valid_fixtures["response_notifications_list.json"] = resp_notif_list.to_json()
+
+    req_notif_dismiss = SnowMessage.create_request(
+        action="notification_dismiss",
+        data={"key": "notif-001"},
+    )
+    valid_fixtures["request_notification_dismiss.json"] = req_notif_dismiss.to_json()
+
+    resp_notif_dismiss = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "notification_dismiss",
+            "data": {"key": "notif-001", "dismissed": True},
+        },
+    )
+    valid_fixtures["response_notification_dismiss.json"] = resp_notif_dismiss.to_json()
+
+    # 56. Valid media_control request and response
+    req_media = SnowMessage.create_request(
+        action="media_control",
+        data={"action": "play_pause", "target": "android"},
+    )
+    valid_fixtures["request_media_control.json"] = req_media.to_json()
+
+    resp_media = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "media_control",
+            "data": {"action": "play_pause", "target": "android", "executed": True},
+        },
+    )
+    valid_fixtures["response_media_control.json"] = resp_media.to_json()
+
+    # 57. Valid share_link request and responses
+    req_share_link = SnowMessage.create_request(
+        action="share_link",
+        data={"url": "https://snow.example.com", "target": "android"},
+    )
+    valid_fixtures["request_share_link.json"] = req_share_link.to_json()
+
+    resp_share_link_opened = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "success",
+            "action": "share_link",
+            "data": {
+                "status": "success",
+                "action": "opened_browser",
+                "url": "https://snow.example.com",
+            },
+        },
+    )
+    valid_fixtures["response_share_link_opened.json"] = resp_share_link_opened.to_json()
+
+    resp_share_link_tap = SnowMessage.create_response(
+        correlation_id=req_id,
+        payload={
+            "status": "NOTIFICATION_TAP_REQUIRED",
+            "action": "share_link",
+            "data": {
+                "status": "NOTIFICATION_TAP_REQUIRED",
+                "action": "notification_posted",
+                "url": "https://snow.example.com",
+                "requires_tap": True,
+            },
+        },
+    )
+    valid_fixtures["response_share_link_notification_tap.json"] = resp_share_link_tap.to_json()
+
     # --- Negative / Invalid Fixtures ---
     # 1. Malformed JSON
     invalid_fixtures["invalid_malformed_json.json"] = (
@@ -1116,6 +1247,54 @@ def generate_python_fixtures() -> tuple[int, int]:
             "id": str(uuid.uuid4()),
             "timestamp": current_iso_timestamp(),
             "payload": {"action": "battery_status", "data": "not_an_object"},
+        }),
+        ErrorCode.INVALID_PAYLOAD,
+    )
+
+    # 28. Phase 21 media_control data not an object
+    invalid_fixtures["invalid_request_media_control_data_not_object.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"action": "media_control", "data": "not_an_object"},
+        }),
+        ErrorCode.INVALID_PAYLOAD,
+    )
+
+    # 29. Phase 21 share_link data not an object
+    invalid_fixtures["invalid_request_share_link_data_not_object.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"action": "share_link", "data": 12345},
+        }),
+        ErrorCode.INVALID_PAYLOAD,
+    )
+
+    # 30. Phase 21 file_list data not an object
+    invalid_fixtures["invalid_request_file_list_data_not_object.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"action": "file_list", "data": ["not", "an", "object"]},
+        }),
+        ErrorCode.INVALID_PAYLOAD,
+    )
+
+    # 31. Phase 21 notifications_list data not an object
+    invalid_fixtures["invalid_request_notifications_list_data_not_object.json"] = (
+        json.dumps({
+            "version": 1,
+            "type": "request",
+            "id": str(uuid.uuid4()),
+            "timestamp": current_iso_timestamp(),
+            "payload": {"action": "notifications_list", "data": False},
         }),
         ErrorCode.INVALID_PAYLOAD,
     )

@@ -1,11 +1,16 @@
 package org.snow.ui.settings
 
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
 import android.os.Bundle
+import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.lifecycle.lifecycleScope
@@ -35,9 +40,85 @@ class SettingsFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
         setupThemeSelection()
         setupDeviceIdentity()
+        setupNotificationSyncAccess()
         setupTrustControls()
         setupDiagnostics()
         observeLogs()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshNotificationAccessStatus()
+    }
+
+    fun isNotificationServiceEnabled(): Boolean {
+        return context?.let { isNotificationServiceEnabled(it) } ?: false
+    }
+
+    fun refreshNotificationAccessStatus() {
+        if (_binding == null) return
+        val enabled = isNotificationServiceEnabled()
+        if (enabled) {
+            binding.tvNotificationAccessStatus.text = "Status: Enabled"
+            binding.tvNotificationAccessStatus.setTextColor(
+                ContextCompat.getColor(requireContext(), R.color.status_connected)
+            )
+            binding.btnGrantNotificationAccess.text = "Notification Access Granted"
+            binding.btnGrantNotificationAccess.setOnClickListener {
+                openNotificationListenerSettings()
+            }
+        } else {
+            binding.tvNotificationAccessStatus.text = "Status: Not Enabled"
+            binding.tvNotificationAccessStatus.setTextColor(
+                ContextCompat.getColor(requireContext(), R.color.secondary_text)
+            )
+            binding.btnGrantNotificationAccess.text = "Grant Notification Access"
+            binding.btnGrantNotificationAccess.setOnClickListener {
+                openNotificationListenerSettings()
+            }
+        }
+    }
+
+    fun openNotificationListenerSettings(): Intent {
+        val intent = createNotificationListenerSettingsIntent()
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(
+                context,
+                "Unable to open notification listener settings: ${e.message}",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+        return intent
+    }
+
+    private fun setupNotificationSyncAccess() {
+        refreshNotificationAccessStatus()
+    }
+
+    companion object {
+        fun createNotificationListenerSettingsIntent(): Intent {
+            return Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+        }
+
+        fun isNotificationServiceEnabled(ctx: Context): Boolean {
+            val packageName = ctx.packageName
+            val flat = Settings.Secure.getString(
+                ctx.contentResolver,
+                "enabled_notification_listeners"
+            )
+            if (!flat.isNullOrEmpty()) {
+                val names = flat.split(":")
+                for (name in names) {
+                    val cn = ComponentName.unflattenFromString(name)
+                    if (cn != null && cn.packageName == packageName) {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
     }
 
     private fun setupThemeSelection() {

@@ -43,7 +43,7 @@ class TestDatabaseManager(unittest.TestCase):
         with self.db._get_connection() as conn:
             cursor = conn.execute("PRAGMA user_version;")
             ver = cursor.fetchone()[0]
-            self.assertIn(ver, (1, 2, 3))
+            self.assertIn(ver, (1, 2, 3, 4))
 
             cursor = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"

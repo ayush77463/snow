@@ -30,6 +30,8 @@ class AndroidCapabilityDispatcher(
     val appLauncherHandler = AppLauncherHandler(context)
     val fileHandler = AndroidFileHandler(context, transferClientProvider)
     val messagingHandler = MessagingHandler(context)
+    val mediaControlHandler = MediaControlHandler(context)
+    val linkShareHandler = LinkShareHandler(context)
 
     /**
      * Centralized pre-execution contract check validating OS constraints, runtime
@@ -254,6 +256,56 @@ class AndroidCapabilityDispatcher(
                     val code = if (isPerm) ErrorCode.UNAUTHORIZED else ErrorCode.INVALID_PAYLOAD
                     Pair(null, SnowError(code = code, message = "$err: ${res["message"] ?: res["error"] ?: "Send message failed"}"))
                 }
+            }
+            "file_list" -> {
+                val res = fileHandler.handleFileList(data)
+                Pair(res, null)
+            }
+            "notifications_list" -> {
+                val isOpted = org.snow.service.SnowNotificationListenerService.isOptedIn(context)
+                val isGranted = org.snow.ui.settings.SettingsFragment.isNotificationServiceEnabled(context)
+                if (!isGranted) {
+                    Pair(mapOf("status" to "PERMISSION_NOT_GRANTED", "error" to "Notification access not granted in Android system settings.", "notifications" to emptyList<Any>(), "count" to 0), null)
+                } else if (!isOpted) {
+                    Pair(mapOf("status" to "SYNC_OPT_OUT", "error" to "Notification synchronization is disabled in SNOW settings.", "notifications" to emptyList<Any>(), "count" to 0), null)
+                } else {
+                    var notifs = org.snow.service.SnowNotificationListenerService.liveNotifications
+                    if (notifs.isEmpty()) {
+                        org.snow.service.SnowNotificationListenerService.instance?.refreshActiveNotifications()
+                        notifs = org.snow.service.SnowNotificationListenerService.liveNotifications
+                    }
+                    Pair(mapOf("status" to "success", "notifications" to notifs, "count" to notifs.size), null)
+                }
+            }
+            "notification_dismiss" -> {
+                val key = data?.get("key") as? String ?: ""
+                if (key.isBlank()) {
+                    Pair(mapOf("status" to "error", "error" to "Notification key is required."), null)
+                } else {
+                    val res = org.snow.service.SnowNotificationListenerService.dismissNotification(key)
+                    Pair(res, null)
+                }
+            }
+            "notification_reply" -> {
+                val key = data?.get("key") as? String ?: ""
+                val text = data?.get("text") as? String ?: ""
+                if (key.isBlank() || text.isBlank()) {
+                    Pair(mapOf("status" to "error", "error" to "Notification key and non-empty reply text are required."), null)
+                } else {
+                    val res = org.snow.service.SnowNotificationListenerService.replyToNotification(key, text)
+                    Pair(res, null)
+                }
+            }
+            "media_control" -> {
+                val act = data?.get("action") as? String
+                val res = mediaControlHandler.handleMediaControl(act)
+                Pair(res, null)
+            }
+            "share_link" -> {
+                val url = data?.get("url") as? String
+                val text = data?.get("text") as? String
+                val res = linkShareHandler.handleShareLink(url, text)
+                Pair(res, null)
             }
             else -> {
                 Pair(

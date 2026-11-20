@@ -30,6 +30,7 @@ import psutil
 logger = logging.getLogger(__name__)
 
 CREATE_NO_WINDOW: int = 0x08000000
+DETACHED_PROCESS: int = 0x00000008
 DEFAULT_SPAWN_TIMEOUT_SECONDS: float = 5.0
 POLL_INTERVAL_SECONDS: float = 0.15
 
@@ -156,7 +157,7 @@ class CoreDaemonManager:
 
             creation_flags = 0
             if sys.platform == "win32":
-                creation_flags |= CREATE_NO_WINDOW
+                creation_flags |= CREATE_NO_WINDOW | DETACHED_PROCESS
 
             try:
                 # Open dedicated log file for daemon output

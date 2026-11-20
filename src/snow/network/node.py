@@ -255,6 +255,7 @@ class DeviceNode:
     capabilities: Optional[CapabilityManifest] = None
     is_authenticated: bool = False
     is_paired: bool = False
+    transport: str = "unknown"
 
     def __post_init__(self) -> None:
         if self.capabilities and not self.supported_capabilities:
@@ -285,6 +286,7 @@ class DeviceNode:
             "trust_tier": self.trust_tier,
             "is_paired": self.is_paired,
             "is_authenticated": self.is_authenticated,
+            "transport": self.transport,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,
@@ -310,6 +312,7 @@ class DeviceNode:
             "reachability_state": str(self.reachability_state),
             "is_connected": self.is_connected,
             "is_paired": self.is_paired,
+            "transport": self.transport,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,

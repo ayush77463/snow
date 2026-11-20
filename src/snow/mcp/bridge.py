@@ -156,7 +156,9 @@ class SnowMcpBridge:
         self.secret_path = Path(secret_path) if secret_path else get_default_secret_path()
 
         # In-process CapabilityEngine for local Windows execution
-        self.capability_engine = CapabilityEngine(allowed_roots=allowed_roots)
+        from snow.security.db import DatabaseManager
+        db_mgr = DatabaseManager()
+        self.capability_engine = CapabilityEngine(allowed_roots=allowed_roots, db_manager=db_mgr)
         self.local_telemetry = self.capability_engine.telemetry
         self.local_processes = self.capability_engine.processes
         self.local_files = self.capability_engine.files
@@ -337,6 +339,24 @@ class SnowMcpBridge:
         }
         return await self.call_cross_device("device_request", payload=payload, timeout=timeout + 5.0)
 
+    async def send_request(
+        self,
+        device_id: str = "",
+        action: str = "",
+        payload: Optional[dict[str, Any]] = None,
+        data: Optional[dict[str, Any]] = None,
+        timeout: float = 30.0,
+        connection_id: str = "",
+    ) -> dict[str, Any]:
+        """Backward-compatible alias for send_device_request."""
+        target_id = device_id or connection_id
+        return await self.send_device_request(
+            device_id=target_id,
+            action=action,
+            data=data if data is not None else payload,
+            timeout=timeout,
+        )
+
     async def _execute_local_or_ipc(
         self, op: str, payload: Optional[dict[str, Any]] = None
     ) -> dict[str, Any]:
@@ -508,12 +528,17 @@ class SnowMcpBridge:
             timeout=60.0,
         )
 
-    async def android_file_receive(self, file_name: str, device_id: str = "") -> dict[str, Any]:
+    async def android_file_receive(
+        self, file_name: str, subpath: str = "", device_id: str = ""
+    ) -> dict[str, Any]:
         """Request and download a file from Android phone to Desktop."""
         target_id = device_id or await self._resolve_target_device_id()
+        payload = {"file_name": file_name, "device_id": target_id or ""}
+        if subpath:
+            payload["subpath"] = subpath
         return await self.call_cross_device(
             "android_file_receive",
-            payload={"file_name": file_name, "device_id": target_id or ""},
+            payload=payload,
             timeout=60.0,
         )
 
@@ -557,6 +582,106 @@ class SnowMcpBridge:
             data={"recipient": recipient, "message": message, "mode": "intent"},
             timeout=30.0,
         )
+
+    async def android_file_list(
+        self, subpath: str = "", device_id: str = ""
+    ) -> dict[str, Any]:
+        """List files and subdirectories within Android SAF-granted storage."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(
+            device_id=target_id,
+            action="file_list",
+            data={"subpath": subpath},
+            timeout=30.0,
+        )
+
+    async def android_notifications_list(self, device_id: str = "") -> dict[str, Any]:
+        """List active non-sensitive notifications from the connected Android phone."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(
+            device_id=target_id,
+            action="notifications_list",
+            data={},
+            timeout=15.0,
+        )
+
+    async def android_notification_dismiss(self, key: str, device_id: str = "") -> dict[str, Any]:
+        """Dismiss a notification on the connected Android phone by key."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(
+            device_id=target_id,
+            action="notification_dismiss",
+            data={"key": key},
+            timeout=15.0,
+        )
+
+    async def android_notification_reply(
+        self, key: str, text: str, device_id: str = ""
+    ) -> dict[str, Any]:
+        """Send a Quick Reply to an active notification on the connected Android phone."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return await self.send_device_request(
+            device_id=target_id,
+            action="notification_reply",
+            data={"key": key, "text": text},
+            timeout=15.0,
+        )
+
+    async def media_control(
+        self, action: str, target: str = "windows", device_id: str = ""
+    ) -> dict[str, Any]:
+        """Send media playback and volume control commands."""
+        clean_target = (target or "windows").strip().lower()
+        if clean_target in ("windows", "desktop", "local"):
+            return await self._execute_local_or_ipc("media_control", {"action": action})
+        else:
+            target_id = device_id or await self._resolve_target_device_id()
+            if not target_id:
+                return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return await self.send_device_request(
+                device_id=target_id,
+                action="media_control",
+                data={"action": action},
+                timeout=15.0,
+            )
+
+    async def share_link(
+        self, url: str = "", text: str = "", target: str = "windows", device_id: str = ""
+    ) -> dict[str, Any]:
+        """Safely share an HTTP/HTTPS link or text note with target device."""
+        clean_target = (target or "windows").strip().lower()
+        if clean_target in ("windows", "desktop", "local"):
+            return await self._execute_local_or_ipc("share_link", {"url": url, "text": text})
+        else:
+            target_id = device_id or await self._resolve_target_device_id()
+            if not target_id:
+                return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return await self.send_device_request(
+                device_id=target_id,
+                action="share_link",
+                data={"url": url, "text": text},
+                timeout=15.0,
+            )
+
+    async def activity_history(
+        self, limit: int = 50, offset: int = 0, event_type: str = "", principal: str = ""
+    ) -> dict[str, Any]:
+        """Query secret-redacted audit activity history."""
+        payload = {
+            "limit": limit,
+            "offset": offset,
+            "event_type": event_type,
+            "principal": principal,
+        }
+        return await self._execute_local_or_ipc("activity_history", payload)
 
     async def sync_clipboard(
         self,

@@ -80,6 +80,7 @@ class NodeRegistry:
             capabilities=self.local_manifest,
             is_authenticated=True,
             is_paired=True,
+            transport="local",
         )
 
     # =========================================================================
@@ -93,6 +94,7 @@ class NodeRegistry:
         host: str,
         port: int = 8765,
         manifest_data: Optional[dict[str, Any] | CapabilityManifest] = None,
+        transport: str = "unknown",
     ) -> DeviceNode:
         """Record an active authenticated WebSocket session for a paired device."""
         with self._lock:
@@ -127,6 +129,7 @@ class NodeRegistry:
                 "port": port,
                 "authenticated_at": now,
                 "last_seen": now,
+                "transport": transport,
             }
 
             # Return resolved DeviceNode view
@@ -144,6 +147,7 @@ class NodeRegistry:
                     last_seen_timestamp=now,
                     is_authenticated=True,
                     is_paired=True,
+                    transport=transport,
                     capabilities=manifest,
                 )
             return node
@@ -231,11 +235,20 @@ class NodeRegistry:
             if node.capabilities:
                 self._manifest_cache[node.device_id] = node.capabilities
 
+    def remove_node(self, device_id: str) -> None:
+        """Remove a node from runtime caches upon device revocation."""
+        with self._lock:
+            self._active_sessions.pop(device_id, None)
+            self._discovered_candidates.pop(device_id, None)
+            self._manifest_cache.pop(device_id, None)
+            self._registered_nodes.pop(device_id, None)
+
     def get_node(self, device_id: str) -> Optional[DeviceNode]:
         """Synthesize and return the current state of a node by device_id."""
         with self._lock:
             # 1. Local node
             if device_id == self.local_identity.device_id:
+                self.local_node.transport = "local"
                 return self.local_node
 
             # 2. Check explicitly registered nodes
@@ -343,6 +356,7 @@ class NodeRegistry:
                 capabilities=manifest,
                 is_authenticated=is_authed,
                 is_paired=is_paired,
+                transport=active_session.get("transport", "unknown") if active_session else "offline",
             )
 
     def list_nodes(
@@ -412,6 +426,15 @@ class NodeRegistry:
             - CAPABILITY_NOT_SUPPORTED: Resolved node does not support required_capability.
         """
         with self._lock:
+            # Fast-path: exact in-memory registered node lookup
+            if target_query:
+                clean_q = target_query.strip()
+                fast_node = self._registered_nodes.get(clean_q)
+                if fast_node and fast_node.device_id != self.local_identity.device_id:
+                    if required_capability and not fast_node.supports_capability(required_capability):
+                        return None, "CAPABILITY_NOT_SUPPORTED"
+                    return fast_node, None
+
             # Candidate pool excludes the local node for remote operations
             all_nodes = [
                 n for n in self.list_nodes()

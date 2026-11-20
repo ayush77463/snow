@@ -26,16 +26,19 @@ import secrets
 import sys
 import time
 from typing import Any, Dict, Optional, Set
+import urllib.parse
 
 from snow.capabilities.windows.apps import WindowsAppLauncher
 from snow.capabilities.windows.clipboard import WindowsClipboardManager
 from snow.capabilities.windows.files import WindowsFileManager
+from snow.capabilities.windows.media import WindowsMediaController
 from snow.capabilities.windows.processes import WindowsProcessMonitor
 from snow.capabilities.windows.telemetry import WindowsTelemetry
 from snow.capabilities.windows.terminal import (
     TerminalSecurityTier,
     WindowsTerminalExecutor,
 )
+from snow.security.approval import ApprovalPolicyEngine, ApprovalRequest, ApprovalStatus
 from snow.security.context import ExecutionContext, ExecutionPrincipal
 from snow.security.policy import (
     ACTION_TO_CAPABILITY,
@@ -85,6 +88,12 @@ ENGINE_ACTION_MAP: dict[str, str] = {
     "desktop_clipboard_get": CAPABILITY_DESKTOP_CLIPBOARD_READ,
     "windows_clipboard_set": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
     "desktop_clipboard_set": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    # Media & Share & Audit (Phase 21)
+    "media_control": "media_control",
+    "windows_media_control": "media_control",
+    "share_link": "share_link",
+    "windows_share_link": "share_link",
+    "activity_history": "activity_history",
 }
 
 
@@ -130,6 +139,9 @@ class CapabilityEngine:
         policy: Optional[PeerCapabilityPolicy] = None,
         allowed_roots: Optional[list[Path | str]] = None,
         node_registry: Optional[Any] = None,
+        approval_engine: Optional[ApprovalPolicyEngine] = None,
+        media_controller: Optional[WindowsMediaController] = None,
+        db_manager: Optional[Any] = None,
     ) -> None:
         self.telemetry = telemetry or WindowsTelemetry()
         self.processes = processes or WindowsProcessMonitor()
@@ -140,6 +152,9 @@ class CapabilityEngine:
         self.clipboard = clipboard or WindowsClipboardManager()
         self.policy = policy or PeerCapabilityPolicy()
         self.node_registry = node_registry
+        self.db_manager = db_manager
+        self.approval_engine = approval_engine or ApprovalPolicyEngine(db_manager=db_manager)
+        self.media_controller = media_controller or WindowsMediaController()
 
         # Confirmation ticket registry for trusted two-step confirmation
         self._tickets: dict[str, dict[str, Any]] = {}
@@ -223,16 +238,94 @@ class CapabilityEngine:
                     error=f"Capability '{capability}' is not authorized for device '{effective_ctx.device_id}'.",
                 )
 
-        # 4. Route to capability implementations
+        # 4. Catastrophic Invariants Check (Permanent hard-block regardless of caller or ticket)
+        if self.approval_engine and self.approval_engine.is_catastrophic(action, params):
+            logger.warning("CapabilityEngine permanently blocked catastrophic action '%s'", action)
+            return CapabilityResponse(
+                success=False,
+                status="POLICY_DENIED",
+                data={"status": "POLICY_DENIED", "tier": "RESTRICTED_BLOCKED"},
+                error="Catastrophic command execution is permanently blocked by security policy.",
+            )
+
+        # 5. Shared Approval Policy Check (Phase 21)
+        # Terminal command authorization is governed by WindowsTerminalExecutor's 4-tier
+        # security policy and confirmation tickets to preserve exact read-only & workspace scoping.
+        if self.approval_engine and action not in ("windows_terminal_exec", "desktop_exec"):
+            requires_approval, reason, risk_level = self.approval_engine.evaluate_policy(
+                action=action,
+                params=params,
+                ctx=effective_ctx,
+                target_device=request.target_device,
+            )
+            if requires_approval:
+                approval_id = params.get("approval_id")
+                if approval_id:
+                    ok, msg = self.approval_engine.consume_approval(
+                        request_id=approval_id,
+                        principal=effective_ctx.principal,
+                        action=action,
+                        target_device=request.target_device,
+                        params=params,
+                    )
+                    if not ok:
+                        logger.warning(
+                            "Approval consumption rejected for '%s' (principal=%s): %s",
+                            action, effective_ctx.principal, msg
+                        )
+                        return CapabilityResponse(
+                            success=False,
+                            status="UNAUTHORIZED",
+                            error=f"Approval validation failed: {msg}",
+                        )
+                else:
+                    # Issue pending approval request
+                    app_req = self.approval_engine.create_request(
+                        principal=effective_ctx.principal,
+                        action=action,
+                        target_device=request.target_device,
+                        params=params,
+                        reason=reason or "Explicit owner approval required.",
+                        risk_level=risk_level or "MEDIUM",
+                    )
+                    logger.info(
+                        "Approval required for '%s' [request_id=%s, risk=%s]",
+                        action, app_req.request_id, risk_level
+                    )
+                    return CapabilityResponse(
+                        success=False,
+                        status="APPROVAL_REQUIRED",
+                        data=app_req.to_dict(),
+                        error="Action requires human owner approval.",
+                    )
+
+        # 5. Route to capability implementations
         try:
-            return await self._dispatch_action(action, params, effective_ctx)
+            resp = await self._dispatch_action(action, params, effective_ctx)
         except Exception as exc:
             logger.error("Unexpected error executing capability action '%s': %s", action, exc, exc_info=True)
-            return CapabilityResponse(
+            resp = CapabilityResponse(
                 success=False,
                 status="INTERNAL_ERROR",
                 error=f"Internal error executing '{action}': {exc}",
             )
+
+        # 6. Audit Activity Log (Phase 21)
+        if self.db_manager and hasattr(self.db_manager, "log_activity"):
+            try:
+                p_str = effective_ctx.principal.value if hasattr(effective_ctx.principal, "value") else str(effective_ctx.principal)
+                self.db_manager.log_activity(
+                    event_type="CAPABILITY_EXECUTION",
+                    capability=action,
+                    principal=p_str,
+                    target_device=request.target_device,
+                    outcome=resp.status,
+                    details=params,
+                )
+            except Exception as exc:
+                logger.debug("Failed logging capability execution activity: %s", exc)
+
+        return resp
 
     async def _dispatch_action(
         self, action: str, params: dict[str, Any], ctx: ExecutionContext
@@ -479,6 +572,79 @@ class CapabilityEngine:
                 success=False,
                 status="REGISTRY_UNAVAILABLE",
                 error="NodeRegistry is not configured in CapabilityEngine.",
+            )
+
+        # --- Media Controls (Phase 21) ---
+        if action in ("media_control", "windows_media_control"):
+            media_act = str(params.get("action", ""))
+            res = self.media_controller.handle_action(media_act)
+            is_ok = res.get("success", False)
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "ERROR"),
+                data=res,
+                error=res.get("error"),
+            )
+
+        # --- Safe Link & Text Sharing (Phase 21) ---
+        if action in ("share_link", "windows_share_link"):
+            url = str(params.get("url", "")).strip()
+            text = str(params.get("text", "")).strip()
+            if url:
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme.lower() not in ("http", "https") or any(c in url for c in ("\r", "\n", "\0")):
+                    return CapabilityResponse(
+                        success=False,
+                        status="INVALID_URL_SCHEME",
+                        error="Only http:// and https:// URL schemes are permitted.",
+                    )
+                import webbrowser
+                opened = webbrowser.open(url)
+                return CapabilityResponse(
+                    success=True,
+                    status="SUCCESS",
+                    data={"opened": opened, "url": url, "action": "opened_browser"},
+                )
+            elif text:
+                res = await self.clipboard.set_clipboard(text=text)
+                is_ok = res.get("success", False)
+                return CapabilityResponse(
+                    success=is_ok,
+                    status="SUCCESS" if is_ok else "ERROR",
+                    data={"copied": is_ok, "text_length": len(text), "action": "copied_to_clipboard"},
+                    error=res.get("error"),
+                )
+            else:
+                return CapabilityResponse(
+                    success=False,
+                    status="INVALID_ARGUMENT",
+                    error="Either 'url' or 'text' must be provided.",
+                )
+
+        # --- Activity History (Phase 21) ---
+        if action in ("activity_history", "audit_history"):
+            if self.db_manager and hasattr(self.db_manager, "query_activity_history"):
+                limit = int(params.get("limit", 50))
+                offset = int(params.get("offset", 0))
+                event_type = params.get("event_type")
+                principal = params.get("principal")
+                since = params.get("since")
+                events = self.db_manager.query_activity_history(
+                    limit=limit,
+                    offset=offset,
+                    event_type=event_type,
+                    principal=principal,
+                    since=since,
+                )
+                return CapabilityResponse(
+                    success=True,
+                    status="SUCCESS",
+                    data={"events": events, "count": len(events)},
+                )
+            return CapabilityResponse(
+                success=False,
+                status="DATABASE_UNAVAILABLE",
+                error="Database manager is not configured for activity history queries.",
             )
 
         # Unsupported Action

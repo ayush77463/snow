@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SNOW — Multi-Device AI Platform</title>
+    <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="theme-light">
+    <div id="auth-overlay" class="overlay">
+        <div class="overlay-card">
+            <div class="snowflake-icon">❄</div>
+            <h2>Connecting to SNOW Core</h2>
+            <p id="auth-status-text">Exchanging secure local bootstrap token...</p>
+            <div class="spinner"></div>
+        </div>
+    </div>
+
+    <div class="app-container">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="brand">
+                    <span class="brand-icon">❄</span>
+                    <span class="brand-name">SNOW</span>
+                    <span class="brand-ver">v3</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" data-tab="overview">
+                    <span class="nav-icon">📊</span> Overview
+                </button>
+                <button class="nav-item" data-tab="devices">
+                    <span class="nav-icon">📱</span> Devices
+                </button>
+                <button class="nav-item" data-tab="files">
+                    <span class="nav-icon">📁</span> Phone Files
+                </button>
+                <button class="nav-item" data-tab="notifications">
+                    <span class="nav-icon">🔔</span> Notifications
+                </button>
+                <button class="nav-item" data-tab="media">
+                    <span class="nav-icon">🎵</span> Media Controls
+                </button>
+                <button class="nav-item" data-tab="share">
+                    <span class="nav-icon">🔗</span> Share Link / Note
+                </button>
+                <button class="nav-item" data-tab="approvals">
+                    <span class="nav-icon">🛡️</span> Approvals <span id="badge-approvals" class="badge">0</span>
+                </button>
+                <button class="nav-item" data-tab="activity">
+                    <span class="nav-icon">📜</span> Activity Audit
+                </button>
+                <button class="nav-item" data-tab="settings">
+                    <span class="nav-icon">⚙️</span> Settings
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="connection-status">
+                    <span id="core-status-dot" class="status-dot dot-offline"></span>
+                    <span id="core-status-text">Core Checking...</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <header class="topbar">
+                <div class="page-title">
+                    <h1 id="active-tab-title">Overview</h1>
+                </div>
+                <div class="topbar-actions">
+                    <button id="btn-theme-toggle" class="btn-secondary" title="Toggle Theme">🌓 Theme</button>
+                    <button id="btn-global-refresh" class="btn-primary" title="Refresh Live State">🔄 Refresh</button>
+                </div>
+            </header>
+
+            <div class="content-body">
+                <!-- 1. Overview Section -->
+                <section id="section-overview" class="tab-pane active">
+                    <div class="grid-overview">
+                        <div class="stat-card">
+                            <div class="stat-title">Active Devices</div>
+                            <div id="stat-connected-devices" class="stat-val">0</div>
+                            <div id="stat-transport-chip" class="chip chip-neutral">No Active Session</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-title">Pending Approvals</div>
+                            <div id="stat-pending-approvals" class="stat-val">0</div>
+                            <div class="stat-desc">Security requests awaiting action</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-title">Core IPC Port</div>
+                            <div class="stat-val">8767</div>
+                            <div class="stat-desc">Loopback authenticated JSON-RPC</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-title">System Status</div>
+                            <div id="stat-sys-status" class="stat-val">Healthy</div>
+                            <div id="stat-sys-details" class="stat-desc">Desktop Core operational</div>
+                        </div>
+                    </div>
+
+                    <!-- Connection Info Banner -->
+                    <div class="connection-banner card mt-4">
+                        <div class="card-body connection-banner-body">
+                            <div class="conn-item">
+                                <span class="conn-label">💻 Desktop Host LAN IP:</span>
+                                <code id="overview-lan-ip" class="conn-ip">Checking LAN...</code>
+                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋 Copy</button>
+                            </div>
+                            <div class="conn-item">
+                                <span class="conn-label">🔌 USB ADB Reverse:</span>
+                                <code class="conn-ip">127.0.0.1:8765</code>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h2>Quick Actions</h2>
+                        </div>
+                        <div class="card-body action-bar">
+                            <button class="btn-secondary" data-quick="qr">📲 Generate Pairing QR</button>
+                            <button class="btn-secondary" data-quick="files">📂 Browse Phone Files</button>
+                            <button class="btn-secondary" data-quick="notifs">🔔 View Notifications</button>
+                            <button class="btn-secondary" data-quick="share">🔗 Quick Share</button>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h2>Recent Activity</h2>
+                        </div>
+                        <div class="card-body">
+                            <div id="overview-activity-list" class="activity-feed">
+                                <div class="empty-state">Loading recent operations...</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 2. Devices Section -->
+                <section id="section-devices" class="tab-pane">
+                    <div class="section-toolbar">
+                        <h2>Connected & Paired Devices</h2>
+                        <div class="toolbar-actions">
+                            <button id="btn-clean-ghosts" class="btn-secondary" title="Remove all disconnected ghost devices">Clean Offline Ghosts</button>
+                            <button id="btn-device-pair-qr" class="btn-primary">Generate Pairing QR</button>
+                        </div>
+                    </div>
+
+                    <!-- Connection Info Banner -->
+                    <div class="connection-banner card mt-4">
+                        <div class="card-body connection-banner-body">
+                            <div class="conn-item">
+                                <span class="conn-label">💻 Desktop Host LAN IP:</span>
+                                <code id="devices-lan-ip" class="conn-ip">Checking LAN...</code>
+                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋 Copy</button>
+                            </div>
+                            <div class="conn-item">
+                                <span class="conn-label">🔌 USB ADB Reverse:</span>
+                                <code class="conn-ip">127.0.0.1:8765</code>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Local Host Card Container -->
+                    <div id="local-host-card-container" class="mt-4"></div>
+
+                    <!-- QR / Live Pairing Modal Container -->
+                    <div id="qr-display-card" class="card mt-4 hidden">
+                        <div class="card-header">
+                            <h3>Zero-Friction Mobile Pairing</h3>
+                            <button id="btn-close-qr" class="btn-icon">✕</button>
+                        </div>
+                        <div class="card-body">
+                            <!-- Trust Tier Selector -->
+                            <div class="pairing-tier-selector mb-3">
+                                <label class="label text-xs">Provision New Device As:</label>
+                                <div class="tier-toggle-group">
+                                    <button id="btn-tier-owner" class="tier-btn active" data-tier="owner" type="button">
+                                        ★ OWNER (Personal Phone — Full Access)
+                                    </button>
+                                    <button id="btn-tier-peer" class="tier-btn" data-tier="peer" type="button">
+                                        👥 PEER (Guest / AI Integration — Restricted)
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="qr-layout mt-3">
+                                <div id="qr-svg-container" class="qr-svg-box"></div>
+                                <div class="qr-details">
+                                    <div class="pin-display-container">
+                                        <div class="pin-label">Temporary PIN:</div>
+                                        <div id="qr-pin-code" class="pin-badge">------</div>
+                                        <div id="qr-countdown" class="countdown-badge">⏳ 60s remaining</div>
+                                    </div>
+                                    <div id="pending-device-alert" class="pending-device-badge hidden">
+                                        📲 <span id="pending-device-name">Phone</span> connected, awaiting PIN entry...
+                                    </div>
+                                    <p class="text-sm mt-2">Scan with SNOW on Android (Devices &gt; Scan QR) or enter the 6-digit PIN manually into the pairing card on your phone.</p>
+                                    <p class="text-xs text-muted mt-1" id="qr-meta-text"></p>
+                                    <div class="qr-actions mt-3">
+                                        <button id="btn-regenerate-pin" class="btn-secondary btn-sm" type="button">🔄 Generate Fresh PIN</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="devices-list" class="cards-grid mt-4">
+                        <div class="empty-state">No devices found. Ensure SNOW Desktop Core is running.</div>
+                    </div>
+                </section>
+
+                <!-- 3. Phone Files Section -->
+                <section id="section-files" class="tab-pane">
+                    <div class="section-toolbar">
+                        <div>
+                            <h2>SAF Storage Browser</h2>
+                            <p class="text-sm text-muted">Browse and download files from Android's user-granted Storage Access Framework folder.</p>
+                        </div>
+                        <div class="toolbar-actions">
+                            <select id="files-device-select" class="form-select">
+                                <option value="">Select target Android device...</option>
+                            </select>
+                            <button id="btn-refresh-files" class="btn-secondary">Refresh Files</button>
+                        </div>
+                    </div>
+
+                    <div class="breadcrumbs-bar mt-2" id="files-breadcrumbs">
+                        <span class="crumb active" data-subpath="">Root</span>
+                    </div>
+
+                    <div class="card mt-2">
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>Type</th>
+                                        <th>Size</th>
+                                        <th>Last Modified</th>
+                                        <th>Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="files-table-body">
+                                    <tr>
+                                        <td colspan="5" class="empty-state">Select a device to view SAF files.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 4. Notifications Section -->
+                <section id="section-notifications" class="tab-pane">
+                    <div class="section-toolbar">
+                        <div>
+                            <h2>Android Notification Mirror</h2>
+                            <p class="text-sm text-muted">Real-time non-sensitive notifications mirrored from your connected Android phone.</p>
+                        </div>
+                        <div class="toolbar-actions">
+                            <button id="btn-refresh-notifs" class="btn-secondary">Refresh</button>
+                        </div>
+                    </div>
+
+                    <div id="notifications-list" class="notifications-feed mt-4">
+                        <div class="empty-state">No active notifications.</div>
+                    </div>
+                </section>
+
+                <!-- 5. Media Controls Section -->
+                <section id="section-media" class="tab-pane">
+                    <div class="section-toolbar">
+                        <h2>Multimedia & Volume Controls</h2>
+                    </div>
+
+                    <div class="media-container mt-4">
+                        <div class="media-target-selector">
+                            <span class="label">Control Target:</span>
+                            <div class="toggle-group">
+                                <button class="btn-toggle active" data-target="windows">💻 Windows (Desktop)</button>
+                                <button class="btn-toggle" data-target="phone">📱 Phone (Android)</button>
+                            </div>
+                        </div>
+
+                        <div class="media-card mt-4">
+                            <div class="media-controls-row">
+                                <button class="btn-media" data-action="prev_track" title="Previous Track">⏮ Previous</button>
+                                <button class="btn-media btn-primary" data-action="play_pause" title="Play / Pause">⏯ Play / Pause</button>
+                                <button class="btn-media" data-action="next_track" title="Next Track">⏭ Next</button>
+                            </div>
+
+                            <div class="volume-controls-row mt-4">
+                                <button class="btn-media" data-action="volume_down" title="Volume Down">🔉 Vol -</button>
+                                <button class="btn-media" data-action="mute" title="Toggle Mute">🔇 Mute</button>
+                                <button class="btn-media" data-action="volume_up" title="Volume Up">🔊 Vol +</button>
+                            </div>
+                            <div id="media-feedback" class="feedback-msg mt-2"></div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 6. Share Section -->
+                <section id="section-share" class="tab-pane">
+                    <div class="section-toolbar">
+                        <h2>Share Link or Text</h2>
+                        <p class="text-sm text-muted">Send verified web URLs or text notes to connected devices.</p>
+                    </div>
+
+                    <div class="card mt-4 share-card">
+                        <div class="form-group">
+                            <label for="share-target-select">Destination Device:</label>
+                            <select id="share-target-select" class="form-select">
+                                <option value="phone">Connected Phone (Android)</option>
+                                <option value="windows">This Laptop (Windows)</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group mt-3">
+                            <label for="share-url-input">HTTP / HTTPS Web Link:</label>
+                            <input type="url" id="share-url-input" class="form-input" placeholder="https://example.com">
+                        </div>
+
+                        <div class="form-group mt-3">
+                            <label for="share-text-input">Text Note / Snippet:</label>
+                            <textarea id="share-text-input" class="form-textarea" rows="3" placeholder="Enter text or note to share..."></textarea>
+                        </div>
+
+                        <div class="mt-4">
+                            <button id="btn-send-share" class="btn-primary">Send to Device</button>
+                        </div>
+                        <div id="share-status-msg" class="feedback-msg mt-3"></div>
+                    </div>
+                </section>
+
+                <!-- 7. Approvals Section -->
+                <section id="section-approvals" class="tab-pane">
+                    <div class="section-toolbar">
+                        <div>
+                            <h2>Security Approval Queue</h2>
+                            <p class="text-sm text-muted">Human-in-the-loop authorization for sensitive AI or remote operations.</p>
+                        </div>
+                        <button id="btn-refresh-approvals" class="btn-secondary">Refresh</button>
+                    </div>
+
+                    <div id="approvals-list" class="approvals-feed mt-4">
+                        <div class="empty-state">No pending approval requests.</div>
+                    </div>
+                </section>
+
+                <!-- 8. Activity Audit Section -->
+                <section id="section-activity" class="tab-pane">
+                    <div class="section-toolbar">
+                        <div>
+                            <h2>Activity Audit Log</h2>
+                            <p class="text-sm text-muted">Cryptographic, secret-redacted audit history from Core SQLite storage.</p>
+                        </div>
+                        <button id="btn-refresh-activity" class="btn-secondary">Refresh</button>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="table-responsive">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Timestamp</th>
+                                        <th>Event Type</th>
+                                        <th>Principal</th>
+                                        <th>Device</th>
+                                        <th>Details</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="activity-table-body">
+                                    <tr>
+                                        <td colspan="5" class="empty-state">Loading activity history...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 9. Settings Section -->
+                <section id="section-settings" class="tab-pane">
+                    <div class="section-toolbar">
+                        <h2>Dashboard Settings & Diagnostics</h2>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h3>Appearance</h3>
+                        </div>
+                        <div class="card-body">
+                            <p>Choose your visual theme:</p>
+                            <div class="theme-options mt-2">
+                                <label class="radio-label">
+                                    <input type="radio" name="theme-choice" value="light" checked>
+                                    <strong>Glacier Crisp</strong> (Light arctic clean surfaces)
+                                </label>
+                                <label class="radio-label mt-2">
+                                    <input type="radio" name="theme-choice" value="dark">
+                                    <strong>Obsidian Frost</strong> (Pitch black high-contrast)
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h3>Environment & Diagnostics</h3>
+                        </div>
+                        <div class="card-body">
+                            <div class="diag-row">
+                                <span class="diag-label">Dashboard Host:</span>
+                                <span class="diag-val">127.0.0.1 (Loopback only)</span>
+                            </div>
+                            <div class="diag-row">
+                                <span class="diag-label">Dashboard Port:</span>
+                                <span class="diag-val" id="diag-port">8769</span>
+                            </div>
+                            <div class="diag-row">
+                                <span class="diag-label">Core IPC Port:</span>
+                                <span class="diag-val">8767</span>
+                            </div>
+                            <div class="diag-row">
+                                <span class="diag-label">WSS Port:</span>
+                                <span class="diag-val">8765</span>
+                            </div>
+                            <div class="diag-row">
+                                <span class="diag-label">HTTPS Transfer Port:</span>
+                                <span class="diag-val">8766</span>
+                            </div>
+                            <div class="diag-row">
+                                <span class="diag-label">Transfer Directory:</span>
+                                <span class="diag-val">~/.snow/transfers/download/</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

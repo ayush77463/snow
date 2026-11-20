@@ -1,7 +1,7 @@
 """Unified static MCP tool registry for SNOW.
 
 Exposes standardized MCP tools for both Windows and Android capabilities to AI assistants.
-All 24 tools are statically discoverable via list_tools, even when the Core or Android
+All 30 tools are statically discoverable via list_tools, even when the Core or Android
 device is currently offline.
 
 In Phase 8:
@@ -18,44 +18,26 @@ from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 from snow.mcp.bridge import SnowMcpBridge
+from snow.mcp.registry import get_mcp_annotations, list_capabilities
 
-# Complete static catalog of the 24 SNOW tool names
-ALL_TOOL_NAMES: List[str] = [
-    # General (Live Core)
-    "snow_get_device_status",
-    "snow_list_devices",
-    # Windows Capabilities
-    "snow_windows_battery",
-    "snow_windows_system_info",
-    "snow_windows_processes",
-    "snow_windows_launch_app",
-    "snow_windows_file_read",
-    "snow_windows_file_write",
-    "snow_windows_file_list",
-    "snow_windows_file_search",
-    "snow_windows_terminal_exec",
-    "snow_windows_clipboard_get",
-    "snow_windows_clipboard_set",
-    # Cross-Device Synchronization
-    "snow_sync_clipboard",
-    # Android Capabilities
-    "snow_android_battery",
-    "snow_android_ring",
-    "snow_android_clipboard_push",
-    "snow_android_launch_app",
-    "snow_android_list_apps",
-    "snow_android_file_send",
-    "snow_android_file_receive",
-    # Mesh and Unified Transfer (Phase 9)
-    "snow_transfer_file",
-    "snow_mesh_connect_peer",
-    # Android Messaging (Phase 10)
-    "snow_android_send_message",
-]
+# Dynamic catalog of all registered SNOW MCP tool names
+ALL_TOOL_NAMES: List[str] = [meta.name for meta in list_capabilities()]
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 24 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 30 static MCP tools onto the provided FastMCP server instance."""
+    # Wrap server.tool to automatically populate MCP ToolAnnotations (readOnlyHint, destructiveHint)
+    _orig_tool = server.tool
+
+    def _annotated_tool(*args: Any, **kwargs: Any) -> Any:
+        tool_name = kwargs.get("name")
+        if tool_name and "annotations" not in kwargs:
+            ann = get_mcp_annotations(tool_name)
+            if ann is not None:
+                kwargs["annotations"] = ann
+        return _orig_tool(*args, **kwargs)
+
+    server.tool = _annotated_tool
 
     # =========================================================================
     # 1. General Tools (Core Daemon via IPC)
@@ -531,5 +513,119 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "success": False,
                 "status": result.get("status", "ERROR"),
                 "error": result.get("error", f"Failed preparing message for '{recipient}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    # =========================================================================
+    # 5. Phase 21 P1 Capabilities
+    # =========================================================================
+
+    @server.tool(
+        name="snow_android_file_list",
+        description=(
+            "Enumerate files and directories within the Android user's persisted SAF-granted folder. "
+            "Returns SAF_FOLDER_NOT_CONFIGURED if no directory grant exists."
+        ),
+    )
+    async def snow_android_file_list(subpath: str = "", device_id: str = "") -> str:
+        """List files in Android SAF-granted folder."""
+        result = await bridge.android_file_list(subpath=subpath, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed retrieving Android SAF file list."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_android_notifications_list",
+        description=(
+            "List active in-memory non-sensitive notifications received from the Android device. "
+            "Sensitive banking, authenticator, and OTP apps are excluded."
+        ),
+    )
+    async def snow_android_notifications_list(device_id: str = "") -> str:
+        """List active non-sensitive notifications from Android."""
+        result = await bridge.android_notifications_list(device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed retrieving notifications."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_android_notification_dismiss",
+        description="Dismiss an active notification on the connected Android phone by notification key.",
+    )
+    async def snow_android_notification_dismiss(key: str, device_id: str = "") -> str:
+        """Dismiss Android notification by key."""
+        result = await bridge.android_notification_dismiss(key=key, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed dismissing notification '{key}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_media_control",
+        description=(
+            "Send media playback and volume control commands (play_pause, next, previous, volume_up, "
+            "volume_down, mute) to Windows or Android."
+        ),
+    )
+    async def snow_media_control(
+        action: str, target: str = "windows", device_id: str = ""
+    ) -> str:
+        """Send media playback or volume command to Windows or Android."""
+        result = await bridge.media_control(action=action, target=target, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed dispatching media control '{action}'."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_share_link",
+        description=(
+            "Safely share a validated HTTP/HTTPS URL or text note with the target device. "
+            "Unsafe schemes (javascript:, file:, intent:) are rejected."
+        ),
+    )
+    async def snow_share_link(
+        url: str = "", text: str = "", target: str = "windows", device_id: str = ""
+    ) -> str:
+        """Share HTTP/HTTPS link or text note with Windows or Android."""
+        result = await bridge.share_link(url=url, text=text, target=target, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed sharing link or text."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_activity_history",
+        description="Query the secret-redacted audit activity log of capability executions and approval decisions.",
+    )
+    async def snow_activity_history(
+        limit: int = 50, offset: int = 0, event_type: str = "", principal: str = ""
+    ) -> str:
+        """Query secret-redacted audit activity log."""
+        result = await bridge.activity_history(
+            limit=limit, offset=offset, event_type=event_type, principal=principal
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed querying activity history."),
             }, indent=2)
         return json.dumps(result.get("data", {}) or result, indent=2)

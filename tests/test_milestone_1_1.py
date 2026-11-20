@@ -242,7 +242,15 @@ class TestSnowCoreServerLifecycle(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def _create_test_server(self) -> SnowCoreServer:
-        config = CoreConfig(bind_host="127.0.0.1", port=_get_free_port(), tls_enabled=False)
+        config = CoreConfig(
+            bind_host="127.0.0.1",
+            port=_get_free_port(),
+            transfer_port=_get_free_port(),
+            ipc_port=_get_free_port(),
+            ipc_secret_path=str(Path(self.temp_dir.name) / "ipc.secret"),
+            tls_enabled=False,
+            discovery_enabled=False,
+        )
         return SnowCoreServer(config=config, db_manager=self.test_db)
 
     def test_server_startup_and_shutdown(self):
