@@ -15,6 +15,7 @@ import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import org.snow.R
 import org.snow.databinding.FragmentDevicesBinding
@@ -29,6 +30,19 @@ class DevicesFragment : Fragment() {
     private val binding get() = _binding!!
 
     private val viewModel: DevicesViewModel by activityViewModels()
+
+    private val qrScanLauncher = registerForActivityResult(com.journeyapps.barcodescanner.ScanContract()) { result ->
+        if (result.contents != null) {
+            val qrText = result.contents
+            viewModel.handleQrScanPayload(qrText) { success, error ->
+                if (!success && error != null) {
+                    Toast.makeText(requireContext(), error, Toast.LENGTH_LONG).show()
+                } else if (success) {
+                    Toast.makeText(requireContext(), "QR Pairing initiated!", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -57,6 +71,22 @@ class DevicesFragment : Fragment() {
     }
 
     private fun setupListeners() {
+        binding.btnScanQr.setOnClickListener {
+            val options = com.journeyapps.barcodescanner.ScanOptions().apply {
+                setPrompt("Scan SNOW Desktop QR Code")
+                setBeepEnabled(false)
+                setOrientationLocked(false)
+                setBarcodeImageEnabled(false)
+                setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
+            }
+            qrScanLauncher.launch(options)
+        }
+
+        binding.btnConnectUsb.setOnClickListener {
+            Toast.makeText(requireContext(), "Connecting via USB (127.0.0.1:8765)...", Toast.LENGTH_SHORT).show()
+            viewModel.connectUsbLocalhost()
+        }
+
         binding.btnConnect.setOnClickListener {
             val host = binding.etHostIp.text?.toString() ?: ""
             val portStr = binding.etPort.text?.toString() ?: ""
@@ -111,8 +141,11 @@ class DevicesFragment : Fragment() {
 
     private fun observeViewModel() {
         viewLifecycleOwner.lifecycleScope.launch {
-            viewModel.connectionState.collectLatest { state ->
+            combine(viewModel.connectionState, viewModel.connectedEndpoint) { state, endpoint ->
+                Pair(state, endpoint)
+            }.collectLatest { (state, endpoint) ->
                 renderConnectionState(state)
+                renderActiveTransport(state, endpoint)
             }
         }
 
@@ -129,8 +162,43 @@ class DevicesFragment : Fragment() {
         }
 
         viewLifecycleOwner.lifecycleScope.launch {
-            viewModel.savedDevices.collectLatest { saved ->
+            combine(viewModel.savedDevices, viewModel.connectedEndpoint, viewModel.connectionState) { saved, _, _ ->
+                saved
+            }.collectLatest { saved ->
                 renderSavedDevices(saved)
+            }
+        }
+    }
+
+    private fun renderActiveTransport(state: ConnectionState, endpoint: String?) {
+        val cleanEndpoint = endpoint ?: ""
+        val isUsb = cleanEndpoint.startsWith("127.0.0.1") || cleanEndpoint.startsWith("localhost")
+        when (state) {
+            ConnectionState.CONNECTED -> {
+                if (isUsb) {
+                    binding.chipActiveTransport.text = getString(R.string.status_usb_mode)
+                    binding.chipActiveTransport.setChipBackgroundColorResource(R.color.status_connected_soft)
+                    binding.chipActiveTransport.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected_dark))
+                    binding.tvActiveTransportDetail.text = getString(R.string.desc_usb_connected)
+                } else {
+                    binding.chipActiveTransport.text = getString(R.string.status_wifi_mode)
+                    binding.chipActiveTransport.setChipBackgroundColorResource(R.color.status_connected_soft)
+                    binding.chipActiveTransport.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected_dark))
+                    binding.tvActiveTransportDetail.text = getString(R.string.desc_wifi_connected, cleanEndpoint)
+                }
+            }
+            ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> {
+                val label = if (state == ConnectionState.CONNECTING) "CONNECTING..." else "RECONNECTING..."
+                binding.chipActiveTransport.text = label
+                binding.chipActiveTransport.setChipBackgroundColorResource(R.color.status_connecting_soft)
+                binding.chipActiveTransport.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connecting_dark))
+                binding.tvActiveTransportDetail.text = if (cleanEndpoint.isNotBlank()) "Connecting to $cleanEndpoint..." else "Locating desktop..."
+            }
+            ConnectionState.DISCONNECTED -> {
+                binding.chipActiveTransport.text = "DISCONNECTED"
+                binding.chipActiveTransport.setChipBackgroundColorResource(R.color.status_disconnected_soft)
+                binding.chipActiveTransport.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected_dark))
+                binding.tvActiveTransportDetail.text = getString(R.string.desc_no_active_connection)
             }
         }
     }
@@ -326,10 +394,21 @@ class DevicesFragment : Fragment() {
                 setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_text))
             }
 
+            val effectiveHost = if (device.host.isNotBlank()) device.host else device.recentEndpoints.firstOrNull()?.host ?: ""
+            val effectivePort = if (device.port in 1..65535) device.port else device.recentEndpoints.firstOrNull()?.port ?: 8765
+
+            val currentEp = viewModel.connectedEndpoint.value ?: ""
+            val isCurrentActive = viewModel.connectionState.value == ConnectionState.CONNECTED &&
+                (currentEp.startsWith("$effectiveHost:") || (effectiveHost == "127.0.0.1" && currentEp.startsWith("127.0.0.1")))
+
             val sub = TextView(requireContext()).apply {
-                text = "${device.host}:${device.port} • ID: ${device.deviceId}"
+                val hostDisplay = if (effectiveHost.isNotBlank()) "$effectiveHost:$effectivePort" else "No active endpoint"
+                val activeBadge = if (isCurrentActive) {
+                    if (currentEp.startsWith("127.0.0.1")) " • ACTIVE [USB]" else " • ACTIVE [WI-FI]"
+                } else ""
+                text = "$hostDisplay • Tier: ${device.trustTier}$activeBadge • ID: ${device.deviceId.take(8)}"
                 textSize = 12f
-                setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+                setTextColor(if (isCurrentActive) ContextCompat.getColor(requireContext(), R.color.status_connected) else ContextCompat.getColor(requireContext(), R.color.secondary_text))
             }
 
             info.addView(title)
@@ -337,10 +416,11 @@ class DevicesFragment : Fragment() {
 
             val reconnectBtn = MaterialButton(requireContext(), null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
                 text = "Reconnect"
+                isEnabled = effectiveHost.isNotBlank()
                 setOnClickListener {
-                    binding.etHostIp.setText(device.host)
-                    binding.etPort.setText(device.port.toString())
-                    viewModel.connect(device.host, device.port)
+                    binding.etHostIp.setText(effectiveHost)
+                    binding.etPort.setText(effectivePort.toString())
+                    viewModel.connect(effectiveHost, effectivePort)
                 }
             }
 

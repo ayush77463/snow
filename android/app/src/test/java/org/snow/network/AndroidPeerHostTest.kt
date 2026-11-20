@@ -5,7 +5,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.runBlocking
+import org.java_websocket.client.WebSocketClient
+import org.java_websocket.handshake.ServerHandshake
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -20,13 +21,12 @@ import org.snow.protocol.JsonSerialization
 import org.snow.protocol.MessageType
 import org.snow.protocol.SnowMessage
 import org.snow.security.TokenStorage
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
 import java.net.ConnectException
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URI
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 class AndroidPeerHostTest {
 
@@ -42,6 +42,21 @@ class AndroidPeerHostTest {
         override fun getToken(): String? = storedToken
         override fun clearToken() { storedToken = null }
         override fun hasToken(): Boolean = storedToken != null
+    }
+
+    private class TestWsClient(uri: URI) : WebSocketClient(uri) {
+        val messages = LinkedBlockingQueue<String>()
+
+        override fun onOpen(handshakedata: ServerHandshake?) {}
+        override fun onMessage(message: String) {
+            messages.offer(message)
+        }
+        override fun onClose(code: Int, reason: String?, remote: Boolean) {}
+        override fun onError(ex: Exception?) {}
+
+        fun receiveMessage(timeoutSeconds: Long = 5): String? {
+            return messages.poll(timeoutSeconds, TimeUnit.SECONDS)
+        }
     }
 
     @Before
@@ -84,6 +99,7 @@ class AndroidPeerHostTest {
         )
         assertTrue("Direct AndroidPeerHostServer should bind", s.start())
         peerHostServer = s
+        testPort = s.boundPort
         return s
     }
 
@@ -92,7 +108,7 @@ class AndroidPeerHostTest {
         assertFalse(hostManager.isHostModeActive())
         assertEquals(ReachabilityProfile.ACTIVE_SESSION_PEER, hostManager.getReachabilityProfile())
 
-        // Under Phase 19A quarantine, enableHostMode must fail closed
+        // Under Phase 19A/20 quarantine release gate, enableHostMode must fail closed until release gate passes
         val enabled = hostManager.enableHostMode(
             port = testPort,
             tokenStorage = mockTokenStorage,
@@ -123,81 +139,79 @@ class AndroidPeerHostTest {
     }
 
     @Test
-    fun testPingPongOverPeerHostSocket() = runBlocking {
-        startDirectServer(testPort)
+    fun testPingPongOverPeerHostWebSocket() {
+        val s = startDirectServer(testPort)
+        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
-        Socket("127.0.0.1", testPort).use { socket ->
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-
+        try {
             val pingMsg = SnowMessage.createRequest("ping")
-            writer.write(JsonSerialization.toJson(pingMsg) + "\n")
-            writer.flush()
+            client.send(JsonSerialization.toJson(pingMsg))
 
-            val line = reader.readLine()
-            assertNotNull(line)
-            val resp = JsonSerialization.fromJson(line)
+            val responseJson = client.receiveMessage()
+            assertNotNull("Should receive pong message", responseJson)
+            val resp = JsonSerialization.fromJson(responseJson!!)
             assertEquals(MessageType.RESPONSE, resp.type)
             assertEquals("pong", resp.payload?.get("action"))
             assertEquals("success", resp.payload?.get("status"))
+        } finally {
+            client.closeBlocking()
         }
     }
 
     @Test
-    fun testUnauthenticatedCapabilityRequestRejected() = runBlocking {
-        startDirectServer(testPort)
+    fun testUnauthenticatedCapabilityRequestRejected() {
+        val s = startDirectServer(testPort)
+        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
-        Socket("127.0.0.1", testPort).use { socket ->
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-
+        try {
             val req = SnowMessage.createRequest("battery_status")
-            writer.write(JsonSerialization.toJson(req) + "\n")
-            writer.flush()
+            client.send(JsonSerialization.toJson(req))
 
-            val line = reader.readLine()
-            assertNotNull(line)
-            val resp = JsonSerialization.fromJson(line)
+            val responseJson = client.receiveMessage()
+            assertNotNull(responseJson)
+            val resp = JsonSerialization.fromJson(responseJson!!)
             assertEquals(MessageType.ERROR, resp.type)
             assertEquals(ErrorCode.UNAUTHORIZED, resp.error?.code)
+        } finally {
+            client.closeBlocking()
         }
     }
 
     @Test
-    fun testPairRequestCannotBypassAuthentication() = runBlocking {
-        startDirectServer(testPort)
+    fun testPairRequestCannotBypassAuthentication() {
+        val s = startDirectServer(testPort)
+        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
-        Socket("127.0.0.1", testPort).use { socket ->
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-
-            // Attempting to bypass auth with unauthenticated pair_request
+        try {
             val bypassReq = SnowMessage.createRequest(
                 action = "pair_request",
                 data = mapOf("device_id" to "attacker-peer")
             )
-            writer.write(JsonSerialization.toJson(bypassReq) + "\n")
-            writer.flush()
+            client.send(JsonSerialization.toJson(bypassReq))
 
-            val line = reader.readLine()
-            assertNotNull(line)
-            val resp = JsonSerialization.fromJson(line)
+            val responseJson = client.receiveMessage()
+            assertNotNull(responseJson)
+            val resp = JsonSerialization.fromJson(responseJson!!)
             assertEquals(MessageType.ERROR, resp.type)
             assertEquals(ErrorCode.UNAUTHORIZED, resp.error?.code)
+        } finally {
+            client.closeBlocking()
         }
     }
 
     @Test
-    fun testAuthenticationWithValidTokenSucceeds() = runBlocking {
-        startDirectServer(
+    fun testAuthenticationWithValidTokenSucceeds() {
+        val s = startDirectServer(
             port = testPort,
             manifestProvider = { mapOf("manifest_version" to "2.0") }
         )
+        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
-        Socket("127.0.0.1", testPort).use { socket ->
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-
+        try {
             val authReq = SnowMessage.createRequest(
                 action = "auth_request",
                 data = mapOf(
@@ -205,27 +219,27 @@ class AndroidPeerHostTest {
                     "device_id" to "remote-peer-99"
                 )
             )
-            writer.write(JsonSerialization.toJson(authReq) + "\n")
-            writer.flush()
+            client.send(JsonSerialization.toJson(authReq))
 
-            val line = reader.readLine()
-            assertNotNull(line)
-            val resp = JsonSerialization.fromJson(line)
+            val responseJson = client.receiveMessage()
+            assertNotNull(responseJson)
+            val resp = JsonSerialization.fromJson(responseJson!!)
             assertEquals(MessageType.RESPONSE, resp.type)
             assertEquals("success", resp.payload?.get("status"))
             assertEquals("android-node-test-1", resp.payload?.get("device_id"))
             assertNotNull(resp.payload?.get("session_id"))
+        } finally {
+            client.closeBlocking()
         }
     }
 
     @Test
-    fun testAuthenticationWithInvalidTokenRejected() = runBlocking {
-        startDirectServer(testPort)
+    fun testAuthenticationWithInvalidTokenRejected() {
+        val s = startDirectServer(testPort)
+        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
-        Socket("127.0.0.1", testPort).use { socket ->
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-
+        try {
             val authReq = SnowMessage.createRequest(
                 action = "auth_request",
                 data = mapOf(
@@ -233,82 +247,81 @@ class AndroidPeerHostTest {
                     "device_id" to "attacker-peer"
                 )
             )
-            writer.write(JsonSerialization.toJson(authReq) + "\n")
-            writer.flush()
+            client.send(JsonSerialization.toJson(authReq))
 
-            val line = reader.readLine()
-            assertNotNull(line)
-            val resp = JsonSerialization.fromJson(line)
+            val responseJson = client.receiveMessage()
+            assertNotNull(responseJson)
+            val resp = JsonSerialization.fromJson(responseJson!!)
             assertEquals(MessageType.ERROR, resp.type)
             assertEquals(ErrorCode.UNAUTHORIZED, resp.error?.code)
+        } finally {
+            client.closeBlocking()
         }
     }
 
     @Test
-    fun testAuthenticatedCapabilityExecutionThroughDispatcher() = runBlocking {
-        startDirectServer(testPort)
+    fun testAuthenticatedCapabilityExecutionThroughDispatcher() {
+        val s = startDirectServer(testPort)
+        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
-        Socket("127.0.0.1", testPort).use { socket ->
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-
+        try {
             // 1. Authenticate
             val authReq = SnowMessage.createRequest(
                 action = "auth_request",
                 data = mapOf("auth_token" to "test-token-secret-1234")
             )
-            writer.write(JsonSerialization.toJson(authReq) + "\n")
-            writer.flush()
-            reader.readLine() // auth response
+            client.send(JsonSerialization.toJson(authReq))
+            client.receiveMessage() // auth response
 
             // 2. Dispatch battery_status
             val batReq = SnowMessage.createRequest("battery_status")
-            writer.write(JsonSerialization.toJson(batReq) + "\n")
-            writer.flush()
+            client.send(JsonSerialization.toJson(batReq))
 
-            val line = reader.readLine()
-            assertNotNull(line)
-            val resp = JsonSerialization.fromJson(line)
+            val responseJson = client.receiveMessage()
+            assertNotNull(responseJson)
+            val resp = JsonSerialization.fromJson(responseJson!!)
             assertEquals(MessageType.RESPONSE, resp.type)
             assertEquals("success", resp.payload?.get("status"))
+        } finally {
+            client.closeBlocking()
         }
     }
 
     @Test
-    fun testExecutionContractEnforcedForForegroundOperation() = runBlocking {
+    fun testExecutionContractEnforcedForForegroundOperation() {
         ClipboardHandler.isAppInForeground = false
         ClipboardHandler.isUserIntentGranted = false
 
-        startDirectServer(testPort)
+        val s = startDirectServer(testPort)
+        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
-        Socket("127.0.0.1", testPort).use { socket ->
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-
+        try {
             val authReq = SnowMessage.createRequest(
                 action = "auth_request",
                 data = mapOf("auth_token" to "test-token-secret-1234")
             )
-            writer.write(JsonSerialization.toJson(authReq) + "\n")
-            writer.flush()
-            reader.readLine()
+            client.send(JsonSerialization.toJson(authReq))
+            client.receiveMessage()
 
             // Request clipboard_pull which requires foreground
             val clipReq = SnowMessage.createRequest("clipboard_pull")
-            writer.write(JsonSerialization.toJson(clipReq) + "\n")
-            writer.flush()
+            client.send(JsonSerialization.toJson(clipReq))
 
-            val line = reader.readLine()
-            assertNotNull(line)
-            val resp = JsonSerialization.fromJson(line)
+            val responseJson = client.receiveMessage()
+            assertNotNull(responseJson)
+            val resp = JsonSerialization.fromJson(responseJson!!)
             assertEquals(MessageType.ERROR, resp.type)
             assertEquals(ErrorCode.UNAUTHORIZED, resp.error?.code)
             assertTrue(resp.error?.message?.contains("foreground") == true)
+        } finally {
+            client.closeBlocking()
         }
     }
 
     @Test
-    fun testStopClosesSocketCleanly() = runBlocking {
+    fun testStopClosesSocketCleanly() {
         val server = startDirectServer(testPort)
         assertTrue(server.isListening())
 
@@ -316,12 +329,16 @@ class AndroidPeerHostTest {
         assertFalse(server.isListening())
 
         var failedToConnect = false
-        try {
-            Socket("127.0.0.1", testPort).close()
-        } catch (_: ConnectException) {
-            failedToConnect = true
-        } catch (_: Exception) {
-            failedToConnect = true
+        val startTime = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startTime < 3000) {
+            try {
+                Socket("127.0.0.1", server.boundPort).use {
+                    Thread.sleep(50)
+                }
+            } catch (_: Exception) {
+                failedToConnect = true
+                break
+            }
         }
         assertTrue("Port should not accept connections when server is stopped", failedToConnect)
     }

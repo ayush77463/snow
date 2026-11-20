@@ -81,6 +81,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
+    private val _connectedEndpoint = MutableStateFlow<String?>(null)
+    val connectedEndpoint: StateFlow<String?> = _connectedEndpoint.asStateFlow()
+
     private val _authState = MutableStateFlow<AuthState>(AuthState.Disconnected)
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
@@ -150,11 +153,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     connectionAttemptCount = 0
                     if (client.currentTargetHost.isNotBlank()) {
                         connectedHost = client.currentTargetHost
+                        _connectedEndpoint.value = "${client.currentTargetHost}:${client.currentTargetPort}"
                     }
                     queryPcStatus()
                 } else if (state == ConnectionState.DISCONNECTED) {
                     _pcTelemetry.value = PcTelemetry.UNAVAILABLE
                     _fileTransferClient = null
+                    _connectedEndpoint.value = null
+                    connectedHost = ""
                 }
             }
         }
@@ -177,7 +183,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         tokenStorage = tokenStorage,
                         useTls = true
                     )
-                    // Auto-restore Instant Sync if enabled in preferences
+                    // Auto-restore Instant Sync only if enabled in preferences
                     val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
                     if (prefs.getBoolean(PREF_KEY_INSTANT_SYNC, true)) {
                         toggleInstantClipboardSync(true)
@@ -185,17 +191,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     if (prefs.getBoolean(PREF_KEY_AUTO_SYNC_SCREENSHOTS, false)) {
                         screenshotObserver.register()
                     }
-                    // Update saved devices list with confirmed endpoint
-                    val savedKey = tokenStorage.getToken()?.take(8) ?: auth.sessionId.take(8)
-                    saveDevice(
-                        SavedDevice(
-                            deviceId = savedKey,
-                            deviceName = "Desktop Core ($host)",
-                            host = host,
-                            port = port,
-                            lastSeen = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-                        )
-                    )
+                    // Update identity-first saved device history and endpoint ring buffer
+                    recordSuccessfulConnection(host = host, port = port, sessionId = auth.sessionId)
                 } else {
                     _fileTransferClient = null
                     screenshotObserver.unregister()
@@ -228,6 +225,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         // Reset retry counter on explicit manual connection attempt
         connectionAttemptCount = 0
         connectedHost = cleanHost
+        _connectedEndpoint.value = "$cleanHost:$port"
         _connectionState.value = ConnectionState.CONNECTING
         appendLog("INFO", TAG, "Connecting to $cleanHost:$port...")
 
@@ -258,6 +256,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
         appContext.startService(intent)
         serviceRef?.client?.disconnect()
+        _connectedEndpoint.value = null
+        connectedHost = ""
         _connectionState.value = ConnectionState.DISCONNECTED
         _authState.value = AuthState.Disconnected
     }
@@ -268,6 +268,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             action = SnowForegroundService.ACTION_DISCONNECT
         }
         appContext.startService(intent)
+        _connectedEndpoint.value = null
+        connectedHost = ""
         _connectionState.value = ConnectionState.DISCONNECTED
     }
 
@@ -311,38 +313,270 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         clearSavedDevices()
     }
 
-    // --- Saved Devices ---
+    // --- Saved Devices (Phase 20 Identity-First Mesh & Endpoint History) ---
 
     private fun loadSavedDevices() {
-        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val savedHost = prefs.getString("last_connected_host", "") ?: ""
-        val savedPort = prefs.getInt("last_connected_port", 8765)
-        val token = tokenStorage.getToken()
-        if (token != null) {
-            val host = if (savedHost.isNotBlank()) savedHost else connectedHost.takeIf { it.isNotBlank() } ?: "Desktop Core"
-            _savedDevices.value = listOf(
-                SavedDevice(
-                    deviceId = token.take(8),
-                    deviceName = "Paired Desktop Core",
-                    host = host,
-                    port = savedPort,
-                    lastSeen = "Active"
-                )
-            )
+        val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+        val rawJson = prefsV2.getString("devices_json", null)
+        if (!rawJson.isNullOrBlank()) {
+            _savedDevices.value = deserializeSavedDevices(rawJson)
         } else {
-            _savedDevices.value = emptyList()
+            // Safe migration from legacy snow_settings: discard placeholder 127.0.0.1
+            val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            val savedHost = (prefs.getString("last_connected_host", "") ?: "").trim()
+            val savedPort = prefs.getInt("last_connected_port", 8765)
+            val token = tokenStorage.getToken()
+            val pinnedFp = certPinStorage.getPinnedFingerprint()
+            if (token != null) {
+                val validHost = if (savedHost.isNotBlank() && savedHost != "127.0.0.1") savedHost else ""
+                val endpoints = if (validHost.isNotBlank()) listOf(DeviceEndpoint(validHost, savedPort)) else emptyList()
+                val migrated = SavedDevice(
+                    deviceId = token.take(8),
+                    deviceName = if (validHost.isNotBlank()) "Paired Desktop ($validHost)" else "Paired Desktop Core",
+                    host = validHost,
+                    port = savedPort,
+                    lastSeen = "Active",
+                    trustTier = "OWNER",
+                    certFingerprint = pinnedFp,
+                    recentEndpoints = endpoints
+                )
+                val list = listOf(migrated)
+                _savedDevices.value = list
+                prefsV2.edit().putString("devices_json", serializeSavedDevices(list)).apply()
+            } else {
+                _savedDevices.value = emptyList()
+            }
         }
     }
 
+    fun recordSuccessfulConnection(host: String, port: Int, sessionId: String, tier: String = "PEER") {
+        val cleanHost = host.trim()
+        val token = tokenStorage.getToken()
+        val deviceId = token?.take(8) ?: sessionId.take(8)
+        val pinnedFp = certPinStorage.getPinnedFingerprint()
+        val nowStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+
+        val current = _savedDevices.value.toMutableList()
+        val existingIdx = current.indexOfFirst { it.deviceId == deviceId }
+
+        val updatedEndpoints = mutableListOf<DeviceEndpoint>()
+        if (cleanHost.isNotBlank() && cleanHost != "127.0.0.1") {
+            updatedEndpoints.add(DeviceEndpoint(cleanHost, port, System.currentTimeMillis()))
+        }
+        if (existingIdx >= 0) {
+            val existing = current[existingIdx]
+            for (ep in existing.recentEndpoints) {
+                if (ep.host != cleanHost && updatedEndpoints.size < 5) {
+                    updatedEndpoints.add(ep)
+                }
+            }
+            current[existingIdx] = existing.copy(
+                host = if (cleanHost != "127.0.0.1" || existing.host.isBlank()) cleanHost else existing.host,
+                port = port,
+                lastSeen = nowStr,
+                trustTier = tier,
+                certFingerprint = pinnedFp ?: existing.certFingerprint,
+                recentEndpoints = updatedEndpoints.take(5)
+            )
+        } else {
+            current.add(
+                0,
+                SavedDevice(
+                    deviceId = deviceId,
+                    deviceName = "Desktop Core ($cleanHost)",
+                    host = cleanHost,
+                    port = port,
+                    lastSeen = nowStr,
+                    trustTier = tier,
+                    certFingerprint = pinnedFp,
+                    recentEndpoints = updatedEndpoints.take(5)
+                )
+            )
+        }
+
+        _savedDevices.value = current
+        val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+        prefsV2.edit().putString("devices_json", serializeSavedDevices(current)).apply()
+    }
+
     private fun saveDevice(device: SavedDevice) {
-        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        prefs.edit().putString("last_connected_host", device.host).putInt("last_connected_port", device.port).apply()
         val current = _savedDevices.value.filter { it.deviceId != device.deviceId }
-        _savedDevices.value = listOf(device) + current
+        val updated = listOf(device) + current
+        _savedDevices.value = updated
+        val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+        prefsV2.edit().putString("devices_json", serializeSavedDevices(updated)).apply()
     }
 
     private fun clearSavedDevices() {
         _savedDevices.value = emptyList()
+        val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+        prefsV2.edit().remove("devices_json").apply()
+    }
+
+    // --- Phase 20 Zero-IP-Friction Onboarding & USB Actions ---
+
+    fun connectUsbLocalhost() {
+        appendLog("INFO", TAG, "Connecting to desktop core over USB reverse mapping (127.0.0.1:8765)...")
+        connect("127.0.0.1", 8765)
+    }
+
+    fun handleQrScanPayload(qrJson: String, onComplete: (Boolean, String?) -> Unit) {
+        appendLog("INFO", TAG, "Processing QR onboarding payload...")
+        val payload = try {
+            org.json.JSONObject(qrJson)
+        } catch (e: Exception) {
+            val err = "Malformed QR payload: not valid JSON."
+            appendLog("ERROR", TAG, err)
+            onComplete(false, err)
+            return
+        }
+
+        val v = payload.optInt("v", -1)
+        if (v != 1) {
+            val err = "Unsupported QR version: $v. Expected 1."
+            appendLog("ERROR", TAG, err)
+            onComplete(false, err)
+            return
+        }
+
+        val nodeId = payload.optString("id", "").trim()
+        val port = payload.optInt("port", 8765)
+        val pin = payload.optString("pin", "").trim()
+        val fp = payload.optString("fp", "").replace(":", "").replace(" ", "").trim()
+
+        if (nodeId.isEmpty() || pin.length != 6 || !pin.all { it.isDigit() } || fp.length != 64) {
+            val err = "Invalid QR payload schema (missing id, invalid 6-digit pin, or invalid fingerprint)."
+            appendLog("ERROR", TAG, err)
+            onComplete(false, err)
+            return
+        }
+
+        val rawIps = payload.optJSONArray("ips")
+        val candidateIps = mutableListOf<String>()
+        if (rawIps != null) {
+            for (i in 0 until rawIps.length()) {
+                val ipStr = rawIps.getString(i).trim()
+                if (ipStr.isNotBlank() && ipStr != "127.0.0.1" && !ipStr.startsWith("169.254.")) {
+                    candidateIps.add(ipStr)
+                }
+            }
+        }
+
+        if (candidateIps.isEmpty()) {
+            val err = "No reachable candidate LAN IPs found in QR payload."
+            appendLog("ERROR", TAG, err)
+            onComplete(false, err)
+            return
+        }
+
+        // Pinned certificate verification
+        val pinnedFp = certPinStorage.getPinnedFingerprint()
+        if (pinnedFp != null) {
+            val cleanPinned = pinnedFp.replace(":", "").replace(" ", "").trim()
+            if (!cleanPinned.equals(fp, ignoreCase = true)) {
+                val err = "CRITICAL: Certificate fingerprint in QR does not match existing pinned certificate! Mismatch blocked."
+                appendLog("ERROR", TAG, err)
+                _authState.value = AuthState.FingerprintMismatch(pinnedFp, fp)
+                onComplete(false, err)
+                return
+            }
+        } else {
+            // TOFU initial trust from scanned QR code
+            certPinStorage.pinFingerprint(fp)
+            appendLog("INFO", TAG, "Pinned TLS certificate fingerprint from scanned QR code.")
+        }
+
+        // Connect to first candidate IP and proceed with pairing
+        val targetIp = candidateIps.first()
+        appendLog("INFO", TAG, "Initiating QR onboarding connection to $targetIp:$port...")
+        connect(targetIp, port)
+
+        // Schedule pairing PIN submission once WebSocket establishes connection
+        repoScope.launch {
+            var attempts = 0
+            while (attempts < 50) {
+                kotlinx.coroutines.delay(200)
+                attempts++
+                val state = _connectionState.value
+                val auth = _authState.value
+                if (state == ConnectionState.CONNECTED && auth is AuthState.ConnectedUnauthenticated) {
+                    appendLog("INFO", TAG, "Connection established; auto-submitting pairing PIN from QR...")
+                    pairDevice(pin) { pState ->
+                        if (pState is PairingState.Paired) {
+                            recordSuccessfulConnection(targetIp, port, pState.sessionId, "OWNER")
+                            onComplete(true, null)
+                        }
+                    }
+                    return@launch
+                } else if (state == ConnectionState.DISCONNECTED && attempts > 15) {
+                    onComplete(false, "Connection to $targetIp:$port timed out or failed.")
+                    return@launch
+                }
+            }
+        }
+    }
+
+    fun serializeSavedDevices(devices: List<SavedDevice>): String {
+        val arr = org.json.JSONArray()
+        for (d in devices) {
+            val obj = org.json.JSONObject()
+            obj.put("deviceId", d.deviceId)
+            obj.put("deviceName", d.deviceName)
+            obj.put("host", d.host)
+            obj.put("port", d.port)
+            obj.put("lastSeen", d.lastSeen ?: "")
+            obj.put("trustTier", d.trustTier)
+            obj.put("certFingerprint", d.certFingerprint ?: "")
+            val epArr = org.json.JSONArray()
+            for (ep in d.recentEndpoints) {
+                val epObj = org.json.JSONObject()
+                epObj.put("host", ep.host)
+                epObj.put("port", ep.port)
+                epObj.put("lastSuccessTimestamp", ep.lastSuccessTimestamp)
+                epArr.put(epObj)
+            }
+            obj.put("recentEndpoints", epArr)
+            arr.put(obj)
+        }
+        return arr.toString()
+    }
+
+    fun deserializeSavedDevices(jsonStr: String): List<SavedDevice> {
+        if (jsonStr.isBlank()) return emptyList()
+        val list = mutableListOf<SavedDevice>()
+        try {
+            val arr = org.json.JSONArray(jsonStr)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val eps = mutableListOf<DeviceEndpoint>()
+                val epArr = obj.optJSONArray("recentEndpoints")
+                if (epArr != null) {
+                    for (j in 0 until epArr.length()) {
+                        val epObj = epArr.getJSONObject(j)
+                        eps.add(
+                            DeviceEndpoint(
+                                host = epObj.getString("host"),
+                                port = epObj.getInt("port"),
+                                lastSuccessTimestamp = epObj.optLong("lastSuccessTimestamp", 0L)
+                            )
+                        )
+                    }
+                }
+                list.add(
+                    SavedDevice(
+                        deviceId = obj.getString("deviceId"),
+                        deviceName = obj.optString("deviceName", "Desktop Core"),
+                        host = obj.getString("host"),
+                        port = obj.getInt("port"),
+                        lastSeen = obj.optString("lastSeen", "").takeIf { it.isNotBlank() },
+                        trustTier = obj.optString("trustTier", "PEER"),
+                        certFingerprint = obj.optString("certFingerprint", "").takeIf { it.isNotBlank() },
+                        recentEndpoints = eps.take(5)
+                    )
+                )
+            }
+        } catch (_: Exception) {}
+        return list
     }
 
     // --- Telemetry & Status ---
@@ -1383,12 +1617,21 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
 // --- Data Models ---
 
+data class DeviceEndpoint(
+    val host: String,
+    val port: Int,
+    val lastSuccessTimestamp: Long = System.currentTimeMillis()
+)
+
 data class SavedDevice(
     val deviceId: String,
     val deviceName: String,
     val host: String,
     val port: Int,
-    val lastSeen: String? = null
+    val lastSeen: String? = null,
+    val trustTier: String = "PEER",
+    val certFingerprint: String? = null,
+    val recentEndpoints: List<DeviceEndpoint> = emptyList()
 )
 
 data class ActiveTransferInfo(

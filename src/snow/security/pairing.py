@@ -3,12 +3,14 @@
 from dataclasses import dataclass
 from enum import StrEnum
 import hmac
+import ipaddress
+import json
 import logging
 import secrets
 import sys
 import threading
 import time
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 import uuid
 
 from snow.protocol.constants import ErrorCode
@@ -293,3 +295,139 @@ class PairingManager:
                     message=f"Invalid pairing PIN. {remaining} attempt(s) remaining.",
                     remaining_attempts=remaining,
                 )
+
+
+# =========================================================================
+# QR Pairing Payload Helpers (Phase 20 Zero-IP-Friction Onboarding)
+# =========================================================================
+
+
+def create_qr_pairing_payload(
+    node_id: str,
+    candidate_ips: List[str],
+    port: int,
+    cert_fingerprint: str,
+    pin: str,
+    version: int = 1,
+) -> dict[str, Any]:
+    """Construct a validated QR pairing payload for SNOW zero-friction onboarding.
+
+    Payload schema:
+    {
+      "v": 1,
+      "id": "<node_id>",
+      "ips": ["<candidate_ip>"],
+      "port": 8765,
+      "fp": "<sha256_cert_fingerprint>",
+      "pin": "<six_digit_pin>"
+    }
+    """
+    if version != 1:
+        raise ValueError(f"Unsupported QR payload version: {version}. Expected 1.")
+
+    clean_id = (node_id or "").strip()
+    if not clean_id:
+        raise ValueError("node_id must not be empty.")
+
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        raise ValueError(f"Invalid port: {port}. Must be between 1 and 65535.")
+
+    clean_pin = str(pin).strip()
+    if len(clean_pin) != 6 or not clean_pin.isdigit():
+        raise ValueError(f"PIN must be exactly 6 decimal digits, got '{clean_pin}'.")
+
+    # Clean & normalize fingerprint (remove colons/spaces, normalize to 64 uppercase hex chars)
+    raw_fp = cert_fingerprint.replace(":", "").replace(" ", "").strip().upper()
+    if len(raw_fp) != 64 or not all(c in "0123456789ABCDEF" for c in raw_fp):
+        raise ValueError(
+            f"Certificate fingerprint must be a 64-character SHA-256 hex string, got {len(raw_fp)} chars."
+        )
+
+    # Filter candidate IPs: exclude loopback, link-local, unspecified, and non-IPv4
+    filtered_ips: list[str] = []
+    seen = set()
+    for ip_str in candidate_ips:
+        try:
+            ip = ipaddress.IPv4Address(ip_str.strip())
+            if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+                continue
+            norm = str(ip)
+            if norm not in seen:
+                seen.add(norm)
+                filtered_ips.append(norm)
+        except Exception:
+            continue
+
+    if not filtered_ips:
+        raise ValueError("At least one reachable, non-loopback candidate IPv4 address is required for QR pairing.")
+
+    return {
+        "v": 1,
+        "id": clean_id,
+        "ips": filtered_ips,
+        "port": port,
+        "fp": raw_fp,
+        "pin": clean_pin,
+    }
+
+
+def validate_qr_pairing_payload(payload: dict[str, Any] | str) -> dict[str, Any]:
+    """Validate and normalize an incoming QR pairing payload.
+
+    Raises ValueError if payload violates format, schema version, or security rules.
+    """
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception as exc:
+            raise ValueError(f"Malformed JSON QR payload: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("QR payload must be a JSON object.")
+
+    v = payload.get("v")
+    if v != 1:
+        raise ValueError(f"Unsupported payload version: {v}. Expected 1.")
+
+    node_id = payload.get("id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        raise ValueError("Missing or invalid 'id' in QR payload.")
+
+    port = payload.get("port")
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        raise ValueError(f"Missing or invalid 'port' in QR payload: {port}.")
+
+    pin = str(payload.get("pin", "")).strip()
+    if len(pin) != 6 or not pin.isdigit():
+        raise ValueError("PIN must be exactly 6 decimal digits.")
+
+    fp = str(payload.get("fp", "")).replace(":", "").replace(" ", "").strip().upper()
+    if len(fp) != 64 or not all(c in "0123456789ABCDEF" for c in fp):
+        raise ValueError("Invalid certificate fingerprint in QR payload. Must be 64-character SHA-256 hex.")
+
+    raw_ips = payload.get("ips")
+    if not isinstance(raw_ips, list) or not raw_ips:
+        raise ValueError("Missing or empty 'ips' list in QR payload.")
+
+    filtered_ips: list[str] = []
+    for item in raw_ips:
+        if not isinstance(item, str):
+            continue
+        try:
+            ip = ipaddress.IPv4Address(item.strip())
+            if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved):
+                filtered_ips.append(str(ip))
+        except Exception:
+            continue
+
+    if not filtered_ips:
+        raise ValueError("No reachable, non-loopback candidate IPv4 addresses found in QR payload.")
+
+    return {
+        "v": 1,
+        "id": node_id.strip(),
+        "ips": filtered_ips,
+        "port": port,
+        "fp": fp,
+        "pin": pin,
+    }

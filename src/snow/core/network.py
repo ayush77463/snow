@@ -148,3 +148,55 @@ def _detect_via_socket_fallback() -> List[NetworkInterfaceInfo]:
         logger.debug("Socket fallback IPv4 enumeration failed: %s", exc)
 
     return interfaces
+
+
+def get_active_ip_addresses() -> List[str]:
+    """Return a deduplicated list of active, usable local IPv4 addresses.
+
+    Filters out loopback, link-local, unspecified, and down interfaces.
+    """
+    interfaces = detect_usable_ipv4_addresses()
+    seen = set()
+    active_ips: List[str] = []
+    for iface in interfaces:
+        if iface.is_up and iface.ip_address not in seen:
+            seen.add(iface.ip_address)
+            active_ips.append(iface.ip_address)
+    # If no up interfaces found, fall back to any usable interface
+    if not active_ips:
+        for iface in interfaces:
+            if iface.ip_address not in seen:
+                seen.add(iface.ip_address)
+                active_ips.append(iface.ip_address)
+    return active_ips
+
+
+def detect_usb_tethering_interfaces() -> List[NetworkInterfaceInfo]:
+    """Detect network interfaces established via physical USB tethering.
+
+    USB tethering presents an actual virtual/physical network adapter to the OS
+    (e.g., 'Remote NDIS', 'Apple Mobile Device Ethernet', 'USB Ethernet', or adapter
+    names/descriptions indicating RNDIS/USB tethering).
+
+    IMPORTANT DISTINCTION:
+    - USB Tethering: Creates a full network interface on Windows with its own subnet
+      and assigned IPv4 address.
+    - ADB Reverse Mode: Does not create an OS network interface; it tunnels loopback
+      ports over the Android Debug Bridge USB transport.
+    """
+    all_ifaces = detect_usable_ipv4_addresses()
+    usb_keywords = (
+        "remote ndis",
+        "rndis",
+        "usb ethernet",
+        "apple mobile device ethernet",
+        "usb tethering",
+        "usb",
+    )
+    tethering_ifaces: List[NetworkInterfaceInfo] = []
+    for iface in all_ifaces:
+        name_lower = iface.interface_name.lower()
+        if any(kw in name_lower for kw in usb_keywords):
+            tethering_ifaces.append(iface)
+
+    return tethering_ifaces

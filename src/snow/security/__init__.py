@@ -8,7 +8,13 @@ from snow.security.db import (
     hash_token,
 )
 from snow.security.identity import DeviceIdentity, load_or_create_device_identity
-from snow.security.pairing import PairingManager, PairingOutcome, VerificationResult
+from snow.security.pairing import (
+    PairingManager,
+    PairingOutcome,
+    VerificationResult,
+    create_qr_pairing_payload,
+    validate_qr_pairing_payload,
+)
 from snow.security.policy import (
     ACTION_TO_CAPABILITY,
     CAPABILITY_DESKTOP_APP_LAUNCH,
@@ -48,6 +54,8 @@ __all__ = [
     "SessionManager",
     "SessionRecord",
     "VerificationResult",
+    "create_qr_pairing_payload",
+    "validate_qr_pairing_payload",
     "compute_cert_fingerprint",
     "create_server_ssl_context",
     "ensure_tls_certificate",

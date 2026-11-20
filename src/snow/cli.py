@@ -421,6 +421,230 @@ def run_devices_connect(
 
 
 # =========================================================================
+# Pair Command (Zero-IP-Friction QR Onboarding)
+# =========================================================================
+
+
+def run_pair(qr_only: bool = False, json_output: bool = False) -> int:
+    """Execute 'snow pair [--qr] [--json]' to display pairing credentials and QR code."""
+    bridge = SnowMcpBridge(auto_start_core=False)
+    daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.3))
+
+    if not daemon_online:
+        print("[-] SNOW Core daemon is not currently running.")
+        print("    Pairing requires an active core server to accept and verify PIN handshakes.")
+        print("    Run 'snow daemon start' to launch the background daemon, then retry 'snow pair'.")
+        return 1
+
+    try:
+        res = asyncio.run(bridge.call("generate_pairing_qr"))
+    except Exception as exc:
+        print(f"[-] Failed to communicate with Core daemon IPC: {exc}")
+        return 1
+
+    if not res.get("success"):
+        print(f"[-] Could not generate pairing credentials: {res.get('error', res.get('status'))}")
+        return 1
+
+    payload = res.get("data", {})
+    if json_output:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print("============================================================")
+    print(" SNOW Zero-Friction QR Pairing (Phase 20)")
+    print("============================================================")
+    print(f" Node ID:          {payload.get('id')}")
+    print(f" Candidate IPs:    {', '.join(payload.get('ips', []))}")
+    print(f" WSS Port:         {payload.get('port')}")
+    print(f" Cert Fingerprint: {payload.get('fp')}")
+    print(f" Temporary PIN:    [ {payload.get('pin')} ] (Single-use, 60s window)")
+    print("============================================================")
+
+    try:
+        import io
+        import qrcode
+        qr = qrcode.QRCode(box_size=1, border=1)
+        qr.add_data(json.dumps(payload))
+        qr.make(fit=True)
+        s = io.StringIO()
+        qr.print_ascii(out=s, invert=True)
+        print("\n" + s.getvalue())
+        print("Open the Devices tab on your Android phone and tap 'Scan QR Code'.\n")
+    except Exception as exc:
+        print(f"\n[-] Terminal QR rendering unavailable ({exc}).")
+        print("Use the temporary PIN above or scan this raw JSON payload:")
+        print(json.dumps(payload))
+
+    return 0
+
+
+# =========================================================================
+# USB Command (Zero-Data ADB Reverse Mode)
+# =========================================================================
+
+
+def find_adb_binary() -> Optional[Path]:
+    """Locate the Android Debug Bridge (adb) executable."""
+    found = shutil.which("adb")
+    if found:
+        return Path(found)
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Android" / "Sdk" / "platform-tools" / ("adb.exe" if sys.platform == "win32" else "adb"),
+        Path(os.environ.get("ANDROID_HOME", "")) / "platform-tools" / ("adb.exe" if sys.platform == "win32" else "adb"),
+        Path(os.environ.get("ANDROID_SDK_ROOT", "")) / "platform-tools" / ("adb.exe" if sys.platform == "win32" else "adb"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def get_connected_adb_devices(adb_bin: Path) -> list[dict[str, str]]:
+    """Enumerate connected ADB devices and their authorization status."""
+    devices: list[dict[str, str]] = []
+    try:
+        import subprocess
+        res = subprocess.run(
+            [str(adb_bin), "devices", "-l"],
+            capture_output=True,
+            text=True,
+            timeout=8.0,
+            check=False,
+        )
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("List of devices") or line.startswith("*"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                serial = parts[0]
+                status = parts[1]
+                model = "Android Device"
+                for p in parts[2:]:
+                    if p.startswith("model:"):
+                        model = p.split(":", 1)[1]
+                devices.append({"serial": serial, "status": status, "model": model, "raw": line})
+    except Exception as exc:
+        logger.debug("Failed running adb devices: %s", exc)
+    return devices
+
+
+def run_usb(
+    serial: Optional[str] = None,
+    remove: bool = False,
+    status: bool = False,
+) -> int:
+    """Execute 'snow usb [--serial <ID>] [--remove] [--status]' for zero-data USB reverse mode."""
+    import subprocess
+    adb_bin = find_adb_binary()
+    if not adb_bin:
+        print("[-] ADB (Android Debug Bridge) executable not found.")
+        print("    Ensure Android SDK platform-tools is installed or adb is added to PATH.")
+        return 1
+
+    devices = get_connected_adb_devices(adb_bin)
+    authorized = [d for d in devices if d["status"] == "device"]
+
+    if not authorized:
+        if devices:
+            print(f"[-] Detected {len(devices)} device(s), but none are authorized:")
+            for d in devices:
+                print(f"    - {d['serial']}: {d['status']}")
+            print("    Please unlock your phone and grant 'Always allow USB debugging from this computer'.")
+        else:
+            print("[-] No connected Android devices detected via USB.")
+            print("    Connect your phone via USB cable and ensure USB debugging is enabled.")
+        return 1
+
+    # Select target device
+    target_device = None
+    if serial:
+        for d in authorized:
+            if d["serial"] == serial:
+                target_device = d
+                break
+        if not target_device:
+            print(f"[-] Specified device serial '{serial}' not found among authorized devices:")
+            for d in authorized:
+                print(f"    - {d['serial']} ({d['model']})")
+            return 1
+    else:
+        target_device = authorized[0]
+
+    dev_serial = target_device["serial"]
+    dev_name = f"{target_device['model']} ({dev_serial})"
+
+    if status:
+        res = subprocess.run(
+            [str(adb_bin), "-s", dev_serial, "reverse", "--list"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        print(f"ADB reverse status for device {dev_name}:")
+        mappings = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+        if mappings:
+            for m in mappings:
+                print(f"  {m}")
+        else:
+            print("  No active reverse socket mappings.")
+        return 0
+
+    if remove:
+        r1 = subprocess.run([str(adb_bin), "-s", dev_serial, "reverse", "--remove", "tcp:8765"], capture_output=True, text=True, check=False)
+        r2 = subprocess.run([str(adb_bin), "-s", dev_serial, "reverse", "--remove", "tcp:8766"], capture_output=True, text=True, check=False)
+        print(f"[+] Removed SNOW reverse port mappings from device {dev_name}.")
+        return 0
+
+    # Establish reverse mappings: tcp:8765 (WSS) and tcp:8766 (HTTPS Transfers)
+    res1 = subprocess.run(
+        [str(adb_bin), "-s", dev_serial, "reverse", "tcp:8765", "tcp:8765"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    res2 = subprocess.run(
+        [str(adb_bin), "-s", dev_serial, "reverse", "tcp:8766", "tcp:8766"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if res1.returncode != 0 or res2.returncode != 0:
+        err = (res1.stderr + " " + res2.stderr).strip()
+        print(f"[-] Failed to establish ADB reverse mappings on {dev_name}: {err}")
+        return 1
+
+    # Verify both mappings in reverse --list
+    check = subprocess.run(
+        [str(adb_bin), "-s", dev_serial, "reverse", "--list"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = check.stdout
+    has_8765 = "tcp:8765" in output
+    has_8766 = "tcp:8766" in output
+
+    if has_8765 and has_8766:
+        print("============================================================")
+        print(f"[+] SNOW Zero-Data USB Mode Configured for {dev_name}")
+        print("============================================================")
+        print(" Active ADB Reverse Mappings:")
+        print("  - Phone 127.0.0.1:8765 -> Desktop 127.0.0.1:8765 (WSS WebSocket Core)")
+        print("  - Phone 127.0.0.1:8766 -> Desktop 127.0.0.1:8766 (HTTPS File Transfers)")
+        print("\nNext step on your phone:")
+        print("  Open Devices tab -> Tap 'Connect via USB (Localhost)'.")
+        print("============================================================")
+        return 0
+    else:
+        print(f"[-] Reverse mapping verification failed on {dev_name}.")
+        print(f"    Current mappings: {output.strip()}")
+        return 1
+
+
+# =========================================================================
 # Doctor Command (System Health & Readiness Diagnostics)
 # =========================================================================
 
@@ -799,7 +1023,18 @@ def build_parser() -> argparse.ArgumentParser:
     # 4. status
     subparsers.add_parser("status", help="Inspect live Core daemon and IPC status")
 
-    # 5. daemon
+    # 5. pair (Phase 20 Zero-IP-Friction Onboarding)
+    pair_parser = subparsers.add_parser("pair", help="Generate QR code and temporary PIN for fast mobile onboarding")
+    pair_parser.add_argument("--qr", action="store_true", help="Display compact ASCII QR code (default)")
+    pair_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON payload")
+
+    # 6. usb (Phase 20 Zero-Data Mode)
+    usb_parser = subparsers.add_parser("usb", help="Configure zero-data USB connection via ADB reverse port forwarding")
+    usb_parser.add_argument("--serial", "-s", default=None, help="Specific target Android device ADB serial number")
+    usb_parser.add_argument("--remove", action="store_true", help="Remove SNOW ADB reverse mappings")
+    usb_parser.add_argument("--status", action="store_true", help="Inspect current ADB reverse mappings")
+
+    # 7. daemon
     daemon_parser = subparsers.add_parser("daemon", help="Manage background Core daemon")
     daemon_sub = daemon_parser.add_subparsers(dest="daemon_action", help="Daemon action")
     daemon_sub.add_parser("start", help="Start Core daemon in background")
@@ -854,6 +1089,16 @@ def main(args: Optional[list[str]] = None) -> int:
             return run_devices_list(json_output=json_flag)
     elif parsed.command == "status":
         return run_status()
+    elif parsed.command == "pair":
+        json_flag = getattr(parsed, "json", False)
+        qr_flag = getattr(parsed, "qr", False)
+        return run_pair(qr_only=qr_flag, json_output=json_flag)
+    elif parsed.command == "usb":
+        return run_usb(
+            serial=getattr(parsed, "serial", None),
+            remove=getattr(parsed, "remove", False),
+            status=getattr(parsed, "status", False),
+        )
     elif parsed.command == "daemon":
         if parsed.daemon_action == "start":
             return run_daemon_start()

@@ -2,11 +2,12 @@ package org.snow.network
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.java_websocket.WebSocket
+import org.java_websocket.handshake.ClientHandshake
+import org.java_websocket.server.DefaultSSLWebSocketServerFactory
+import org.java_websocket.server.WebSocketServer
 import org.snow.capabilities.AndroidCapabilityDispatcher
 import org.snow.protocol.ErrorCode
 import org.snow.protocol.JsonSerialization
@@ -15,19 +16,14 @@ import org.snow.protocol.SnowError
 import org.snow.protocol.SnowMessage
 import org.snow.security.SafeLog
 import org.snow.security.TokenStorage
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.SocketException
-import java.util.Collections
+import java.net.InetSocketAddress
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.SSLContext
 
 /**
- * Lightweight, foreground-only TCP/WebSocket server for Android-to-Android peer host mode.
+ * Lightweight RFC 6455 WebSocket peer host server for Android-to-Android and Python-to-Android peer mesh.
  *
  * Security & Lifecycle Invariants:
  * 1. Runs exclusively in the foreground under user control and active Foreground Service.
@@ -36,6 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 4. Dispatches all operations through [AndroidCapabilityDispatcher], strictly enforcing
  *    Android 17 OS execution contracts (BACKGROUND_SAFE vs FOREGROUND_USER_INTERACTION_REQUIRED).
  * 5. Bounded memory and frame sizes (max 64KB per frame).
+ * 6. Supports TLS 1.2+ via [DefaultSSLWebSocketServerFactory].
  */
 class AndroidPeerHostServer(
     val requestedPort: Int = 8767,
@@ -44,24 +41,29 @@ class AndroidPeerHostServer(
     private val localDeviceId: String,
     private val manifestProvider: () -> Map<String, Any?> = { emptyMap() },
     private val peerTokenValidator: ((String) -> Boolean)? = null,
-    private val parentScope: CoroutineScope? = null
+    private val parentScope: CoroutineScope? = null,
+    private val sslContext: SSLContext? = null
 ) {
     companion object {
         private const val TAG = "AndroidPeerHostServer"
         const val MAX_FRAME_SIZE = 65536
     }
 
+    private data class PeerSession(
+        var isAuthenticated: Boolean = false,
+        var peerDeviceId: String? = null,
+        var sessionId: String? = null
+    )
+
     private val isRunning = AtomicBoolean(false)
-    private var serverSocket: ServerSocket? = null
-    private var serverJob: Job? = null
-    private val activeSockets = Collections.synchronizedSet(mutableSetOf<Socket>())
+    private var wsServer: WebSocketServer? = null
     private val serverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     var boundPort: Int = requestedPort
         private set
 
     /**
-     * Start listening for incoming peer connections on the requested port.
+     * Start listening for incoming peer connections on the requested port using RFC 6455 WebSocket protocol.
      */
     @Synchronized
     fun start(): Boolean {
@@ -71,15 +73,49 @@ class AndroidPeerHostServer(
         }
 
         return try {
-            val ss = ServerSocket(requestedPort)
-            serverSocket = ss
-            boundPort = ss.localPort
+            val address = InetSocketAddress(requestedPort)
+            val server = object : WebSocketServer(address) {
+                override fun onStart() {
+                    SafeLog.i(TAG, "WebSocket peer host listening on port $boundPort")
+                }
+
+                override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
+                    conn.setAttachment(PeerSession())
+                    SafeLog.i(TAG, "Inbound peer WebSocket connection opened: ${conn.remoteSocketAddress}")
+                }
+
+                override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
+                    SafeLog.i(TAG, "Peer WebSocket closed: code=$code reason=$reason remote=$remote")
+                }
+
+                override fun onMessage(conn: WebSocket, message: String) {
+                    handleIncomingMessage(conn, message)
+                }
+
+                override fun onError(conn: WebSocket?, ex: Exception?) {
+                    SafeLog.w(TAG, "WebSocket peer host error: ${ex?.message}")
+                }
+            }
+
+            server.isReuseAddr = true
+            server.maxPendingConnections = 10
+            if (sslContext != null) {
+                server.setWebSocketFactory(DefaultSSLWebSocketServerFactory(sslContext))
+            }
+
+            server.start()
+
+            // Wait briefly for port binding if 0 (ephemeral port)
+            var attempts = 0
+            while (server.port <= 0 && attempts < 25) {
+                Thread.sleep(20)
+                attempts++
+            }
+
+            boundPort = if (server.port > 0) server.port else requestedPort
+            wsServer = server
             isRunning.set(true)
             SafeLog.i(TAG, "AndroidPeerHostServer started on port $boundPort")
-
-            serverJob = (parentScope ?: serverScope).launch(Dispatchers.IO) {
-                acceptLoop(ss)
-            }
             true
         } catch (e: Exception) {
             SafeLog.e(TAG, "Failed to start AndroidPeerHostServer on port $requestedPort: ${e.message}", e)
@@ -89,7 +125,7 @@ class AndroidPeerHostServer(
     }
 
     /**
-     * Stop the server socket and disconnect all active peer sessions cleanly.
+     * Stop the WebSocket server and disconnect all active peer sessions cleanly.
      */
     @Synchronized
     fun stop() {
@@ -97,210 +133,160 @@ class AndroidPeerHostServer(
             return
         }
         SafeLog.i(TAG, "Stopping AndroidPeerHostServer on port $boundPort...")
-
-        serverJob?.cancel()
-        serverJob = null
-
         try {
-            serverSocket?.close()
-        } catch (_: Exception) {}
-        serverSocket = null
-
-        synchronized(activeSockets) {
-            for (sock in activeSockets) {
-                try {
-                    sock.close()
-                } catch (_: Exception) {}
-            }
-            activeSockets.clear()
+            wsServer?.stop()
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Error stopping WebSocketServer: ${e.message}")
         }
+        wsServer = null
         SafeLog.i(TAG, "AndroidPeerHostServer stopped cleanly.")
     }
 
-    fun isListening(): Boolean = isRunning.get() && serverSocket != null && !serverSocket!!.isClosed
+    fun isListening(): Boolean = isRunning.get() && wsServer != null
 
-    private suspend fun acceptLoop(ss: ServerSocket) {
-        while (isRunning.get() && !ss.isClosed) {
-            try {
-                val clientSocket = ss.accept()
-                activeSockets.add(clientSocket)
-                (parentScope ?: serverScope).launch(Dispatchers.IO) {
-                    handleClientConnection(clientSocket)
-                }
-            } catch (e: SocketException) {
-                // Expected when serverSocket.close() is called
-                break
-            } catch (e: Exception) {
-                if (isRunning.get()) {
-                    SafeLog.w(TAG, "Error in acceptLoop: ${e.message}")
-                }
-            }
+    private fun handleIncomingMessage(conn: WebSocket, rawMessage: String) {
+        if (rawMessage.length > MAX_FRAME_SIZE) {
+            val err = SnowMessage.createError(
+                code = ErrorCode.OVERSIZED_MESSAGE,
+                message = "Message exceeds maximum size of $MAX_FRAME_SIZE bytes."
+            )
+            conn.send(JsonSerialization.toJson(err))
+            conn.close(1009, "Message too big")
+            return
         }
-    }
 
-    private suspend fun handleClientConnection(socket: Socket) {
-        var isAuthenticated = false
-        var authenticatedPeerId: String? = null
+        val message = try {
+            JsonSerialization.fromJson(rawMessage)
+        } catch (pe: Exception) {
+            val err = SnowMessage.createError(
+                code = ErrorCode.INVALID_JSON,
+                message = "Malformed JSON message: ${pe.message}"
+            )
+            conn.send(JsonSerialization.toJson(err))
+            return
+        }
 
-        try {
-            socket.soTimeout = 30000 // 30s read timeout
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-            val writer = BufferedWriter(OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8))
+        val session = conn.getAttachment<PeerSession>() ?: PeerSession().also { conn.setAttachment(it) }
 
-            while (isRunning.get() && !socket.isClosed) {
-                val line = reader.readLine() ?: break
-                if (line.length > MAX_FRAME_SIZE) {
-                    val err = SnowMessage.createError(
-                        code = ErrorCode.OVERSIZED_MESSAGE,
-                        message = "Message exceeds maximum size of $MAX_FRAME_SIZE bytes."
+        if (message.type == MessageType.HEARTBEAT) {
+            val ack = SnowMessage.createHeartbeatAck(correlationId = message.id)
+            conn.send(JsonSerialization.toJson(ack))
+            return
+        }
+
+        if (message.type != MessageType.REQUEST) {
+            return
+        }
+
+        val action = message.payload?.get("action") as? String
+        @Suppress("UNCHECKED_CAST")
+        val data = message.payload?.get("data") as? Map<String, Any?> ?: emptyMap()
+
+        if (action == "auth_request") {
+            val presentedToken = data["auth_token"] as? String
+            val peerId = data["device_id"] as? String
+
+            val storedToken = tokenStorage.getToken()
+            val isValid = when {
+                storedToken != null && presentedToken != null -> {
+                    MessageDigest.isEqual(
+                        presentedToken.toByteArray(Charsets.UTF_8),
+                        storedToken.toByteArray(Charsets.UTF_8)
                     )
-                    writer.write(JsonSerialization.toJson(err) + "\n")
-                    writer.flush()
-                    break
                 }
+                peerTokenValidator != null && presentedToken != null -> {
+                    peerTokenValidator.invoke(presentedToken)
+                }
+                else -> false
+            }
 
-                val message = try {
-                    JsonSerialization.fromJson(line)
-                } catch (pe: Exception) {
-                    val err = SnowMessage.createError(
-                        code = ErrorCode.INVALID_JSON,
-                        message = "Malformed JSON message: ${pe.message}"
+            if (isValid) {
+                val newSessionId = UUID.randomUUID().toString()
+                session.isAuthenticated = true
+                session.peerDeviceId = peerId
+                session.sessionId = newSessionId
+
+                val resp = SnowMessage.createResponse(
+                    correlationId = message.id,
+                    payload = mapOf(
+                        "status" to "success",
+                        "session_id" to newSessionId,
+                        "device_id" to localDeviceId,
+                        "manifest" to manifestProvider()
                     )
-                    writer.write(JsonSerialization.toJson(err) + "\n")
-                    writer.flush()
-                    continue
+                )
+                conn.send(JsonSerialization.toJson(resp))
+                SafeLog.i(TAG, "Peer authenticated successfully: device_id=$peerId session=$newSessionId")
+            } else {
+                val err = SnowMessage.createError(
+                    code = ErrorCode.UNAUTHORIZED,
+                    message = "Invalid or unverified peer authorization token.",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                conn.close(1008, "Unauthorized")
+                SafeLog.w(TAG, "Peer authentication rejected for device_id=$peerId")
+            }
+        } else if (action == "ping") {
+            val resp = SnowMessage.createResponse(
+                correlationId = message.id,
+                payload = mapOf(
+                    "status" to "success",
+                    "action" to "pong"
+                )
+            )
+            conn.send(JsonSerialization.toJson(resp))
+        } else {
+            if (!session.isAuthenticated) {
+                val err = SnowMessage.createError(
+                    code = ErrorCode.UNAUTHORIZED,
+                    message = "Session not authenticated. Please authenticate first.",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                return
+            }
+
+            if (action == null) {
+                val err = SnowMessage.createError(
+                    code = ErrorCode.INVALID_PAYLOAD,
+                    message = "Missing request action.",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                return
+            }
+
+            (parentScope ?: serverScope).launch(Dispatchers.IO) {
+                val peerHost = conn.remoteSocketAddress?.address?.hostAddress ?: "127.0.0.1"
+                SafeLog.i(TAG, "Dispatching capability: action=$action peer=${session.peerDeviceId}")
+
+                val (resultPayload, error) = try {
+                    dispatcher.dispatch(
+                        action = action,
+                        data = data,
+                        serverHost = peerHost,
+                        defaultTransferPort = 8766
+                    )
+                } catch (e: Exception) {
+                    Pair(null, SnowError(ErrorCode.INTERNAL_ERROR, "Execution failed: ${e.message}"))
                 }
 
-                if (message.type == MessageType.HEARTBEAT) {
-                    val ack = SnowMessage.createHeartbeatAck(correlationId = message.id)
-                    writer.write(JsonSerialization.toJson(ack) + "\n")
-                    writer.flush()
-                    continue
-                }
-
-                if (message.type != MessageType.REQUEST) {
-                    continue
-                }
-
-                val action = message.payload?.get("action") as? String
-                @Suppress("UNCHECKED_CAST")
-                val data = message.payload?.get("data") as? Map<String, Any?> ?: emptyMap()
-
-                if (action == "auth_request") {
-                    val presentedToken = data["auth_token"] as? String
-                    val peerId = data["device_id"] as? String
-
-                    val storedToken = tokenStorage.getToken()
-                    val isValid = when {
-                        storedToken != null && presentedToken != null -> {
-                            java.security.MessageDigest.isEqual(
-                                presentedToken.toByteArray(Charsets.UTF_8),
-                                storedToken.toByteArray(Charsets.UTF_8)
-                            )
-                        }
-                        peerTokenValidator != null && presentedToken != null -> {
-                            peerTokenValidator.invoke(presentedToken)
-                        }
-                        else -> false
-                    }
-
-                    if (isValid) {
-                        isAuthenticated = true
-                        authenticatedPeerId = peerId
-                        val resp = SnowMessage.createResponse(
-                            correlationId = message.id,
-                            payload = mapOf(
-                                "status" to "success",
-                                "session_id" to UUID.randomUUID().toString(),
-                                "device_id" to localDeviceId,
-                                "manifest" to manifestProvider()
-                            )
-                        )
-                        writer.write(JsonSerialization.toJson(resp) + "\n")
-                        writer.flush()
-                        SafeLog.i(TAG, "Peer authenticated successfully: device_id=$peerId")
-                    } else {
-                        val err = SnowMessage.createError(
-                            code = ErrorCode.UNAUTHORIZED,
-                            message = "Invalid or unverified peer authorization token.",
-                            correlationId = message.id
-                        )
-                        writer.write(JsonSerialization.toJson(err) + "\n")
-                        writer.flush()
-                        SafeLog.w(TAG, "Peer authentication rejected for device_id=$peerId")
-                        break
-                    }
-                } else if (action == "ping") {
+                if (error != null) {
+                    val err = SnowMessage.createError(
+                        code = error.code,
+                        message = error.message,
+                        correlationId = message.id
+                    )
+                    conn.send(JsonSerialization.toJson(err))
+                } else {
                     val resp = SnowMessage.createResponse(
                         correlationId = message.id,
-                        payload = mapOf(
-                            "status" to "success",
-                            "action" to "pong"
-                        )
+                        payload = resultPayload ?: mapOf("status" to "success")
                     )
-                    writer.write(JsonSerialization.toJson(resp) + "\n")
-                    writer.flush()
-                } else {
-                    if (!isAuthenticated) {
-                        val err = SnowMessage.createError(
-                            code = ErrorCode.UNAUTHORIZED,
-                            message = "Session not authenticated. Please authenticate first.",
-                            correlationId = message.id
-                        )
-                        writer.write(JsonSerialization.toJson(err) + "\n")
-                        writer.flush()
-                        continue
-                    }
-
-                    if (action == null) {
-                        val err = SnowMessage.createError(
-                            code = ErrorCode.INVALID_PAYLOAD,
-                            message = "Missing request action.",
-                            correlationId = message.id
-                        )
-                        writer.write(JsonSerialization.toJson(err) + "\n")
-                        writer.flush()
-                        continue
-                    }
-
-                    // Dispatch action through AndroidCapabilityDispatcher (which validates execution contract)
-                    SafeLog.i(TAG, "Dispatching capability: action=$action peer=$authenticatedPeerId")
-                    val peerHost = socket.inetAddress?.hostAddress ?: "127.0.0.1"
-                    val (resultPayload, error) = try {
-                        dispatcher.dispatch(
-                            action = action,
-                            data = data,
-                            serverHost = peerHost,
-                            defaultTransferPort = 8766
-                        )
-                    } catch (e: Exception) {
-                        Pair(null, SnowError(ErrorCode.INTERNAL_ERROR, "Execution failed: ${e.message}"))
-                    }
-
-                    if (error != null) {
-                        val err = SnowMessage.createError(
-                            code = error.code,
-                            message = error.message,
-                            correlationId = message.id
-                        )
-                        writer.write(JsonSerialization.toJson(err) + "\n")
-                    } else {
-                        val resp = SnowMessage.createResponse(
-                            correlationId = message.id,
-                            payload = resultPayload ?: mapOf("status" to "success")
-                        )
-                        writer.write(JsonSerialization.toJson(resp) + "\n")
-                    }
-                    writer.flush()
+                    conn.send(JsonSerialization.toJson(resp))
                 }
             }
-        } catch (e: Exception) {
-            SafeLog.i(TAG, "Peer connection ended: ${e.message}")
-        } finally {
-            activeSockets.remove(socket)
-            try {
-                socket.close()
-            } catch (_: Exception) {}
         }
     }
 }

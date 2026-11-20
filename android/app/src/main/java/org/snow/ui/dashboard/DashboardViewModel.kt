@@ -15,6 +15,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     private val repository = SnowUiRepository.getInstance(application)
 
     val connectionState: StateFlow<ConnectionState> = repository.connectionState
+    val connectedEndpoint: StateFlow<String?> = repository.connectedEndpoint
     val authState: StateFlow<AuthState> = repository.authState
     val phoneTelemetry: StateFlow<PhoneTelemetry> = repository.phoneTelemetry
     val pcTelemetry: StateFlow<PcTelemetry> = repository.pcTelemetry

@@ -14,6 +14,7 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     private val repository = SnowUiRepository.getInstance(application)
 
     val connectionState: StateFlow<ConnectionState> = repository.connectionState
+    val connectedEndpoint: StateFlow<String?> = repository.connectedEndpoint
     val authState: StateFlow<AuthState> = repository.authState
     val discoveredPeers: StateFlow<List<DiscoveredPeer>> = repository.discoveredPeers
     val savedDevices: StateFlow<List<SavedDevice>> = repository.savedDevices
@@ -69,5 +70,13 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
 
     fun confirmAndPinCertificate(fingerprint: String) {
         repository.confirmAndPinCertificate(fingerprint)
+    }
+
+    fun connectUsbLocalhost() {
+        repository.connectUsbLocalhost()
+    }
+
+    fun handleQrScanPayload(qrJson: String, onComplete: (Boolean, String?) -> Unit) {
+        repository.handleQrScanPayload(qrJson, onComplete)
     }
 }

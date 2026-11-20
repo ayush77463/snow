@@ -16,6 +16,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import org.snow.R
 import org.snow.databinding.ActivityMainBinding
@@ -243,16 +244,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun observeGlobalState() {
         lifecycleScope.launch {
-            repository.connectionState.collectLatest { state ->
-                renderHeaderStatus(state)
+            combine(repository.connectionState, repository.connectedEndpoint) { state, endpoint ->
+                Pair(state, endpoint)
+            }.collectLatest { (state, endpoint) ->
+                renderHeaderStatus(state, endpoint)
             }
         }
     }
 
-    private fun renderHeaderStatus(state: ConnectionState) {
+    private fun renderHeaderStatus(state: ConnectionState, endpoint: String?) {
+        val cleanEndpoint = endpoint ?: ""
+        val isUsb = cleanEndpoint.startsWith("127.0.0.1") || cleanEndpoint.startsWith("localhost")
         when (state) {
             ConnectionState.CONNECTED -> {
-                binding.headerStatusPill.text = "CONNECTED"
+                binding.headerStatusPill.text = if (isUsb) "CONNECTED • USB" else if (cleanEndpoint.isNotBlank()) "CONNECTED • WI-FI" else "CONNECTED"
                 binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connected))
             }
             ConnectionState.CONNECTING -> {

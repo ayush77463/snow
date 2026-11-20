@@ -19,6 +19,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.snow.R
@@ -314,8 +315,10 @@ class DashboardFragment : Fragment() {
 
     private fun observeViewModel() {
         viewLifecycleOwner.lifecycleScope.launch {
-            viewModel.connectionState.collectLatest { state ->
-                renderConnectionState(state)
+            combine(viewModel.connectionState, viewModel.connectedEndpoint) { state, endpoint ->
+                Pair(state, endpoint)
+            }.collectLatest { (state, endpoint) ->
+                renderConnectionState(state, endpoint)
             }
         }
 
@@ -342,7 +345,9 @@ class DashboardFragment : Fragment() {
                     binding.tvPcBattery.text = if (pc.batteryPercent != null) "${pc.batteryPercent}%" else "AC Power"
                     binding.tvPcCharging.text = if (pc.isCharging == true) "Charging" else if (pc.batteryPercent != null) "Battery" else "Plugged in"
                     if (pc.hostname != null) {
-                        binding.tvHeroPeerName.text = "${pc.hostname} (${pc.os ?: "Windows"})"
+                        val endpoint = viewModel.connectedEndpoint.value ?: ""
+                        val transportSuffix = if (endpoint.startsWith("127.0.0.1") || endpoint.startsWith("localhost")) " • USB" else " • Wi-Fi"
+                        binding.tvHeroPeerName.text = "${pc.hostname} (${pc.os ?: "Windows"})$transportSuffix"
                     }
                     binding.tvPcCpu.text = if (pc.cpuPercent != null) String.format(Locale.getDefault(), "%.1f%%", pc.cpuPercent) else "0.0%"
                     binding.tvPcRam.text = if (pc.memoryPercent != null) String.format(Locale.getDefault(), "%.1f%%", pc.memoryPercent) else "0.0%"
@@ -378,10 +383,12 @@ class DashboardFragment : Fragment() {
         }
     }
 
-    private fun renderConnectionState(state: ConnectionState) {
+    private fun renderConnectionState(state: ConnectionState, endpoint: String?) {
+        val cleanEndpoint = endpoint ?: ""
+        val isUsb = cleanEndpoint.startsWith("127.0.0.1") || cleanEndpoint.startsWith("localhost")
         when (state) {
             ConnectionState.CONNECTED -> {
-                binding.tvHeroStatusPill.text = "CONNECTED"
+                binding.tvHeroStatusPill.text = if (isUsb) "CONNECTED • USB" else if (cleanEndpoint.isNotBlank()) "CONNECTED • WI-FI" else "CONNECTED"
                 binding.tvHeroStatusPill.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
                 binding.btnGotoDevices.visibility = View.GONE
             }

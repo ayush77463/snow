@@ -107,4 +107,16 @@
     <string name="title_peer_host_notice">Android Peer Host</string>
     <string name="desc_peer_host_quarantine">Android Peer Host is currently disabled. Secure TLS/WSS implementation is planned for Phase 20.</string>
     <string name="title_diagnostics">Developer Diagnostics</string>
+
+    <!-- Phase 20 Fast Onboarding & Connectivity Strings -->
+    <string name="title_fast_onboarding">Instant Onboarding</string>
+    <string name="desc_fast_onboarding">Scan desktop QR code for zero-friction setup, or connect over USB after running \'snow usb\' on PC.</string>
+    <string name="btn_scan_qr">Scan QR Code</string>
+    <string name="btn_connect_usb">Connect via USB (Localhost)</string>
+    <string name="title_active_connection">Active Connection</string>
+    <string name="desc_no_active_connection">No active connection. Tap \'Connect via USB\' or \'Scan QR\' above.</string>
+    <string name="status_usb_mode">USB MODE</string>
+    <string name="status_wifi_mode">WI-FI MESH</string>
+    <string name="desc_usb_connected">Connected via USB cable (ADB reverse 127.0.0.1:8765). Zero Wi-Fi latency.</string>
+    <string name="desc_wifi_connected">Connected over local network to %1$s.</string>
 </resources>

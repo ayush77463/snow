@@ -579,6 +579,68 @@ class SnowIpcServer:
                 "error": None if deleted else f"Device [{device_id}] not found in paired database.",
             }, now_authed
 
+        if op == "generate_pairing_qr":
+            cs = self.core_server
+            ws = getattr(cs, "ws_server", None) if cs else None
+            pm = getattr(ws, "pairing_manager", None) if ws else None
+            if not ws or not pm:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "NOT_AVAILABLE",
+                    "error": "Core WebSocket server or pairing manager is not active.",
+                }, now_authed
+
+            pin = pm.generate_pin(display_to_stderr=False)
+            from snow.core.network import get_active_ip_addresses
+            candidate_ips = get_active_ip_addresses()
+
+            cfg = getattr(cs, "config", None)
+            node_id = getattr(cfg, "node_id", "desktop-core")
+            port = getattr(cfg, "port", 8765)
+
+            cert_info = getattr(ws, "certificate_info", None)
+            if not cert_info:
+                from snow.security.tls import (
+                    DEFAULT_CERT_FILE,
+                    DEFAULT_KEY_FILE,
+                    DEFAULT_TLS_DIR,
+                    ensure_tls_certificate,
+                )
+                cert_info = ensure_tls_certificate(
+                    DEFAULT_TLS_DIR / DEFAULT_CERT_FILE,
+                    DEFAULT_TLS_DIR / DEFAULT_KEY_FILE,
+                    active_ips=candidate_ips,
+                )
+
+            fp = cert_info.fingerprint_sha256 if cert_info else ""
+            from snow.security.pairing import create_qr_pairing_payload
+
+            try:
+                qr_payload = create_qr_pairing_payload(
+                    node_id=node_id,
+                    candidate_ips=candidate_ips,
+                    port=port,
+                    cert_fingerprint=fp,
+                    pin=pin,
+                )
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": qr_payload,
+                }, now_authed
+            except Exception as exc:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "ERROR",
+                    "error": str(exc),
+                }, now_authed
+
         return {
             "version": IPC_PROTOCOL_VERSION,
             "request_id": request_id,

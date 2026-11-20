@@ -66,6 +66,12 @@ dependencies {
     // OkHttp WebSocket Client
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // QR Code Scanning (ZXing Embedded)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    // RFC 6455 WebSocket Server with TLS 1.2+ for Android Peer Host Mode
+    implementation("org.java-websocket:Java-WebSocket:1.5.7")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
