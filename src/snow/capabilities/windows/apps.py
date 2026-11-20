@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 import urllib.parse
 
@@ -76,6 +77,29 @@ FORBIDDEN_FILE_EXTENSIONS = {
 }
 
 
+def _is_interactive_window_station() -> bool:
+    """Verify current process is attached to an interactive desktop window station (WinSta0)."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwinsta = user32.GetProcessWindowStation()
+        if not hwinsta:
+            return False
+        # UOI_NAME = 2
+        buf = ctypes.create_unicode_buffer(256)
+        length = ctypes.c_ulong()
+        res = user32.GetUserObjectInformationW(
+            hwinsta, 2, buf, ctypes.sizeof(buf), ctypes.byref(length)
+        )
+        if res and "winsta0" in buf.value.lower():
+            return True
+        return False
+    except Exception:
+        return True
+
+
 class WindowsAppLauncher:
     """Manages secure launching of allowlisted Windows desktop applications and targets."""
 
@@ -89,6 +113,25 @@ class WindowsAppLauncher:
 
     def _resolve_app_executable(self, alias: str) -> Optional[Path]:
         """Resolve the executable path for a given alias from candidates or PATH."""
+        if alias == "wt":
+            # 1. shutil.which("wt.exe") or shutil.which("wt")
+            which_hit = shutil.which("wt.exe") or shutil.which("wt")
+            if which_hit:
+                p = Path(which_hit).resolve()
+                try:
+                    if p.is_file():
+                        return p
+                except Exception:
+                    pass
+            # 2. %LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe
+            candidate = LOCAL_APPDATA / "Microsoft" / "WindowsApps" / "wt.exe"
+            try:
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+            except Exception:
+                pass
+            return None
+
         # 1. Check fixed candidate paths first
         candidates = self._allowlist.get(alias, [])
         for candidate in candidates:
@@ -98,7 +141,7 @@ class WindowsAppLauncher:
             except Exception:
                 continue
 
-        # 2. Check PATH via shutil.which for developer apps (code, wt, powershell, etc.)
+        # 2. Check PATH via shutil.which for developer apps (code, powershell, etc.)
         which_hit = shutil.which(alias)
         if which_hit:
             p = Path(which_hit).resolve()
@@ -140,7 +183,7 @@ class WindowsAppLauncher:
         # 1. Check against strict allowlist first
         if canonical_alias in self._allowlist:
             target_path = self._resolve_app_executable(canonical_alias)
-            if target_path is None:
+            if target_path is None and canonical_alias != "wt":
                 return {
                     "success": False,
                     "status": "APP_NOT_FOUND",
@@ -178,7 +221,63 @@ class WindowsAppLauncher:
                     ),
                 }
 
+        # Check interactive window station for GUI application launches
+        if sys.platform == "win32" and not _is_interactive_window_station():
+            return {
+                "success": False,
+                "status": "NON_INTERACTIVE_SESSION",
+                "error": "Cannot launch graphical desktop applications in a non-interactive Windows session.",
+            }
+
         try:
+            # On Windows, Windows Terminal (wt.exe) is an execution alias that requires
+            # ShellExecute with SW_SHOWNORMAL to attach to the desktop shell properly.
+            if sys.platform == "win32" and canonical_alias == "wt":
+                import ctypes
+                from ctypes import wintypes
+                shell32 = ctypes.windll.shell32
+                shell32.ShellExecuteW.restype = ctypes.c_void_p
+                shell32.ShellExecuteW.argtypes = [
+                    wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                    wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int
+                ]
+                SW_SHOWNORMAL = 1
+                rc = 0
+                wt_path = target_path or self._resolve_app_executable("wt")
+                if wt_path and wt_path.exists():
+                    try:
+                        res = shell32.ShellExecuteW(None, "open", str(wt_path), None, None, SW_SHOWNORMAL)
+                        rc = res if res is not None else 0
+                    except Exception as shell_err:
+                        logger.debug("ShellExecuteW failed for wt path: %s", shell_err)
+                if rc <= 32:
+                    apps_folder_wt = r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+                    try:
+                        res = shell32.ShellExecuteW(None, "open", apps_folder_wt, None, None, SW_SHOWNORMAL)
+                        rc = res if res is not None else 0
+                    except Exception as shell_err:
+                        logger.debug("ShellExecuteW failed for AppsFolder wt: %s", shell_err)
+
+                if rc > 32:
+                    logger.info("Launched Windows Terminal via ShellExecuteW (rc=%d)", rc)
+                    return {
+                        "success": True,
+                        "status": "SUCCESS",
+                        "app_name": "wt",
+                        "pid": 0,
+                        "executable": str(wt_path) if wt_path else "wt",
+                        "message": "Successfully launched Windows Terminal.",
+                    }
+                else:
+                    logger.warning("ShellExecuteW failed for wt (rc=%d)", rc)
+                    return {
+                        "success": False,
+                        "status": "APP_NOT_FOUND" if wt_path is None else "APP_LAUNCH_FAILED",
+                        "error": (
+                            f"Failed launching Windows Terminal via ShellExecuteW (return code {rc})."
+                        ),
+                    }
+
             # Launch via subprocess.Popen with shell=False and no user arguments
             proc = subprocess.Popen(
                 [str(target_path)],

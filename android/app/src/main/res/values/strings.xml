@@ -58,4 +58,53 @@
     <string name="btn_lock_pc">Lock PC</string>
     <string name="btn_run_command">Run Command</string>
     <string name="hint_pc_command">e.g. dir, python --version, hostname</string>
+
+    <!-- Five Tab Navigation -->
+    <string name="tab_dashboard">Dashboard</string>
+    <string name="tab_devices">Devices</string>
+    <string name="tab_files">Files</string>
+    <string name="tab_terminal">Terminal</string>
+    <string name="tab_settings">Settings</string>
+
+    <!-- Stage 19B Specific Strings -->
+    <string name="title_connected_hero">Connected Device</string>
+    <string name="desc_no_connected_device">No active desktop connection. Connect or discover peers in the Devices tab.</string>
+    <string name="btn_goto_devices">Open Devices</string>
+    <string name="title_live_telemetry">Live Device Telemetry</string>
+    <string name="label_phone_battery">Phone Battery</string>
+    <string name="label_pc_battery">PC Battery</string>
+    <string name="label_battery_temp">Battery Temp</string>
+    <string name="label_charging">Charging</string>
+    <string name="label_discharging">Discharging</string>
+    <string name="label_last_updated">Last updated: %s</string>
+    <string name="title_clipboard_bridge">Clipboard</string>
+    <string name="btn_push_clipboard">Push to PC</string>
+    <string name="btn_pull_clipboard">Pull from PC</string>
+    <string name="title_active_transfer">Active Transfer</string>
+    <string name="btn_cancel_transfer">Cancel Transfer</string>
+    <string name="btn_cancel_connection">Cancel</string>
+    <string name="title_discovered_peers">Discovered Peers (UDP)</string>
+    <string name="title_saved_devices">Saved Devices</string>
+    <string name="title_manual_connect">Manual Connection</string>
+    <string name="title_cert_mismatch">Security Warning: Certificate Mismatch</string>
+    <string name="desc_cert_mismatch">The server certificate does not match the pinned security fingerprint for this device. Connection is blocked to prevent interception (MitM attack).</string>
+    <string name="btn_reset_trust">Reset Trust</string>
+    <string name="btn_dismiss">Dismiss</string>
+    <string name="title_remote_files">Remote PC File Explorer</string>
+    <string name="switch_hide_hidden">Hide hidden files</string>
+    <string name="btn_select_download_folder">Choose Download Folder</string>
+    <string name="title_terminal_console">SNOW Terminal Console</string>
+    <string name="btn_execute">Run</string>
+    <string name="btn_cancel_command">Cancel</string>
+    <string name="title_confirm_command">Owner Confirmation Required</string>
+    <string name="btn_authorize_run">Authorize &amp; Run</string>
+    <string name="title_appearance">Appearance</string>
+    <string name="theme_system">System Default</string>
+    <string name="theme_light">Light Mode</string>
+    <string name="theme_dark">Dark Mode</string>
+    <string name="title_device_identity">Device Identity</string>
+    <string name="title_manifest_permissions">Capabilities &amp; Permissions</string>
+    <string name="title_peer_host_notice">Android Peer Host</string>
+    <string name="desc_peer_host_quarantine">Android Peer Host is currently disabled. Secure TLS/WSS implementation is planned for Phase 20.</string>
+    <string name="title_diagnostics">Developer Diagnostics</string>
 </resources>

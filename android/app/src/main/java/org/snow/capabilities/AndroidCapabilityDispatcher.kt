@@ -1,10 +1,16 @@
 package org.snow.capabilities
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.snow.protocol.ErrorCode
 import org.snow.protocol.SnowError
 import org.snow.security.SafeLog
 import org.snow.transfer.FileTransferClient
+import java.io.File
 
 /**
  * Central router dispatching incoming SNOW Device Protocol v1 requests to
@@ -123,12 +129,59 @@ class AndroidCapabilityDispatcher(
                 }
             }
             "clipboard_push" -> {
-                val text = data?.get("text") as? String
-                val res = clipboardHandler.pushClipboard(text)
-                if (res["status"] == "success" || res["success"] == true) {
-                    Pair(res, null)
+                val type = data?.get("type") as? String
+                if (type == "image") {
+                    val transferId = data?.get("transfer_id") as? String
+                    val sha256 = data?.get("sha256") as? String ?: ""
+                    val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: defaultTransferPort
+                    val host = serverHost
+                    val transferClient = transferClientProvider()
+                    if (transferClient != null && transferId != null && host.isNotBlank()) {
+                        val cacheDir = File(context.cacheDir, "clipboard").apply { mkdirs() }
+                        val localFile = File(cacheDir, "clip_${sha256.take(16)}.png")
+                        val dlRes = transferClient.downloadFile(
+                            serverHost = host,
+                            transferPort = transferPort,
+                            transferId = transferId,
+                            destinationFile = localFile,
+                            expectedSha256 = sha256
+                        )
+                        if (dlRes is FileTransferClient.TransferResult.Success) {
+                            try {
+                                val contentUri = FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    dlRes.file
+                                )
+                                withContext(Dispatchers.Main) {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    val clip = ClipData.newUri(context.contentResolver, "Image", contentUri)
+                                    cm.setPrimaryClip(clip)
+                                }
+                                org.snow.ui.SnowUiRepository.getInstance(context).recordIncomingClipboardText(sha256)
+                                SafeLog.i(TAG, "Pushed image to Android clipboard via FileProvider.")
+                                Pair(mapOf("status" to "success", "type" to "image"), null)
+                            } catch (e: Exception) {
+                                SafeLog.e(TAG, "Failed placing image on Android clipboard: ${e.message}", e)
+                                Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Failed setting image clip"))
+                            }
+                        } else {
+                            Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Failed downloading clipboard image"))
+                        }
+                    } else {
+                        Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Transfer client not ready"))
+                    }
                 } else {
-                    Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = res["error"] as? String ?: "Clipboard push failed"))
+                    val text = data?.get("text") as? String
+                    try {
+                        org.snow.ui.SnowUiRepository.getInstance(context).recordIncomingClipboardText(text)
+                    } catch (_: Exception) {}
+                    val res = clipboardHandler.pushClipboard(text)
+                    if (res["status"] == "success" || res["success"] == true) {
+                        Pair(res, null)
+                    } else {
+                        Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = res["error"] as? String ?: "Clipboard push failed"))
+                    }
                 }
             }
             "clipboard_pull" -> {

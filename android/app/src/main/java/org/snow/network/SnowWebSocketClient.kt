@@ -71,6 +71,7 @@ class SnowWebSocketClient(
 ) {
     companion object {
         private const val TAG = "SnowWebSocketClient"
+        const val MAX_CONNECT_RETRIES = 3
     }
 
     private var webSocket: WebSocket? = null
@@ -89,6 +90,10 @@ class SnowWebSocketClient(
 
     private val _authState = MutableStateFlow<AuthState>(AuthState.Disconnected)
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
+
+    fun setAuthenticated(sessionId: String) {
+        _authState.value = AuthState.Authenticated(sessionId)
+    }
 
     private val _logs = MutableSharedFlow<String>(replay = 50, extraBufferCapacity = 100)
     val logs: SharedFlow<String> = _logs.asSharedFlow()
@@ -381,9 +386,18 @@ class SnowWebSocketClient(
             return
         }
 
+        if (backoffPolicy.currentAttempt >= MAX_CONNECT_RETRIES) {
+            log("Maximum connection retries ($MAX_CONNECT_RETRIES) reached. Stopping auto-reconnect.")
+            _connectionState.value = ConnectionState.DISCONNECTED
+            _authState.value = AuthState.AuthFailed("Connection retry limit reached ($MAX_CONNECT_RETRIES attempts).")
+            reconnectJob?.cancel()
+            reconnectJob = null
+            return
+        }
+
         _connectionState.value = ConnectionState.RECONNECTING
         val delayMs = backoffPolicy.nextDelayMs()
-        log("Reconnecting in ${delayMs}ms (attempt #${backoffPolicy.currentAttempt}) ...")
+        log("Reconnecting in ${delayMs}ms (attempt #${backoffPolicy.currentAttempt}/$MAX_CONNECT_RETRIES) ...")
 
         reconnectJob?.cancel()
         reconnectJob = scope.launch {

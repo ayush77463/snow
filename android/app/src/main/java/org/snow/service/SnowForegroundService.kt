@@ -102,6 +102,7 @@ class SnowForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        org.snow.ui.SnowUiRepository.getInstance(applicationContext).bindService(this)
         client.requestDispatcher = { action, data ->
             capabilityDispatcher.dispatch(
                 action = action,
@@ -283,11 +284,22 @@ class SnowForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val pushClipIntent = Intent(this, org.snow.ui.ClipSyncActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val pendingPushClip = PendingIntent.getActivity(
+            this,
+            2,
+            pushClipIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("SNOW Capability Bridge")
             .setContentText(statusText)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentIntent(pendingOpenApp)
+            .addAction(android.R.drawable.ic_menu_send, "Push Clipboard", pendingPushClip)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", pendingDisconnect)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -301,6 +313,7 @@ class SnowForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        org.snow.ui.SnowUiRepository.getInstance(applicationContext).unbindService()
         peerHostManager.disableHostMode()
         stateObserverJob?.cancel()
         stateObserverJob = null

@@ -407,9 +407,13 @@ class WindowsFileManager:
                 try:
                     stat = entry.stat()
                     mod_iso = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+                    is_entry_dir = entry.is_dir()
                     items.append({
                         "name": entry.name,
-                        "type": "directory" if entry.is_dir() else "file",
+                        "path": str(entry.resolve()),
+                        "type": "directory" if is_entry_dir else "file",
+                        "is_dir": is_entry_dir,
+                        "is_directory": is_entry_dir,
                         "size_bytes": stat.st_size if entry.is_file() else 0,
                         "modified_at": mod_iso,
                     })

@@ -1,0 +1,358 @@
+package org.snow.ui.devices
+
+import android.content.Context
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.card.MaterialCardView
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import org.snow.R
+import org.snow.databinding.FragmentDevicesBinding
+import org.snow.network.AuthState
+import org.snow.network.ConnectionState
+import org.snow.network.DiscoveredPeer
+import org.snow.ui.SavedDevice
+
+class DevicesFragment : Fragment() {
+
+    private var _binding: FragmentDevicesBinding? = null
+    private val binding get() = _binding!!
+
+    private val viewModel: DevicesViewModel by activityViewModels()
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
+        _binding = FragmentDevicesBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        try {
+            val prefs = requireContext().getSharedPreferences("snow_connection_prefs", Context.MODE_PRIVATE)
+            val savedHost = prefs.getString("last_host", null)
+            val savedPort = prefs.getString("last_port", null)
+            if (!savedHost.isNullOrBlank()) {
+                binding.etHostIp.setText(savedHost)
+            }
+            if (!savedPort.isNullOrBlank()) {
+                binding.etPort.setText(savedPort)
+            }
+        } catch (_: Exception) {}
+        setupListeners()
+        observeViewModel()
+    }
+
+    private fun setupListeners() {
+        binding.btnConnect.setOnClickListener {
+            val host = binding.etHostIp.text?.toString() ?: ""
+            val portStr = binding.etPort.text?.toString() ?: ""
+
+            val validationErr = viewModel.validateConnectionInput(host, portStr)
+            if (validationErr != null) {
+                binding.tilHostIp.error = validationErr
+                Toast.makeText(requireContext(), validationErr, Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            binding.tilHostIp.error = null
+
+            val cleanHost = host.trim()
+            val port = portStr.trim().toInt()
+            try {
+                requireContext().getSharedPreferences("snow_connection_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .putString("last_host", cleanHost)
+                    .putString("last_port", portStr.trim())
+                    .apply()
+            } catch (_: Exception) {}
+            viewModel.connect(cleanHost, port)
+        }
+
+        binding.btnCancelConnection.setOnClickListener {
+            viewModel.cancelConnection()
+        }
+
+        binding.btnDisconnect.setOnClickListener {
+            viewModel.disconnect()
+        }
+
+        binding.btnPair.setOnClickListener {
+            val pin = binding.etPin.text?.toString() ?: ""
+            if (pin.length != 6) {
+                binding.tilPin.error = "PIN must be 6 digits"
+                return@setOnClickListener
+            }
+            binding.tilPin.error = null
+            viewModel.pairDevice(pin)
+        }
+
+        binding.btnUnpair.setOnClickListener {
+            viewModel.unpairDevice()
+            Toast.makeText(requireContext(), "Device unpaired", Toast.LENGTH_SHORT).show()
+        }
+
+        binding.btnRequestPin.setOnClickListener {
+            Toast.makeText(requireContext(), "Check desktop console for fresh PIN", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun observeViewModel() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.connectionState.collectLatest { state ->
+                renderConnectionState(state)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.authState.collectLatest { auth ->
+                renderAuthState(auth)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.discoveredPeers.collectLatest { peers ->
+                renderDiscoveredPeers(peers)
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.savedDevices.collectLatest { saved ->
+                renderSavedDevices(saved)
+            }
+        }
+    }
+
+    private fun renderConnectionState(state: ConnectionState) {
+        when (state) {
+            ConnectionState.CONNECTED -> {
+                binding.btnConnect.visibility = View.GONE
+                binding.btnCancelConnection.visibility = View.GONE
+                binding.btnDisconnect.visibility = View.VISIBLE
+            }
+            ConnectionState.CONNECTING, ConnectionState.RECONNECTING -> {
+                binding.btnConnect.visibility = View.GONE
+                binding.btnCancelConnection.visibility = View.VISIBLE
+                binding.btnDisconnect.visibility = View.GONE
+            }
+            ConnectionState.DISCONNECTED -> {
+                binding.btnConnect.visibility = View.VISIBLE
+                binding.btnCancelConnection.visibility = View.GONE
+                binding.btnDisconnect.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun renderAuthState(auth: AuthState) {
+        when (auth) {
+            is AuthState.Authenticated -> {
+                binding.tvPairingBadge.text = "PAIRED"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
+                binding.layoutPinInput.visibility = View.GONE
+                binding.layoutPairedControls.visibility = View.VISIBLE
+            }
+            is AuthState.ConnectedUnauthenticated -> {
+                binding.tvPairingBadge.text = "CONNECTED (ENTER PIN)"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connecting))
+                binding.layoutPinInput.visibility = View.VISIBLE
+                binding.layoutPairedControls.visibility = View.GONE
+            }
+            is AuthState.Connecting -> {
+                binding.tvPairingBadge.text = "CONNECTING..."
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connecting))
+                binding.layoutPinInput.visibility = View.GONE
+                binding.layoutPairedControls.visibility = View.GONE
+            }
+            is AuthState.Disconnected -> {
+                binding.tvPairingBadge.text = "DISCONNECTED"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
+                binding.layoutPinInput.visibility = View.GONE
+                binding.layoutPairedControls.visibility = View.GONE
+            }
+            is AuthState.AuthFailed -> {
+                binding.tvPairingBadge.text = "AUTH FAILED: ${auth.reason}"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
+                binding.layoutPinInput.visibility = View.VISIBLE
+                binding.layoutPairedControls.visibility = View.GONE
+            }
+            is AuthState.FingerprintConfirmationRequired -> {
+                binding.tvPairingBadge.text = "CONFIRM CERT"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connecting))
+                binding.layoutPinInput.visibility = View.GONE
+                binding.layoutPairedControls.visibility = View.GONE
+                CertConfirmDialog.show(
+                    context = requireContext(),
+                    fingerprint = auth.fingerprint,
+                    onTrustConfirmed = {
+                        viewModel.confirmAndPinCertificate(auth.fingerprint)
+                    },
+                    onReject = {
+                        viewModel.disconnect()
+                    }
+                )
+            }
+            is AuthState.FingerprintMismatch -> {
+                binding.tvPairingBadge.text = "SECURITY BLOCKED"
+                binding.tvPairingBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
+                binding.layoutPinInput.visibility = View.GONE
+                binding.layoutPairedControls.visibility = View.GONE
+                CertMismatchDialog.show(requireContext(), auth.pinned, auth.presented, onResetTrustConfirmed = {
+                    viewModel.resetTrust()
+                })
+            }
+        }
+    }
+
+    private fun renderDiscoveredPeers(peers: List<DiscoveredPeer>) {
+        binding.containerDiscoveredPeers.removeAllViews()
+        if (peers.isEmpty()) {
+            val emptyTv = TextView(requireContext()).apply {
+                text = "Listening for UDP discovery beacons on port 8768..."
+                textSize = 13f
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+            }
+            binding.containerDiscoveredPeers.addView(emptyTv)
+            return
+        }
+
+        for (peer in peers) {
+            val card = MaterialCardView(requireContext()).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, 0, 0, 8) }
+                radius = 12f
+                cardElevation = 1f
+                setCardBackgroundColor(ContextCompat.getColor(requireContext(), R.color.card_surface))
+                strokeWidth = 1
+                setStrokeColor(ContextCompat.getColor(requireContext(), R.color.card_border))
+            }
+
+            val row = LinearLayout(requireContext()).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(12, 12, 12, 12)
+                gravity = android.view.Gravity.CENTER_VERTICAL
+            }
+
+            val info = LinearLayout(requireContext()).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val title = TextView(requireContext()).apply {
+                text = peer.deviceName
+                textSize = 14f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_text))
+            }
+
+            val sub = TextView(requireContext()).apply {
+                text = "${peer.ipAddress}:${peer.port} • ID: ${peer.deviceId.take(8)}"
+                textSize = 12f
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+            }
+
+            info.addView(title)
+            info.addView(sub)
+
+            val connectBtn = MaterialButton(requireContext(), null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+                text = "Connect"
+                setOnClickListener {
+                    binding.etHostIp.setText(peer.ipAddress)
+                    binding.etPort.setText(peer.port.toString())
+                    viewModel.connect(peer.ipAddress, peer.port)
+                }
+            }
+
+            row.addView(info)
+            row.addView(connectBtn)
+            card.addView(row)
+            binding.containerDiscoveredPeers.addView(card)
+        }
+    }
+
+    private fun renderSavedDevices(saved: List<SavedDevice>) {
+        binding.containerSavedDevices.removeAllViews()
+        if (saved.isEmpty()) {
+            val emptyTv = TextView(requireContext()).apply {
+                text = "No previously paired devices."
+                textSize = 13f
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+            }
+            binding.containerSavedDevices.addView(emptyTv)
+            return
+        }
+
+        for (device in saved) {
+            val card = MaterialCardView(requireContext()).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, 0, 0, 8) }
+                radius = 12f
+                cardElevation = 1f
+                setCardBackgroundColor(ContextCompat.getColor(requireContext(), R.color.card_surface))
+                strokeWidth = 1
+                setStrokeColor(ContextCompat.getColor(requireContext(), R.color.card_border))
+            }
+
+            val row = LinearLayout(requireContext()).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(12, 12, 12, 12)
+                gravity = android.view.Gravity.CENTER_VERTICAL
+            }
+
+            val info = LinearLayout(requireContext()).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+
+            val title = TextView(requireContext()).apply {
+                text = device.deviceName
+                textSize = 14f
+                setTypeface(null, android.graphics.Typeface.BOLD)
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_text))
+            }
+
+            val sub = TextView(requireContext()).apply {
+                text = "${device.host}:${device.port} • ID: ${device.deviceId}"
+                textSize = 12f
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+            }
+
+            info.addView(title)
+            info.addView(sub)
+
+            val reconnectBtn = MaterialButton(requireContext(), null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+                text = "Reconnect"
+                setOnClickListener {
+                    binding.etHostIp.setText(device.host)
+                    binding.etPort.setText(device.port.toString())
+                    viewModel.connect(device.host, device.port)
+                }
+            }
+
+            row.addView(info)
+            row.addView(reconnectBtn)
+            card.addView(row)
+            binding.containerSavedDevices.addView(card)
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        _binding = null
+    }
+}

@@ -392,6 +392,22 @@ class CapabilityEngine:
                 confirmation_ticket=confirmation_ticket,
             )
 
+            # Stage 19A / 19B Two-Step Confirmation Ticket Flow:
+            # If an OWNER_MANUAL caller requests an OWNER_CONFIRMED command without a ticket,
+            # issue a secure single-use confirmation ticket for client-side user approval.
+            if (
+                res.get("status") == "CONFIRMATION_REQUIRED"
+                and ctx
+                and ctx.principal == ExecutionPrincipal.OWNER_MANUAL
+            ):
+                ticket = self.issue_confirmation_ticket(
+                    device_id=ctx.device_id,
+                    command=command.strip(),
+                    ttl_seconds=300.0,
+                )
+                res["confirmation_ticket"] = ticket
+                res["action"] = action
+
             is_ok = res.get("success", False)
             return CapabilityResponse(
                 success=is_ok,

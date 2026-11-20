@@ -323,6 +323,7 @@ class SnowHttpTransferServer:
                     dest_path=dest_path,
                     expected_sha256=record.sha256,
                 )
+                record.file_path = str(dest_path)
                 self.transfer_manager.mark_completed(transfer_id)
                 logger.info("Upload [%s] verified and committed successfully.", transfer_id)
                 return web.json_response({

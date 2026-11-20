@@ -1,15 +1,43 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Base application theme using MaterialComponents Light NoActionBar (Glacier Blue) -->
-    <style name="Theme.SNOW" parent="Theme.MaterialComponents.Light.NoActionBar">
+    <!-- Base application theme using Material 3 DayNight (Glacier Crisp & Obsidian Frost) -->
+    <style name="Theme.SNOW" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Brand Colors -->
         <item name="colorPrimary">@color/primary_blue</item>
-        <item name="colorPrimaryVariant">@color/tertiary_blue</item>
+        <item name="colorOnPrimary">@color/card_surface</item>
+        <item name="colorPrimaryContainer">@color/soft_blue_surface</item>
+        <item name="colorOnPrimaryContainer">@color/primary_blue</item>
+
         <item name="colorSecondary">@color/secondary_cyan</item>
+        <item name="colorOnSecondary">@color/card_surface</item>
+        <item name="colorSecondaryContainer">@color/soft_blue_surface</item>
+        <item name="colorOnSecondaryContainer">@color/primary_text</item>
+
+        <item name="colorSurface">@color/card_surface</item>
+        <item name="colorOnSurface">@color/primary_text</item>
+        <item name="colorSurfaceVariant">@color/app_background</item>
+        <item name="colorOnSurfaceVariant">@color/secondary_text</item>
+        <item name="colorOutline">@color/card_border</item>
+        <item name="colorOutlineVariant">@color/input_border</item>
+
+        <!-- System Bars & Window -->
         <item name="android:windowBackground">@color/app_background</item>
         <item name="android:statusBarColor">@color/app_background</item>
-        <item name="android:windowLightStatusBar">true</item>
         <item name="android:navigationBarColor">@color/app_background</item>
         <item name="android:textColorPrimary">@color/primary_text</item>
         <item name="android:textColorSecondary">@color/secondary_text</item>
+
+        <!-- Bottom Navigation Indicator & Style -->
+        <item name="bottomNavigationStyle">@style/Widget.SNOW.BottomNavigationView</item>
+    </style>
+
+    <style name="Widget.SNOW.BottomNavigationView" parent="Widget.Material3.BottomNavigationView">
+        <item name="itemIconTint">@color/nav_item_color</item>
+        <item name="itemTextColor">@color/nav_item_color</item>
+        <item name="itemActiveIndicatorStyle">@style/Widget.SNOW.BottomNavIndicator</item>
+    </style>
+
+    <style name="Widget.SNOW.BottomNavIndicator" parent="Widget.Material3.BottomNavigationView.ActiveIndicator">
+        <item name="android:color">@color/soft_blue_surface</item>
     </style>
 </resources>

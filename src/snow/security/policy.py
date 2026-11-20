@@ -63,6 +63,7 @@ ACTION_TO_CAPABILITY: dict[str, str] = {
     "desktop_app_launch": CAPABILITY_DESKTOP_APP_LAUNCH,
     "desktop_clipboard_get": CAPABILITY_DESKTOP_CLIPBOARD_READ,
     "desktop_clipboard_set": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "desktop_clipboard_sync_toggle": CAPABILITY_DESKTOP_CLIPBOARD_READ,
     "desktop_file_list": CAPABILITY_DESKTOP_FILES_LIST,
     "desktop_file_stage_download": CAPABILITY_DESKTOP_FILES_DOWNLOAD,
     "file_transfer_offer": CAPABILITY_FILE_TRANSFER,

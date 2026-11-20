@@ -46,4 +46,5 @@
     <color name="log_background">#F8FAFC</color>
     <color name="log_text">#172B4D</color>
     <color name="log_timestamp">#73839A</color>
+    <color name="ic_launcher_background">#0E121E</color>
 </resources>

@@ -43,6 +43,7 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "desktop_battery": "desktop.battery",
     "desktop_clipboard_get": "desktop.clipboard.read",
     "desktop_clipboard_set": "desktop.clipboard.write",
+    "desktop_clipboard_sync_toggle": "desktop.clipboard.read",
     "desktop_file_list": "desktop.file.list",
     "desktop_file_stage_download": "desktop.file.transfer",
     "desktop_app_launch": "desktop.apps.launch",

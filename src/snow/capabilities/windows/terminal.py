@@ -25,6 +25,8 @@ import os
 from pathlib import Path
 import re
 import shlex
+import subprocess
+import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -137,6 +139,89 @@ def get_default_workspace_roots() -> list[Path]:
     except Exception:
         pass
     return roots
+
+
+def check_interactive_repl(command: str) -> Optional[str]:
+    """Check if command is an interactive REPL invocation without execution arguments.
+
+    Returns a friendly error message if it would hang waiting for interactive input,
+    or None if the command includes non-interactive execution arguments.
+    """
+    parts = command.strip().split()
+    if not parts:
+        return None
+    raw_exe = parts[0].lower().replace('"', '').replace("'", "")
+    exe_name = Path(raw_exe).name
+    if exe_name.endswith(".exe"):
+        exe_name = exe_name[:-4]
+
+    repl_names = {"python", "py", "node", "cmd", "powershell", "pwsh"}
+    if exe_name not in repl_names:
+        return None
+
+    args = parts[1:]
+    # Bare command: e.g. 'python', 'py', 'node', 'cmd', 'powershell'
+    if not args:
+        return (
+            f"Interactive REPL '{exe_name}' requires arguments in non-interactive command mode. "
+            f"Try '{exe_name} --version' or '{exe_name} -c \"print(1 + 1)\"'."
+        )
+
+    # For 'python' and 'py', check if flags or scripts are provided
+    if exe_name in ("python", "py"):
+        non_interactive_markers = {"-c", "-m", "-h", "--help", "-v", "-V", "--version", "-W", "-X", "-?", "/?"}
+        has_action = False
+        for a in args:
+            if a in non_interactive_markers:
+                has_action = True
+                break
+            if a.endswith(".py") or a.endswith(".pyw"):
+                has_action = True
+                break
+            # If there's an argument that does not look like a version selector (-3, -3.13) or -i
+            if not a.startswith("-"):
+                has_action = True
+                break
+            elif a not in ("-i", "-3", "-2") and not re.match(r"^-[23](\.\d+)?$", a):
+                has_action = True
+                break
+        if not has_action:
+            return (
+                f"Interactive REPL '{exe_name}' requires arguments in non-interactive command mode. "
+                f"Try '{exe_name} --version' or '{exe_name} -c \"print(1 + 1)\"'."
+            )
+
+    elif exe_name in ("powershell", "pwsh"):
+        non_interactive_markers = {"-command", "-c", "-file", "-f", "-help", "-?", "/?", "-version", "-v"}
+        has_action = any(a.lower() in non_interactive_markers or a.endswith(".ps1") for a in args)
+        if not has_action:
+            return (
+                f"Interactive REPL '{exe_name}' requires arguments in non-interactive command mode. "
+                f"Try '{exe_name} -Command \"Get-Date\"'."
+            )
+
+    elif exe_name == "cmd":
+        non_interactive_markers = {"/c", "/k", "/?"}
+        has_action = any(a.lower() in non_interactive_markers for a in args)
+        if not has_action:
+            return (
+                f"Interactive REPL '{exe_name}' requires arguments in non-interactive command mode. "
+                f"Try 'cmd /c \"echo hello\"'."
+            )
+
+    elif exe_name == "node":
+        non_interactive_markers = {"-e", "--eval", "-p", "--print", "-v", "--version", "-h", "--help"}
+        has_action = any(
+            a in non_interactive_markers or a.endswith(".js") or a.endswith(".mjs") or not a.startswith("-")
+            for a in args
+        )
+        if not has_action:
+            return (
+                f"Interactive REPL '{exe_name}' requires arguments in non-interactive command mode. "
+                f"Try 'node --version' or 'node -e \"console.log(1+1)\"'."
+            )
+
+    return None
 
 
 @dataclass
@@ -462,18 +547,43 @@ class WindowsTerminalExecutor:
                 "working_directory": str(resolved_cwd),
             }
 
+        # 6. Fast-fail guard: Reject bare/interactive REPLs that require input
+        repl_err = check_interactive_repl(command)
+        if repl_err:
+            return {
+                "success": False,
+                "status": "INTERACTIVE_REPL_REJECTED",
+                "tier": tier.value,
+                "error": repl_err,
+                "command": command,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": repl_err,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "timed_out": False,
+                "execution_time_ms": 0.0,
+                "working_directory": str(resolved_cwd),
+            }
+
         effective_timeout = min(float(timeout), self.policy.max_timeout)
         start_time = time.monotonic()
 
-        # 6. Spawn process
+        # 7. Spawn process
         proc = None
         try:
+            extra_kwargs: dict[str, Any] = {}
+            if sys.platform == "win32":
+                extra_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
             # On Windows, create_subprocess_shell uses cmd.exe /c
             proc = await asyncio.create_subprocess_shell(
                 command,
                 cwd=str(resolved_cwd),
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **extra_kwargs,
             )
         except (PermissionError, OSError) as exc:
             elapsed_ms = round((time.monotonic() - start_time) * 1000, 2)
