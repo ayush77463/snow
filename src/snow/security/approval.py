@@ -317,6 +317,14 @@ class ApprovalPolicyEngine:
         if not req:
             return False, "Approval request not found."
 
+        # Strictly enforce that only OWNER_MANUAL can approve requests
+        is_owner = (
+            approver_principal == ExecutionPrincipal.OWNER_MANUAL
+            or (isinstance(approver_principal, str) and approver_principal.upper() == "OWNER_MANUAL")
+        )
+        if not is_owner:
+            return False, "Only OWNER_MANUAL principal is authorized to resolve approvals."
+
         if req.status != ApprovalStatus.PENDING:
             return False, f"Request is not pending (current state: {req.status.value})."
 
@@ -356,6 +364,17 @@ class ApprovalPolicyEngine:
         req = self._requests.get(request_id.strip())
         if not req:
             return False, "Approval request not found."
+
+        # Strictly enforce that only OWNER_MANUAL can deny requests
+        is_owner = (
+            approver_principal == ExecutionPrincipal.OWNER_MANUAL
+            or (isinstance(approver_principal, str) and approver_principal.upper() == "OWNER_MANUAL")
+        )
+        if not is_owner:
+            return False, "Only OWNER_MANUAL principal is authorized to resolve approvals."
+
+        if req.status != ApprovalStatus.PENDING:
+            return False, f"Request is not pending (current state: {req.status.value})."
 
         req.status = ApprovalStatus.DENIED
         approver_str = approver_principal.value if isinstance(approver_principal, ExecutionPrincipal) else str(approver_principal)

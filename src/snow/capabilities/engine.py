@@ -89,6 +89,9 @@ ENGINE_ACTION_MAP: dict[str, str] = {
     "desktop_clipboard_get": CAPABILITY_DESKTOP_CLIPBOARD_READ,
     "windows_clipboard_set": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
     "desktop_clipboard_set": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "android_clipboard_push": "android.clipboard.set",
+    "snow_android_clipboard_push": "android.clipboard.set",
+    "clipboard_push": "android.clipboard.set",
     # Media & Share & Audit (Phase 21)
     "media_control": "media_control",
     "windows_media_control": "media_control",

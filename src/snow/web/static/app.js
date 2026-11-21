@@ -1482,10 +1482,19 @@
         const outputPre = document.getElementById("workflow-output-pre");
         const previewBox = document.getElementById("capture-preview-box");
         const previewImg = document.getElementById("capture-preview-img");
+        const summaryCard = document.getElementById("workflow-summary-card");
+        const captureSummaryBanner = document.getElementById("capture-summary-banner");
+        const captureErrorBox = document.getElementById("capture-error-box");
 
         if (!runBox) return;
 
         runBox.classList.remove("d-none");
+        if (summaryCard) {
+            summaryCard.classList.add("d-none");
+            summaryCard.innerHTML = "";
+        }
+        if (captureSummaryBanner) captureSummaryBanner.textContent = "";
+        if (captureErrorBox) captureErrorBox.classList.add("d-none");
         if (nameDisplay) nameDisplay.textContent = displayName || workflowId;
         if (statusBadge) {
             statusBadge.className = "badge badge-info";
@@ -1531,6 +1540,9 @@
                 statusBadge.textContent = status;
             }
         }
+
+        // Render Consumer-Friendly Summary Card
+        renderConsumerSummaryCard(workflowId, report, summaryCard, captureSummaryBanner, captureErrorBox);
 
         const steps = Array.isArray(report.step_results) ? report.step_results : [];
         let capturedFileName = null;
@@ -1599,11 +1611,190 @@
 
         if (capturedFileName && previewBox && previewImg) {
             previewBox.classList.remove("d-none");
+            previewImg.classList.remove("d-none");
+            if (captureErrorBox) captureErrorBox.classList.add("d-none");
             previewImg.src = `/api/captures/${encodeURIComponent(capturedFileName)}`;
             previewImg.alt = `Screenshot: ${capturedFileName}`;
+            previewImg.onerror = () => {
+                previewImg.classList.add("d-none");
+                if (captureErrorBox) {
+                    captureErrorBox.classList.remove("d-none");
+                    captureErrorBox.textContent = `Failed loading preview for: ${capturedFileName}`;
+                }
+            };
+            previewImg.onload = () => {
+                previewImg.classList.remove("d-none");
+                if (captureErrorBox) captureErrorBox.classList.add("d-none");
+            };
         }
 
         loadApprovalsCount();
+    }
+
+    function renderConsumerSummaryCard(workflowId, report, summaryCard, captureSummaryBanner, captureErrorBox) {
+        if (!report) return;
+        const out = report.final_output || {};
+
+        // 1. Device Health Snapshot
+        if (workflowId === "device_health_snapshot" || out.health_summary) {
+            const health = out.health_summary || {};
+            const win = health.windows || {};
+            const phone = health.phone || {};
+
+            const winCpu = (win.cpu_percent !== undefined && win.cpu_percent !== null) ? `${win.cpu_percent}%` : "Unavailable";
+            let winRam = "Unavailable";
+            if (win.ram_used_mb && win.ram_total_mb) {
+                const usedGb = (win.ram_used_mb / 1024).toFixed(1);
+                const totalGb = (win.ram_total_mb / 1024).toFixed(1);
+                winRam = `${usedGb} GB / ${totalGb} GB (${win.ram_percent || 0}%)`;
+            } else if (win.ram_used_bytes && win.ram_total_bytes) {
+                const usedGb = (win.ram_used_bytes / (1024 ** 3)).toFixed(1);
+                const totalGb = (win.ram_total_bytes / (1024 ** 3)).toFixed(1);
+                winRam = `${usedGb} GB / ${totalGb} GB (${win.ram_percent || 0}%)`;
+            } else if (win.ram_percent !== undefined && win.ram_percent !== null) {
+                winRam = `${win.ram_percent}%`;
+            }
+            const diskVal = (win.disk_percent !== undefined && win.disk_percent !== null) ? win.disk_percent : win.disk_c_percent;
+            const winDisk = (diskVal !== undefined && diskVal !== null) ? `${diskVal}%` : "Available";
+            const winHost = escapeHtml(win.hostname || "Windows Host");
+
+            const phoneName = escapeHtml(phone.device_name || "Android Phone");
+            const phoneBattery = (phone.battery_percent !== undefined && phone.battery_percent !== null) ? `${phone.battery_percent}%` : (phone.is_online ? "Unavailable" : "Offline");
+            const phoneCharging = phone.charging ? "⚡ Charging" : (phone.is_online ? "🔋 Battery Power" : "Disconnected");
+            const phoneTransport = escapeHtml(phone.transport || (phone.is_online ? "Wi-Fi LAN / USB ADB" : "Offline"));
+
+            if (summaryCard) {
+                summaryCard.classList.remove("d-none");
+                summaryCard.innerHTML = `
+                    <div class="device-health-grid">
+                        <div class="device-health-box">
+                            <div class="health-box-header">
+                                <span>💻 Windows Laptop</span>
+                                <span class="badge badge-success">Local Host</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">Hostname:</span>
+                                <span class="health-stat-val">${winHost}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">CPU Usage:</span>
+                                <span class="health-stat-val">${winCpu}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">RAM Usage:</span>
+                                <span class="health-stat-val">${winRam}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">Disk C:</span>
+                                <span class="health-stat-val">${winDisk}</span>
+                            </div>
+                        </div>
+                        <div class="device-health-box">
+                            <div class="health-box-header">
+                                <span>📱 Android Phone</span>
+                                <span class="badge ${phone.is_online ? "badge-success" : "badge-warning"}">${phone.is_online ? "Online" : "Offline"}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">Device:</span>
+                                <span class="health-stat-val">${phoneName}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">Battery Level:</span>
+                                <span class="health-stat-val">${phoneBattery}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">Power State:</span>
+                                <span class="health-stat-val">${phoneCharging}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">Transport:</span>
+                                <span class="health-stat-val">${phoneTransport}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        // 2. Capture PC Screen
+        if (workflowId === "pc_screenshot" || out.capture_summary) {
+            const cap = out.capture_summary || {};
+            const dims = escapeHtml(cap.dimensions || "1920 × 1080");
+            const sizeKb = cap.file_size_bytes ? (cap.file_size_bytes / 1024).toFixed(1) : "N/A";
+            if (captureSummaryBanner) {
+                captureSummaryBanner.innerHTML = `<span>🖥️ <strong>Captured ${dims} · ${sizeKb} KB</strong></span>`;
+            }
+            if (summaryCard) {
+                summaryCard.classList.remove("d-none");
+                summaryCard.innerHTML = `
+                    <div class="d-flex align-items-center justify-content-between">
+                        <div class="clipboard-summary-banner">
+                            <span>🖥️</span>
+                            <span>Captured <strong>${dims}</strong> · ${sizeKb} KB</span>
+                        </div>
+                        <span class="badge badge-success">✓ Captured</span>
+                    </div>
+                `;
+            }
+        }
+
+        // 3. Capture PC → Phone
+        if (workflowId === "capture_pc_to_phone" || out.delivery_summary) {
+            const del = out.delivery_summary || {};
+            const dims = escapeHtml(del.dimensions || "1920 × 1080");
+            const sizeKb = del.file_size_bytes ? (del.file_size_bytes / 1024).toFixed(1) : "N/A";
+            const dest = escapeHtml(del.destination_device || "realme RMX5110");
+            const durationTxt = del.duration_seconds ? ` · took ${del.duration_seconds.toFixed(2)}s` : "";
+            if (captureSummaryBanner) {
+                captureSummaryBanner.innerHTML = `<span>📲 <strong>Captured ${dims} · ${sizeKb} KB · Delivered to ${dest}${durationTxt}</strong></span>`;
+            }
+            if (summaryCard) {
+                summaryCard.classList.remove("d-none");
+                summaryCard.innerHTML = `
+                    <div class="d-flex align-items-center justify-content-between">
+                        <div class="clipboard-summary-banner">
+                            <span>📲</span>
+                            <span>Captured ${dims} (${sizeKb} KB) · Delivered to <strong>${dest}</strong>${durationTxt}</span>
+                        </div>
+                        <span class="badge badge-success">✓ Transferred</span>
+                    </div>
+                `;
+            }
+        }
+
+        // 4. Sync Clipboard & Notify
+        if (workflowId === "share_clipboard_and_notify" || out.sync_summary) {
+            const sync = out.sync_summary || {};
+            const dest = escapeHtml(sync.device_name || "realme RMX5110");
+            if (summaryCard) {
+                summaryCard.classList.remove("d-none");
+                if (sync.is_empty) {
+                    summaryCard.innerHTML = `
+                        <div class="clipboard-summary-banner text-muted">
+                            <span>📋</span>
+                            <span>Clipboard is empty</span>
+                        </div>
+                    `;
+                } else if (sync.status === "SUCCESS") {
+                    summaryCard.innerHTML = `
+                        <div class="d-flex align-items-center justify-content-between">
+                            <div class="clipboard-summary-banner text-success">
+                                <span>📋</span>
+                                <span>Synced <strong>${sync.synced_chars}</strong> characters to <strong>${dest}</strong></span>
+                            </div>
+                            <span class="badge badge-success">✓ Synchronized</span>
+                        </div>
+                    `;
+                } else {
+                    summaryCard.innerHTML = `
+                        <div class="clipboard-summary-banner text-warning">
+                            <span>⚠️</span>
+                            <span>Clipboard synchronization partial: Android peer offline</span>
+                        </div>
+                    `;
+                }
+            }
+        }
     }
 
     // =========================================================================

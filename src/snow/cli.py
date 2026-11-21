@@ -930,7 +930,7 @@ def run_status() -> int:
     print("=" * 60)
     print("SNOW — System Status Overview")
     print("=" * 60)
-    print(f"  Version:           2.0.0")
+    print(f"  Version:           3.0.0")
     print(f"  Daemon Running:    {'YES' if status_data['daemon_running'] else 'NO'}")
     print(f"  IPC Endpoint:      {'READY (online)' if status_data['ipc_ready'] else 'OFFLINE'}")
     if status_data.get("pid"):

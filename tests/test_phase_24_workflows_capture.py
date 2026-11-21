@@ -830,21 +830,45 @@ class TestPhase24Sprint2Repairs(unittest.IsolatedAsyncioTestCase):
             rep1 = await orchestrator.run_workflow("pc_screenshot", ctx=ctx)
             self.assertEqual(rep1.status, "COMPLETED")
             self.assertEqual(len(rep1.step_results), 1)
+            self.assertIn("capture_summary", rep1.final_output)
+            cap_sum = rep1.final_output["capture_summary"]
+            self.assertEqual(cap_sum["dimensions"], "1920 × 1080")
+            self.assertEqual(cap_sum["file_name"], "test.png")
+            self.assertEqual(cap_sum["file_size_bytes"], 1024)
 
         # 2. device_health_snapshot
         rep2 = await orchestrator.run_workflow("device_health_snapshot", ctx=ctx)
         self.assertIn(rep2.status, ("COMPLETED", "PARTIAL"))
         self.assertEqual(len(rep2.step_results), 3)
+        self.assertIn("health_summary", rep2.final_output)
+        health_sum = rep2.final_output["health_summary"]
+        self.assertIn("windows", health_sum)
+        self.assertIn("phone", health_sum)
+        self.assertIsNotNone(health_sum["windows"]["cpu_percent"])
+        self.assertIsNotNone(health_sum["windows"]["ram_total_mb"])
 
         # 3. share_clipboard_and_notify
+        async def _mock_exec_clip(req, ctx=None):
+            if req.action in ("windows_clipboard_get", "desktop_clipboard_get"):
+                return CapabilityResponse(success=True, status="SUCCESS", data={"status": "SUCCESS", "text": "sample", "length": 6})
+            return CapabilityResponse(success=True, status="SUCCESS", data={"status": "SUCCESS"})
+
         with patch.object(
-            engine.clipboard,
-            "get_clipboard",
-            new=AsyncMock(return_value={"success": True, "status": "SUCCESS", "text": "sample", "length": 6}),
+            orchestrator,
+            "_find_connected_android_node",
+            return_value=("mock-phone-id", "Realme Phone", "USB ADB"),
+        ), patch.object(
+            engine,
+            "execute",
+            side_effect=_mock_exec_clip,
         ):
             rep3 = await orchestrator.run_workflow("share_clipboard_and_notify", ctx=ctx)
             self.assertEqual(rep3.status, "COMPLETED")
-            self.assertEqual(len(rep3.step_results), 2)
+            self.assertEqual(len(rep3.step_results), 3)
+            self.assertIn("sync_summary", rep3.final_output)
+            sync_sum = rep3.final_output["sync_summary"]
+            self.assertEqual(sync_sum["synced_chars"], 6)
+            self.assertFalse(sync_sum["is_empty"])
 
         # 4. capture_pc_to_phone
         with patch("snow.capabilities.windows.screenshot.WindowsScreenshotCapture.capture_screen") as mock_cap:
@@ -865,6 +889,67 @@ class TestPhase24Sprint2Repairs(unittest.IsolatedAsyncioTestCase):
             rep4 = await orchestrator.run_workflow("capture_pc_to_phone", ctx=ctx)
             self.assertIn(rep4.status, ("COMPLETED", "PARTIAL"))
             self.assertEqual(len(rep4.step_results), 2)
+            self.assertIn("delivery_summary", rep4.final_output)
+            del_sum = rep4.final_output["delivery_summary"]
+            self.assertEqual(del_sum["dimensions"], "1920 × 1080")
+            self.assertEqual(del_sum["file_name"], "capture_flow.png")
+            self.assertEqual(del_sum["file_size_bytes"], 40)
+
+    async def test_27_workflow_clipboard_empty_skips_remote_push(self):
+        """27. Empty Windows clipboard records clean EMPTY summary and skips remote push."""
+        engine = CapabilityEngine(db_manager=self.db)
+        orchestrator = WorkflowOrchestrator(capability_engine=engine)
+        ctx = ExecutionContext(principal=ExecutionPrincipal.OWNER_MANUAL)
+
+        async def _mock_exec_empty(req, ctx=None):
+            if req.action in ("windows_clipboard_get", "desktop_clipboard_get"):
+                return CapabilityResponse(success=True, status="SUCCESS", data={"status": "SUCCESS", "text": "", "length": 0})
+            return CapabilityResponse(success=True, status="SUCCESS", data={"status": "SUCCESS"})
+
+        mock_execute = AsyncMock(side_effect=_mock_exec_empty)
+        with patch.object(
+            orchestrator,
+            "_find_connected_android_node",
+            return_value=("mock-phone-id", "Realme Phone", "USB ADB"),
+        ), patch.object(
+            engine,
+            "execute",
+            new=mock_execute,
+        ):
+            rep = await orchestrator.run_workflow("share_clipboard_and_notify", ctx=ctx)
+            self.assertEqual(rep.status, "COMPLETED")
+            sync_sum = rep.final_output.get("sync_summary", {})
+            self.assertTrue(sync_sum.get("is_empty"))
+            self.assertEqual(sync_sum.get("synced_chars"), 0)
+            self.assertEqual(sync_sum.get("status"), "EMPTY")
+            # Verify no remote android_clipboard_push request was dispatched to engine
+            for call_args in mock_execute.call_args_list:
+                req_arg = call_args[0][0]
+                self.assertNotEqual(req_arg.action, "android_clipboard_push")
+
+    async def test_28_workflow_clipboard_peer_offline_partial(self):
+        """28. Non-empty clipboard with offline peer returns PARTIAL status."""
+        engine = CapabilityEngine(db_manager=self.db)
+        orchestrator = WorkflowOrchestrator(capability_engine=engine)
+        ctx = ExecutionContext(principal=ExecutionPrincipal.OWNER_MANUAL)
+
+        async def _mock_exec_offline(req, ctx=None):
+            if req.action in ("windows_clipboard_get", "desktop_clipboard_get"):
+                return CapabilityResponse(success=True, status="SUCCESS", data={"status": "SUCCESS", "text": "sensitive", "length": 9})
+            return CapabilityResponse(success=True, status="SUCCESS", data={"status": "SUCCESS"})
+
+        with patch.object(
+            orchestrator,
+            "_find_connected_android_node",
+            return_value=(None, None, None),
+        ), patch.object(
+            engine,
+            "execute",
+            side_effect=_mock_exec_offline,
+        ):
+            rep = await orchestrator.run_workflow("share_clipboard_and_notify", ctx=ctx)
+            self.assertEqual(rep.status, "PARTIAL")
+            self.assertIn("offline", rep.error.lower())
 
 
 if __name__ == "__main__":

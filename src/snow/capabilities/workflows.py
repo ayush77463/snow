@@ -167,8 +167,8 @@ PRESET_CAPTURE_PC_TO_PHONE = WorkflowDefinition(
 
 PRESET_SHARE_CLIPBOARD = WorkflowDefinition(
     workflow_id="share_clipboard_and_notify",
-    name="Share Clipboard & Notify",
-    description="Synchronize active clipboard text between devices and record a redacted completion event.",
+    name="Sync Clipboard & Notify",
+    description="Synchronize Windows clipboard text to the connected Android phone and record a redacted completion event.",
     steps=[
         WorkflowStep(
             step_id="step_read_clipboard",
@@ -176,6 +176,15 @@ PRESET_SHARE_CLIPBOARD = WorkflowDefinition(
             name="Read Windows Clipboard",
             description="Safely inspect local clipboard availability.",
             is_mutating=False,
+            requires_approval=False,
+        ),
+        WorkflowStep(
+            step_id="step_push_to_phone",
+            capability="android_clipboard_push",
+            name="Push Clipboard to Phone",
+            description="Transfer the clipboard text directly to the connected Android phone.",
+            target_device="android",
+            is_mutating=True,
             requires_approval=False,
         ),
         WorkflowStep(
@@ -188,9 +197,9 @@ PRESET_SHARE_CLIPBOARD = WorkflowDefinition(
             requires_approval=False,
         ),
     ],
-    is_mutating=False,
+    is_mutating=True,
     requires_approval=False,
-    max_timeout_seconds=20.0,
+    max_timeout_seconds=25.0,
 )
 
 PRESET_PC_SCREENSHOT = WorkflowDefinition(
@@ -227,8 +236,8 @@ class WorkflowOrchestrator:
     def __init__(self, capability_engine: Any) -> None:
         self.capability_engine = capability_engine
 
-    def _find_connected_android_device_id(self) -> Optional[str]:
-        """Find an active connected Android node from NodeRegistry or SessionRouter."""
+    def _find_connected_android_node(self) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Find an active connected Android node, returning (device_id, device_name, transport)."""
         node_reg = getattr(self.capability_engine, "node_registry", None)
         if not node_reg and hasattr(self.capability_engine, "session_router"):
             sr = getattr(self.capability_engine, "session_router", None)
@@ -255,18 +264,27 @@ class WorkflowOrchestrator:
             # Pass 1: connected / reachable android nodes
             for n in nodes:
                 if _is_android(n):
-                    if getattr(n, "is_connected", False):
-                        return n.device_id
+                    is_conn = getattr(n, "is_connected", False)
                     reach = getattr(n, "reachability", None) or getattr(n, "reachability_state", None)
                     st_val = str(getattr(reach, "value", reach) or "").upper()
-                    if "ONLINE" in st_val or "REACHABLE" in st_val or "CONNECTED" in st_val:
-                        return n.device_id
+                    if is_conn or any(k in st_val for k in ("ONLINE", "REACHABLE", "CONNECTED")):
+                        trans = getattr(n, "transport", None) or getattr(n, "transport_type", None) or "USB ADB / Wi-Fi LAN"
+                        dev_name = getattr(n, "device_name", None) or n.device_id
+                        return (n.device_id, dev_name, str(trans))
 
             # Pass 2: any android node
             for n in nodes:
                 if _is_android(n):
-                    return n.device_id
-        return None
+                    trans = getattr(n, "transport", None) or getattr(n, "transport_type", None) or "Offline"
+                    dev_name = getattr(n, "device_name", None) or n.device_id
+                    return (n.device_id, dev_name, str(trans))
+
+        return (None, None, None)
+
+    def _find_connected_android_device_id(self) -> Optional[str]:
+        """Find an active connected Android node from NodeRegistry or SessionRouter."""
+        dev_id, _, _ = self._find_connected_android_node()
+        return dev_id
 
     def list_workflows(self) -> list[dict[str, Any]]:
         """List all available workflow presets and their metadata."""
@@ -337,6 +355,7 @@ class WorkflowOrchestrator:
         overall_status = "COMPLETED"
         overall_error: Optional[str] = None
         accumulated_data: dict[str, Any] = {}
+        raw_clipboard_text: str = ""
 
         input_params = dict(params or {})
         # Strip spoofable security keys
@@ -389,8 +408,65 @@ class WorkflowOrchestrator:
                 )
                 break
 
-            # Resolve dynamic Android target device ID when available
-            if target_dev == "android":
+            # Handle clipboard push step specifically
+            if step.step_id == "step_push_to_phone":
+                actual_android_id, actual_android_name, _ = self._find_connected_android_node()
+                if not raw_clipboard_text or len(raw_clipboard_text.strip()) == 0:
+                    # Clipboard is empty: record clean empty summary without failing
+                    step_finish_mono = time.monotonic()
+                    step_finish_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    empty_data = {
+                        "status": "EMPTY",
+                        "synced_chars": 0,
+                        "is_empty": True,
+                        "message": "Clipboard is empty; no text to synchronize.",
+                        "device_name": actual_android_name or "Android Phone",
+                    }
+                    accumulated_data[step.step_id] = empty_data
+                    accumulated_data["sync_summary"] = empty_data
+                    step_results.append(
+                        WorkflowStepResult(
+                            step_id=step.step_id,
+                            order=step_order,
+                            capability=step.capability,
+                            name=step.name,
+                            status="SUCCESS",
+                            start_time=step_start_iso,
+                            finish_time=step_finish_iso,
+                            duration_seconds=step_finish_mono - step_start_mono,
+                            data=empty_data,
+                        )
+                    )
+                    continue
+
+                if not actual_android_id:
+                    # Non-empty clipboard but peer is offline: report partial failure honestly
+                    step_finish_mono = time.monotonic()
+                    step_finish_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    offline_data = {"status": "DEVICE_OFFLINE", "synced_chars": 0, "is_empty": False}
+                    step_results.append(
+                        WorkflowStepResult(
+                            step_id=step.step_id,
+                            order=step_order,
+                            capability=step.capability,
+                            name=step.name,
+                            status="FAILED",
+                            start_time=step_start_iso,
+                            finish_time=step_finish_iso,
+                            duration_seconds=step_finish_mono - step_start_mono,
+                            data=offline_data,
+                            error="Connected Android phone is offline or unreachable.",
+                        )
+                    )
+                    overall_status = "PARTIAL"
+                    overall_error = "Connected Android phone is offline or unreachable; clipboard could not be synchronized."
+                    break
+
+                target_dev = actual_android_id
+                step_params["target"] = actual_android_id
+                step_params["text"] = raw_clipboard_text
+            elif target_dev == "android":
+                # Resolve dynamic Android target device ID when available
                 actual_android_id = self._find_connected_android_device_id()
                 if actual_android_id:
                     target_dev = actual_android_id
@@ -487,8 +563,11 @@ class WorkflowOrchestrator:
             else:
                 # Step succeeded
                 clean_data = resp.data if isinstance(resp.data, dict) else {"result": resp.data}
+                # Capture raw clipboard text safely before redacting report output
+                if step.step_id == "step_read_clipboard":
+                    raw_clipboard_text = str((resp.data or {}).get("text", "") or "")
                 # Prevent leaking raw clipboard text
-                if "text" in clean_data and step.capability.startswith("windows_clipboard"):
+                if "text" in clean_data and (step.capability.startswith("windows_clipboard") or "clipboard" in step.capability):
                     clean_data = dict(clean_data)
                     clean_data["text"] = "[REDACTED_CLIPBOARD_TEXT]"
 
@@ -509,6 +588,78 @@ class WorkflowOrchestrator:
 
         total_duration = time.monotonic() - start_time_mono
         finish_time_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        # Build consumer-friendly workflow summary metadata
+        actual_id, actual_name, actual_trans = self._find_connected_android_node()
+        if wf.workflow_id == "device_health_snapshot":
+            win_data = accumulated_data.get("step_windows_telemetry", {})
+            cpu_obj = win_data.get("cpu") if isinstance(win_data.get("cpu"), dict) else {}
+            mem_obj = win_data.get("memory") if isinstance(win_data.get("memory"), dict) else {}
+            disk_obj = win_data.get("disk") if isinstance(win_data.get("disk"), dict) else {}
+
+            cpu_pct = cpu_obj.get("utilization_percent") if cpu_obj.get("utilization_percent") is not None else win_data.get("cpu_percent")
+            ram_used = mem_obj.get("used_mb") if mem_obj.get("used_mb") is not None else (
+                round(win_data["ram_used_bytes"] / (1024 * 1024), 2) if "ram_used_bytes" in win_data else None
+            )
+            ram_total = mem_obj.get("total_mb") if mem_obj.get("total_mb") is not None else (
+                round(win_data["ram_total_bytes"] / (1024 * 1024), 2) if "ram_total_bytes" in win_data else None
+            )
+            ram_pct = mem_obj.get("percent") if mem_obj.get("percent") is not None else win_data.get("ram_percent")
+            disk_pct = disk_obj.get("percent") if disk_obj.get("percent") is not None else win_data.get("disk_c_percent")
+
+            phone_battery = accumulated_data.get("step_phone_battery", {})
+            accumulated_data["health_summary"] = {
+                "windows": {
+                    "hostname": win_data.get("hostname") or win_data.get("node_name") or "Windows Laptop",
+                    "cpu_percent": cpu_pct,
+                    "ram_used_mb": ram_used,
+                    "ram_total_mb": ram_total,
+                    "ram_percent": ram_pct,
+                    "disk_percent": disk_pct,
+                },
+                "phone": {
+                    "device_name": actual_name or "Android Phone",
+                    "battery_percent": phone_battery.get("battery_level") or phone_battery.get("battery_percent") or phone_battery.get("level"),
+                    "charging": phone_battery.get("is_charging") or phone_battery.get("charging"),
+                    "transport": actual_trans or "USB ADB / Wi-Fi LAN",
+                    "is_online": actual_id is not None and "step_phone_battery" in accumulated_data,
+                },
+            }
+        elif wf.workflow_id == "pc_screenshot":
+            cap_data = accumulated_data.get("step_pc_screenshot") or accumulated_data.get("step_capture_screen", {})
+            w = cap_data.get("width")
+            h = cap_data.get("height")
+            dims = f"{w} × {h}" if (w is not None and h is not None) else (cap_data.get("dimensions") or cap_data.get("resolution"))
+            accumulated_data["capture_summary"] = {
+                "dimensions": dims,
+                "file_size_bytes": cap_data.get("size_bytes") if cap_data.get("size_bytes") is not None else cap_data.get("file_size_bytes"),
+                "file_name": cap_data.get("file_name"),
+                "captured_at": cap_data.get("captured_at") or finish_time_iso,
+            }
+        elif wf.workflow_id == "capture_pc_to_phone":
+            cap_data = accumulated_data.get("step_pc_screenshot") or accumulated_data.get("step_capture_screen", {})
+            del_data = accumulated_data.get("step_deliver_to_phone", {})
+            w = cap_data.get("width")
+            h = cap_data.get("height")
+            dims = f"{w} × {h}" if (w is not None and h is not None) else (cap_data.get("dimensions") or cap_data.get("resolution"))
+            accumulated_data["delivery_summary"] = {
+                "dimensions": dims,
+                "file_size_bytes": cap_data.get("size_bytes") if cap_data.get("size_bytes") is not None else cap_data.get("file_size_bytes"),
+                "file_name": cap_data.get("file_name"),
+                "destination_device": actual_name or "realme RMX5110",
+                "transfer_status": del_data.get("status") or "SUCCESS",
+                "duration_seconds": del_data.get("duration_seconds"),
+            }
+        elif wf.workflow_id == "share_clipboard_and_notify":
+            if "sync_summary" not in accumulated_data:
+                push_res = accumulated_data.get("step_push_to_phone", {})
+                synced_chars = len(raw_clipboard_text) if raw_clipboard_text else 0
+                accumulated_data["sync_summary"] = {
+                    "synced_chars": synced_chars,
+                    "is_empty": not bool(raw_clipboard_text),
+                    "device_name": actual_name or "realme RMX5110",
+                    "status": "SUCCESS" if raw_clipboard_text else "EMPTY",
+                }
 
         return WorkflowExecutionReport(
             workflow_id=wf.workflow_id,

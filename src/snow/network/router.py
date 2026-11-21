@@ -55,6 +55,8 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "snow_android_battery_status": "android.telemetry.get",
     "android_clipboard_get": "android.clipboard.get",
     "android_clipboard_set": "android.clipboard.set",
+    "android_clipboard_push": "android.clipboard.set",
+    "snow_android_clipboard_push": "android.clipboard.set",
     "android_notification": "android.notification.post",
     "android_sms_send": "android.telephony.sms",
     "android_torch": "android.hardware.flashlight",

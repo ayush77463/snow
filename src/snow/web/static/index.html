@@ -154,15 +154,23 @@
                                     <h4 id="workflow-name-display">Workflow Execution</h4>
                                     <span id="workflow-status-badge" class="badge badge-info">RUNNING</span>
                                 </div>
-                                <div id="workflow-steps-list" class="workflow-steps mt-2"></div>
-                                <div id="workflow-output-box" class="code-box mt-3 d-none">
-                                    <pre id="workflow-output-pre"></pre>
-                                </div>
+                                <div id="workflow-summary-card" class="workflow-summary-card mt-3 d-none"></div>
+                                <div id="workflow-steps-list" class="workflow-steps mt-3"></div>
                                 <div id="capture-preview-box" class="mt-3 d-none">
+                                    <div id="capture-summary-banner" class="capture-summary-banner mb-2"></div>
                                     <h4>Screenshot Preview</h4>
                                     <div class="preview-img-wrapper mt-2">
-                                        <img id="capture-preview-img" src="" alt="Capture Preview" style="max-width: 100%; border-radius: 6px; border: 1px solid var(--border);" />
+                                        <img id="capture-preview-img" src="" alt="Capture Preview" style="max-width: 100%; border-radius: 6px; border: 1px solid var(--border-color);" />
                                     </div>
+                                    <div id="capture-error-box" class="empty-state text-danger mt-2 d-none">Failed loading preview image.</div>
+                                </div>
+                                <div id="workflow-output-box" class="mt-3 d-none">
+                                    <details class="workflow-technical-details">
+                                        <summary class="workflow-tech-summary">View Technical JSON</summary>
+                                        <div class="code-box mt-2">
+                                            <pre id="workflow-output-pre"></pre>
+                                        </div>
+                                    </details>
                                 </div>
                             </div>
                         </div>
