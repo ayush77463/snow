@@ -291,3 +291,7 @@ def validate_raw_message(
         payload=payload if isinstance(payload, dict) else None,
         error=error_data if isinstance(error_data, dict) else None,
     )
+
+
+# Alias for convenience
+validate_message = validate_raw_message

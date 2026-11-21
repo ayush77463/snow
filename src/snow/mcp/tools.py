@@ -528,8 +528,8 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         ),
     )
     async def snow_android_file_list(subpath: str = "", device_id: str = "") -> str:
-        """List files in Android SAF-granted folder."""
-        result = await bridge.android_file_list(subpath=subpath, device_id=device_id)
+        """List files in Android SAF-granted folder (strictly scoped to SAF for AI callers)."""
+        result = await bridge.android_file_list(subpath=subpath, device_id=device_id, scope="saf")
         if not result.get("success", False):
             return json.dumps({
                 "success": False,

@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Optional Phase 22 Full Shared Storage Access (All Files Access) -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <!-- Android 14+ (API 34+) connectedDevice FGS prerequisite:
          Starting a Foreground Service with type "connectedDevice" strictly requires
          at least one qualifying permission (e.g. CHANGE_NETWORK_STATE, CHANGE_WIFI_MULTICAST_STATE,

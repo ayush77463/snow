@@ -411,11 +411,24 @@ class SnowIpcServer:
             }, False
 
         # 4. Handle operations
-        # Anti-spoofing: All IPC callers are strictly stamped with AI_MCP principal
+        owner_token = payload.pop("owner_token", None) or request.get("owner_token")
+        expected_owner_token = hmac.new(
+            self._secret.encode("utf-8"), b"SNOW_OWNER_AUTHORIZATION", hashlib.sha256
+        ).hexdigest()
+        is_owner = bool(
+            owner_token
+            and isinstance(owner_token, str)
+            and hmac.compare_digest(owner_token, expected_owner_token)
+        )
+        # Anti-spoofing: strip caller-supplied principal and trust tier overrides
         payload.pop("principal", None)
         payload.pop("trust_tier", None)
         payload.pop("execution_principal", None)
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+
+        if is_owner:
+            ctx = ExecutionContext(principal=ExecutionPrincipal.OWNER_MANUAL, origin="trusted_owner_ipc")
+        else:
+            ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
 
         if op == "ping":
             return {
@@ -456,7 +469,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "device_request":
-            dev_resp = await self._handle_device_request(payload)
+            dev_resp = await self._handle_device_request(payload, ctx=ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -612,11 +625,24 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "android_file_list":
+            requested_scope = payload.get("scope", "saf")
+            # Enforce caller-specific storage scopes: AI_MCP is strictly locked to saf
+            if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                effective_scope = "saf"
+                show_hidden = False
+            else:
+                effective_scope = "full" if requested_scope == "full" else "saf"
+                show_hidden = bool(payload.get("show_hidden", False))
+
             dev_resp = await self._handle_device_request({
                 "device_id": payload.get("device_id"),
                 "action": "file_list",
-                "data": {"subpath": payload.get("subpath", "")},
-            })
+                "data": {
+                    "subpath": payload.get("subpath", ""),
+                    "scope": effective_scope,
+                    "show_hidden": show_hidden,
+                },
+            }, ctx=ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -638,7 +664,7 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "android_file_receive":
-            res = await self._handle_android_file_receive(payload)
+            res = await self._handle_android_file_receive(payload, ctx=ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -926,7 +952,7 @@ class SnowIpcServer:
 
         return results
 
-    async def _handle_device_request(self, payload: dict) -> dict:
+    async def _handle_device_request(self, payload: dict, ctx: Optional[ExecutionContext] = None) -> dict:
         """Route a request action to a connected, authenticated Android device."""
         device_id = payload.get("device_id")
         action = payload.get("action")
@@ -1012,6 +1038,7 @@ class SnowIpcServer:
                 action=action,
                 target=device_id,
                 data=data,
+                ctx=ctx,
                 timeout=timeout,
             )
 
@@ -1378,7 +1405,7 @@ class SnowIpcServer:
             cs.transfer_manager.fail_transfer(record.transfer_id, str(exc))
             return {"success": False, "status": "INTERNAL_ERROR", "error": f"Error dispatching file transfer: {exc}"}
 
-    async def _handle_android_file_receive(self, payload: dict) -> dict:
+    async def _handle_android_file_receive(self, payload: dict, ctx: Optional[ExecutionContext] = None) -> dict:
         """Coordinate requesting a file from an Android phone and uploading to Desktop."""
         cs = self.core_server
         device_id = payload.get("device_id")
@@ -1442,9 +1469,11 @@ class SnowIpcServer:
         )
 
         subpath = payload.get("subpath") or ""
+        scope = payload.get("scope", "full") if (ctx and ctx.principal == ExecutionPrincipal.OWNER_MANUAL) else "saf"
         req_data = {
             "file_name": clean_name,
             "transfer_port": transfer_port,
+            "scope": scope,
         }
         if subpath:
             req_data["subpath"] = subpath
@@ -1463,6 +1492,7 @@ class SnowIpcServer:
                 action="file_receive_request",
                 target=device_id,
                 data=req_data,
+                ctx=ctx,
                 timeout=timeout,
             )
             if route_res.get("success"):

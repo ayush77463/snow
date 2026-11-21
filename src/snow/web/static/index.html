@@ -220,15 +220,32 @@
                 <section id="section-files" class="tab-pane">
                     <div class="section-toolbar">
                         <div>
-                            <h2>SAF Storage Browser</h2>
-                            <p class="text-sm text-muted">Browse and download files from Android's user-granted Storage Access Framework folder.</p>
+                            <div class="files-title-row">
+                                <h2>Phone Storage Explorer</h2>
+                                <span id="files-storage-badge" class="badge badge-muted">Checking Storage...</span>
+                            </div>
+                            <p class="text-sm text-muted">Browse and download files from your phone's accessible storage (Full Shared Storage or SAF folder).</p>
                         </div>
                         <div class="toolbar-actions">
                             <select id="files-device-select" class="form-select">
                                 <option value="">Select target Android device...</option>
                             </select>
-                            <button id="btn-refresh-files" class="btn-secondary">Refresh Files</button>
+                            <label class="toggle-hidden-label" title="Show hidden files and folders (.dotfiles)">
+                                <input type="checkbox" id="chk-show-hidden"> Hidden files
+                            </label>
+                            <button id="btn-refresh-files" class="btn-secondary">Refresh</button>
                         </div>
+                    </div>
+
+                    <!-- Quick Navigation Chips (Phase 22) -->
+                    <div class="quick-nav-chips mt-2" id="quick-nav-chips">
+                        <button class="chip-btn" data-chip="">📁 Root</button>
+                        <button class="chip-btn" data-chip="Download">📥 Download</button>
+                        <button class="chip-btn" data-chip="DCIM">📷 DCIM</button>
+                        <button class="chip-btn" data-chip="Documents">📄 Documents</button>
+                        <button class="chip-btn" data-chip="Pictures">🖼 Pictures</button>
+                        <button class="chip-btn" data-chip="Music">🎵 Music</button>
+                        <button class="chip-btn" data-chip="Movies">🎬 Movies</button>
                     </div>
 
                     <div class="breadcrumbs-bar mt-2" id="files-breadcrumbs">

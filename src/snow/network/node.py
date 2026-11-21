@@ -40,6 +40,8 @@ class ReachabilityState(StrEnum):
     LAN_DISCOVERABLE = "LAN_DISCOVERABLE"        # Discovered via UDP beacon, socket not yet open
     LAST_KNOWN_IP_DIRECT = "LAST_KNOWN_IP_DIRECT"# Socket closed, last-known IP cached
     ONLINE_ROUTED = "ONLINE_ROUTED"              # Reachable through an authenticated peer relay node
+    ONLINE_RELAYED = "ONLINE_RELAYED"            # Reachable through dedicated remote E2E relay tunnel
+    DORMANT_RELAY = "DORMANT_RELAY"              # Known to remote relay but socket inactive
     UNREACHABLE_OFFLINE = "UNREACHABLE_OFFLINE"  # No socket and no beacon received for > 30s
 
     # Architectural aliases from docs/ARCHITECTURE_V2.md

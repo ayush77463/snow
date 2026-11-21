@@ -22,6 +22,8 @@ enum class ReachabilityState {
     LAN_DISCOVERABLE,
     LAST_KNOWN_IP_DIRECT,
     ONLINE_ROUTED,
+    ONLINE_RELAYED,
+    DORMANT_RELAY,
     UNREACHABLE_OFFLINE
 }
 

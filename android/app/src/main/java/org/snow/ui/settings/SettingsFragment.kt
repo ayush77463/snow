@@ -3,7 +3,10 @@ package org.snow.ui.settings
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.Settings
 import android.view.LayoutInflater
 import android.view.View
@@ -41,6 +44,7 @@ class SettingsFragment : Fragment() {
         setupThemeSelection()
         setupDeviceIdentity()
         setupNotificationSyncAccess()
+        refreshStorageAccessStatus()
         setupTrustControls()
         setupDiagnostics()
         observeLogs()
@@ -49,6 +53,55 @@ class SettingsFragment : Fragment() {
     override fun onResume() {
         super.onResume()
         refreshNotificationAccessStatus()
+        refreshStorageAccessStatus()
+    }
+
+    fun isAllFilesAccessGranted(): Boolean {
+        return context?.let { isAllFilesAccessGranted(it) } ?: false
+    }
+
+    fun refreshStorageAccessStatus() {
+        if (_binding == null) return
+        val granted = isAllFilesAccessGranted()
+        if (granted) {
+            binding.tvStorageAccessStatus.text = "Status: Granted — Shared Storage"
+            binding.tvStorageAccessStatus.setTextColor(
+                ContextCompat.getColor(requireContext(), R.color.status_connected)
+            )
+            binding.btnGrantStorageAccess.text = "Manage All Files Access"
+            binding.btnGrantStorageAccess.setOnClickListener {
+                openManageAllFilesAccessSettings()
+            }
+        } else {
+            binding.tvStorageAccessStatus.text = "Status: Not Granted — SAF Folder Only"
+            binding.tvStorageAccessStatus.setTextColor(
+                ContextCompat.getColor(requireContext(), R.color.secondary_text)
+            )
+            binding.btnGrantStorageAccess.text = "Grant All Files Access"
+            binding.btnGrantStorageAccess.setOnClickListener {
+                openManageAllFilesAccessSettings()
+            }
+        }
+    }
+
+    fun openManageAllFilesAccessSettings(): Intent {
+        val intent = createManageAllFilesAccessIntent(requireContext())
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            // Fallback to generic storage settings if package URI is unresolvable on some OEMs
+            val fallback = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+            try {
+                startActivity(fallback)
+            } catch (fe: Exception) {
+                Toast.makeText(
+                    context,
+                    "Unable to open All Files Access settings: ${fe.message}",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+        return intent
     }
 
     fun isNotificationServiceEnabled(): Boolean {
@@ -100,6 +153,25 @@ class SettingsFragment : Fragment() {
     companion object {
         fun createNotificationListenerSettingsIntent(): Intent {
             return Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+        }
+
+        fun createManageAllFilesAccessIntent(ctx: Context): Intent {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:${ctx.packageName}")
+                )
+            } else {
+                Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+            }
+        }
+
+        fun isAllFilesAccessGranted(ctx: Context): Boolean {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                false
+            }
         }
 
         fun isNotificationServiceEnabled(ctx: Context): Boolean {

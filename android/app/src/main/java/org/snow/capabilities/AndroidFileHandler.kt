@@ -23,6 +23,12 @@ class AndroidFileHandler(
 ) {
     companion object {
         private const val TAG = "AndroidFileHandler"
+
+        fun isPathContained(candidate: File, root: File): Boolean {
+            val candPath = candidate.canonicalPath
+            val rootPath = root.canonicalPath
+            return candPath == rootPath || candPath.startsWith(rootPath + File.separator)
+        }
     }
 
     /**
@@ -151,8 +157,55 @@ class AndroidFileHandler(
             return@withContext mapOf("status" to "error", "error" to "FileTransferClient not initialized.")
         }
 
-        // 1. First resolve from user-configured SAF DocumentFile tree
+        val requestedScope = data["scope"] as? String
+        val principal = data["principal"] as? String ?: "AI_MCP"
         val subpath = data["subpath"] as? String
+
+        val isFullStorageEligible = isAllFilesAccessGranted() && principal == "OWNER_MANUAL" && requestedScope != "saf"
+
+        // 1. If eligible, resolve from full shared internal storage
+        if (isFullStorageEligible) {
+            val sharedFile = resolveSharedStorageFile(subpath, safeFileName)
+            if (sharedFile != null && sharedFile.exists() && sharedFile.isFile) {
+                SafeLog.i(TAG, "Uploading full storage file '$safeFileName' (${sharedFile.length()} bytes) to desktop core...")
+                val result = client.uploadFile(
+                    serverHost = serverHost,
+                    transferPort = transferPort,
+                    file = sharedFile
+                )
+                return@withContext when (result) {
+                    is FileTransferClient.TransferResult.Success -> {
+                        SafeLog.i(TAG, "Full storage upload successful: ${sharedFile.name} (sha256=${result.sha256})")
+                        mapOf(
+                            "status" to "success",
+                            "transfer_id" to result.transferId,
+                            "file_name" to sharedFile.name,
+                            "bytes_uploaded" to sharedFile.length(),
+                            "sha256" to result.sha256
+                        )
+                    }
+                    is FileTransferClient.TransferResult.Duplicate -> {
+                        mapOf(
+                            "status" to "success",
+                            "file_name" to sharedFile.name,
+                            "bytes_uploaded" to sharedFile.length(),
+                            "sha256" to result.sha256,
+                            "message" to "File already exists on desktop core with matching SHA-256."
+                        )
+                    }
+                    is FileTransferClient.TransferResult.Error -> {
+                        SafeLog.e(TAG, "Full storage upload failed: ${result.message}")
+                        mapOf(
+                            "status" to "error",
+                            "transfer_id" to result.transferId,
+                            "error" to result.message
+                        )
+                    }
+                }
+            }
+        }
+
+        // 2. Resolve from user-configured SAF DocumentFile tree
         val safDoc = resolveSafDocument(subpath, safeFileName)
         if (safDoc != null && safDoc.exists() && safDoc.isFile) {
             SafeLog.i(TAG, "Uploading SAF file '$safeFileName' (${safDoc.length()} bytes) to desktop core...")
@@ -194,66 +247,177 @@ class AndroidFileHandler(
             }
         }
 
-        // 2. Documented fallback: app-specific transfers directory
-        val transferDir = getTransfersDirectory()
-        val localFile = File(transferDir, safeFileName)
-
-        if (!localFile.exists() || !localFile.isFile) {
-            SafeLog.w(TAG, "Requested file '$safeFileName' not found in SAF tree or ${transferDir.absolutePath}")
-            return@withContext mapOf(
-                "status" to "error",
-                "error" to "File '$safeFileName' does not exist in Android SAF storage or transfer directory."
-            )
-        }
-
-        SafeLog.i(TAG, "Uploading fallback file '$safeFileName' (${localFile.length()} bytes) to desktop core...")
-        val result = client.uploadFile(
-            serverHost = serverHost,
-            transferPort = transferPort,
-            file = localFile
+        SafeLog.w(TAG, "Requested file '$safeFileName' not found in accessible storage.")
+        return@withContext mapOf(
+            "status" to "error",
+            "error" to "FILE_NOT_FOUND",
+            "message" to "File '$safeFileName' does not exist in Android shared storage or SAF folder."
         )
+    }
 
-        when (result) {
-            is FileTransferClient.TransferResult.Success -> {
-                SafeLog.i(TAG, "Upload successful: ${localFile.name} (sha256=${result.sha256})")
-                mapOf(
-                    "status" to "success",
-                    "transfer_id" to result.transferId,
-                    "file_name" to localFile.name,
-                    "bytes_uploaded" to localFile.length(),
-                    "sha256" to result.sha256
-                )
-            }
-            is FileTransferClient.TransferResult.Duplicate -> {
-                mapOf(
-                    "status" to "success",
-                    "file_name" to localFile.name,
-                    "bytes_uploaded" to localFile.length(),
-                    "sha256" to result.sha256,
-                    "message" to "File already exists on desktop core with matching SHA-256."
-                )
-            }
-            is FileTransferClient.TransferResult.Error -> {
-                SafeLog.e(TAG, "Upload failed: ${result.message}")
-                mapOf(
-                    "status" to "error",
-                    "error" to result.message
-                )
-            }
+    /**
+     * Check whether Android 11+ All Files Access (MANAGE_EXTERNAL_STORAGE) is granted.
+     */
+    fun isAllFilesAccessGranted(): Boolean {
+        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            false
         }
     }
 
     /**
-     * Enumerate files and directories within the user-configured SAF DocumentFile tree.
+     * Enumerate files and directories within Full Shared Internal Storage or SAF DocumentFile tree.
      */
     fun handleFileList(data: Map<String, Any?>?): Map<String, Any?> {
-        val safManager = org.snow.ui.files.SafFolderManager(context)
-        val treeUri = safManager.getDestinationUri()
-        if (treeUri == null) {
+        val requestedScope = data?.get("scope") as? String
+        val principal = data?.get("principal") as? String ?: "AI_MCP"
+        val showHidden = (data?.get("show_hidden") as? Boolean) ?: false
+        val subpath = (data?.get("subpath") as? String ?: data?.get("path") as? String)?.trim()?.trim('/')
+
+        // AI_MCP is strictly restricted to SAF mode in this phase
+        val isFullStorageEligible = isAllFilesAccessGranted() && principal != "AI_MCP" && requestedScope != "saf"
+
+        if (requestedScope == "full" && !isAllFilesAccessGranted()) {
+            return mapOf(
+                "status" to "ALL_FILES_ACCESS_REQUIRED",
+                "error" to "Full Phone Storage Access is not granted on this device. Please grant access in Android Settings.",
+                "remediation_hint" to "Open SNOW Settings > Full Phone Storage Access on your phone.",
+                "storage_mode" to "unavailable",
+                "items" to emptyList<Any>()
+            )
+        }
+
+        if (isFullStorageEligible && (requestedScope == "full" || requestedScope == null)) {
+            return listFullSharedStorage(subpath, showHidden)
+        }
+
+        // Fallback to SAF DocumentFile Tree
+        return listSafTree(subpath)
+    }
+
+    private fun listFullSharedStorage(subpath: String?, showHidden: Boolean): Map<String, Any?> {
+        val rootDir = Environment.getExternalStorageDirectory()
+        if (rootDir == null || !rootDir.exists() || !rootDir.canRead()) {
+            return mapOf(
+                "status" to "STORAGE_UNAVAILABLE",
+                "error" to "Shared internal storage root is currently inaccessible.",
+                "storage_mode" to "full_shared_storage",
+                "items" to emptyList<Any>()
+            )
+        }
+
+        val canonicalRoot = rootDir.canonicalFile
+        var targetDir = canonicalRoot
+
+        if (!subpath.isNullOrEmpty()) {
+            // Path traversal validation
+            val segments = subpath.split('/')
+            for (segment in segments) {
+                if (segment.isBlank() || segment == ".") continue
+                if (segment == ".." || segment.contains('\\')) {
+                    return mapOf(
+                        "status" to "error",
+                        "error" to "PATH_TRAVERSAL_DETECTED",
+                        "message" to "Relative path traversal '..' is strictly prohibited.",
+                        "storage_mode" to "full_shared_storage",
+                        "items" to emptyList<Any>()
+                    )
+                }
+            }
+
+            val candidate = File(canonicalRoot, subpath).canonicalFile
+            if (!isPathContained(candidate, canonicalRoot)) {
+                return mapOf(
+                    "status" to "error",
+                    "error" to "PATH_TRAVERSAL_DETECTED",
+                    "message" to "Target directory lies outside the allowed shared storage root.",
+                    "storage_mode" to "full_shared_storage",
+                    "items" to emptyList<Any>()
+                )
+            }
+
+            // Block restricted Android/data and Android/obb directories
+            val relPath = candidate.path.removePrefix(canonicalRoot.path).replace('\\', '/').trim('/')
+            if (relPath.equals("Android/data", ignoreCase = true) ||
+                relPath.startsWith("Android/data/", ignoreCase = true) ||
+                relPath.equals("Android/obb", ignoreCase = true) ||
+                relPath.startsWith("Android/obb/", ignoreCase = true)) {
+                return mapOf(
+                    "status" to "ACCESS_DENIED",
+                    "error" to "Access to protected directory '$relPath' is denied by Android OS security policy.",
+                    "storage_mode" to "full_shared_storage",
+                    "items" to emptyList<Any>()
+                )
+            }
+
+            if (!candidate.exists() || !candidate.isDirectory) {
+                return mapOf(
+                    "status" to "DIRECTORY_NOT_FOUND",
+                    "error" to "Directory '$subpath' was not found on phone shared storage.",
+                    "storage_mode" to "full_shared_storage",
+                    "items" to emptyList<Any>()
+                )
+            }
+            targetDir = candidate
+        }
+
+        val items = mutableListOf<Map<String, Any?>>()
+        val files = targetDir.listFiles() ?: emptyArray()
+
+        // Sort directories first, then alphabetical
+        val sortedFiles = files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+
+        for (file in sortedFiles) {
+            val name = file.name
+            val isHidden = name.startsWith(".")
+            if (isHidden && !showHidden) continue
+
+            // Block listing internal Android/data and Android/obb folders
+            val relFromRoot = file.canonicalFile.path.removePrefix(canonicalRoot.path).replace('\\', '/').trim('/')
+            if (relFromRoot.equals("Android/data", ignoreCase = true) || relFromRoot.equals("Android/obb", ignoreCase = true)) {
+                continue
+            }
+
+            items.add(mapOf(
+                "name" to name,
+                "type" to if (file.isDirectory) "directory" else "file",
+                "size_bytes" to (if (file.isDirectory) 0L else file.length()),
+                "last_modified" to file.lastModified(),
+                "is_hidden" to isHidden,
+                "path" to relFromRoot
+            ))
+            if (items.size >= 200) break
+        }
+
+        val displayFolder = if (targetDir == canonicalRoot) "Root" else targetDir.name
+        return mapOf(
+            "status" to "success",
+            "storage_mode" to "full_shared_storage",
+            "folder_name" to displayFolder,
+            "subpath" to (subpath ?: ""),
+            "count" to items.size,
+            "items" to items
+        )
+    }
+
+    private fun listSafTree(subpath: String?): Map<String, Any?> {
+        val safManager = try {
+            org.snow.ui.files.SafFolderManager(context)
+        } catch (_: Exception) {
+            null
+        }
+        val treeUri = try {
+            safManager?.getDestinationUri()
+        } catch (_: Exception) {
+            null
+        }
+        if (treeUri == null || safManager == null) {
             return mapOf(
                 "status" to "SAF_FOLDER_NOT_CONFIGURED",
                 "error" to "No SAF destination folder has been configured by the user.",
                 "remediation_hint" to "Open SNOW Files tab on the phone and pick a destination folder.",
+                "storage_mode" to "saf_tree",
                 "items" to emptyList<Any>()
             )
         }
@@ -264,6 +428,7 @@ class AndroidFileHandler(
             return mapOf(
                 "status" to "error",
                 "error" to "Failed resolving SAF tree URI: ${e.message}",
+                "storage_mode" to "saf_tree",
                 "items" to emptyList<Any>()
             )
         }
@@ -272,22 +437,22 @@ class AndroidFileHandler(
             return mapOf(
                 "status" to "SAF_PERMISSION_REVOKED",
                 "error" to "Persisted SAF tree permission has expired or been revoked.",
+                "storage_mode" to "saf_tree",
                 "items" to emptyList<Any>()
             )
         }
 
-        // Navigate subpath if requested
-        val subpath = (data?.get("subpath") as? String ?: data?.get("path") as? String)?.trim()?.trim('/')
         var targetDoc: androidx.documentfile.provider.DocumentFile = rootDoc
         if (!subpath.isNullOrEmpty()) {
             val segments = subpath.split('/')
             for (segment in segments) {
                 if (segment.isBlank() || segment == ".") continue
-                if (segment == "..") {
+                if (segment == ".." || segment.contains('\\')) {
                     return mapOf(
                         "status" to "error",
                         "error" to "PATH_TRAVERSAL_DETECTED",
-                        "message" to "Relative path traversal '..' is forbidden."
+                        "message" to "Relative path traversal '..' is forbidden.",
+                        "storage_mode" to "saf_tree"
                     )
                 }
                 val child = targetDoc.findFile(segment)
@@ -295,6 +460,7 @@ class AndroidFileHandler(
                     return mapOf(
                         "status" to "DIRECTORY_NOT_FOUND",
                         "error" to "Subdirectory '$segment' not found in SAF tree.",
+                        "storage_mode" to "saf_tree",
                         "items" to emptyList<Any>()
                     )
                 }
@@ -310,14 +476,16 @@ class AndroidFileHandler(
                 "type" to if (child.isDirectory) "directory" else "file",
                 "size_bytes" to (if (child.isDirectory) 0L else child.length()),
                 "last_modified" to child.lastModified(),
-                "uri" to child.uri.toString()
+                "uri" to child.uri.toString(),
+                "storage_mode" to "saf_tree"
             ))
             if (items.size >= 100) break
         }
 
         return mapOf(
             "status" to "success",
-            "folder_name" to (targetDoc.name ?: safManager.getDestinationDisplayName()),
+            "storage_mode" to "saf_tree",
+            "folder_name" to (targetDoc.name ?: safManager?.getDestinationDisplayName() ?: "SAF Folder"),
             "subpath" to (subpath ?: ""),
             "count" to items.size,
             "items" to items
@@ -352,5 +520,42 @@ class AndroidFileHandler(
         }
         val target = currentDoc.findFile(fileName)
         return if (target != null && target.exists() && target.isFile) target else null
+    }
+
+    /**
+     * Resolve a regular File on shared internal storage safely with path containment.
+     */
+    fun resolveSharedStorageFile(subpath: String?, fileName: String): File? {
+        if (!isAllFilesAccessGranted()) return null
+        val rootDir = Environment.getExternalStorageDirectory() ?: return null
+        val canonicalRoot = rootDir.canonicalFile
+
+        val safeFileName = File(fileName).name
+        if (safeFileName.isBlank() || safeFileName == "." || safeFileName == ".." || safeFileName.contains('\\')) {
+            return null
+        }
+
+        val cleanSub = subpath?.trim()?.trim('/')
+        if (!cleanSub.isNullOrEmpty()) {
+            val segments = cleanSub.split('/')
+            for (seg in segments) {
+                if (seg.isBlank() || seg == "." || seg == ".." || seg.contains('\\')) return null
+            }
+        }
+
+        val parentDir = if (cleanSub.isNullOrEmpty()) canonicalRoot else File(canonicalRoot, cleanSub).canonicalFile
+        if (!isPathContained(parentDir, canonicalRoot)) return null
+
+        val relPath = parentDir.path.removePrefix(canonicalRoot.path).replace('\\', '/').trim('/')
+        if (relPath.equals("Android/data", ignoreCase = true) ||
+            relPath.startsWith("Android/data/", ignoreCase = true) ||
+            relPath.equals("Android/obb", ignoreCase = true) ||
+            relPath.startsWith("Android/obb/", ignoreCase = true)) {
+            return null
+        }
+
+        val targetFile = File(parentDir, safeFileName).canonicalFile
+        if (!isPathContained(targetFile, canonicalRoot)) return null
+        return if (targetFile.exists() && targetFile.isFile && targetFile.canRead()) targetFile else null
     }
 }

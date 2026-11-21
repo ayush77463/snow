@@ -36,6 +36,29 @@ class SnowMessage:
     payload: Optional[Dict[str, Any]] = None
     error: Optional[Dict[str, Any]] = None
 
+    @property
+    def action(self) -> Optional[str]:
+        """Extract request action string if present in payload."""
+        if self.payload and isinstance(self.payload, dict):
+            return self.payload.get("action")
+        return None
+
+    @property
+    def data(self) -> Dict[str, Any]:
+        """Extract data dictionary from payload if present."""
+        if self.payload and isinstance(self.payload, dict):
+            val = self.payload.get("data")
+            if isinstance(val, dict):
+                return val
+            return self.payload
+        return {}
+
+    @classmethod
+    def from_json(cls, raw: str) -> "SnowMessage":
+        """Parse and validate JSON string into SnowMessage."""
+        from snow.protocol.validator import validate_raw_message
+        return validate_raw_message(raw)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert the message into a dictionary, omitting None values for clean JSON."""
         data: Dict[str, Any] = {

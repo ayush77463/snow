@@ -338,6 +338,7 @@
             fileDevSelect.innerHTML = '<option value="">Select target Android device...</option>';
         }
 
+        const isCoreOnline = Boolean(data && data.success);
         const devices = (data && Array.isArray(data.devices)) ? data.devices : ((data && data.data && Array.isArray(data.data.devices)) ? data.data.devices : []);
         
         // Partition into local desktop host node vs peer mobile devices
@@ -352,8 +353,13 @@
         const hostName = document.createElement("h3");
         hostName.textContent = (localNodes[0] && localNodes[0].device_name) ? `💻 ${localNodes[0].device_name} (Host Core)` : "💻 Windows Laptop (Desktop Core)";
         const hostBadge = document.createElement("span");
-        hostBadge.className = "badge badge-success";
-        hostBadge.textContent = "Core Active";
+        if (isCoreOnline) {
+            hostBadge.className = "badge badge-success";
+            hostBadge.textContent = "Core Active";
+        } else {
+            hostBadge.className = "badge badge-muted";
+            hostBadge.textContent = "Core Offline";
+        }
         hostHeader.appendChild(hostName);
         hostHeader.appendChild(hostBadge);
 
@@ -369,8 +375,13 @@
         hostTrLabel.className = "label";
         hostTrLabel.textContent = "Transport:";
         const hostTrChip = document.createElement("span");
-        hostTrChip.className = "chip chip-loopback";
-        hostTrChip.textContent = "🔁 Localhost Loopback IPC (8767)";
+        if (isCoreOnline) {
+            hostTrChip.className = "chip chip-loopback";
+            hostTrChip.textContent = "🔁 Localhost Loopback IPC (8767)";
+        } else {
+            hostTrChip.className = "chip chip-neutral";
+            hostTrChip.textContent = "⚪ IPC Offline (Run 'snow daemon start')";
+        }
         hostTrRow.appendChild(hostTrLabel);
         hostTrRow.appendChild(hostTrChip);
         hostBody.appendChild(hostTrRow);
@@ -384,7 +395,16 @@
             container.appendChild(hostCard);
         }
 
-        // 2. Render Peer Devices
+        // 2. Render Peer Devices or Offline Diagnostics
+        if (!isCoreOnline) {
+            const empty = document.createElement("div");
+            empty.className = "empty-state";
+            const errMsg = (data && data.error) ? data.error : "SNOW Desktop Core is offline or unreachable.";
+            empty.innerHTML = `⚠️ <strong>Desktop Core Offline</strong><br><small class="text-muted">${errMsg}<br>Please launch the core daemon in terminal with <code>python -m snow daemon start</code> or <code>snow</code>, then refresh.</small>`;
+            container.appendChild(empty);
+            return;
+        }
+
         if (peerDevices.length === 0) {
             const empty = document.createElement("div");
             empty.className = "empty-state";
@@ -557,8 +577,8 @@
                     metaText.textContent = `Node: ${payload.node_id || payload.id || 'desktop-core'} | Port: ${payload.port || 8765} | Tier: ${tierLabel} | LAN IPs: ${ips}`;
                 }
             } else {
-                const errMsg = (res && res.error) ? res.error : "Failed to generate pairing QR.";
-                svgBox.innerHTML = `<div class="empty-state">${errMsg}</div>`;
+                const errMsg = (res && res.error) ? res.error : "Failed to generate pairing QR. Ensure SNOW Desktop Core is running.";
+                svgBox.innerHTML = `<div class="empty-state text-danger">${errMsg}</div>`;
             }
         }
 
@@ -624,18 +644,36 @@
             return;
         }
 
-        tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><div class="spinner"></div> Loading SAF directory...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="empty-state"><div class="spinner"></div> Loading phone storage...</td></tr>';
 
-        const endpoint = `/api/files?device_id=${encodeURIComponent(targetDev)}&subpath=${encodeURIComponent(currentSubpath)}`;
+        const showHidden = document.getElementById("chk-show-hidden")?.checked || false;
+        const endpoint = `/api/files?device_id=${encodeURIComponent(targetDev)}&subpath=${encodeURIComponent(currentSubpath)}&show_hidden=${showHidden}`;
         const res = await apiRequest(endpoint);
+
+        const storageBadge = document.getElementById("files-storage-badge");
+        if (storageBadge) {
+            const mode = (res && res.storage_mode) || (res && res.data && res.data.storage_mode);
+            if (mode === "full_shared_storage") {
+                storageBadge.className = "badge badge-success";
+                storageBadge.textContent = "Full Internal Shared Storage";
+            } else if (mode === "saf_tree") {
+                storageBadge.className = "badge badge-primary";
+                storageBadge.textContent = "SAF Folder";
+            } else {
+                storageBadge.className = "badge badge-muted";
+                storageBadge.textContent = "Storage Unavailable";
+            }
+        }
 
         tbody.innerHTML = "";
         if (!res || !res.success) {
             let errorText = res ? (res.error || res.status || "Failed loading files") : "Connection failed";
             if (res && (res.status === "SAF_FOLDER_NOT_CONFIGURED" || (res.error && res.error.includes("SAF_FOLDER_NOT_CONFIGURED")))) {
-                errorText = "SAF storage folder not configured on phone. Please open the SNOW app on your phone (Files tab) and select a storage folder.";
+                errorText = "SAF storage folder not configured on phone. Please open the SNOW app on your phone (Files tab) and select a storage folder, or grant Full Phone Storage Access in Settings.";
             } else if (res && (res.status === "SAF_PERMISSION_REVOKED" || (res.error && res.error.includes("SAF_PERMISSION_REVOKED")))) {
-                errorText = "SAF storage permission expired or revoked on phone. Please re-select a folder in the SNOW Android app.";
+                errorText = "Storage permission expired or revoked on phone. Please re-select a folder or check permissions in the SNOW Android app.";
+            } else if (res && res.status === "ALL_FILES_ACCESS_REQUIRED") {
+                errorText = "Full Phone Storage Access is not granted. Please open SNOW Settings > Full Phone Storage Access on your phone to enable.";
             }
             tbody.innerHTML = `<tr><td colspan="5" class="empty-state text-danger">${errorText}</td></tr>`;
             return;
@@ -1278,6 +1316,19 @@
 
         const btnRefreshFiles = document.getElementById("btn-refresh-files");
         if (btnRefreshFiles) btnRefreshFiles.addEventListener("click", loadSafFiles);
+
+        const chkShowHidden = document.getElementById("chk-show-hidden");
+        if (chkShowHidden) {
+            chkShowHidden.addEventListener("change", loadSafFiles);
+        }
+
+        document.querySelectorAll("#quick-nav-chips .chip-btn").forEach(chipBtn => {
+            chipBtn.addEventListener("click", () => {
+                currentSubpath = chipBtn.getAttribute("data-chip") || "";
+                updateBreadcrumbs();
+                loadSafFiles();
+            });
+        });
 
         const fileSelect = document.getElementById("files-device-select");
         if (fileSelect) {

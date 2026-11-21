@@ -89,6 +89,8 @@ class SessionRouter:
         db_manager: Optional[DatabaseManager] = None,
         direct_dial_timeout: float = 2.5,
         wake_grace_period: float = 6.0,
+        relay_client: Optional[Any] = None,
+        relay_enabled: bool = False,
     ) -> None:
         self.node_registry = node_registry
         self.ws_server = ws_server
@@ -97,6 +99,8 @@ class SessionRouter:
         self.db_manager = db_manager or (node_registry.db_manager if node_registry else DatabaseManager())
         self.direct_dial_timeout = direct_dial_timeout
         self.wake_grace_period = wake_grace_period
+        self.relay_client = relay_client
+        self.relay_enabled = relay_enabled
 
         # Active outbound peer client sessions: device_id -> SnowPeerClient
         self._outbound_clients: dict[str, SnowPeerClient] = {}
@@ -181,6 +185,8 @@ class SessionRouter:
         clean_data.pop("principal", None)
         clean_data.pop("trust_tier", None)
         clean_data.pop("execution_principal", None)
+        if action in ("file_list", "file_receive_request") and effective_ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
+            clean_data["principal"] = effective_ctx.principal.value
 
         # =====================================================================
         # Tier 1: Active Session Routing
@@ -303,6 +309,22 @@ class SessionRouter:
         )
         if relay_res is not None:
             return relay_res
+
+        # =====================================================================
+        # Tier 3.75: Dedicated Remote E2E Relay Tunnel
+        # =====================================================================
+        if self.relay_enabled and self.relay_client is not None:
+            attempted_transports.append("remote_relay_tunnel")
+            logger.info("Router Tier 3.75: Attempting remote E2E relay tunnel for [%s]...", device_id)
+            relay_tunnel_res = await self._attempt_remote_relay_tunnel(
+                node=node,
+                action=action,
+                clean_data=clean_data,
+                timeout=timeout,
+                attempted_transports=attempted_transports,
+            )
+            if relay_tunnel_res is not None:
+                return relay_tunnel_res
 
         # =====================================================================
         # Tier 4: Structured Failure
@@ -622,5 +644,50 @@ class SessionRouter:
                         }
                 except Exception as exc:
                     logger.debug("Relay attempt via inbound [%s] failed: %s", sess.device_id, exc)
+
+        return None
+
+    async def _attempt_remote_relay_tunnel(
+        self,
+        node: DeviceNode,
+        action: str,
+        clean_data: dict[str, Any],
+        timeout: float,
+        attempted_transports: list[str],
+    ) -> Optional[dict[str, Any]]:
+        """Attempt to route request through dedicated remote E2E encrypted relay tunnel (Tier 3.75)."""
+        if not self.relay_client or not getattr(self.relay_client, "_is_connected", False):
+            logger.debug("Remote relay tunnel skipped: Relay client is not connected.")
+            return None
+
+        device_id = node.device_id
+        msg = SnowMessage.create_request(action=action, data=clean_data)
+
+        try:
+            sent = await self.relay_client.send_message(device_id, msg)
+            if not sent:
+                return None
+
+            resp = await self.relay_client.receive_message(device_id, timeout=timeout)
+            if resp:
+                node.reachability_state = ReachabilityState.ONLINE_RELAYED
+                err_text = None
+                if resp.error:
+                    err_text = resp.error.message if hasattr(resp.error, "message") else str(resp.error)
+                return {
+                    "success": resp.type != MessageType.ERROR,
+                    "status": "SUCCESS" if resp.type != MessageType.ERROR else "REMOTE_ERROR",
+                    "data": resp.data,
+                    "error": err_text,
+                    "routing": {
+                        "tier": "Tier 3.75 (Remote E2E Relay Tunnel)",
+                        "transport": "relay",
+                        "reachability": "ONLINE_RELAYED",
+                        "target_device_id": device_id,
+                    },
+                }
+        except Exception as e:
+            logger.warning("Remote relay tunnel dispatch to [%s] failed: %s", device_id, e)
+            return None
 
         return None

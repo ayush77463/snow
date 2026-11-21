@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -148,10 +149,12 @@ class SnowMcpBridge:
         secret_path: Optional[Path | str] = None,
         allowed_roots: Optional[list[Path | str]] = None,
         auto_start_core: bool = True,
+        is_owner_channel: bool = False,
     ) -> None:
         self.host = host
         self.port = port
         self.auto_start_core = auto_start_core
+        self.is_owner_channel = is_owner_channel
         self._explicit_secret = secret
         self.secret_path = Path(secret_path) if secret_path else get_default_secret_path()
 
@@ -219,6 +222,10 @@ class SnowMcpBridge:
             "auth_token": secret,
             "payload": payload or {},
         }
+        if self.is_owner_channel:
+            request_obj["owner_token"] = hmac.new(
+                secret.encode("utf-8"), b"SNOW_OWNER_AUTHORIZATION", hashlib.sha256
+            ).hexdigest()
 
         try:
             reader, writer = await asyncio.wait_for(
@@ -584,16 +591,20 @@ class SnowMcpBridge:
         )
 
     async def android_file_list(
-        self, subpath: str = "", device_id: str = ""
+        self, subpath: str = "", device_id: str = "", scope: str = "saf", show_hidden: bool = False
     ) -> dict[str, Any]:
-        """List files and subdirectories within Android SAF-granted storage."""
+        """List files and subdirectories within Android storage (SAF tree for AI/MCP, or Full Storage when authorized)."""
         target_id = device_id or await self._resolve_target_device_id()
         if not target_id:
             return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
         return await self.send_device_request(
             device_id=target_id,
             action="file_list",
-            data={"subpath": subpath},
+            data={
+                "subpath": subpath,
+                "scope": scope,
+                "show_hidden": show_hidden,
+            },
             timeout=30.0,
         )
 

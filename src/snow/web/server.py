@@ -55,7 +55,7 @@ class SnowWebServer:
         self.host = host
         self.port = port
         self.auto_open_browser = auto_open_browser
-        self.bridge = bridge or SnowMcpBridge(auto_start_core=False)
+        self.bridge = bridge or SnowMcpBridge(auto_start_core=False, is_owner_channel=True)
 
         # Security state
         self.bootstrap_token: str = secrets.token_urlsafe(32)
@@ -336,19 +336,37 @@ class SnowWebServer:
         })
 
     async def handle_api_files(self, request: web.Request) -> web.Response:
-        """Enumerate files in the phone's persisted SAF storage tree."""
+        """Enumerate files in the phone's storage (Full Shared Storage or SAF fallback)."""
         device_id = request.query.get("device_id", "")
         subpath = request.query.get("subpath", "")
-        res = await self.bridge.android_file_list(subpath=subpath, device_id=device_id)
+        scope = request.query.get("scope", "full")
+        show_hidden = request.query.get("show_hidden", "false").lower() in ("true", "1")
+        res = await self.bridge.android_file_list(
+            subpath=subpath,
+            device_id=device_id,
+            scope=scope,
+            show_hidden=show_hidden,
+        )
         items = []
-        if isinstance(res.get("data"), dict) and "items" in res["data"]:
-            items = res["data"]["items"]
+        storage_mode = "saf_tree"
+        folder_name = "Root"
+        if isinstance(res.get("data"), dict):
+            data_dict = res["data"]
+            items = data_dict.get("items", [])
+            storage_mode = data_dict.get("storage_mode", storage_mode)
+            folder_name = data_dict.get("folder_name", folder_name)
         elif isinstance(res.get("items"), list):
             items = res["items"]
+            storage_mode = res.get("storage_mode", storage_mode)
+            folder_name = res.get("folder_name", folder_name)
+
         return web.json_response({
             "success": res.get("success", False),
             "status": res.get("status", "SUCCESS"),
             "items": items,
+            "storage_mode": storage_mode,
+            "folder_name": folder_name,
+            "subpath": subpath,
             "data": res.get("data", {}),
             "error": res.get("error"),
         })
@@ -525,6 +543,23 @@ class SnowWebServer:
             "error": res.get("error"),
         })
 
+    async def handle_api_relay_status(self, request: web.Request) -> web.Response:
+        """Query remote relay status, endpoint, and enabled state."""
+        from snow.relay.config import RelayConfig
+        config = RelayConfig.from_env()
+        return web.json_response({
+            "success": True,
+            "status": "SUCCESS",
+            "data": {
+                "enabled": config.enabled,
+                "host": config.host,
+                "port": config.port,
+                "endpoint": f"wss://{config.host}:{config.port}/v1/tunnel" if config.host else None,
+                "max_frame_size_mib": config.max_frame_size // (1024 * 1024),
+                "quota_mib_hr": config.max_transfer_quota_bytes // (1024 * 1024),
+            },
+        })
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -555,6 +590,7 @@ class SnowWebServer:
         app.router.add_get("/api/approvals", self.handle_api_approvals)
         app.router.add_post("/api/approvals/resolve", self.handle_api_approvals_resolve)
         app.router.add_get("/api/activity", self.handle_api_activity)
+        app.router.add_get("/api/relay/status", self.handle_api_relay_status)
 
         return app
 

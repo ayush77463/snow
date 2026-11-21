@@ -1051,6 +1051,11 @@ def build_parser() -> argparse.ArgumentParser:
     # 9. ui (Deprecated Textual TUI)
     subparsers.add_parser("ui", help="[Deprecated] Launch interactive UI (redirects to 'snow web')")
 
+    # 10. relay (Phase 22 Remote Connectivity)
+    relay_parser = subparsers.add_parser("relay", help="Manage remote relay connectivity and presence")
+    relay_sub = relay_parser.add_subparsers(dest="relay_action", help="Relay action")
+    relay_sub.add_parser("status", help="Display current remote relay configuration and presence status")
+
     # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")
     start_parser.add_argument("--daemon", action="store_true", default=True)
@@ -1084,6 +1089,25 @@ def run_ui() -> int:
     """Launch interactive UI (deprecated in favor of 'snow web')."""
     print("[!] Notice: 'snow ui' (Textual TUI) has been retired in favor of the lightweight SNOW Web Dashboard.", file=sys.stderr)
     print("    Please run 'snow web' to launch the dashboard on http://127.0.0.1:8769.\n", file=sys.stderr)
+    return 0
+
+
+def run_relay(action: str = "status") -> int:
+    """Manage and inspect remote relay connectivity."""
+    from snow.relay.config import RelayConfig
+    config = RelayConfig.from_env()
+
+    print("=" * 70)
+    print(" SNOW Remote Relay Status (Phase 22)")
+    print("=" * 70)
+    enabled_str = "YES (Active)" if config.enabled else "NO (Disabled by default)"
+    endpoint_str = f"wss://{config.host}:{config.port}/v1/tunnel" if config.host else "Not Configured"
+    print(f"  Relay Enabled:       {enabled_str}")
+    print(f"  Relay Endpoint:      {endpoint_str}")
+    print(f"  Max Frame Size:      {config.max_frame_size // (1024 * 1024)} MiB")
+    print(f"  Rolling Quota:       {config.max_transfer_quota_bytes // (1024 * 1024)} MiB / hr")
+    print(f"  Transport Policy:    Local-First (LAN -> USB ADB -> Remote Relay)")
+    print("=" * 70)
     return 0
 
 
@@ -1140,6 +1164,9 @@ def main(args: Optional[list[str]] = None) -> int:
         return run_web(port=parsed.port, no_browser=parsed.no_browser)
     elif parsed.command == "ui":
         return run_ui()
+    elif parsed.command == "relay":
+        action = getattr(parsed, "relay_action", "status") or "status"
+        return run_relay(action=action)
     elif parsed.command == "start":
         return run_daemon_start()
     elif parsed.command == "stop":
