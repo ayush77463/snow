@@ -53,6 +53,40 @@ class CapabilityMetadata:
 # Dynamic internal storage of registered capability metadata
 _CAPABILITY_REGISTRY: dict[str, CapabilityMetadata] = {}
 
+# Phase 26B Shared Clipboard Buffer Capabilities
+CLIPBOARD_BUFFER_CAPABILITIES: dict[str, CapabilityMetadata] = {
+    "snow_clipboard_buffer_list": CapabilityMetadata(
+        name="snow_clipboard_buffer_list",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="List the 10 most recent items in the SNOW shared clipboard ring buffer.",
+    ),
+    "snow_clipboard_buffer_add": CapabilityMetadata(
+        name="snow_clipboard_buffer_add",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="cross_platform",
+        description="Add a text entry to the SNOW shared clipboard ring buffer.",
+    ),
+    "snow_clipboard_buffer_apply": CapabilityMetadata(
+        name="snow_clipboard_buffer_apply",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="cross_platform",
+        description="Apply a specific item from the shared clipboard buffer to Windows or Android.",
+    ),
+}
+
 
 def register_capability(meta: CapabilityMetadata) -> None:
     """Register or update a capability in the dynamic registry."""
@@ -65,7 +99,10 @@ def get_capability_metadata(tool_name: str) -> Optional[CapabilityMetadata]:
     """Retrieve metadata for a given capability name."""
     if not tool_name or not isinstance(tool_name, str):
         return None
-    return _CAPABILITY_REGISTRY.get(tool_name.strip())
+    name = tool_name.strip()
+    if name in _CAPABILITY_REGISTRY:
+        return _CAPABILITY_REGISTRY[name]
+    return CLIPBOARD_BUFFER_CAPABILITIES.get(name)
 
 
 def list_capabilities() -> list[CapabilityMetadata]:
@@ -127,8 +164,8 @@ def validate_registry() -> tuple[bool, list[str]]:
         if not isinstance(meta.tier, str) or not meta.tier.strip():
             errors.append(f"Capability '{name}': tier must be non-empty string.")
 
-    if len(_CAPABILITY_REGISTRY) != 34:
-        errors.append(f"Expected exactly 34 registered capabilities (24 V2 baseline + 6 P1 + 4 Phase 24), found {len(_CAPABILITY_REGISTRY)}.")
+    if len(_CAPABILITY_REGISTRY) != 37:
+        errors.append(f"Expected exactly 37 registered capabilities (24 V2 baseline + 6 P1 + 4 Phase 24 + 3 Phase 26B), found {len(_CAPABILITY_REGISTRY)}.")
 
     return (len(errors) == 0, errors)
 
@@ -488,6 +525,36 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         requires_approval=True,
         os_classification="cross_platform",
         description="Execute an authorized declarative multi-step workflow with bounded step execution and approval checks.",
+    ),
+    CapabilityMetadata(
+        name="snow_clipboard_buffer_list",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="List the 10 most recent items in the SNOW shared clipboard ring buffer.",
+    ),
+    CapabilityMetadata(
+        name="snow_clipboard_buffer_add",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="cross_platform",
+        description="Add a text entry to the SNOW shared clipboard ring buffer.",
+    ),
+    CapabilityMetadata(
+        name="snow_clipboard_buffer_apply",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="cross_platform",
+        description="Apply a specific item from the shared clipboard buffer to Windows or Android.",
     ),
 ]
 

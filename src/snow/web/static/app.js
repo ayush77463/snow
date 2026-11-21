@@ -156,6 +156,11 @@
         };
         activeTabTitle.textContent = titleMap[tabName] || "Dashboard";
 
+        // Stop screen streaming poll when leaving overview
+        if (tabName !== "overview") {
+            stopScreenPoll();
+        }
+
         // Load Tab Data
         refreshActiveTab();
     }
@@ -206,6 +211,10 @@
             loadApprovalsList();
         } else if (currentTab === "activity") {
             loadActivityHistory();
+        } else if (currentTab === "clipboard") {
+            loadClipboardBuffer();
+        } else if (currentTab === "apps") {
+            loadAndroidApps();
         } else if (currentTab === "settings") {
             loadRelayStatus();
             loadMcpGatewayStatus();
@@ -247,7 +256,14 @@
         const count = (data && data.success) ? approvals.length : 0;
         const badge = document.getElementById("badge-approvals");
         const statApprovals = document.getElementById("stat-pending-approvals");
-        if (badge) badge.textContent = count.toString();
+        if (badge) {
+            if (count > 0) {
+                badge.textContent = count.toString();
+                badge.style.display = "";
+            } else {
+                badge.style.display = "none";
+            }
+        }
         if (statApprovals) statApprovals.textContent = count.toString();
 
         const banner = document.getElementById("pending-approval-banner");
@@ -340,6 +356,392 @@
                 feed.appendChild(empty);
             }
         }
+
+        // Live screen sharing & camera photo polling on overview tab
+        startScreenPoll();
+        loadLatestCameraPhoto();
+        loadClipboardBuffer();
+    }
+
+    // =========================================================================
+    // 4A.1 Live Screen Sharing & Camera Delivery (Phase 26A)
+    // =========================================================================
+
+    let screenPollTimer = null;
+    let screenPollActive = false;
+
+    async function pollScreenFrame() {
+        if (!screenPollActive) return;
+
+        const statusRes = await apiRequest("/api/screen/status");
+        const statusBadge = document.getElementById("screen-status-badge");
+        const idleMsg = document.getElementById("screen-idle-message");
+        const frameImg = document.getElementById("screen-frame-img");
+        const statsBar = document.getElementById("screen-stats-bar");
+        const stopBtn = document.getElementById("btn-stop-screen-share");
+
+        if (statusRes && statusRes.state === "STREAMING") {
+            if (idleMsg) idleMsg.classList.add("d-none");
+            if (frameImg) frameImg.classList.remove("d-none");
+            if (statsBar) statsBar.classList.remove("d-none");
+            if (stopBtn) stopBtn.classList.remove("d-none");
+            if (statusBadge) {
+                statusBadge.textContent = "STREAMING";
+                statusBadge.className = "badge badge-success";
+            }
+
+            try {
+                const frameRes = await fetch("/api/screen/frame");
+                if (frameRes.ok && frameRes.status === 200) {
+                    const blob = await frameRes.blob();
+                    if (blob.size > 0) {
+                        const oldSrc = frameImg.src;
+                        frameImg.src = URL.createObjectURL(blob);
+                        if (oldSrc && oldSrc.startsWith("blob:")) URL.revokeObjectURL(oldSrc);
+
+                        const fpsEl = document.getElementById("screen-stat-fps");
+                        const resEl = document.getElementById("screen-stat-resolution");
+                        const bwEl = document.getElementById("screen-stat-bandwidth");
+                        const lastEl = document.getElementById("screen-stat-last-update");
+
+                        if (fpsEl && statusRes.fps) fpsEl.textContent = `FPS: ${Number(statusRes.fps).toFixed(1)}`;
+                        if (resEl && statusRes.frame_width && statusRes.frame_height) {
+                            resEl.textContent = `${statusRes.frame_width}×${statusRes.frame_height}`;
+                        }
+                        if (bwEl) bwEl.textContent = `${(blob.size / 1024).toFixed(1)} KiB/frame`;
+                        if (lastEl) lastEl.textContent = `Last: ${new Date().toLocaleTimeString()}`;
+                    }
+                }
+            } catch (e) {
+                console.debug("Screen frame fetch error:", e);
+            }
+        } else {
+            if (idleMsg) idleMsg.classList.remove("d-none");
+            if (frameImg) frameImg.classList.add("d-none");
+            if (statsBar) statsBar.classList.add("d-none");
+            if (stopBtn) stopBtn.classList.add("d-none");
+            if (statusBadge) {
+                const state = (statusRes && statusRes.state) || "IDLE";
+                statusBadge.textContent = state;
+                statusBadge.className = "badge " + (state === "STOPPED" ? "badge-muted" : state === "REVOKED" ? "badge-danger" : "badge-muted");
+            }
+        }
+
+        if (screenPollActive) {
+            const delay = document.hidden ? 2500 : 500;
+            screenPollTimer = setTimeout(pollScreenFrame, delay);
+        }
+    }
+
+    function startScreenPoll() {
+        if (screenPollActive) return;
+        screenPollActive = true;
+        pollScreenFrame();
+    }
+
+    function stopScreenPoll() {
+        screenPollActive = false;
+        if (screenPollTimer) {
+            clearTimeout(screenPollTimer);
+            screenPollTimer = null;
+        }
+    }
+
+    async function loadLatestCameraPhoto() {
+        const container = document.getElementById("camera-preview-container");
+        const idleMsg = document.getElementById("camera-idle-message");
+        const img = document.getElementById("camera-latest-img");
+        const info = document.getElementById("camera-delivery-info");
+
+        try {
+            const res = await fetch("/api/camera/latest");
+            if (res.ok && res.status === 200) {
+                const blob = await res.blob();
+                if (blob.size > 0) {
+                    if (container) container.classList.remove("d-none");
+                    if (idleMsg) idleMsg.classList.add("d-none");
+                    if (img) {
+                        const oldSrc = img.src;
+                        img.src = URL.createObjectURL(blob);
+                        if (oldSrc && oldSrc.startsWith("blob:")) URL.revokeObjectURL(oldSrc);
+                    }
+                    const filename = res.headers.get("X-Snow-Filename") || "Camera photo";
+                    if (info) info.textContent = `Delivered: ${filename} (${(blob.size / 1024).toFixed(1)} KiB) at ${new Date().toLocaleTimeString()}`;
+                }
+            }
+        } catch (e) {
+            console.debug("Camera photo fetch error:", e);
+        }
+    }
+
+    // =========================================================================
+    // 4A.2 Shared Clipboard Ring Buffer & Remote Apps (Phase 26B)
+    // =========================================================================
+
+    async function loadClipboardBuffer() {
+        const overviewTimeline = document.getElementById("hub-overview-timeline");
+        const fullTimeline = document.getElementById("clipboard-full-timeline");
+        const countBadge = document.getElementById("hub-buffer-count-badge");
+        const detailCount = document.getElementById("clipboard-detail-count");
+
+        const res = await apiRequest("/api/clipboard/buffer");
+        const items = (res && res.data && Array.isArray(res.data.items)) ? res.data.items :
+                      (res && Array.isArray(res.items)) ? res.items : [];
+        const count = items.length;
+        const pinnedCount = items.filter(it => it.is_pinned).length;
+
+        if (countBadge) countBadge.textContent = `${count} item${count === 1 ? '' : 's'}`;
+        if (detailCount) detailCount.textContent = `${count} / 10 items (${pinnedCount} pinned)`;
+
+        const renderTimeline = (container, isOverview = false) => {
+            if (!container) return;
+            container.innerHTML = "";
+            if (items.length === 0) {
+                const empty = document.createElement("div");
+                empty.className = "empty-state";
+                empty.textContent = "No items in clipboard buffer yet.";
+                container.appendChild(empty);
+                return;
+            }
+
+            const displayItems = isOverview ? items.slice(0, 5) : items;
+            displayItems.forEach(item => {
+                const card = document.createElement("div");
+                card.className = "clipboard-card" + (item.is_pinned ? " pinned" : "");
+
+                // Header
+                const hdr = document.createElement("div");
+                hdr.className = "clip-header";
+
+                const metaLeft = document.createElement("div");
+                metaLeft.className = "clip-meta-left";
+                const chip = document.createElement("span");
+                chip.className = "clip-device-chip";
+                const dev = (item.source_device || "pc").toLowerCase();
+                chip.textContent = (dev === "pc" || dev === "windows" || dev === "desktop") ? "💻 PC" : "📱 Phone";
+                metaLeft.appendChild(chip);
+
+                const typeSpan = document.createElement("span");
+                typeSpan.className = "text-muted";
+                typeSpan.textContent = item.type === "image" ? "📷 Image" : "📝 Text";
+                metaLeft.appendChild(typeSpan);
+
+                const metaRight = document.createElement("div");
+                metaRight.className = "clip-meta-right";
+                if (item.is_pinned) {
+                    const pin = document.createElement("span");
+                    pin.className = "clip-pin-badge";
+                    pin.textContent = "📌 Pinned";
+                    metaRight.appendChild(pin);
+                }
+                const timeSpan = document.createElement("span");
+                timeSpan.textContent = formatTimestamp(item.timestamp);
+                metaRight.appendChild(timeSpan);
+
+                hdr.appendChild(metaLeft);
+                hdr.appendChild(metaRight);
+                card.appendChild(hdr);
+
+                // Body
+                const body = document.createElement("div");
+                body.className = "clip-body";
+                if (item.type === "image") {
+                    const img = document.createElement("img");
+                    img.className = "clip-thumb";
+                    img.src = `/api/clipboard/image/${item.item_id}`;
+                    img.alt = "Clipboard Image";
+                    body.appendChild(img);
+                } else {
+                    const txt = document.createElement("div");
+                    txt.className = "clip-text";
+                    txt.textContent = item.preview_text || item.text_content || "";
+                    body.appendChild(txt);
+                }
+                card.appendChild(body);
+
+                // Footer & Actions
+                const footer = document.createElement("div");
+                footer.className = "clip-footer";
+
+                const info = document.createElement("div");
+                info.className = "clip-info";
+                const sz = item.size_bytes || 0;
+                info.textContent = sz > 1024 ? `${(sz / 1024).toFixed(1)} KiB` : `${sz} B`;
+                footer.appendChild(info);
+
+                const actions = document.createElement("div");
+                actions.className = "clip-actions";
+
+                const btnApplyPc = document.createElement("button");
+                btnApplyPc.className = "btn-xs btn-primary";
+                btnApplyPc.textContent = "⚡ Apply PC";
+                btnApplyPc.title = "Copy to Windows clipboard";
+                btnApplyPc.addEventListener("click", async () => {
+                    btnApplyPc.disabled = true;
+                    btnApplyPc.textContent = "Applying...";
+                    await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: item.item_id, target: "pc" });
+                    btnApplyPc.textContent = "Applied!";
+                    setTimeout(() => { btnApplyPc.textContent = "⚡ Apply PC"; btnApplyPc.disabled = false; }, 1500);
+                });
+                actions.appendChild(btnApplyPc);
+
+                const btnSendPhone = document.createElement("button");
+                btnSendPhone.className = "btn-xs btn-secondary";
+                btnSendPhone.textContent = "📲 Send Phone";
+                btnSendPhone.title = "Push to connected Android phone";
+                btnSendPhone.addEventListener("click", async () => {
+                    btnSendPhone.disabled = true;
+                    btnSendPhone.textContent = "Sending...";
+                    await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: item.item_id, target: "android" });
+                    btnSendPhone.textContent = "Sent!";
+                    setTimeout(() => { btnSendPhone.textContent = "📲 Send Phone"; btnSendPhone.disabled = false; }, 1500);
+                });
+                actions.appendChild(btnSendPhone);
+
+                const btnPin = document.createElement("button");
+                btnPin.className = "btn-xs btn-secondary";
+                btnPin.textContent = item.is_pinned ? "Unpin" : "📌 Pin";
+                btnPin.addEventListener("click", async () => {
+                    const ep = item.is_pinned ? "/api/clipboard/buffer/unpin" : "/api/clipboard/buffer/pin";
+                    await apiRequest(ep, "POST", { item_id: item.item_id });
+                    loadClipboardBuffer();
+                });
+                actions.appendChild(btnPin);
+
+                const btnDel = document.createElement("button");
+                btnDel.className = "btn-xs btn-danger";
+                btnDel.textContent = "✕";
+                btnDel.title = "Delete item";
+                btnDel.addEventListener("click", async () => {
+                    await apiRequest("/api/clipboard/buffer/delete", "POST", { item_id: item.item_id });
+                    loadClipboardBuffer();
+                });
+                actions.appendChild(btnDel);
+
+                footer.appendChild(actions);
+                card.appendChild(footer);
+
+                container.appendChild(card);
+            });
+        };
+
+        renderTimeline(overviewTimeline, true);
+        renderTimeline(fullTimeline, false);
+    }
+
+    async function loadAndroidApps() {
+        const container = document.getElementById("android-apps-container");
+        const statusEl = document.getElementById("android-app-status");
+        if (!container) return;
+
+        // Resolve target Android device
+        const devData = await apiRequest("/api/devices");
+        const devList = (devData && Array.isArray(devData.devices)) ? devData.devices :
+                        ((devData && devData.data && Array.isArray(devData.data.devices)) ? devData.data.devices : []);
+        const androidDevs = devList.filter(d => !isLocalNode(d) && d.is_connected && (d.platform === "android" || !d.platform));
+
+        let targetId = activeDeviceId;
+        if (targetId) {
+            const devExists = androidDevs.find(d => d.device_id === targetId);
+            if (!devExists) {
+                targetId = "";
+            }
+        }
+
+        if (!targetId) {
+            if (androidDevs.length === 1) {
+                targetId = androidDevs[0].device_id;
+                activeDeviceId = targetId;
+            } else if (androidDevs.length === 0) {
+                container.innerHTML = '<div class="empty-state">No connected Android device found. Connect or pair an Android device first.</div>';
+                return;
+            } else {
+                container.innerHTML = '<div class="empty-state">Multiple Android devices connected. Please select an active target device.</div>';
+                return;
+            }
+        }
+
+        container.innerHTML = '<div class="empty-state"><div class="spinner"></div> Fetching installed Android apps...</div>';
+        const res = await apiRequest(`/api/apps/android?device_id=${encodeURIComponent(targetId)}`);
+        container.innerHTML = "";
+
+        const apps = (res && res.data && Array.isArray(res.data.apps)) ? res.data.apps :
+                     (res && Array.isArray(res.apps)) ? res.apps : [];
+
+        if (apps.length === 0) {
+            const empty = document.createElement("div");
+            empty.className = "empty-state";
+            empty.textContent = res && res.error ? `Failed to load apps: ${res.error}` : "No applications found or Android device is not connected.";
+            container.appendChild(empty);
+            return;
+        }
+
+        const filterInput = document.getElementById("android-app-filter");
+        const renderFiltered = (filterText = "") => {
+            container.innerHTML = "";
+            const lowerFilter = filterText.toLowerCase();
+            const filtered = apps.filter(app => {
+                const name = (app.app_name || app.name || "").toLowerCase();
+                const pkg = (app.package_name || app.package || "").toLowerCase();
+                return name.includes(lowerFilter) || pkg.includes(lowerFilter);
+            });
+
+            if (filtered.length === 0) {
+                const empty = document.createElement("div");
+                empty.className = "empty-state";
+                empty.textContent = "No matching apps.";
+                container.appendChild(empty);
+                return;
+            }
+
+            filtered.forEach(app => {
+                const row = document.createElement("div");
+                row.className = "app-row";
+
+                const info = document.createElement("div");
+                info.className = "app-info";
+                const nameSpan = document.createElement("span");
+                nameSpan.className = "app-name";
+                nameSpan.textContent = app.app_name || app.name || app.package_name;
+                const pkgSpan = document.createElement("span");
+                pkgSpan.className = "app-pkg";
+                pkgSpan.textContent = app.package_name || app.package || "";
+                info.appendChild(nameSpan);
+                info.appendChild(pkgSpan);
+                row.appendChild(info);
+
+                const btnLaunch = document.createElement("button");
+                btnLaunch.className = "btn-xs btn-primary";
+                btnLaunch.textContent = "🚀 Launch";
+                btnLaunch.addEventListener("click", async () => {
+                    btnLaunch.disabled = true;
+                    btnLaunch.textContent = "Launching...";
+                    const lRes = await apiRequest("/api/apps/android/launch", "POST", {
+                        package_name: app.package_name || app.package,
+                        device_id: targetId
+                    });
+                    btnLaunch.disabled = false;
+                    btnLaunch.textContent = "🚀 Launch";
+                    if (statusEl) {
+                        if (lRes && lRes.success) {
+                            statusEl.textContent = `Launched ${app.app_name || app.package_name} successfully.`;
+                            statusEl.className = "text-sm text-success mt-2";
+                        } else {
+                            statusEl.textContent = `Launch failed: ${lRes ? (lRes.error || lRes.status) : 'Unknown error'}`;
+                            statusEl.className = "text-sm text-danger mt-2";
+                        }
+                    }
+                });
+                row.appendChild(btnLaunch);
+
+                container.appendChild(row);
+            });
+        };
+
+        if (filterInput) {
+            filterInput.oninput = () => renderFiltered(filterInput.value);
+        }
+        renderFiltered();
     }
 
     // 4B. Devices
@@ -1921,10 +2323,158 @@
         btnRefreshRelay.addEventListener("click", () => loadRelayStatus());
     }
 
-    const btnJumpApprovals = document.getElementById("btn-jump-approvals");
-    if (btnJumpApprovals) {
-        btnJumpApprovals.addEventListener("click", () => switchTab("approvals"));
-    }
+        const btnJumpApprovals = document.getElementById("btn-jump-approvals");
+        if (btnJumpApprovals) {
+            btnJumpApprovals.addEventListener("click", () => switchTab("approvals"));
+        }
+
+        // Live screen sharing stop button
+        const btnStopScreen = document.getElementById("btn-stop-screen-share");
+        if (btnStopScreen) {
+            btnStopScreen.addEventListener("click", async () => {
+                btnStopScreen.disabled = true;
+                btnStopScreen.textContent = "Stopping...";
+                await apiRequest("/api/screen/stop", "POST");
+                btnStopScreen.disabled = false;
+                btnStopScreen.textContent = "Stop Sharing";
+                pollScreenFrame();
+            });
+        }
+
+        // Document visibility handling for frame polling
+        document.addEventListener("visibilitychange", () => {
+            if (!document.hidden && currentTab === "overview" && !screenPollActive) {
+                startScreenPoll();
+            }
+        });
+
+        // =====================================================================
+        // Phase 26B: Clipboard Hub & Remote Apps Bindings
+        // =====================================================================
+
+        const bindHubAction = (btnId, handler) => {
+            const btn = document.getElementById(btnId);
+            if (btn) btn.addEventListener("click", handler);
+        };
+
+        const handleCapPcClip = async () => {
+            const statusEl = document.getElementById("hub-overview-status");
+            if (statusEl) statusEl.textContent = "Capturing Windows clipboard...";
+            const res = await apiRequest("/api/clipboard/buffer/capture_pc", "POST");
+            if (statusEl) {
+                if (res && res.success) {
+                    statusEl.textContent = "Captured Windows clipboard to shared buffer!";
+                    statusEl.className = "hub-status-text text-sm text-success mt-2";
+                } else {
+                    statusEl.textContent = `Capture failed: ${res ? (res.error || res.status) : 'Empty or unavailable'}`;
+                    statusEl.className = "hub-status-text text-sm text-danger mt-2";
+                }
+            }
+            loadClipboardBuffer();
+        };
+
+        const handlePullPhone = async () => {
+            const statusEl = document.getElementById("hub-overview-status");
+            if (statusEl) statusEl.textContent = "Pulling clipboard from phone...";
+            const res = await apiRequest("/api/clipboard/buffer/pull_phone", "POST");
+            if (statusEl) {
+                if (res && res.success) {
+                    statusEl.textContent = "Pulled clipboard from Android phone!";
+                    statusEl.className = "hub-status-text text-sm text-success mt-2";
+                } else {
+                    statusEl.textContent = `Pull failed: ${res ? (res.error || res.status) : 'Phone offline or foreground required'}`;
+                    statusEl.className = "hub-status-text text-sm text-danger mt-2";
+                }
+            }
+            loadClipboardBuffer();
+        };
+
+        const handleApplyLatestPc = async () => {
+            const statusEl = document.getElementById("hub-overview-status");
+            if (statusEl) statusEl.textContent = "Applying latest buffer item to PC...";
+            const res = await apiRequest("/api/clipboard/buffer/apply", "POST", { target: "pc" });
+            if (statusEl) {
+                if (res && res.success) {
+                    statusEl.textContent = "Applied latest item to Windows clipboard!";
+                    statusEl.className = "hub-status-text text-sm text-success mt-2";
+                } else {
+                    statusEl.textContent = `Apply failed: ${res ? (res.error || res.status) : 'Buffer empty'}`;
+                    statusEl.className = "hub-status-text text-sm text-danger mt-2";
+                }
+            }
+        };
+
+        const handleClearUnpinned = async () => {
+            await apiRequest("/api/clipboard/buffer/clear", "POST");
+            loadClipboardBuffer();
+        };
+
+        bindHubAction("btn-hub-cap-pc-clip", handleCapPcClip);
+        bindHubAction("btn-hub-tab-cap-pc", handleCapPcClip);
+        bindHubAction("btn-hub-pull-phone", handlePullPhone);
+        bindHubAction("btn-hub-tab-pull-phone", handlePullPhone);
+        bindHubAction("btn-hub-apply-pc", handleApplyLatestPc);
+        bindHubAction("btn-hub-tab-apply-pc", handleApplyLatestPc);
+        bindHubAction("btn-hub-clear-unpinned", handleClearUnpinned);
+        bindHubAction("btn-clipboard-clear-unpinned", handleClearUnpinned);
+        bindHubAction("btn-clipboard-refresh", () => loadClipboardBuffer());
+
+        bindHubAction("btn-hub-cap-screen", async () => {
+            const res = await apiRequest("/api/workflows/run", "POST", { workflow_id: "workflow_capture_pc_to_phone" });
+            loadClipboardBuffer();
+        });
+        bindHubAction("btn-hub-tab-cap-screen", async () => {
+            const res = await apiRequest("/api/workflows/run", "POST", { workflow_id: "workflow_capture_pc_to_phone" });
+            loadClipboardBuffer();
+        });
+
+        // Add custom text to buffer
+        bindHubAction("btn-clipboard-add-text", async () => {
+            const txtArea = document.getElementById("input-clipboard-text");
+            const pinChk = document.getElementById("check-clipboard-pin");
+            const statusEl = document.getElementById("clipboard-add-status");
+            const text = (txtArea ? txtArea.value : "").trim();
+            if (!text) return;
+            const isPinned = pinChk ? pinChk.checked : false;
+
+            const res = await apiRequest("/api/clipboard/buffer/add", "POST", { text: text, is_pinned: isPinned });
+            if (res && res.success) {
+                if (txtArea) txtArea.value = "";
+                if (pinChk) pinChk.checked = false;
+                if (statusEl) {
+                    statusEl.textContent = "Added to shared buffer!";
+                    statusEl.className = "text-sm text-success mt-2";
+                    setTimeout(() => { statusEl.textContent = ""; }, 2500);
+                }
+                loadClipboardBuffer();
+            } else {
+                if (statusEl) {
+                    statusEl.textContent = `Failed: ${res ? (res.error || res.status) : 'Unknown error'}`;
+                    statusEl.className = "text-sm text-danger mt-2";
+                }
+            }
+        });
+
+        // Windows Apps launcher buttons
+        document.querySelectorAll("[data-win-app]").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const appName = btn.getAttribute("data-win-app");
+                const statusEl = document.getElementById("windows-app-status");
+                if (statusEl) statusEl.textContent = `Launching ${appName}...`;
+                const res = await apiRequest("/api/apps/windows/launch", "POST", { app_name: appName });
+                if (statusEl) {
+                    if (res && res.success) {
+                        statusEl.textContent = `Launched ${appName} successfully.`;
+                        statusEl.className = "text-sm text-success mt-2";
+                    } else {
+                        statusEl.textContent = `Launch failed: ${res ? (res.error || res.status) : 'Unknown error'}`;
+                        statusEl.className = "text-sm text-danger mt-2";
+                    }
+                }
+            });
+        });
+
+        bindHubAction("btn-apps-refresh-android", () => loadAndroidApps());
 
     setupWorkflows();
 
@@ -1942,6 +2492,8 @@
             loadDevices();
         } else if (currentTab === "notifications") {
             loadNotifications();
+        } else if (currentTab === "clipboard") {
+            loadClipboardBuffer();
         } else if (currentTab === "settings") {
             loadRelayStatus();
             loadMcpGatewayStatus();

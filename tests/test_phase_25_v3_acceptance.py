@@ -50,12 +50,12 @@ from snow.security.context import ExecutionContext, ExecutionPrincipal
 
 
 class TestDynamicCatalogAndSecurityIntegrity(unittest.TestCase):
-    """Group A: Dynamic 34-tool catalog and security principal boundaries."""
+    """Group A: Dynamic 37-tool catalog and security principal boundaries."""
 
     def test_dynamic_catalog_exact_count_and_uniqueness(self) -> None:
-        """Verify dynamic registry contains exactly 34 tools with unique names."""
+        """Verify dynamic registry contains exactly 37 tools with unique names."""
         caps = list_capabilities()
-        self.assertEqual(len(caps), 34, f"Expected exactly 34 registered capabilities, got {len(caps)}")
+        self.assertEqual(len(caps), 37, f"Expected exactly 37 registered capabilities, got {len(caps)}")
         names = [c.name for c in caps]
         self.assertEqual(len(names), len(set(names)), "Tool names must be globally unique across all categories.")
 

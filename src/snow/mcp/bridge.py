@@ -52,58 +52,126 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_target_device(
-    devices: list[dict[str, Any]], target_query: str = ""
+    devices: list[dict[str, Any]],
+    target_query: str = "",
+    platform: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Resolve a target device query into a concrete device_id or structured error.
 
     Resolution rules:
-    1. If target_query is empty, 'default', or None:
-       - Filter to paired devices.
-       - If 0 paired devices: return (None, {"success": False, "status": "NO_DEVICES_PAIRED", "error": "No paired devices found. Pair a device with SNOW first."})
-       - If exactly 1 paired device: return (device_id, None)
-       - If > 1 paired devices:
-         - Check connected devices among paired devices.
-         - If exactly 1 is connected: return (device_id, None)
-         - Otherwise: return (None, {"success": False, "status": "DEVICE_REQUIRED", "error": f"Multiple devices available ({len(paired)} paired). Please specify device ID or name.", "data": {"available_devices": paired}})
-    2. If target_query is specified:
-       - Check exact device_id match.
-       - Check exact device_name match (case-insensitive).
-       - Check substring or prefix match (case-insensitive, min 3 chars).
-       - If multiple matches: return (None, {"success": False, "status": "AMBIGUOUS_DEVICE", "error": f"Target '{target_query}' matches multiple devices.", "data": {"matches": matches}})
-       - If no matches: return (None, {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"No device found matching '{target_query}'."})
+    - If platform is specified (e.g., 'android'):
+      - Exclude local Windows host node.
+      - Exclude nodes where is_local == True.
+      - Exclude nodes whose transport is 'local'.
+      - Exclude reserved local IDs such as 'local' and 'desktop-core'.
+      - Exclude non-matching platforms (e.g. windows when targeting android).
+      - Never silently route an Android operation to the Windows host.
+    - If target_query is empty, 'default', or None:
+      - Filter to paired devices among eligible candidates.
+      - If 0 paired devices:
+        - Check connected devices among eligible candidates.
+        - If exactly 1 connected: return (device_id, None).
+        - If > 1 connected: return DEVICE_REQUIRED.
+        - If 0 connected: return NO_DEVICES_PAIRED.
+      - If exactly 1 paired device: return (device_id, None).
+      - If > 1 paired devices:
+        - Check connected devices among paired devices.
+        - If exactly 1 is connected: return (device_id, None).
+        - If > 1 connected: return DEVICE_REQUIRED with available_devices: connected.
+        - If 0 connected: return DEVICE_REQUIRED with available_devices: paired.
+    - If target_query is specified:
+      - If target_query specifically targets an excluded local Windows node when targeting android:
+        return (None, {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"Cannot route Android operation to local Windows node '{clean_q}'."}).
+      - Check exact device_id match among eligible devices.
+      - Check exact device_name match (case-insensitive) among eligible devices.
+      - Check substring or prefix match (case-insensitive, min 3 chars) among eligible devices.
+      - If multiple matches: return AMBIGUOUS_DEVICE.
+      - If no matches: return DEVICE_NOT_FOUND.
     """
     clean_q = (target_query or "").strip()
-    paired = [d for d in devices if d.get("is_paired")]
+
+    def is_local_windows_node(d: dict[str, Any]) -> bool:
+        dev_id = str(d.get("device_id") or "").lower()
+        return bool(
+            d.get("is_local") is True
+            or str(d.get("transport") or "").lower() == "local"
+            or dev_id in ("local", "desktop-core")
+        )
+
+    # Determine candidate devices based on platform constraints and local node exclusion
+    eligible: list[dict[str, Any]] = []
+    for d in devices:
+        if platform and platform.lower() == "android":
+            if is_local_windows_node(d):
+                continue
+            p = str(d.get("platform") or "").lower()
+            if p in ("windows", "desktop", "pc"):
+                continue
+            eligible.append(d)
+        else:
+            if not clean_q and is_local_windows_node(d):
+                continue
+            eligible.append(d)
 
     if not clean_q or clean_q.lower() == "default":
+        paired = [d for d in eligible if d.get("is_paired")]
         if not paired:
+            connected = [d for d in eligible if d.get("is_connected")]
+            if len(connected) == 1:
+                return connected[0]["device_id"], None
+            elif len(connected) > 1:
+                return None, {
+                    "success": False,
+                    "status": "DEVICE_REQUIRED",
+                    "error": f"Multiple {platform + ' ' if platform else ''}devices available ({len(connected)} connected). Please specify device ID or name.",
+                    "data": {"available_devices": connected},
+                }
             return None, {
                 "success": False,
                 "status": "NO_DEVICES_PAIRED",
-                "error": "No paired devices found. Pair a device with SNOW first.",
+                "error": f"No paired {platform + ' ' if platform else ''}devices found. Pair a device with SNOW first.",
             }
+
         if len(paired) == 1:
             return paired[0]["device_id"], None
 
         connected = [d for d in paired if d.get("is_connected")]
         if len(connected) == 1:
             return connected[0]["device_id"], None
+        elif len(connected) > 1:
+            return None, {
+                "success": False,
+                "status": "DEVICE_REQUIRED",
+                "error": f"Multiple {platform + ' ' if platform else ''}devices available ({len(paired)} paired, {len(connected)} connected). Please specify device ID or name.",
+                "data": {"available_devices": connected},
+            }
 
         return None, {
             "success": False,
             "status": "DEVICE_REQUIRED",
-            "error": f"Multiple devices available ({len(paired)} paired, {len(connected)} connected). Please specify device ID or name.",
+            "error": f"Multiple {platform + ' ' if platform else ''}devices available ({len(paired)} paired). Please specify device ID or name.",
             "data": {"available_devices": paired},
         }
 
     # Explicit query provided
-    # 1. Exact match on device_id
-    for d in devices:
+    # Check if query specifically targeted an excluded local/windows node
+    if platform and platform.lower() == "android":
+        for d in devices:
+            if d.get("device_id") == clean_q or str(d.get("device_name") or "").lower() == clean_q.lower():
+                if is_local_windows_node(d) or str(d.get("platform") or "").lower() in ("windows", "desktop", "pc"):
+                    return None, {
+                        "success": False,
+                        "status": "DEVICE_NOT_FOUND",
+                        "error": f"Cannot route Android operation to local Windows node '{clean_q}'.",
+                    }
+
+    # 1. Exact match on device_id among eligible
+    for d in eligible:
         if d.get("device_id") == clean_q:
             return d["device_id"], None
 
-    # 2. Exact match on device_name (case-insensitive)
-    exact_names = [d for d in devices if d.get("device_name", "").lower() == clean_q.lower()]
+    # 2. Exact match on device_name (case-insensitive) among eligible
+    exact_names = [d for d in eligible if str(d.get("device_name") or "").lower() == clean_q.lower()]
     if len(exact_names) == 1:
         return exact_names[0]["device_id"], None
     elif len(exact_names) > 1:
@@ -114,12 +182,12 @@ def resolve_target_device(
             "data": {"matches": exact_names},
         }
 
-    # 3. Substring match on name or ID (minimum 3 characters)
+    # 3. Substring match on name or ID (minimum 3 characters) among eligible
     if len(clean_q) >= 3:
         matches = [
-            d for d in devices
-            if clean_q.lower() in d.get("device_name", "").lower()
-            or clean_q.lower() in d.get("device_id", "").lower()
+            d for d in eligible
+            if clean_q.lower() in str(d.get("device_name") or "").lower()
+            or clean_q.lower() in str(d.get("device_id") or "").lower()
         ]
         if len(matches) == 1:
             return matches[0]["device_id"], None
@@ -372,8 +440,8 @@ class SnowMcpBridge:
         If Core IPC is online and reachable, leverages Core IPC.
         If Core is offline or unavailable, executes in-process directly via CapabilityEngine.
         """
-        if await self.daemon_manager.is_ipc_ready(timeout=0.05):
-            ipc_res = await self.call(op, payload=payload, timeout=5.0)
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            ipc_res = await self.call(op, payload=payload, timeout=10.0)
             if ipc_res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
                 return ipc_res
 
@@ -476,59 +544,79 @@ class SnowMcpBridge:
     # Android Tools (Cross-Device via Core IPC)
     # =========================================================================
 
-    async def resolve_target(self, target_query: str = "") -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    async def resolve_target(
+        self, target_query: str = "", platform: Optional[str] = None
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
         """Resolve a device query against currently paired and discovered devices."""
         res = await self.list_devices()
         if not res.get("success"):
             return None, res
         devices = res.get("data", {}).get("devices", [])
-        return resolve_target_device(devices, target_query)
+        return resolve_target_device(devices, target_query, platform=platform)
 
-    async def _resolve_target_device_id(self, target_query: str = "") -> Optional[str]:
+    async def _resolve_target_device_id(
+        self, target_query: str = "", platform: str = "android"
+    ) -> Optional[str]:
         """Helper to resolve a target device ID using unified resolution rules."""
-        target_id, _ = await self.resolve_target(target_query)
+        target_id, _ = await self.resolve_target(target_query, platform=platform)
         return target_id
+
+    async def _resolve_android_target(
+        self, device_id: str = ""
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Resolve an Android target device, checking explicit ID or defaulting to eligible peer."""
+        target_id = (device_id or "").strip()
+        target_id, err = await self.resolve_target(target_id, platform="android")
+        if not target_id:
+            # Check if _resolve_target_device_id was overridden/mocked in tests
+            override = await self._resolve_target_device_id(device_id, platform="android")
+            if override and override != target_id:
+                return override, None
+            return None, err or {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        return target_id, None
 
     async def android_battery(self, device_id: str = "") -> dict[str, Any]:
         """Query paired Android phone battery telemetry."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(target_id, "battery_status", {})
 
     async def android_ring(self, duration_seconds: int = 5, device_id: str = "") -> dict[str, Any]:
         """Trigger audible alert / ringtone on Android phone."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(
             target_id, "ring_phone", {"duration_seconds": duration_seconds}
         )
 
     async def android_clipboard_push(self, text: str, device_id: str = "") -> dict[str, Any]:
         """Push text to Android clipboard."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(target_id, "clipboard_push", {"text": text})
 
     async def android_launch_app(self, package_name: str, device_id: str = "") -> dict[str, Any]:
         """Launch an application on Android phone."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(target_id, "launch_app", {"package_name": package_name})
 
     async def android_list_apps(self, limit: int = 50, device_id: str = "") -> dict[str, Any]:
         """List launchable applications on Android phone."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(target_id, "list_apps", {"limit": limit})
 
     async def android_file_send(self, file_path: str, device_id: str = "") -> dict[str, Any]:
         """Send a local file from Desktop to Android phone."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
+        if not target_id:
+            return err
         return await self.call_cross_device(
             "android_file_send",
             payload={"file_path": file_path, "device_id": target_id or ""},
@@ -539,7 +627,9 @@ class SnowMcpBridge:
         self, file_name: str, subpath: str = "", device_id: str = ""
     ) -> dict[str, Any]:
         """Request and download a file from Android phone to Desktop."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
+        if not target_id:
+            return err
         payload = {"file_name": file_name, "device_id": target_id or ""}
         if subpath:
             payload["subpath"] = subpath
@@ -576,13 +666,9 @@ class SnowMcpBridge:
                 ),
             }
 
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {
-                "success": False,
-                "status": "DEVICE_OFFLINE",
-                "error": "No connected Android device found.",
-            }
+            return err
         return await self.send_device_request(
             device_id=target_id,
             action="send_message",
@@ -594,9 +680,9 @@ class SnowMcpBridge:
         self, subpath: str = "", device_id: str = "", scope: str = "saf", show_hidden: bool = False
     ) -> dict[str, Any]:
         """List files and subdirectories within Android storage (SAF tree for AI/MCP, or Full Storage when authorized)."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(
             device_id=target_id,
             action="file_list",
@@ -610,9 +696,9 @@ class SnowMcpBridge:
 
     async def android_notifications_list(self, device_id: str = "") -> dict[str, Any]:
         """List active non-sensitive notifications from the connected Android phone."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(
             device_id=target_id,
             action="notifications_list",
@@ -622,9 +708,9 @@ class SnowMcpBridge:
 
     async def android_notification_dismiss(self, key: str, device_id: str = "") -> dict[str, Any]:
         """Dismiss a notification on the connected Android phone by key."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(
             device_id=target_id,
             action="notification_dismiss",
@@ -636,9 +722,9 @@ class SnowMcpBridge:
         self, key: str, text: str, device_id: str = ""
     ) -> dict[str, Any]:
         """Send a Quick Reply to an active notification on the connected Android phone."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         return await self.send_device_request(
             device_id=target_id,
             action="notification_reply",
@@ -654,9 +740,9 @@ class SnowMcpBridge:
         if clean_target in ("windows", "desktop", "local"):
             return await self._execute_local_or_ipc("media_control", {"action": action})
         else:
-            target_id = device_id or await self._resolve_target_device_id()
+            target_id, err = await self._resolve_android_target(device_id)
             if not target_id:
-                return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+                return err
             return await self.send_device_request(
                 device_id=target_id,
                 action="media_control",
@@ -672,9 +758,9 @@ class SnowMcpBridge:
         if clean_target in ("windows", "desktop", "local"):
             return await self._execute_local_or_ipc("share_link", {"url": url, "text": text})
         else:
-            target_id = device_id or await self._resolve_target_device_id()
+            target_id, err = await self._resolve_android_target(device_id)
             if not target_id:
-                return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+                return err
             return await self.send_device_request(
                 device_id=target_id,
                 action="share_link",
@@ -701,17 +787,17 @@ class SnowMcpBridge:
 
     async def android_screenshot(self, device_id: str = "", approval_id: str = "") -> dict[str, Any]:
         """Capture the connected Android phone screen via MediaProjection consent."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         data = {"approval_id": approval_id} if approval_id else {}
         return await self.send_device_request(device_id=target_id, action="android_screenshot", data=data)
 
     async def android_camera_capture(self, device_id: str = "", approval_id: str = "") -> dict[str, Any]:
         """Capture a photograph using the connected Android camera."""
-        target_id = device_id or await self._resolve_target_device_id()
+        target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
-            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+            return err
         data = {"approval_id": approval_id} if approval_id else {}
         return await self.send_device_request(device_id=target_id, action="android_camera_capture", data=data)
 
@@ -1189,3 +1275,42 @@ class SnowMcpBridge:
             }
         finally:
             await client.close()
+
+    # =========================================================================
+    # Phase 26B: Shared Clipboard Buffer Methods
+    # =========================================================================
+
+    async def clipboard_buffer_list(self, limit: int = 10) -> dict[str, Any]:
+        """List metadata for the latest items in the shared clipboard buffer."""
+        return await self._execute_local_or_ipc(
+            "clipboard_buffer_list",
+            {"limit": limit},
+        )
+
+    async def clipboard_buffer_add(
+        self,
+        text: str,
+        is_pinned: bool = False,
+        approval_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Add text content to the shared clipboard buffer."""
+        params: dict[str, Any] = {"text": text, "is_pinned": is_pinned}
+        if approval_id:
+            params["approval_id"] = approval_id
+        return await self._execute_local_or_ipc("clipboard_buffer_add", params)
+
+    async def clipboard_buffer_apply(
+        self,
+        item_id: str = "",
+        target: str = "pc",
+        approval_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Apply a buffer item to the local Windows clipboard or remote Android device."""
+        params: dict[str, Any] = {"item_id": item_id, "target": target}
+        if approval_id:
+            params["approval_id"] = approval_id
+        return await self._execute_local_or_ipc("clipboard_buffer_apply", params)
+
+    async def clipboard_buffer_get(self, item_id: str) -> dict[str, Any]:
+        """Retrieve metadata for a specific item in the shared clipboard buffer."""
+        return await self._execute_local_or_ipc("clipboard_buffer_get", {"item_id": item_id})

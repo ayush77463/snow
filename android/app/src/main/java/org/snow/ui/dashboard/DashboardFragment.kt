@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 import org.snow.R
 import org.snow.capabilities.CameraCaptureHandler
 import org.snow.capabilities.ClipboardHandler
+import org.snow.capabilities.LiveScreenStreamHandler
 import org.snow.capabilities.ScreenCaptureHandler
 import org.snow.databinding.FragmentDashboardBinding
 import org.snow.network.ConnectionState
@@ -70,15 +71,13 @@ class DashboardFragment : Fragment() {
     private val mediaProjectionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
-                val projectionManager =
-                    requireContext().getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
-                val projection = projectionManager?.getMediaProjection(result.resultCode, result.data!!)
-                ScreenCaptureHandler.isConsentGranted = true
-                ScreenCaptureHandler.activeMediaProjection = projection
-                Toast.makeText(requireContext(), "Screen capture consent granted 🛡️", Toast.LENGTH_SHORT).show()
+                Toast.makeText(requireContext(), "Screen sharing consent granted 🛡️ Starting stream...", Toast.LENGTH_SHORT).show()
+                org.snow.service.SnowForegroundService.startScreenShare(
+                    requireContext(),
+                    result.resultCode,
+                    result.data!!
+                )
             } else {
-                ScreenCaptureHandler.isConsentGranted = false
-                ScreenCaptureHandler.activeMediaProjection = null
                 Toast.makeText(requireContext(), "Screen capture consent cancelled", Toast.LENGTH_SHORT).show()
             }
         }
@@ -91,11 +90,21 @@ class DashboardFragment : Fragment() {
             if (success && capturedFile != null && capturedFile.exists() && capturedFile.length() > 0) {
                 CameraCaptureHandler.stagedPhotoFile = capturedFile
                 CameraCaptureHandler.isUserInteractionActive = true
-                Toast.makeText(requireContext(), "Photo captured and staged 📸", Toast.LENGTH_SHORT).show()
+                Toast.makeText(requireContext(), "Photo captured! Delivering to PC 📸", Toast.LENGTH_SHORT).show()
+                viewModel.uploadCameraPhoto { uploadSuccess, resOrErr ->
+                    activity?.runOnUiThread {
+                        if (uploadSuccess) {
+                            Toast.makeText(requireContext(), "Photo delivered to PC: $resOrErr ✅", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(requireContext(), "Photo delivery failed: $resOrErr", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
             } else {
                 CameraCaptureHandler.isUserInteractionActive = false
                 capturedFile?.delete()
                 pendingCameraCaptureFile = null
+                viewModel.dismissCameraDelivery()
                 Toast.makeText(requireContext(), "Photo capture cancelled", Toast.LENGTH_SHORT).show()
             }
         }
@@ -110,6 +119,7 @@ class DashboardFragment : Fragment() {
         }
 
     private fun launchCameraCapture() {
+        viewModel.setCameraCapturing()
         val cacheDir = File(requireContext().cacheDir, "camera_captures").apply { mkdirs() }
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val file = File(cacheDir, "manual_photo_${timeStamp}.jpg")
@@ -238,13 +248,24 @@ class DashboardFragment : Fragment() {
         }
 
         binding.btnScreenConsent.setOnClickListener {
-            val projectionManager =
-                requireContext().getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
-            if (projectionManager != null) {
-                mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+            val currentState = viewModel.screenShareState.value
+            if (currentState == LiveScreenStreamHandler.StreamState.STREAMING || currentState == LiveScreenStreamHandler.StreamState.STARTING) {
+                viewModel.stopScreenShare()
+                Toast.makeText(requireContext(), "Stopping screen share...", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(requireContext(), "MediaProjection service unavailable", Toast.LENGTH_SHORT).show()
+                val projectionManager =
+                    requireContext().getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
+                if (projectionManager != null) {
+                    mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                } else {
+                    Toast.makeText(requireContext(), "MediaProjection service unavailable", Toast.LENGTH_SHORT).show()
+                }
             }
+        }
+
+        binding.btnStopScreenSharing.setOnClickListener {
+            viewModel.stopScreenShare()
+            Toast.makeText(requireContext(), "Stopping screen share...", Toast.LENGTH_SHORT).show()
         }
 
         binding.btnCameraCapture.setOnClickListener {
@@ -255,8 +276,49 @@ class DashboardFragment : Fragment() {
             }
         }
 
+        binding.btnRetryCameraUpload.setOnClickListener {
+            viewModel.retryCameraUpload { success, resOrErr ->
+                activity?.runOnUiThread {
+                    if (success) {
+                        Toast.makeText(requireContext(), "Photo delivered to PC: $resOrErr ✅", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(requireContext(), "Retry failed: $resOrErr", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+
+        binding.btnDismissCameraDelivery.setOnClickListener {
+            viewModel.dismissCameraDelivery()
+        }
+
         binding.btnRefreshApprovals.setOnClickListener {
             refreshPendingApprovals()
+        }
+
+        binding.btnRefreshClipboardBuffer.setOnClickListener {
+            viewModel.refreshClipboardBuffer { success, msg ->
+                activity?.runOnUiThread {
+                    if (success) {
+                        Toast.makeText(requireContext(), "Refreshed clipboard buffer ❄️", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(requireContext(), "Refresh failed: $msg", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+
+        binding.btnCopyLatestBuffer.setOnClickListener {
+            val items = viewModel.clipboardBufferItems.value
+            if (items.isNotEmpty()) {
+                viewModel.applyBufferItem(items.first()) { success, msg ->
+                    activity?.runOnUiThread {
+                        Toast.makeText(requireContext(), msg ?: "Copied to clipboard", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } else {
+                Toast.makeText(requireContext(), "Clipboard buffer is empty", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -464,6 +526,141 @@ class DashboardFragment : Fragment() {
                     binding.cardActiveTransfer.visibility = View.GONE
                 }
             }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.screenShareState.collectLatest { state ->
+                when (state) {
+                    LiveScreenStreamHandler.StreamState.STREAMING -> {
+                        binding.btnScreenConsent.text = "Stop Sharing"
+                        binding.cardScreenSharing.visibility = View.VISIBLE
+                        binding.tvScreenShareStatus.text = "STREAMING"
+                    }
+                    LiveScreenStreamHandler.StreamState.STARTING -> {
+                        binding.btnScreenConsent.text = "Starting..."
+                        binding.cardScreenSharing.visibility = View.VISIBLE
+                        binding.tvScreenShareStatus.text = "STARTING"
+                    }
+                    LiveScreenStreamHandler.StreamState.REVOKED -> {
+                        binding.btnScreenConsent.text = "Share Screen"
+                        binding.cardScreenSharing.visibility = View.GONE
+                        Toast.makeText(requireContext(), "Screen sharing was stopped by system", Toast.LENGTH_SHORT).show()
+                    }
+                    else -> {
+                        binding.btnScreenConsent.text = "Share Screen"
+                        binding.cardScreenSharing.visibility = View.GONE
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewModel.cameraDelivery.collectLatest { info ->
+                when (info.status) {
+                    SnowUiRepository.CameraDeliveryStatus.IDLE -> {
+                        binding.cardCameraDelivery.visibility = View.GONE
+                    }
+                    SnowUiRepository.CameraDeliveryStatus.CAPTURING -> {
+                        binding.cardCameraDelivery.visibility = View.VISIBLE
+                        binding.tvCameraDeliveryBadge.text = "CAPTURING"
+                        binding.tvCameraDeliveryBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_cyan))
+                        binding.tvCameraDeliveryDetails.text = "Taking photo with camera..."
+                        binding.btnRetryCameraUpload.visibility = View.GONE
+                    }
+                    SnowUiRepository.CameraDeliveryStatus.UPLOADING -> {
+                        binding.cardCameraDelivery.visibility = View.VISIBLE
+                        binding.tvCameraDeliveryBadge.text = "UPLOADING"
+                        binding.tvCameraDeliveryBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_blue))
+                        binding.tvCameraDeliveryDetails.text = "Uploading photo to PC over HTTPS..."
+                        binding.btnRetryCameraUpload.visibility = View.GONE
+                    }
+                    SnowUiRepository.CameraDeliveryStatus.DELIVERED -> {
+                        binding.cardCameraDelivery.visibility = View.VISIBLE
+                        binding.tvCameraDeliveryBadge.text = "DELIVERED"
+                        binding.tvCameraDeliveryBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
+                        binding.tvCameraDeliveryDetails.text = "Photo delivered to PC successfully: ${info.fileName ?: "photo.jpg"}"
+                        binding.btnRetryCameraUpload.visibility = View.GONE
+                    }
+                    SnowUiRepository.CameraDeliveryStatus.FAILED -> {
+                        binding.cardCameraDelivery.visibility = View.VISIBLE
+                        binding.tvCameraDeliveryBadge.text = "FAILED"
+                        binding.tvCameraDeliveryBadge.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
+                        binding.tvCameraDeliveryDetails.text = "Upload failed: ${info.error ?: "Network error"}"
+                        binding.btnRetryCameraUpload.visibility = View.VISIBLE
+                    }
+                }
+            }
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.clipboardBufferItems.collectLatest { items ->
+                    renderClipboardBufferItems(items)
+                }
+            }
+        }
+    }
+
+    private fun renderClipboardBufferItems(items: List<SnowUiRepository.ClipboardItemDto>) {
+        if (_binding == null) return
+        val container = binding.layoutBufferItems
+        container.removeAllViews()
+
+        if (items.isEmpty()) {
+            binding.tvBufferEmpty.visibility = View.VISIBLE
+            binding.tvBufferEmpty.text = "Buffer empty or offline."
+            return
+        }
+
+        binding.tvBufferEmpty.visibility = View.GONE
+        items.take(10).forEach { item ->
+            val row = android.widget.LinearLayout(requireContext()).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                layoutParams = android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = 8
+                }
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(8, 8, 8, 8)
+                setBackgroundResource(R.drawable.bg_card_glacier)
+            }
+
+            val tvText = android.widget.TextView(requireContext()).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(
+                    0,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                    1f
+                )
+                val deviceTag = if (item.sourceDevice.lowercase().contains("phone")) "📱" else "💻"
+                val pinTag = if (item.isPinned) "📌 " else ""
+                val preview = item.previewText.take(60)
+                text = "$deviceTag $pinTag$preview"
+                textSize = 12f
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_text))
+            }
+            row.addView(tvText)
+
+            val btnCopy = com.google.android.material.button.MaterialButton(
+                requireContext(),
+                null,
+                com.google.android.material.R.attr.materialButtonOutlinedStyle
+            ).apply {
+                text = "Copy"
+                textSize = 10f
+                setPadding(12, 4, 12, 4)
+                setOnClickListener {
+                    viewModel.applyBufferItem(item) { success, msg ->
+                        activity?.runOnUiThread {
+                            Toast.makeText(requireContext(), msg ?: "Copied", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+            row.addView(btnCopy)
+
+            container.addView(row)
         }
     }
 

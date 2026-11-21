@@ -503,4 +503,70 @@ open class FileTransferClient(
             TransferResult.Error(transferId, e.message ?: "Download exception")
         }
     }
+
+    /**
+     * Post a single bounded JPEG screen frame to the desktop HTTP transfer server.
+     */
+    suspend fun postScreenFrame(
+        serverHost: String,
+        transferPort: Int,
+        frameBytes: ByteArray,
+        sessionId: String,
+        width: Int,
+        height: Int,
+        fps: Float
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val url = "$baseUrl/api/v1/screen/frame"
+        val token = getAuthToken() ?: ""
+        val mediaType = "image/jpeg".toMediaType()
+        val reqBody = frameBytes.toRequestBody(mediaType)
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("X-Snow-Device-Id", deviceId)
+            .addHeader("X-Snow-Session-Id", sessionId)
+            .addHeader("X-Snow-Frame-Width", width.toString())
+            .addHeader("X-Snow-Frame-Height", height.toString())
+            .addHeader("X-Snow-FPS", fps.toString())
+            .post(reqBody)
+            .build()
+
+        try {
+            httpClient.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Screen frame POST error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Signal the desktop HTTP transfer server that screen streaming has stopped.
+     */
+    suspend fun postScreenStreamStop(
+        serverHost: String,
+        transferPort: Int
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val url = "$baseUrl/api/v1/screen/stop"
+        val token = getAuthToken() ?: ""
+        val emptyBody = "".toRequestBody(JSON_MEDIA_TYPE)
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("X-Snow-Device-Id", deviceId)
+            .post(emptyBody)
+            .build()
+
+        try {
+            httpClient.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Screen stop POST error: ${e.message}")
+            false
+        }
+    }
 }

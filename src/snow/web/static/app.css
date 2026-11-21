@@ -1336,3 +1336,244 @@ body.theme-dark .data-table tr:hover td {
 .workflow-technical-details summary:hover {
     color: var(--accent-primary);
 }
+
+/* Phase 26A Live Screen Viewer */
+.screen-viewer-container {
+    text-align: center;
+    min-height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-app);
+    border-radius: 8px;
+    padding: 1rem;
+    border: 1px dashed var(--border-color);
+}
+
+.screen-frame-img {
+    max-width: 100%;
+    max-height: 520px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    object-fit: contain;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.screen-stats-bar {
+    display: flex;
+    gap: 1.25rem;
+    padding: 0.75rem 0.25rem 0.25rem 0.25rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    flex-wrap: wrap;
+    font-family: monospace;
+}
+
+.screen-controls {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+/* Phase 26A Camera Photo Delivery */
+.camera-preview-container {
+    text-align: center;
+}
+
+.camera-latest-img {
+    max-width: 100%;
+    max-height: 420px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    object-fit: contain;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.badge-danger {
+    background: #dc3545;
+    color: #fff;
+}
+
+/* =========================================================================
+   Phase 26B: Clipboard & Capture Hub & Remote Apps
+   ========================================================================= */
+
+.hub-quick-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.clipboard-timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+}
+
+.clipboard-card {
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.clipboard-card:hover {
+    border-color: var(--accent-primary);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.clipboard-card.pinned {
+    border-left: 3px solid #ffc107;
+}
+
+.clip-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.clip-meta-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.clip-meta-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.clip-device-chip {
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    background: var(--bg-hover);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+}
+
+.clip-pin-badge {
+    color: #ffc107;
+    font-weight: 600;
+}
+
+.clip-body {
+    font-size: 0.9rem;
+    line-height: 1.4;
+    word-break: break-word;
+    color: var(--text-primary);
+}
+
+.clip-text {
+    white-space: pre-wrap;
+    max-height: 120px;
+    overflow-y: auto;
+    background: var(--bg-base);
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    font-family: inherit;
+}
+
+.clip-thumb {
+    max-height: 180px;
+    max-width: 100%;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+    object-fit: contain;
+    background: var(--bg-base);
+}
+
+.clip-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 0.25rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border-color);
+}
+
+.clip-info {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.clip-actions {
+    display: flex;
+    gap: 0.4rem;
+}
+
+/* Remote Apps Grid & List */
+.apps-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 0.75rem;
+}
+
+.btn-app {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.75rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    transition: all 0.15s ease;
+}
+
+.btn-app:hover {
+    border-color: var(--accent-primary);
+    background: var(--bg-hover);
+    transform: translateY(-1px);
+}
+
+.apps-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.app-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.6rem 0.75rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+}
+
+.app-row:hover {
+    background: var(--bg-hover);
+}
+
+.app-info {
+    display: flex;
+    flex-direction: column;
+}
+
+.app-name {
+    font-weight: 500;
+    font-size: 0.9rem;
+    color: var(--text-primary);
+}
+
+.app-pkg {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-family: monospace;
+}

@@ -29,6 +29,7 @@ import time
 from typing import Any, Dict, Optional, Set
 import urllib.parse
 
+from snow.capabilities.clipboard_buffer import ClipboardRingBuffer
 from snow.capabilities.windows.apps import WindowsAppLauncher
 from snow.capabilities.windows.clipboard import WindowsClipboardManager
 from snow.capabilities.windows.files import WindowsFileManager
@@ -92,6 +93,14 @@ ENGINE_ACTION_MAP: dict[str, str] = {
     "android_clipboard_push": "android.clipboard.set",
     "snow_android_clipboard_push": "android.clipboard.set",
     "clipboard_push": "android.clipboard.set",
+    # Shared Clipboard Ring Buffer (Phase 26B)
+    "clipboard_buffer_list": CAPABILITY_DESKTOP_CLIPBOARD_READ,
+    "clipboard_buffer_add": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_pin": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_unpin": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_delete": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_clear": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_apply": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
     # Media & Share & Audit (Phase 21)
     "media_control": "media_control",
     "windows_media_control": "media_control",
@@ -160,6 +169,7 @@ class CapabilityEngine:
         storage_manager: Optional[Any] = None,
         http_transfer_server: Optional[Any] = None,
         core_server: Optional[Any] = None,
+        clipboard_buffer: Optional[ClipboardRingBuffer] = None,
     ) -> None:
         self.telemetry = telemetry or WindowsTelemetry()
         self.processes = processes or WindowsProcessMonitor()
@@ -168,6 +178,7 @@ class CapabilityEngine:
         self.terminal = terminal or WindowsTerminalExecutor()
         self.terminal.set_ticket_validator(self.validate_confirmation_ticket)
         self.clipboard = clipboard or WindowsClipboardManager()
+        self.clipboard_buffer = clipboard_buffer or ClipboardRingBuffer()
         self.policy = policy or PeerCapabilityPolicy()
         self.node_registry = node_registry
         self.db_manager = db_manager
@@ -269,6 +280,15 @@ class CapabilityEngine:
                 status="POLICY_DENIED",
                 data={"status": "POLICY_DENIED", "tier": "RESTRICTED_BLOCKED"},
                 error="Catastrophic command execution is permanently blocked by security policy.",
+            )
+
+        # Phase 26B Policy: AI_MCP is strictly forbidden from deleting or clearing clipboard buffer items
+        if action in ("clipboard_buffer_delete", "clipboard_buffer_clear") and effective_ctx.principal == ExecutionPrincipal.AI_MCP:
+            logger.warning("CapabilityEngine denied '%s' for AI_MCP caller", action)
+            return CapabilityResponse(
+                success=False,
+                status="POLICY_DENIED",
+                error="Principal AI_MCP is not authorized to delete or clear items from clipboard buffer.",
             )
 
         # 5. Shared Approval Policy Check (Phase 21)
@@ -553,6 +573,171 @@ class CapabilityEngine:
                 data=res if is_ok else None,
                 error=res.get("error"),
             )
+
+        # --- Shared Clipboard Ring Buffer (Phase 26B) ---
+        if action == "clipboard_buffer_list":
+            limit = int(params.get("limit", 10))
+            items = self.clipboard_buffer.list_items(limit=limit)
+            return CapabilityResponse(
+                success=True,
+                status="SUCCESS",
+                data={"items": items, "count": len(items)},
+            )
+
+        if action == "clipboard_buffer_add":
+            text = params.get("text")
+            image_bytes = params.get("image_bytes")
+            mime_type = params.get("mime_type", "image/png")
+            source_device = params.get("source_device") or (ctx.device_id if ctx and ctx.device_id else "pc")
+            is_pinned = bool(params.get("is_pinned", False))
+            if image_bytes:
+                b_res = self.clipboard_buffer.add_image(
+                    image_bytes=image_bytes,
+                    mime_type=mime_type,
+                    source_device_id=source_device,
+                    pin=is_pinned,
+                )
+            elif text is not None:
+                b_res = self.clipboard_buffer.add_text(
+                    text=str(text),
+                    source_device_id=source_device,
+                    pin=is_pinned,
+                )
+            else:
+                return CapabilityResponse(
+                    success=False,
+                    status="INVALID_ARGUMENT",
+                    error="Either 'text' or 'image_bytes' is required.",
+                )
+            if not b_res.get("success"):
+                return CapabilityResponse(
+                    success=False,
+                    status=b_res.get("status", "ERROR"),
+                    error=b_res.get("error", "Failed adding item to clipboard buffer."),
+                )
+            return CapabilityResponse(
+                success=True,
+                status="SUCCESS",
+                data={"item": b_res.get("item")},
+            )
+
+        if action == "clipboard_buffer_pin":
+            item_id = params.get("item_id")
+            if not item_id:
+                return CapabilityResponse(success=False, status="INVALID_ARGUMENT", error="Missing 'item_id'.")
+            p_res = self.clipboard_buffer.pin(str(item_id))
+            if not p_res.get("success"):
+                return CapabilityResponse(
+                    success=False,
+                    status=p_res.get("status", "ERROR"),
+                    error=p_res.get("error", f"Pin failed for item {item_id}"),
+                )
+            return CapabilityResponse(
+                success=True,
+                status="SUCCESS",
+                data={"item": p_res.get("item")},
+            )
+
+        if action == "clipboard_buffer_unpin":
+            item_id = params.get("item_id")
+            if not item_id:
+                return CapabilityResponse(success=False, status="INVALID_ARGUMENT", error="Missing 'item_id'.")
+            u_res = self.clipboard_buffer.unpin(str(item_id))
+            if not u_res.get("success"):
+                return CapabilityResponse(
+                    success=False,
+                    status=u_res.get("status", "ERROR"),
+                    error=u_res.get("error", f"Unpin failed for item {item_id}"),
+                )
+            return CapabilityResponse(
+                success=True,
+                status="SUCCESS",
+                data={"item": u_res.get("item")},
+            )
+
+        if action == "clipboard_buffer_delete":
+            item_id = params.get("item_id")
+            if not item_id:
+                return CapabilityResponse(success=False, status="INVALID_ARGUMENT", error="Missing 'item_id'.")
+            d_res = self.clipboard_buffer.delete(str(item_id))
+            if not d_res.get("success"):
+                return CapabilityResponse(
+                    success=False,
+                    status=d_res.get("status", "ITEM_NOT_FOUND"),
+                    error=d_res.get("error", f"Item '{item_id}' not found."),
+                )
+            return CapabilityResponse(
+                success=True,
+                status="SUCCESS",
+                data={"deleted": True, "item_id": item_id},
+            )
+
+        if action == "clipboard_buffer_clear":
+            unpinned_only = bool(params.get("unpinned_only", True))
+            c_res = self.clipboard_buffer.clear(unpinned_only=unpinned_only)
+            return CapabilityResponse(
+                success=c_res.get("success", True),
+                status="SUCCESS",
+                data=c_res,
+            )
+
+        if action == "clipboard_buffer_apply":
+            item_id = params.get("item_id")
+            target = str(params.get("target") or params.get("target_device") or "pc").strip().lower()
+            if not item_id:
+                items = self.clipboard_buffer.list_items()
+                if not items:
+                    return CapabilityResponse(success=False, status="BUFFER_EMPTY", error="Clipboard buffer is empty.")
+                item_meta = items[0]
+                target_id = item_meta["item_id"]
+            else:
+                target_id = str(item_id)
+
+            item = self.clipboard_buffer.get_item(target_id, include_content=True)
+            if not item:
+                return CapabilityResponse(success=False, status="ITEM_NOT_FOUND", error=f"Item '{target_id}' not found.")
+
+            c_type = item.get("content_type", "text")
+            if target in ("pc", "windows", "local"):
+                if c_type == "image":
+                    img_path = self.clipboard_buffer.get_image_path(target_id)
+                    if not img_path or not img_path.exists():
+                        return CapabilityResponse(success=False, status="FILE_NOT_FOUND", error="Image file missing on disk.")
+                    res = self.clipboard.set_image_sync(img_path)
+                else:
+                    res = await self.clipboard.set_clipboard(text=item.get("text_content", ""))
+                is_ok = res.get("success", False)
+                return CapabilityResponse(
+                    success=is_ok,
+                    status="SUCCESS" if is_ok else res.get("status", "ERROR"),
+                    data={"applied": is_ok, "item_id": target_id, "type": c_type, "target": "pc"},
+                    error=res.get("error"),
+                )
+            else:
+                router = getattr(self, "session_router", None)
+                if not router or not hasattr(router, "route_request"):
+                    return CapabilityResponse(success=False, status="DEVICE_OFFLINE", error="Session router not available.")
+                if c_type == "text":
+                    route_res = await router.route_request(
+                        action="clipboard_push",
+                        target=target,
+                        data={"text": item.get("text_content", "")},
+                        ctx=ctx,
+                    )
+                else:
+                    route_res = await router.route_request(
+                        action="clipboard_push",
+                        target=target,
+                        data={"type": "image", "sha256": item.get("sha256"), "mime_type": item.get("mime_type")},
+                        ctx=ctx,
+                    )
+                is_ok = route_res.get("success", False)
+                return CapabilityResponse(
+                    success=is_ok,
+                    status=route_res.get("status", "SUCCESS" if is_ok else "ERROR"),
+                    data={"applied": is_ok, "item_id": target_id, "type": c_type, "target": target},
+                    error=route_res.get("error"),
+                )
 
         # --- Device Registry Queries ---
         if action in ("list_devices", "device_list", "devices"):

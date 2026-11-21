@@ -25,7 +25,7 @@ ALL_TOOL_NAMES: List[str] = [meta.name for meta in list_capabilities()]
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 30 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 37 static MCP tools onto the provided FastMCP server instance."""
     # Wrap server.tool to automatically populate MCP ToolAnnotations (readOnlyHint, destructiveHint)
     _orig_tool = server.tool
 
@@ -702,6 +702,148 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "success": False,
                 "status": result.get("status", "ERROR"),
                 "error": result.get("error", f"Failed running workflow '{workflow_id}'."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    # =========================================================================
+    # Phase 26B: Shared Clipboard Buffer Tools
+    # =========================================================================
+
+    @server.tool(
+        name="snow_clipboard_buffer_list",
+        description="List metadata of up to 10 most recent items in the SNOW shared clipboard ring buffer.",
+    )
+    async def snow_clipboard_buffer_list(limit: int = 10) -> str:
+        """List metadata for items in the shared clipboard buffer."""
+        result = await bridge.clipboard_buffer_list(limit=limit)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed listing clipboard buffer items."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_clipboard_buffer_add",
+        description="Add a text entry to the SNOW shared clipboard ring buffer (requires owner approval for AI).",
+    )
+    async def snow_clipboard_buffer_add(
+        text: str,
+        is_pinned: bool = False,
+        approval_id: str = "",
+    ) -> str:
+        """Add text content to the shared clipboard buffer."""
+        result = await bridge.clipboard_buffer_add(
+            text=text,
+            is_pinned=is_pinned,
+            approval_id=approval_id or None,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed adding item to clipboard buffer."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_clipboard_buffer_apply",
+        description="Apply an item from the shared clipboard buffer to Windows or Android (requires approval).",
+    )
+    async def snow_clipboard_buffer_apply(
+        item_id: str = "",
+        target: str = "pc",
+        approval_id: str = "",
+    ) -> str:
+        """Apply a shared clipboard buffer item to local Windows or remote Android device."""
+        result = await bridge.clipboard_buffer_apply(
+            item_id=item_id,
+            target=target,
+            approval_id=approval_id or None,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed applying clipboard buffer item."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+
+def register_clipboard_buffer_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
+    """Register Phase 26B shared clipboard buffer tools independently if needed."""
+    _orig_tool = server.tool
+
+    def _annotated_tool(*args: Any, **kwargs: Any) -> Any:
+        tool_name = kwargs.get("name")
+        if tool_name and "annotations" not in kwargs:
+            ann = get_mcp_annotations(tool_name)
+            if ann is not None:
+                kwargs["annotations"] = ann
+        return _orig_tool(*args, **kwargs)
+
+    server.tool = _annotated_tool
+
+    @server.tool(
+        name="snow_clipboard_buffer_list",
+        description="List metadata of up to 10 most recent items in the SNOW shared clipboard ring buffer.",
+    )
+    async def snow_clipboard_buffer_list(limit: int = 10) -> str:
+        result = await bridge.clipboard_buffer_list(limit=limit)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed listing clipboard buffer items."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_clipboard_buffer_add",
+        description="Add a text entry to the SNOW shared clipboard ring buffer (requires owner approval for AI).",
+    )
+    async def snow_clipboard_buffer_add(
+        text: str,
+        is_pinned: bool = False,
+        approval_id: str = "",
+    ) -> str:
+        result = await bridge.clipboard_buffer_add(
+            text=text,
+            is_pinned=is_pinned,
+            approval_id=approval_id or None,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed adding item to clipboard buffer."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_clipboard_buffer_apply",
+        description="Apply an item from the shared clipboard buffer to Windows or Android (requires approval).",
+    )
+    async def snow_clipboard_buffer_apply(
+        item_id: str = "",
+        target: str = "pc",
+        approval_id: str = "",
+    ) -> str:
+        result = await bridge.clipboard_buffer_apply(
+            item_id=item_id,
+            target=target,
+            approval_id=approval_id or None,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed applying clipboard buffer item."),
                 "data": result.get("data"),
             }, indent=2)
         return json.dumps(result.get("data", {}) or result, indent=2)

@@ -86,6 +86,8 @@ class SnowCoreServer:
         self.ws_server.windows_clipboard = self.windows_clipboard
         self.ws_server.capability_policy = self.capability_policy
         self.ws_server.capability_engine = self.capability_engine
+        self.clipboard_buffer = self.capability_engine.clipboard_buffer
+        self.ws_server.clipboard_buffer = self.capability_engine.clipboard_buffer
         self.node_registry = NodeRegistry(
             db_manager=self.db_manager,
             connection_manager=self.ws_server.connection_manager,

@@ -51,6 +51,8 @@ class CameraCaptureHandler(
         @Volatile
         var stagedPhotoFile: File? = null
 
+        fun hasStagedPhoto(): Boolean = stagedPhotoFile != null && stagedPhotoFile!!.exists()
+
         fun resetInteraction() {
             isUserInteractionActive = false
             mockBitmapProvider = null
@@ -133,8 +135,7 @@ class CameraCaptureHandler(
                 }
             } else if (stagedPhotoFile != null && stagedPhotoFile!!.exists()) {
                 stagedPhotoFile!!.copyTo(tempFile, overwrite = true)
-                stagedPhotoFile!!.delete()
-                stagedPhotoFile = null
+                // Retain stagedPhotoFile until delivery is confirmed!
             } else {
                 SafeLog.w(TAG, "Camera capture rejected: no staged photo available from user interaction.")
                 return@withContext mapOf(
@@ -176,6 +177,10 @@ class CameraCaptureHandler(
             }
 
             val transferId = uploadRes.transferId
+
+            // Critical retention rule: Delete staged photo ONLY after confirmed successful delivery
+            stagedPhotoFile?.delete()
+            stagedPhotoFile = null
 
             SafeLog.i(TAG, "Android camera photo captured and uploaded successfully (file=$fileName, size=$sizeBytes).")
             return@withContext mapOf(

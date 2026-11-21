@@ -78,12 +78,22 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "share_link": "android.apps.launch",
     "android_screenshot": "android.media.projection",
     "snow_android_screenshot": "android.media.projection",
+    "screen_stream_stop": "android.media.projection",
     "android_camera_capture": "android.camera.capture",
     "snow_android_camera_capture": "android.camera.capture",
+    "clipboard_buffer_list": "desktop.clipboard.read",
+    "clipboard_buffer_add": "desktop.clipboard.write",
+    "clipboard_buffer_apply": "desktop.clipboard.write",
 }
 
 # Mapping from high-level unified actions to physical peer wire actions
 ACTION_TO_WIRE_ACTION: dict[str, str] = {
+    "clipboard_buffer_list": "clipboard_buffer_list",
+    "clipboard_buffer_get": "clipboard_buffer_get",
+    "clipboard_buffer_add": "clipboard_buffer_add",
+    "clipboard_buffer_apply": "clipboard_buffer_apply",
+    "screen_stream_stop": "screen_stream_stop",
+    "android_screen_stream_stop": "screen_stream_stop",
     "snow_android_battery": "battery_status",
     "android_battery_status": "battery_status",
     "snow_android_battery_status": "battery_status",

@@ -19,7 +19,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import org.snow.capabilities.CameraCaptureHandler
 import org.snow.capabilities.ClipboardHandler
+import org.snow.capabilities.LiveScreenStreamHandler
 import org.snow.capabilities.RingerHandler
 import org.snow.capabilities.ScreenshotObserver
 import org.snow.network.AuthState
@@ -112,12 +114,49 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _logs = MutableStateFlow<List<UiLogEntry>>(emptyList())
     val logs: StateFlow<List<UiLogEntry>> = _logs.asStateFlow()
 
+    // Phase 26A Live Screen Sharing state
+    private val _screenShareState = MutableStateFlow(LiveScreenStreamHandler.StreamState.IDLE)
+    val screenShareState: StateFlow<LiveScreenStreamHandler.StreamState> = _screenShareState.asStateFlow()
+
+    // Phase 26A Camera Delivery State Machine
+    enum class CameraDeliveryStatus {
+        IDLE,
+        CAPTURING,
+        UPLOADING,
+        DELIVERED,
+        FAILED
+    }
+
+    data class CameraDeliveryInfo(
+        val status: CameraDeliveryStatus = CameraDeliveryStatus.IDLE,
+        val fileName: String? = null,
+        val error: String? = null
+    )
+
+    private val _cameraDelivery = MutableStateFlow(CameraDeliveryInfo())
+    val cameraDelivery: StateFlow<CameraDeliveryInfo> = _cameraDelivery.asStateFlow()
+
+    // Phase 26B Shared Clipboard Buffer DTO & State
+    data class ClipboardItemDto(
+        val itemId: String,
+        val type: String,
+        val sourceDevice: String,
+        val previewText: String,
+        val sizeBytes: Long,
+        val timestamp: Double,
+        val isPinned: Boolean
+    )
+
+    private val _clipboardBufferItems = MutableStateFlow<List<ClipboardItemDto>>(emptyList())
+    val clipboardBufferItems: StateFlow<List<ClipboardItemDto>> = _clipboardBufferItems.asStateFlow()
+
     // Bounded retries tracking
     private var connectionAttemptCount = 0
     private var activeDownloadJob: Job? = null
     private var clientConnectionJob: Job? = null
     private var clientAuthJob: Job? = null
     private var discoveryJob: Job? = null
+    private var screenShareJob: Job? = null
     private var _fileTransferClient: FileTransferClient? = null
     var connectedHost: String = ""
         private set
@@ -134,6 +173,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         serviceRef = service
         observeClientFlows(service.client)
         observeDiscoveryFlow(service.discoveryManager)
+
+        screenShareJob?.cancel()
+        screenShareJob = repoScope.launch {
+            service.liveScreenHandler.streamState.collectLatest { s ->
+                _screenShareState.value = s
+            }
+        }
     }
 
     fun unbindService() {
@@ -143,6 +189,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         clientAuthJob = null
         discoveryJob?.cancel()
         discoveryJob = null
+        screenShareJob?.cancel()
+        screenShareJob = null
+        _screenShareState.value = LiveScreenStreamHandler.StreamState.IDLE
         serviceRef = null
     }
 
@@ -193,6 +242,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     if (prefs.getBoolean(PREF_KEY_AUTO_SYNC_SCREENSHOTS, false)) {
                         screenshotObserver.register()
                     }
+                    // Fetch latest shared clipboard buffer items
+                    fetchClipboardBuffer()
                     // Update identity-first saved device history and endpoint ring buffer
                     recordSuccessfulConnection(host = host, port = port, sessionId = auth.sessionId, tier = auth.trustTier)
                 } else {
@@ -1005,6 +1056,106 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
+    /**
+     * Start live screen streaming session via foreground service.
+     */
+    fun startScreenShare(resultCode: Int, data: Intent) {
+        SnowForegroundService.startScreenShare(appContext, resultCode, data)
+    }
+
+    /**
+     * Stop live screen streaming session via foreground service.
+     */
+    fun stopScreenShare() {
+        SnowForegroundService.stopScreenShare(appContext)
+    }
+
+    fun setCameraCapturing() {
+        _cameraDelivery.value = CameraDeliveryInfo(status = CameraDeliveryStatus.CAPTURING)
+    }
+
+    /**
+     * Upload staged camera photo to connected desktop PC via authenticated HTTPS.
+     */
+    fun uploadCameraPhoto(onComplete: (Boolean, String?) -> Unit) {
+        val client = serviceRef?.client
+        val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
+        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (isConnectedAndAuthenticated()) {
+            FileTransferClient(
+                context = appContext,
+                deviceId = identity.deviceId,
+                certPinStorage = certPinStorage,
+                tokenStorage = tokenStorage,
+                useTls = true
+            ).also { _fileTransferClient = it }
+        } else null
+
+        if (client == null || !isConnectedAndAuthenticated() || transferClient == null) {
+            val err = "Desktop not connected or transfer client not ready."
+            _cameraDelivery.value = CameraDeliveryInfo(status = CameraDeliveryStatus.FAILED, error = err)
+            onComplete(false, err)
+            return
+        }
+
+        _cameraDelivery.value = CameraDeliveryInfo(status = CameraDeliveryStatus.UPLOADING)
+        val handler = CameraCaptureHandler(appContext) { transferClient }
+        repoScope.launch(Dispatchers.IO) {
+            try {
+                val res = handler.capturePhoto(targetHost, 8766)
+                val success = res["success"] as? Boolean ?: false
+                if (success) {
+                    val fileName = res["file_name"] as? String ?: "photo.jpg"
+                    val sizeBytes = (res["size_bytes"] as? Number)?.toLong() ?: 0L
+                    val sha256 = res["sha256"] as? String ?: ""
+                    // Notify desktop via WSS control plane
+                    client.sendRequest(
+                        action = "camera_photo_delivered",
+                        data = mapOf(
+                            "file_name" to fileName,
+                            "size_bytes" to sizeBytes,
+                            "sha256" to sha256,
+                            "timestamp" to System.currentTimeMillis()
+                        )
+                    ) { _ -> }
+                    _cameraDelivery.value = CameraDeliveryInfo(
+                        status = CameraDeliveryStatus.DELIVERED,
+                        fileName = fileName
+                    )
+                    repoScope.launch(Dispatchers.Main) {
+                        onComplete(true, fileName)
+                    }
+                } else {
+                    val err = res["error"] as? String ?: "Camera upload failed"
+                    _cameraDelivery.value = CameraDeliveryInfo(
+                        status = CameraDeliveryStatus.FAILED,
+                        error = err
+                    )
+                    repoScope.launch(Dispatchers.Main) {
+                        onComplete(false, err)
+                    }
+                }
+            } catch (e: Exception) {
+                val err = e.message ?: "Camera upload error"
+                _cameraDelivery.value = CameraDeliveryInfo(
+                    status = CameraDeliveryStatus.FAILED,
+                    error = err
+                )
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete(false, err)
+                }
+            }
+        }
+    }
+
+    fun retryCameraUpload(onComplete: (Boolean, String?) -> Unit) {
+        CameraCaptureHandler.isUserInteractionActive = true
+        uploadCameraPhoto(onComplete)
+    }
+
+    fun dismissCameraDelivery() {
+        _cameraDelivery.value = CameraDeliveryInfo(status = CameraDeliveryStatus.IDLE)
+    }
+
     fun toggleInstantClipboardSync(enabled: Boolean, onComplete: ((Boolean) -> Unit)? = null) {
         val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         prefs.edit().putBoolean(PREF_KEY_INSTANT_SYNC, enabled).apply()
@@ -1289,6 +1440,92 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         appendLog("ERROR", TAG, err)
                         onComplete(false, err)
                     }
+                }
+            }
+        }
+    }
+
+    // --- Phase 26B: Shared Clipboard Buffer Operations ---
+
+    fun fetchClipboardBuffer(onComplete: ((Boolean, String?) -> Unit)? = null) {
+        val client = serviceRef?.client ?: run {
+            onComplete?.invoke(false, "Client disconnected")
+            return
+        }
+        client.sendRequest("clipboard_buffer_list", mapOf("limit" to 10)) { resp ->
+            if (resp.isSuccess) {
+                val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
+                val rawItems = data?.get("items") as? List<*> ?: emptyList<Any>()
+                val parsed = rawItems.mapNotNull { itemMap ->
+                    (itemMap as? Map<*, *>)?.let { map ->
+                        ClipboardItemDto(
+                            itemId = map["item_id"] as? String ?: "",
+                            type = map["type"] as? String ?: "text",
+                            sourceDevice = map["source_device"] as? String ?: "pc",
+                            previewText = map["preview_text"] as? String ?: (map["text_content"] as? String ?: ""),
+                            sizeBytes = (map["size_bytes"] as? Number)?.toLong() ?: 0L,
+                            timestamp = (map["timestamp"] as? Number)?.toDouble() ?: 0.0,
+                            isPinned = (map["is_pinned"] as? Boolean) ?: false
+                        )
+                    }
+                }
+                _clipboardBufferItems.value = parsed
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete?.invoke(true, "Fetched ${parsed.size} items")
+                }
+            } else {
+                val errMsg = resp.error?.message ?: "Failed fetching clipboard buffer"
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete?.invoke(false, errMsg)
+                }
+            }
+        }
+    }
+
+    fun applyBufferItemToClipboard(item: ClipboardItemDto, onComplete: (Boolean, String?) -> Unit) {
+        if (item.type != "text") {
+            onComplete(false, "Image items must be transferred via HTTP download")
+            return
+        }
+        val client = serviceRef?.client ?: run {
+            onComplete(false, "Client disconnected or offline")
+            return
+        }
+        // Fetch full text content via clipboard_buffer_get rather than preview truncation
+        client.sendRequest("clipboard_buffer_get", mapOf("item_id" to item.itemId)) { resp ->
+            if (resp.isSuccess) {
+                val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
+                val textContent = data?.get("text_content") as? String
+                if (textContent != null) {
+                    val bytes = textContent.toByteArray(Charsets.UTF_8)
+                    if (bytes.size > 65536) {
+                        repoScope.launch(Dispatchers.Main) {
+                            onComplete(false, "Item exceeds 64 KiB clipboard limit")
+                        }
+                        return@sendRequest
+                    }
+                    repoScope.launch(Dispatchers.Main) {
+                        try {
+                            val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            val clip = ClipData.newPlainText("SNOW Shared Clipboard", textContent)
+                            cm.setPrimaryClip(clip)
+                            recordIncomingClipboardText(textContent)
+                            appendLog("INFO", TAG, "Applied full text buffer item to Android clipboard (${bytes.size} bytes).")
+                            onComplete(true, "Copied full text to Android clipboard")
+                        } catch (e: Exception) {
+                            SafeLog.e(TAG, "Failed applying buffer item: ${e.message}", e)
+                            onComplete(false, "Failed copying to clipboard: ${e.message}")
+                        }
+                    }
+                } else {
+                    repoScope.launch(Dispatchers.Main) {
+                        onComplete(false, "Empty or missing text content in response")
+                    }
+                }
+            } else {
+                val errMsg = resp.error?.message ?: "Failed retrieving full clipboard item"
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete(false, errMsg)
                 }
             }
         }

@@ -198,6 +198,7 @@ class SnowIpcServer:
             ("transfer_manager", "transfer_manager"),
             ("storage_manager", "storage_manager"),
             ("http_transfer_server", "http_transfer_server"),
+            ("clipboard_buffer", "clipboard_buffer"),
         ]:
             val = getattr(self.core_server, attr, None)
             if val is not None and not type(val).__name__.endswith("Mock"):
@@ -485,6 +486,26 @@ class SnowIpcServer:
                 "error": dev_resp.get("error"),
             }, now_authed
 
+        if op == "screen_stream_status":
+            status_data = self._handle_screen_stream_status(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SUCCESS",
+                "data": status_data,
+            }, now_authed
+
+        if op == "screen_stream_stop":
+            stop_data = await self._handle_screen_stream_stop(payload, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "STOPPED",
+                "data": stop_data,
+            }, now_authed
+
         LOCAL_WINDOWS_OPS = {
             "windows_battery",
             "windows_system_info",
@@ -506,6 +527,14 @@ class SnowIpcServer:
             "snow_windows_screenshot",
             "workflow_run",
             "snow_workflow_run",
+            # Shared Clipboard Ring Buffer (Phase 26B)
+            "clipboard_buffer_list",
+            "clipboard_buffer_add",
+            "clipboard_buffer_pin",
+            "clipboard_buffer_unpin",
+            "clipboard_buffer_delete",
+            "clipboard_buffer_clear",
+            "clipboard_buffer_apply",
         }
         if op in LOCAL_WINDOWS_OPS:
             req = CapabilityRequest(action=op, params=payload)
@@ -517,6 +546,236 @@ class SnowIpcServer:
                 "status": res.status,
                 "data": res.data,
                 "error": res.error,
+            }, now_authed
+
+        if op == "clipboard_buffer_get":
+            item_id = payload.get("item_id", "")
+            import re
+            if not isinstance(item_id, str) or not re.match(r"^cb_[0-9a-f]{12}_[0-9a-f]{6}$", item_id):
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Invalid item ID format. Expected format: cb_<12hex>_<6hex>.",
+                }, now_authed
+            buf = getattr(self.capability_engine, "clipboard_buffer", None)
+            if not buf:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "ENGINE_UNAVAILABLE",
+                    "error": "Clipboard buffer unavailable.",
+                }, now_authed
+            item = buf.get_item(item_id, include_content=False)
+            if not item:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "NOT_FOUND",
+                    "error": f"Item '{item_id}' not found in clipboard buffer.",
+                }, now_authed
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SUCCESS",
+                "data": {"item": item},
+            }, now_authed
+
+        if op == "clipboard_capture_pc":
+            clip = getattr(self.capability_engine, "clipboard", None)
+            buf = getattr(self.capability_engine, "clipboard_buffer", None)
+            if not clip or not buf:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "ENGINE_UNAVAILABLE",
+                    "error": "Clipboard engine or buffer unavailable.",
+                }, now_authed
+            content = clip.get_content_sync(output_dir=buf.storage_dir)
+            if content.get("success"):
+                ctype = content.get("type")
+                if ctype == "image":
+                    fpath = content.get("file_path")
+                    try:
+                        with open(fpath, "rb") as f:
+                            ibytes = f.read()
+                        res = buf.add_image(ibytes, mime_type="image/png", source_device="pc")
+                        if fpath and os.path.isfile(fpath):
+                            try:
+                                os.remove(fpath)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        res = {"success": False, "status": "ERROR", "error": str(e)}
+                elif ctype == "text" and content.get("text"):
+                    res = buf.add_text(content["text"], source_device="pc")
+                else:
+                    res = {"success": False, "status": "EMPTY_CLIPBOARD", "error": "Clipboard is empty or unsupported format."}
+
+                if not res.get("success", False):
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": False,
+                        "status": res.get("status", "CAPTURE_FAILED"),
+                        "error": res.get("error", "Failed capturing PC clipboard."),
+                    }, now_authed
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"item": res.get("item")},
+                }, now_authed
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": False,
+                "status": "CAPTURE_FAILED",
+                "error": content.get("error", "Failed reading PC clipboard."),
+            }, now_authed
+
+        if op == "clipboard_pull_from_phone":
+            dev_id = payload.get("device_id")
+            dev_resp = await self._handle_device_request({
+                "device_id": dev_id,
+                "action": "clipboard_pull",
+                "data": {},
+            }, ctx=ctx)
+            buf = getattr(self.capability_engine, "clipboard_buffer", None)
+            if dev_resp.get("success") and buf:
+                data = dev_resp.get("data") or {}
+                pulled_text = data.get("text")
+                if pulled_text:
+                    res = buf.add_text(pulled_text, source_device=dev_id or "phone")
+                    if res.get("success", False):
+                        return {
+                            "version": IPC_PROTOCOL_VERSION,
+                            "request_id": request_id,
+                            "success": True,
+                            "status": "SUCCESS",
+                            "data": {"item": res.get("item"), "text": pulled_text},
+                        }, now_authed
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": False,
+                        "status": res.get("status", "ADD_FAILED"),
+                        "error": res.get("error", "Failed adding pulled text to clipboard buffer."),
+                    }, now_authed
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": dev_resp.get("data"),
+                "error": dev_resp.get("error"),
+            }, now_authed
+
+        if op == "clipboard_push_to_phone":
+            dev_id = payload.get("device_id")
+            text = payload.get("text")
+            item_id = payload.get("item_id")
+            buf = getattr(self.capability_engine, "clipboard_buffer", None)
+            if item_id and buf:
+                item_detail = buf.get_item(str(item_id), include_content=True)
+                if not item_detail:
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": False,
+                        "status": "NOT_FOUND",
+                        "error": f"Item '{item_id}' not found in clipboard buffer.",
+                    }, now_authed
+                c_type = item_detail.get("type") or item_detail.get("content_type")
+                if c_type == "image":
+                    img_path = buf.get_image_path(str(item_id))
+                    if not img_path or not img_path.is_file():
+                        return {
+                            "version": IPC_PROTOCOL_VERSION,
+                            "request_id": request_id,
+                            "success": False,
+                            "status": "NOT_FOUND",
+                            "error": "Clipboard image file not found on disk.",
+                        }, now_authed
+                    cs = getattr(self, "core_server", None)
+                    tm = getattr(cs, "transfer_manager", None) if cs else None
+                    if not tm:
+                        tm = getattr(self.capability_engine, "transfer_manager", None)
+                    if not tm:
+                        return {
+                            "version": IPC_PROTOCOL_VERSION,
+                            "request_id": request_id,
+                            "success": False,
+                            "status": "ENGINE_UNAVAILABLE",
+                            "error": "Transfer manager unavailable for image push.",
+                        }, now_authed
+                    from snow.transfer.manager import TransferDirection, TransferState
+                    t_port = 8766
+                    if cs and getattr(cs, "http_transfer_server", None):
+                        t_port = cs.http_transfer_server.bound_port or 8766
+                    c_hash = item_detail.get("sha256") or ""
+                    f_size = item_detail.get("size_bytes") or img_path.stat().st_size
+                    f_name = img_path.name
+                    record = tm.create_transfer(
+                        device_id=dev_id or "device",
+                        file_name=f_name,
+                        file_size=f_size,
+                        sha256=c_hash,
+                        direction=TransferDirection.DOWNLOAD,
+                    )
+                    record.file_path = img_path
+                    record.status = TransferState.IN_PROGRESS
+                    dev_resp = await self._handle_device_request({
+                        "device_id": dev_id,
+                        "action": "clipboard_push",
+                        "data": {
+                            "type": "image",
+                            "mime_type": item_detail.get("mime_type") or "image/png",
+                            "transfer_id": record.transfer_id,
+                            "file_name": f_name,
+                            "sha256": c_hash,
+                            "size": f_size,
+                            "transfer_port": t_port,
+                            "transfer_url": f"/api/v1/transfers/download/{record.transfer_id}",
+                        },
+                    }, ctx=ctx)
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": dev_resp.get("success", False),
+                        "status": dev_resp.get("status", "ERROR"),
+                        "data": dev_resp.get("data"),
+                        "error": dev_resp.get("error"),
+                    }, now_authed
+                elif c_type == "text":
+                    text = item_detail.get("text_content")
+
+            if not text:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "No text provided or item has no text content.",
+                }, now_authed
+            dev_resp = await self._handle_device_request({
+                "device_id": dev_id,
+                "action": "clipboard_push",
+                "data": {"text": text},
+            }, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": dev_resp.get("data"),
+                "error": dev_resp.get("error"),
             }, now_authed
 
         if op == "approval_list":
@@ -1654,3 +1913,59 @@ class SnowIpcServer:
             return {"success": False, "status": "REQUEST_TIMEOUT", "error": f"File request timed out after {timeout:.1f}s."}
         except Exception as exc:
             return {"success": False, "status": "INTERNAL_ERROR", "error": f"Error requesting file from Android: {exc}"}
+
+    def _handle_screen_stream_status(self, payload: dict) -> dict:
+        """Query live screen streaming session metadata."""
+        device_id = payload.get("device_id") if isinstance(payload, dict) else None
+        from snow.transfer.http_server import SnowHttpTransferServer
+        status_data = SnowHttpTransferServer.get_screen_stream_status(device_id)
+        cs = self.core_server
+        transfer_port = (
+            cs.http_transfer_server.bound_port
+            if cs and getattr(cs, "http_transfer_server", None)
+            else (cs.config.transfer_port if cs and hasattr(cs, "config") else 8766)
+        )
+        use_tls = bool(
+            cs and getattr(cs, "http_transfer_server", None) and cs.http_transfer_server.ssl_context
+        )
+        cert_path = (
+            getattr(cs.http_transfer_server, "cert_path", None)
+            if cs and getattr(cs, "http_transfer_server", None)
+            else (getattr(cs.config, "tls_cert_file", None) if cs and hasattr(cs, "config") else None)
+        )
+        return {
+            **status_data,
+            "transfer_port": transfer_port,
+            "use_tls": use_tls,
+            "cert_path": str(cert_path) if cert_path else None,
+        }
+
+    async def _handle_screen_stream_stop(self, payload: dict, ctx: Optional[ExecutionContext] = None) -> dict:
+        """Stop active screen streaming session across transfer server and connected Android device."""
+        device_id = payload.get("device_id") if isinstance(payload, dict) else None
+        from snow.transfer.http_server import SnowHttpTransferServer
+        # 1. Clear session buffer in transfer server
+        SnowHttpTransferServer.set_session_state(device_id=device_id, state="STOPPED")
+
+        # 2. Dispatch screen_stream_stop to connected Android device via SessionRouter if available
+        dispatched = False
+        router = getattr(self, "session_router", None) or (
+            getattr(self.core_server, "session_router", None) if self.core_server else None
+        )
+        if router is not None:
+            try:
+                res = await router.route_request(
+                    action="screen_stream_stop",
+                    target=device_id or None,
+                    data={},
+                    ctx=ctx or ExecutionContext(principal=ExecutionPrincipal.OWNER_MANUAL, origin="ipc"),
+                    timeout=5.0,
+                )
+                dispatched = res.get("success", False)
+            except Exception as e:
+                logger.debug("Failed dispatching screen_stream_stop to device via router: %s", e)
+
+        return {
+            "status": "STOPPED",
+            "device_dispatched": dispatched,
+        }

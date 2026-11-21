@@ -3,6 +3,7 @@ package org.snow.ui.dashboard
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import kotlinx.coroutines.flow.StateFlow
+import org.snow.capabilities.LiveScreenStreamHandler
 import org.snow.network.AuthState
 import org.snow.network.ConnectionState
 import org.snow.ui.ActiveTransferInfo
@@ -21,6 +22,37 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     val phoneTelemetry: StateFlow<PhoneTelemetry> = repository.phoneTelemetry
     val pcTelemetry: StateFlow<PcTelemetry> = repository.pcTelemetry
     val activeTransfer: StateFlow<ActiveTransferInfo?> = repository.activeTransfer
+    val screenShareState: StateFlow<LiveScreenStreamHandler.StreamState> = repository.screenShareState
+    val cameraDelivery: StateFlow<SnowUiRepository.CameraDeliveryInfo> = repository.cameraDelivery
+    val clipboardBufferItems: StateFlow<List<SnowUiRepository.ClipboardItemDto>> = repository.clipboardBufferItems
+
+    fun startScreenShare(resultCode: Int, data: android.content.Intent) {
+        repository.startScreenShare(resultCode, data)
+    }
+
+    fun stopScreenShare() {
+        repository.stopScreenShare()
+    }
+
+    fun setCameraCapturing() {
+        repository.setCameraCapturing()
+    }
+
+    fun uploadCameraPhoto(onComplete: ((Boolean, String?) -> Unit)? = null) {
+        repository.uploadCameraPhoto { success, resOrErr ->
+            onComplete?.invoke(success, resOrErr)
+        }
+    }
+
+    fun retryCameraUpload(onComplete: ((Boolean, String?) -> Unit)? = null) {
+        repository.retryCameraUpload { success, resOrErr ->
+            onComplete?.invoke(success, resOrErr)
+        }
+    }
+
+    fun dismissCameraDelivery() {
+        repository.dismissCameraDelivery()
+    }
 
     fun refreshTelemetry(onComplete: ((Boolean) -> Unit)? = null) {
         repository.refreshPhoneTelemetry()
@@ -65,6 +97,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun cancelActiveTransfer() {
         repository.cancelActiveTransfer()
+    }
+
+    fun refreshClipboardBuffer(onComplete: ((Boolean, String?) -> Unit)? = null) {
+        repository.fetchClipboardBuffer(onComplete)
+    }
+
+    fun applyBufferItem(item: SnowUiRepository.ClipboardItemDto, onComplete: (Boolean, String?) -> Unit) {
+        repository.applyBufferItemToClipboard(item, onComplete)
     }
 
     fun fetchPendingApprovals(callback: (Result<List<PendingApprovalItem>>) -> Unit) {

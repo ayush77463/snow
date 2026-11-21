@@ -482,6 +482,62 @@
                     android:text="Push Latest Screenshot to PC 📸"
                     style="@style/Widget.Material3.Button.OutlinedButton" />
 
+                <!-- Shared Buffer (Phase 26B) -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginTop="12dp"
+                    android:layout_marginBottom="8dp"
+                    android:background="@color/card_border" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/primary_text"
+                        android:text="Shared Buffer (Latest 10)" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_refresh_clipboard_buffer"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="🔄 Refresh"
+                        android:textSize="11sp"
+                        style="@style/Widget.Material3.Button.TextButton" />
+                </LinearLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_copy_latest_buffer"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="📋 Copy Latest to Phone"
+                    style="@style/Widget.Material3.Button.TonalButton" />
+
+                <TextView
+                    android:id="@+id/tv_buffer_empty"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textSize="12sp"
+                    android:textColor="@color/secondary_text"
+                    android:text="Buffer empty or offline." />
+
+                <LinearLayout
+                    android:id="@+id/layout_buffer_items"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:orientation="vertical" />
+
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
@@ -570,7 +626,7 @@
                         style="@style/Widget.Material3.Button.OutlinedButton" />
                 </LinearLayout>
 
-                <!-- Grid Row 3: Screen Consent | Camera Photo -->
+                <!-- Grid Row 3: Share Screen | Camera Photo (Phase 26A) -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -583,7 +639,7 @@
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
                         android:layout_marginEnd="6dp"
-                        android:text="Screen Consent"
+                        android:text="Share Screen"
                         android:singleLine="true"
                         android:ellipsize="end"
                         style="@style/Widget.Material3.Button.OutlinedButton" />
@@ -600,6 +656,157 @@
                         style="@style/Widget.Material3.Button.OutlinedButton" />
                 </LinearLayout>
 
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Section D.1: Active Screen Sharing Card (Conditionally Visible, Phase 26A) -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/card_screen_sharing"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="14dp"
+            android:visibility="gone"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/card_surface"
+            app:strokeColor="@color/status_connected"
+            app:strokeWidth="1.5dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:textSize="16sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/primary_text"
+                        android:text="📱 Live Screen Sharing" />
+
+                    <TextView
+                        android:id="@+id/tv_screen_share_status"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:paddingHorizontal="8dp"
+                        android:paddingVertical="2dp"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/status_connected"
+                        android:background="@drawable/bg_pill_status"
+                        android:text="ACTIVE" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tv_screen_share_details"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textSize="12sp"
+                    android:textColor="@color/secondary_text"
+                    android:text="Streaming phone screen to PC over HTTPS (2 FPS, 720p)." />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_stop_screen_sharing"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:text="Stop Sharing"
+                    app:icon="@android:drawable/ic_menu_close_clear_cancel"
+                    style="@style/Widget.Material3.Button.TonalButton" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <!-- Section D.2: Camera Photo Delivery Card (Conditionally Visible, Phase 26A) -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/card_camera_delivery"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="14dp"
+            android:visibility="gone"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/card_surface"
+            app:strokeColor="@color/card_border"
+            app:strokeWidth="1.5dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:textSize="16sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/primary_text"
+                        android:text="📸 Camera Photo Delivery" />
+
+                    <TextView
+                        android:id="@+id/tv_camera_delivery_badge"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:paddingHorizontal="8dp"
+                        android:paddingVertical="2dp"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/primary_blue"
+                        android:background="@drawable/bg_pill_status"
+                        android:text="UPLOADING" />
+                </LinearLayout>
+
+                <TextView
+                    android:id="@+id/tv_camera_delivery_details"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textSize="12sp"
+                    android:textColor="@color/secondary_text"
+                    android:text="Delivering photo to connected PC..." />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_retry_camera_upload"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="6dp"
+                        android:visibility="gone"
+                        android:text="Retry Upload"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_dismiss_camera_delivery"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="6dp"
+                        android:text="Dismiss"
+                        style="@style/Widget.Material3.Button.OutlinedButton" />
+                </LinearLayout>
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 

@@ -12,7 +12,9 @@ from pathlib import Path
 import secrets
 import ssl
 import sys
+import time
 from typing import Any, Optional
+import uuid
 
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
@@ -168,6 +170,8 @@ class SnowWebSocketServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Phase 21: Live in-memory notification cache (strictly never persisted to disk)
         self.live_notifications: dict[str, list[dict[str, Any]]] = {}
+        # Phase 26A: Screen streaming session metadata (control plane only, strictly no image bytes)
+        self._screen_stream_sessions: dict[str, dict[str, Any]] = {}
 
     def _sync_capability_engine(self) -> None:
         """Synchronize capability engine references with server attributes."""
@@ -695,6 +699,22 @@ class SnowWebSocketServer:
                 await self._handle_approval_list(client, message, data, session, ctx)
             elif action == "approval_resolve":
                 await self._handle_approval_resolve(client, message, data, session, ctx)
+            elif action == "screen_stream_start":
+                await self._handle_screen_stream_start(client, message, data, session)
+            elif action == "screen_stream_stop":
+                await self._handle_screen_stream_stop(client, message, data, session)
+            elif action == "screen_stream_status":
+                await self._handle_screen_stream_status(client, message, data, session)
+            elif action == "camera_photo_delivered":
+                await self._handle_camera_photo_delivered(client, message, data, session)
+            elif action == "clipboard_buffer_list":
+                await self._handle_clipboard_buffer_list(client, message, data, session)
+            elif action == "clipboard_buffer_get":
+                await self._handle_clipboard_buffer_get(client, message, data, session)
+            elif action == "clipboard_buffer_add":
+                await self._handle_clipboard_buffer_add(client, message, data, session)
+            elif action == "clipboard_buffer_apply":
+                await self._handle_clipboard_buffer_apply(client, message, data, session)
             else:
                 logger.warning("Rejected unsupported action '%s' from client [%s]",
                                action, client.connection_id)
@@ -704,6 +724,287 @@ class SnowWebSocketServer:
                     correlation_id=message.id,
                 )
                 await client.websocket.send(error_response.to_json())
+
+    async def _handle_screen_stream_start(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle control-plane request to start screen streaming. Metadata only (no image bytes)."""
+        device_id = session.device_id if session and session.device_id else "unknown"
+        session_id = str(data.get("session_id") or uuid.uuid4())
+        fps = float(data.get("fps", 2.0))
+        width = int(data.get("frame_width", 720))
+        height = int(data.get("frame_height", 1280))
+
+        self._screen_stream_sessions[device_id] = {
+            "session_id": session_id,
+            "state": "STREAMING",
+            "fps": fps,
+            "frame_width": width,
+            "frame_height": height,
+            "timestamp": time.time(),
+        }
+
+        # Sync with HTTP transfer server session state if bound
+        if self.http_transfer_server:
+            try:
+                self.http_transfer_server.set_session_state(
+                    device_id=device_id,
+                    state="STREAMING",
+                    session_id=session_id,
+                    fps=fps,
+                    width=width,
+                    height=height,
+                )
+            except Exception as e:
+                logger.debug("Failed notifying http_transfer_server of screen_stream_start: %s", e)
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "state": "STREAMING",
+                "session_id": session_id,
+                "fps": fps,
+                "frame_width": width,
+                "frame_height": height,
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_screen_stream_stop(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle control-plane request to stop screen streaming."""
+        device_id = session.device_id if session and session.device_id else "unknown"
+        if device_id in self._screen_stream_sessions:
+            self._screen_stream_sessions[device_id]["state"] = "STOPPED"
+
+        if self.http_transfer_server:
+            try:
+                self.http_transfer_server.set_session_state(device_id=device_id, state="STOPPED")
+            except Exception as e:
+                logger.debug("Failed notifying http_transfer_server of screen_stream_stop: %s", e)
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "state": "STOPPED",
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_screen_stream_status(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Return screen streaming metadata for the session. Strictly metadata only."""
+        device_id = session.device_id if session and session.device_id else "unknown"
+        meta = self._screen_stream_sessions.get(device_id, {"state": "IDLE"})
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "metadata": meta,
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_camera_photo_delivered(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle control-plane acknowledgement of an uploaded camera photo."""
+        device_id = session.device_id if session and session.device_id else "unknown"
+        file_name = str(data.get("file_name", ""))
+        size_bytes = int(data.get("size_bytes", 0))
+        sha256 = str(data.get("sha256", ""))
+        logger.info(
+            "Camera photo delivered from device [%s]: %s (%d bytes, sha256=%s)",
+            device_id, file_name, size_bytes, sha256[:8] if sha256 else "none"
+        )
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "acknowledged": True,
+                "file_name": file_name,
+                "size_bytes": size_bytes,
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_clipboard_buffer_list(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle request to list metadata of shared clipboard buffer items (<= 64 KiB)."""
+        limit = min(int(data.get("limit", 10)), 10)
+        buf = getattr(self, "clipboard_buffer", None)
+        if not buf and hasattr(self, "capability_engine"):
+            buf = getattr(self.capability_engine, "clipboard_buffer", None)
+        items = buf.list_items(limit=limit) if buf else []
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={"status": "success", "items": items, "count": len(items)},
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_clipboard_buffer_get(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle request to retrieve full text content of a clipboard item."""
+        item_id = data.get("item_id")
+        import re
+        if not item_id or not isinstance(item_id, str) or not re.match(r"^cb_[0-9a-f]{12}_[0-9a-f]{6}$", item_id):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Invalid or missing 'item_id'. Expected format: cb_<12hex>_<6hex>.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        buf = getattr(self, "clipboard_buffer", None)
+        if not buf and hasattr(self, "capability_engine"):
+            buf = getattr(self.capability_engine, "clipboard_buffer", None)
+
+        if not buf:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Clipboard buffer unavailable on host.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        item = buf.get_item(str(item_id), include_content=True)
+        if not item:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.NOT_FOUND,
+                message=f"Item '{item_id}' not found in clipboard buffer.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        c_type = item.get("type") or item.get("content_type")
+        if c_type != "text":
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Item is not a text entry. Image entries must be transferred via HTTP.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        text_content = item.get("text_content") or ""
+        if len(text_content.encode("utf-8")) > 65536:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.PAYLOAD_TOO_LARGE,
+                message="Clipboard text exceeds 64 KiB limit.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "item_id": item_id,
+                "text_content": text_content,
+                "sha256": item.get("sha256"),
+                "size_bytes": item.get("size_bytes"),
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_clipboard_buffer_add(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle request to add a text item to the shared clipboard buffer."""
+        text = data.get("text")
+        if text is None:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Missing 'text' field in clipboard_buffer_add payload.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        source_device = (session.device_id if session and session.device_id else "android")
+        is_pinned = bool(data.get("is_pinned", False))
+        buf = getattr(self, "clipboard_buffer", None)
+        if not buf and hasattr(self, "capability_engine"):
+            buf = getattr(self.capability_engine, "clipboard_buffer", None)
+
+        if not buf:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Clipboard buffer unavailable on host.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        res = buf.add_text(text=str(text), source_device=source_device, is_pinned=is_pinned)
+        if not res.get("success", False):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message=f"Failed adding item to clipboard buffer: {res.get('error', 'Unknown error')}",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={"status": "success", "item": res.get("item")},
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_clipboard_buffer_apply(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Handle notification or request to apply a clipboard item."""
+        item_id = data.get("item_id")
+        target = data.get("target", "android")
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={"status": "success", "applied": True, "item_id": item_id, "target": target},
+        )
+        await client.websocket.send(response.to_json())
 
     async def _handle_manifest_update(
         self,

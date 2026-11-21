@@ -23,7 +23,7 @@
                 <div class="brand">
                     <span class="brand-icon">❄</span>
                     <span class="brand-name">SNOW</span>
-                    <span class="brand-ver">v3</span>
+                    <span class="brand-ver">v4</span>
                 </div>
             </div>
 
@@ -46,8 +46,14 @@
                 <button class="nav-item" data-tab="share">
                     <span class="nav-icon">🔗</span> Share Link / Note
                 </button>
+                <button class="nav-item" data-tab="clipboard">
+                    <span class="nav-icon">📋</span> Clipboard Hub
+                </button>
+                <button class="nav-item" data-tab="apps">
+                    <span class="nav-icon">🚀</span> Remote Apps
+                </button>
                 <button class="nav-item" data-tab="approvals">
-                    <span class="nav-icon">🛡️</span> Approvals <span id="badge-approvals" class="badge">0</span>
+                    <span class="nav-icon">🛡️</span> Approvals <span id="badge-approvals" class="badge" style="display: none;">0</span>
                 </button>
                 <button class="nav-item" data-tab="activity">
                     <span class="nav-icon">📜</span> Activity Audit
@@ -155,7 +161,10 @@
                                     <span id="workflow-status-badge" class="badge badge-info">RUNNING</span>
                                 </div>
                                 <div id="workflow-summary-card" class="workflow-summary-card mt-3 d-none"></div>
-                                <div id="workflow-steps-list" class="workflow-steps mt-3"></div>
+                                <details class="workflow-technical-details mt-3" id="workflow-steps-details">
+                                    <summary class="workflow-tech-summary">Execution Steps</summary>
+                                    <div id="workflow-steps-list" class="workflow-steps mt-2"></div>
+                                </details>
                                 <div id="capture-preview-box" class="mt-3 d-none">
                                     <div id="capture-summary-banner" class="capture-summary-banner mb-2"></div>
                                     <h4>Screenshot Preview</h4>
@@ -172,6 +181,70 @@
                                         </div>
                                     </details>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Live Phone Screen Viewer (Phase 26A) -->
+                    <div class="card mt-4" id="card-live-screen">
+                        <div class="card-header">
+                            <h2>📱 Live Phone Screen</h2>
+                            <div class="screen-controls">
+                                <span id="screen-status-badge" class="badge badge-muted">IDLE</span>
+                                <button id="btn-stop-screen-share" class="btn-danger btn-sm d-none">Stop Sharing</button>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div id="screen-viewer-container" class="screen-viewer-container">
+                                <div id="screen-idle-message" class="empty-state">
+                                    No active screen sharing session. Tap "Share Screen" on your Android phone.
+                                </div>
+                                <img id="screen-frame-img" src="" alt="Live Phone Screen" class="screen-frame-img d-none" />
+                            </div>
+                            <div id="screen-stats-bar" class="screen-stats-bar d-none">
+                                <span id="screen-stat-fps">FPS: --</span>
+                                <span id="screen-stat-resolution">--×--</span>
+                                <span id="screen-stat-bandwidth">-- KiB/frame</span>
+                                <span id="screen-stat-last-update">Last: --</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Camera Photo Auto-Delivery (Phase 26A) -->
+                    <div class="card mt-4" id="card-camera-delivery">
+                        <div class="card-header">
+                            <h2>📷 Camera Photo Delivery</h2>
+                        </div>
+                        <div class="card-body">
+                            <div id="camera-idle-message" class="empty-state">
+                                No camera photos delivered yet. Tap "Camera Photo" on your Android phone.
+                            </div>
+                            <div id="camera-preview-container" class="camera-preview-container d-none">
+                                <img id="camera-latest-img" src="" alt="Latest Camera Photo" class="camera-latest-img" />
+                                <div id="camera-delivery-info" class="text-sm text-muted mt-2"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Unified Clipboard & Capture Hub (Phase 26B) -->
+                    <div class="card mt-4" id="card-clipboard-hub-overview">
+                        <div class="card-header">
+                            <h2>📋 Unified Clipboard & Capture Hub</h2>
+                            <div class="header-actions">
+                                <span id="hub-buffer-count-badge" class="badge badge-info">0 items</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="action-bar hub-quick-actions">
+                                <button id="btn-hub-cap-pc-clip" class="btn-secondary" title="Capture text or image from Windows clipboard">📋 Capture PC Clip</button>
+                                <button id="btn-hub-pull-phone" class="btn-secondary" title="Pull clipboard from connected phone">📲 Pull from Phone</button>
+                                <button id="btn-hub-apply-pc" class="btn-primary" title="Apply newest item to PC clipboard">⚡ Apply Latest to PC</button>
+                                <button id="btn-hub-cap-screen" class="btn-secondary" title="Take a PC screenshot and add to buffer">🖥️ Capture PC Screen</button>
+                                <button id="btn-hub-clear-unpinned" class="btn-danger" title="Clear all unpinned buffer items">🗑️ Clear Unpinned</button>
+                            </div>
+                            <div id="hub-overview-status" class="hub-status-text text-sm text-muted mt-2"></div>
+                            <div id="hub-overview-timeline" class="clipboard-timeline mt-3">
+                                <div class="empty-state">No items in clipboard buffer yet.</div>
                             </div>
                         </div>
                     </div>
@@ -445,6 +518,103 @@
                                     </tr>
                                 </tbody>
                             </table>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Clipboard Hub Section (Phase 26B) -->
+                <section id="section-clipboard" class="tab-pane">
+                    <div class="section-toolbar">
+                        <h2>📋 Shared Clipboard Ring Buffer</h2>
+                        <div class="toolbar-actions">
+                            <button id="btn-clipboard-refresh" class="btn-secondary">🔄 Refresh Buffer</button>
+                            <button id="btn-clipboard-clear-unpinned" class="btn-danger">🗑️ Clear Unpinned</button>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h3>Quick Actions</h3>
+                        </div>
+                        <div class="card-body action-bar">
+                            <button id="btn-hub-tab-cap-pc" class="btn-secondary">📋 Capture PC Clipboard</button>
+                            <button id="btn-hub-tab-pull-phone" class="btn-secondary">📲 Pull from Phone</button>
+                            <button id="btn-hub-tab-apply-pc" class="btn-primary">⚡ Apply Latest to PC</button>
+                            <button id="btn-hub-tab-cap-screen" class="btn-secondary">🖥️ Capture PC Screen</button>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h3>Add Custom Text to Buffer</h3>
+                        </div>
+                        <div class="card-body">
+                            <div class="form-group">
+                                <textarea id="input-clipboard-text" class="form-control" rows="3" placeholder="Enter text to push to shared buffer (max 64 KiB)..."></textarea>
+                            </div>
+                            <div class="form-actions mt-2" style="display: flex; align-items: center; justify-content: space-between;">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="check-clipboard-pin"> Pin this item
+                                </label>
+                                <button id="btn-clipboard-add-text" class="btn-primary">Add to Shared Buffer</button>
+                            </div>
+                            <div id="clipboard-add-status" class="text-sm mt-2"></div>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                            <h3>Shared Timeline (Latest 10 Items)</h3>
+                            <span id="clipboard-detail-count" class="badge badge-info">0 / 10 items (0 pinned)</span>
+                        </div>
+                        <div class="card-body">
+                            <div id="clipboard-full-timeline" class="clipboard-timeline">
+                                <div class="empty-state">Loading clipboard buffer...</div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Remote Apps Section (Phase 26B) -->
+                <section id="section-apps" class="tab-pane">
+                    <div class="section-toolbar">
+                        <h2>🚀 Authorized Remote App Launcher</h2>
+                        <div class="toolbar-actions">
+                            <button id="btn-apps-refresh-android" class="btn-secondary">🔄 Refresh Android Apps</button>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h3>💻 Authorized Windows Applications</h3>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-sm text-muted">Allowlisted Windows utilities executed securely with strict parameter validation.</p>
+                            <div id="windows-apps-grid" class="apps-grid mt-3">
+                                <button class="btn-app" data-win-app="notepad">📝 Notepad</button>
+                                <button class="btn-app" data-win-app="calc">🧮 Calculator</button>
+                                <button class="btn-app" data-win-app="explorer">📁 File Explorer</button>
+                                <button class="btn-app" data-win-app="taskmgr">⚡ Task Manager</button>
+                                <button class="btn-app" data-win-app="mspaint">🎨 Paint</button>
+                                <button class="btn-app" data-win-app="code">💻 VS Code</button>
+                                <button class="btn-app" data-win-app="chrome">🌐 Google Chrome</button>
+                                <button class="btn-app" data-win-app="msedge">🌐 Microsoft Edge</button>
+                            </div>
+                            <div id="windows-app-status" class="text-sm mt-2"></div>
+                        </div>
+                    </div>
+
+                    <div class="card mt-4">
+                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                            <h3>📱 Android Applications</h3>
+                            <input type="text" id="android-app-filter" class="form-control-sm" placeholder="Filter apps..." style="max-width: 200px;" />
+                        </div>
+                        <div class="card-body">
+                            <p class="text-sm text-muted">User-launchable applications discovered on the connected Android phone.</p>
+                            <div id="android-apps-container" class="apps-list mt-3">
+                                <div class="empty-state">Connect an Android device and tap "Refresh Android Apps" to load applications.</div>
+                            </div>
+                            <div id="android-app-status" class="text-sm mt-2"></div>
                         </div>
                     </div>
                 </section>

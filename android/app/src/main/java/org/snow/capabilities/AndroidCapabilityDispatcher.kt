@@ -364,6 +364,10 @@ class AndroidCapabilityDispatcher(
                     Pair(null, SnowError(code = code, message = "${res["status"]}: ${res["error"] ?: "Camera capture failed"}"))
                 }
             }
+            "screen_stream_stop" -> {
+                org.snow.service.SnowForegroundService.stopScreenShare(context)
+                Pair(mapOf("status" to "success", "action" to "screen_stream_stop"), null)
+            }
             "approval_event" -> {
                 val eventType = data?.get("event_type") as? String ?: ""
                 val appReq = data?.get("request") as? Map<*, *>

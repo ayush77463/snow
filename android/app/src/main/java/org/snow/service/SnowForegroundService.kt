@@ -84,6 +84,13 @@ class SnowForegroundService : Service() {
         )
     }
 
+    val liveScreenHandler: org.snow.capabilities.LiveScreenStreamHandler by lazy {
+        org.snow.capabilities.LiveScreenStreamHandler(
+            context = applicationContext,
+            transferClientProvider = { transferClient }
+        )
+    }
+
     val peerHostManager: org.snow.network.AndroidPeerHostManager by lazy {
         org.snow.network.AndroidPeerHostManager()
     }
@@ -171,6 +178,45 @@ class SnowForegroundService : Service() {
                 startObservingAuth()
                 client.connect(host, port)
             }
+            ACTION_START_SCREEN_SHARE -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, android.app.Activity.RESULT_CANCELED)
+                val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                }
+
+                // 1. Elevate foreground service with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION first
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildScreenShareNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+
+                // 2. Only after foreground elevation, obtain the MediaProjection
+                val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
+                val projection = if (resultCode == android.app.Activity.RESULT_OK && resultData != null) {
+                    projectionManager?.getMediaProjection(resultCode, resultData)
+                } else null
+
+                if (projection != null) {
+                    liveScreenHandler.onRevoked = {
+                        demoteScreenShareNotification()
+                    }
+                    val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
+                    liveScreenHandler.startStreaming(projection, host, 8766)
+                } else {
+                    org.snow.security.SafeLog.w("SnowForegroundService", "MediaProjection is null after elevation, cannot start screen share.")
+                    demoteScreenShareNotification()
+                }
+            }
+            ACTION_STOP_SCREEN_SHARE -> {
+                val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
+                liveScreenHandler.stopStreaming(host, 8766)
+                demoteScreenShareNotification()
+            }
             ACTION_DISCONNECT -> {
                 handleDisconnect()
             }
@@ -251,6 +297,9 @@ class SnowForegroundService : Service() {
     }
 
     private fun handleDisconnect() {
+        // 0. Stop live screen sharing if active
+        liveScreenHandler.stopStreaming(client.currentTargetHost, 8766)
+
         // 1. Cancel observers first so that DISCONNECTED state does NOT trigger updateNotification()
         peerHostManager.disableHostMode()
         stateObserverJob?.cancel()
@@ -339,8 +388,41 @@ class SnowForegroundService : Service() {
         manager.notify(NOTIFICATION_ID, buildNotification(statusText))
     }
 
+    private fun buildScreenShareNotification(): Notification {
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingOpenApp = PendingIntent.getActivity(
+            this,
+            0,
+            openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopShareIntent = Intent(this, SnowForegroundService::class.java).apply {
+            action = ACTION_STOP_SCREEN_SHARE
+        }
+        val pendingStopShare = PendingIntent.getService(
+            this,
+            3,
+            stopShareIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("SNOW Live Screen Sharing")
+            .setContentText("Active live screen sharing to desktop")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentIntent(pendingOpenApp)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop Sharing", pendingStopShare)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        liveScreenHandler.stopStreaming()
         org.snow.ui.SnowUiRepository.getInstance(applicationContext).unbindService()
         peerHostManager.disableHostMode()
         stateObserverJob?.cancel()
@@ -357,6 +439,17 @@ class SnowForegroundService : Service() {
         serviceScope.cancel()
     }
 
+    fun demoteScreenShareNotification() {
+        if (client.connectionState.value == ConnectionState.CONNECTED) {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                buildNotification("Connected to desktop"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        }
+    }
+
     companion object {
         const val PREFS_ENDPOINT = "snow_endpoint_prefs"
         const val PREF_SAVED_HOST = "saved_host"
@@ -367,8 +460,12 @@ class SnowForegroundService : Service() {
 
         const val ACTION_CONNECT = "org.snow.action.CONNECT"
         const val ACTION_DISCONNECT = "org.snow.action.DISCONNECT"
+        const val ACTION_START_SCREEN_SHARE = "org.snow.action.START_SCREEN_SHARE"
+        const val ACTION_STOP_SCREEN_SHARE = "org.snow.action.STOP_SCREEN_SHARE"
         const val EXTRA_HOST = "org.snow.extra.HOST"
         const val EXTRA_PORT = "org.snow.extra.PORT"
+        const val EXTRA_RESULT_CODE = "org.snow.extra.RESULT_CODE"
+        const val EXTRA_RESULT_DATA = "org.snow.extra.RESULT_DATA"
 
         fun startConnect(context: Context, host: String, port: Int) {
             val intent = Intent(context, SnowForegroundService::class.java).apply {
@@ -386,6 +483,26 @@ class SnowForegroundService : Service() {
         fun stop(context: Context) {
             val intent = Intent(context, SnowForegroundService::class.java).apply {
                 action = ACTION_DISCONNECT
+            }
+            context.startService(intent)
+        }
+
+        fun startScreenShare(context: Context, resultCode: Int, data: Intent) {
+            val intent = Intent(context, SnowForegroundService::class.java).apply {
+                action = ACTION_START_SCREEN_SHARE
+                putExtra(EXTRA_RESULT_CODE, resultCode)
+                putExtra(EXTRA_RESULT_DATA, data)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stopScreenShare(context: Context) {
+            val intent = Intent(context, SnowForegroundService::class.java).apply {
+                action = ACTION_STOP_SCREEN_SHARE
             }
             context.startService(intent)
         }

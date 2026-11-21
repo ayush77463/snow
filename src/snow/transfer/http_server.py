@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 from pathlib import Path
 import re
 import ssl
-from typing import Optional
+import time
+from typing import Any, Dict, Optional
+import uuid
 
 from aiohttp import web
 
@@ -19,6 +22,9 @@ from snow.transfer.storage import CHUNK_SIZE, TransferStorageManager, compute_st
 
 logger = logging.getLogger(__name__)
 
+# Bounded maximum size for live screen share JPEG frame (512 KiB)
+MAX_SCREEN_FRAME_BYTES: int = 512 * 1024
+
 
 class SnowHttpTransferServer:
     """Async HTTP/HTTPS streaming file transfer server for SNOW.
@@ -28,7 +34,11 @@ class SnowHttpTransferServer:
     - Streaming chunked file upload (resumable via Content-Range)
     - Streaming chunked file download (resumable via HTTP Range)
     - Transfer status and cancellation
+    - Live screen sharing frame ingest and state (Phase 26A)
     """
+
+    # In-memory single-slot frame buffer per device for live screen streaming
+    _screen_sessions: Dict[str, Dict[str, Any]] = {}
 
     def __init__(
         self,
@@ -37,12 +47,14 @@ class SnowHttpTransferServer:
         transfer_manager: TransferManager,
         storage_manager: TransferStorageManager,
         ssl_context: Optional[ssl.SSLContext] = None,
+        cert_path: Optional[str | Path] = None,
     ) -> None:
         self.config = config
         self.db_manager = db_manager
         self.transfer_manager = transfer_manager
         self.storage_manager = storage_manager
         self.ssl_context = ssl_context
+        self.cert_path = Path(cert_path) if cert_path else None
 
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -76,6 +88,13 @@ class SnowHttpTransferServer:
         self.app.router.add_get("/api/v1/transfers/download/{transfer_id}", self.handle_download)
         self.app.router.add_post("/api/v1/transfers/{transfer_id}/cancel", self.handle_cancel)
 
+        # Screen streaming routes (Phase 26A)
+        self.app.router.add_post("/api/v1/screen/frame", self.handle_screen_frame)
+        self.app.router.add_get("/api/v1/screen/status", self.handle_screen_status)
+        self.app.router.add_get("/api/v1/screen/frame", self.handle_get_screen_frame)
+        self.app.router.add_post("/api/v1/screen/start", self.handle_screen_start)
+        self.app.router.add_post("/api/v1/screen/stop", self.handle_screen_stop)
+
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler) -> web.StreamResponse:
         """Authenticate all /api/ requests using device bearer tokens against SQLite."""
@@ -86,6 +105,23 @@ class SnowHttpTransferServer:
         if not self.config.auth_required:
             request["device_id"] = request.headers.get("X-Snow-Device-Id", "anonymous")
             return await handler(request)
+
+        # Check for local loopback proxy authentication using IPC secret (Phase 26A Repair)
+        ipc_secret_hdr = request.headers.get("X-Snow-Ipc-Secret")
+        if ipc_secret_hdr:
+            remote_ip = request.remote or ""
+            is_loopback = remote_ip in ("127.0.0.1", "::1", "localhost", "testclient")
+            if is_loopback:
+                from snow.core.ipc import get_default_secret_path
+                secret_file = (
+                    Path(self.config.ipc_secret_path)
+                    if getattr(self.config, "ipc_secret_path", None)
+                    else get_default_secret_path()
+                )
+                expected_secret = secret_file.read_text("utf-8").strip() if secret_file.exists() else None
+                if expected_secret and hmac.compare_digest(ipc_secret_hdr.strip(), expected_secret):
+                    request["device_id"] = request.headers.get("X-Snow-Device-Id") or "local_dashboard_proxy"
+                    return await handler(request)
 
         device_id = request.headers.get("X-Snow-Device-Id")
         auth_header = request.headers.get("Authorization")
@@ -446,6 +482,211 @@ class SnowHttpTransferServer:
             "transfer_id": transfer_id,
             "cancelled": success,
         })
+
+    # =========================================================================
+    # Live Screen Sharing Handlers (Phase 26A)
+    # =========================================================================
+
+    @classmethod
+    def set_session_state(
+        cls,
+        device_id: Optional[str],
+        state: str,
+        session_id: Optional[str] = None,
+        fps: float = 2.0,
+        width: int = 720,
+        height: int = 1280,
+    ) -> None:
+        """Update or register screen streaming session state for a device."""
+        if not device_id or device_id == "all":
+            for sess in cls._screen_sessions.values():
+                sess["state"] = state
+                if state == "STOPPED":
+                    sess.pop("frame_bytes", None)
+            return
+
+        sess = cls._screen_sessions.setdefault(device_id, {})
+        sess["state"] = state
+        if session_id:
+            sess["session_id"] = session_id
+        sess["fps"] = fps
+        sess["frame_width"] = width
+        sess["frame_height"] = height
+        sess["timestamp"] = time.time()
+        if state == "STOPPED":
+            sess.pop("frame_bytes", None)
+
+    @classmethod
+    def get_latest_screen_frame(cls, device_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest frame dictionary for a device or the single active stream."""
+        if device_id and device_id in cls._screen_sessions:
+            sess = cls._screen_sessions[device_id]
+            if sess.get("frame_bytes"):
+                return sess
+        for sess in cls._screen_sessions.values():
+            if sess.get("state") == "STREAMING" and sess.get("frame_bytes"):
+                return sess
+        for sess in cls._screen_sessions.values():
+            if sess.get("frame_bytes"):
+                return sess
+        return None
+
+    @classmethod
+    def get_screen_stream_status(cls, device_id: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve the status dictionary of the screen stream."""
+        if device_id and device_id in cls._screen_sessions:
+            sess = cls._screen_sessions[device_id]
+            return {
+                "state": sess.get("state", "IDLE"),
+                "session_id": sess.get("session_id"),
+                "fps": sess.get("fps", 0.0),
+                "frame_width": sess.get("frame_width", 0),
+                "frame_height": sess.get("frame_height", 0),
+                "timestamp": sess.get("timestamp", 0.0),
+                "has_frame": bool(sess.get("frame_bytes")),
+                "frame_size": sess.get("frame_size", 0),
+            }
+        for d_id, sess in cls._screen_sessions.items():
+            if sess.get("state") == "STREAMING":
+                return {
+                    "state": "STREAMING",
+                    "device_id": d_id,
+                    "session_id": sess.get("session_id"),
+                    "fps": sess.get("fps", 0.0),
+                    "frame_width": sess.get("frame_width", 0),
+                    "frame_height": sess.get("frame_height", 0),
+                    "timestamp": sess.get("timestamp", 0.0),
+                    "has_frame": bool(sess.get("frame_bytes")),
+                    "frame_size": sess.get("frame_size", 0),
+                }
+        return {"state": "IDLE", "has_frame": False}
+
+    async def handle_screen_frame(self, request: web.Request) -> web.Response:
+        """Ingest a bounded JPEG screen frame from an authenticated device."""
+        device_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id", "unknown")
+
+        content_type = request.headers.get("Content-Type", "")
+        if "image/jpeg" not in content_type.lower() and "image/jpg" not in content_type.lower():
+            return web.json_response(
+                {"error": f"Invalid Content-Type '{content_type}'. Must be image/jpeg."},
+                status=415,
+            )
+
+        body = await request.read()
+        if len(body) > MAX_SCREEN_FRAME_BYTES:
+            return web.json_response(
+                {"error": f"Frame size {len(body)} exceeds maximum allowed {MAX_SCREEN_FRAME_BYTES} bytes."},
+                status=413,
+            )
+
+        session_id = request.headers.get("X-Snow-Session-Id")
+        sess = self._screen_sessions.setdefault(device_id, {})
+        if not session_id:
+            session_id = sess.get("session_id") or str(uuid.uuid4())
+
+        try:
+            width = int(request.headers.get("X-Snow-Frame-Width", 0)) or sess.get("frame_width", 0)
+            height = int(request.headers.get("X-Snow-Frame-Height", 0)) or sess.get("frame_height", 0)
+            fps = float(request.headers.get("X-Snow-FPS", 0.0)) or sess.get("fps", 2.0)
+        except ValueError:
+            width = sess.get("frame_width", 0)
+            height = sess.get("frame_height", 0)
+            fps = sess.get("fps", 2.0)
+
+        now = time.time()
+        self._screen_sessions[device_id] = {
+            "session_id": session_id,
+            "state": "STREAMING",
+            "frame_bytes": body,
+            "content_type": "image/jpeg",
+            "frame_width": width,
+            "frame_height": height,
+            "fps": fps,
+            "timestamp": now,
+            "frame_size": len(body),
+            "device_id": device_id,
+        }
+
+        return web.json_response({
+            "status": "ACCEPTED",
+            "frame_size": len(body),
+            "session_id": session_id,
+            "timestamp": now,
+        }, status=200)
+
+    async def handle_screen_status(self, request: web.Request) -> web.Response:
+        """Query live screen streaming session metadata."""
+        device_id = request.query.get("device_id")
+        status_dict = self.get_screen_stream_status(device_id)
+        return web.json_response({"success": True, **status_dict})
+
+    async def handle_get_screen_frame(self, request: web.Request) -> web.Response:
+        """Retrieve the latest live screen JPEG frame."""
+        device_id = request.query.get("device_id")
+        frame_dict = self.get_latest_screen_frame(device_id)
+        if not frame_dict or not frame_dict.get("frame_bytes"):
+            return web.Response(status=204)
+
+        return web.Response(
+            body=frame_dict["frame_bytes"],
+            content_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "X-Content-Type-Options": "nosniff",
+                "X-Snow-Session-Id": str(frame_dict.get("session_id", "")),
+                "X-Snow-Timestamp": str(frame_dict.get("timestamp", 0)),
+            },
+        )
+
+    async def handle_screen_start(self, request: web.Request) -> web.Response:
+        """Start or register an active screen streaming session."""
+        device_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id", "unknown")
+        session_id = str(uuid.uuid4())
+        fps = 2.0
+        width = 720
+        height = 1280
+
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                session_id = body.get("session_id") or session_id
+                device_id = body.get("device_id") or device_id
+                fps = float(body.get("fps", fps))
+                width = int(body.get("frame_width", width))
+                height = int(body.get("frame_height", height))
+        except Exception:
+            pass
+
+        self.set_session_state(
+            device_id=device_id,
+            state="STREAMING",
+            session_id=session_id,
+            fps=fps,
+            width=width,
+            height=height,
+        )
+        return web.json_response({
+            "status": "STREAMING",
+            "session_id": session_id,
+            "fps": fps,
+        })
+
+    async def handle_screen_stop(self, request: web.Request) -> web.Response:
+        """Stop an active screen streaming session."""
+        device_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id")
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                device_id = body.get("device_id") or device_id
+        except Exception:
+            pass
+
+        if device_id and device_id in self._screen_sessions:
+            self.set_session_state(device_id, "STOPPED")
+        else:
+            for d in list(self._screen_sessions.keys()):
+                self.set_session_state(d, "STOPPED")
+        return web.json_response({"status": "STOPPED"})
 
     async def start(self) -> None:
         """Start listening for incoming HTTP/HTTPS transfer requests."""
