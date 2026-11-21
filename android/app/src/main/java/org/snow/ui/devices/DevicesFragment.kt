@@ -173,9 +173,15 @@ class DevicesFragment : Fragment() {
     private fun renderActiveTransport(state: ConnectionState, endpoint: String?) {
         val cleanEndpoint = endpoint ?: ""
         val isUsb = cleanEndpoint.startsWith("127.0.0.1") || cleanEndpoint.startsWith("localhost")
+        val isRelay = cleanEndpoint.startsWith("relay:") || cleanEndpoint.contains("tunnel") || cleanEndpoint.contains(":8770")
         when (state) {
             ConnectionState.CONNECTED -> {
-                if (isUsb) {
+                if (isRelay) {
+                    binding.chipActiveTransport.text = "CONNECTED • RELAY"
+                    binding.chipActiveTransport.setChipBackgroundColorResource(R.color.status_connected_soft)
+                    binding.chipActiveTransport.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected_dark))
+                    binding.tvActiveTransportDetail.text = "Zero-Trust TLS 1.3 fallback tunnel active."
+                } else if (isUsb) {
                     binding.chipActiveTransport.text = getString(R.string.status_usb_mode)
                     binding.chipActiveTransport.setChipBackgroundColorResource(R.color.status_connected_soft)
                     binding.chipActiveTransport.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected_dark))

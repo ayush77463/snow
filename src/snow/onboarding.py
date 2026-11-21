@@ -42,6 +42,19 @@ def get_canonical_mcp_entry(python_exe: Optional[str] = None) -> dict[str, Any]:
     }
 
 
+def get_remote_mcp_entry(
+    url: str = "http://127.0.0.1:8771/mcp", auth_token: Optional[str] = None
+) -> dict[str, Any]:
+    """Generate the Streamable HTTP MCP entry for remote/networked AI clients."""
+    entry: dict[str, Any] = {
+        "url": url,
+        "transport": "streamable_http",
+    }
+    if auth_token:
+        entry["headers"] = {"Authorization": f"Bearer {auth_token}"}
+    return entry
+
+
 def atomic_write_json(
     file_path: Path, data: dict[str, Any], backup: bool = True
 ) -> Optional[Path]:
@@ -410,6 +423,20 @@ class ChatGPTAdapter(BaseHostAdapter):
             }
 
 
+class RemoteMcpAdapter(BaseHostAdapter):
+    """Adapter for Remote MCP Streamable HTTP configuration artifact."""
+
+    name: str = "remote"
+    display_name: str = "Remote MCP (Streamable HTTP)"
+
+    def get_default_config_path(self) -> Path:
+        snow_dir = Path.home() / ".snow"
+        return snow_dir / "remote_mcp_config.json"
+
+    def get_mcp_entry(self, python_exe: Optional[str] = None) -> dict[str, Any]:
+        return get_remote_mcp_entry()
+
+
 # =========================================================================
 # Host Onboarding Manager
 # =========================================================================
@@ -430,6 +457,7 @@ class HostOnboardingManager:
             "gemini": GeminiAdapter(),
             "cursor": CursorAdapter(),
             "chatgpt": ChatGPTAdapter(),
+            "remote": RemoteMcpAdapter(),
         }
         self.custom_paths: dict[str, Path] = {
             k: Path(v) for k, v in (custom_paths or {}).items()

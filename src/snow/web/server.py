@@ -26,6 +26,7 @@ from typing import Any, Optional
 import urllib.parse
 import webbrowser
 
+import aiohttp
 from aiohttp import web
 
 from snow.mcp.bridge import SnowMcpBridge
@@ -560,6 +561,75 @@ class SnowWebServer:
             },
         })
 
+    async def handle_api_mcp_gateway_status(self, request: web.Request) -> web.Response:
+        """Query Remote MCP Streamable HTTP Gateway status and local host integrations."""
+        gw_host = "127.0.0.1"
+        gw_port = 8771
+        metadata_url = f"http://{gw_host}:{gw_port}/.well-known/oauth-protected-resource"
+
+        gw_status = "offline"
+        metadata = None
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=0.5, connect=0.5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(metadata_url) as resp:
+                    if resp.status == 200:
+                        try:
+                            metadata = await resp.json()
+                            if isinstance(metadata, dict) and "resource" in metadata:
+                                gw_status = "online"
+                            else:
+                                gw_status = "unhealthy"
+                        except Exception:
+                            gw_status = "unhealthy"
+                    else:
+                        gw_status = "unhealthy"
+        except asyncio.TimeoutError:
+            gw_status = "timeout"
+        except (aiohttp.ClientConnectorError, OSError):
+            gw_status = "offline"
+        except Exception:
+            gw_status = "unhealthy"
+
+        # Safe AI hosts summary from HostOnboardingManager (no secrets or sensitive paths)
+        safe_hosts = []
+        try:
+            from snow.onboarding import HostOnboardingManager
+            mgr = HostOnboardingManager()
+            for h in ["claude", "gemini", "cursor", "chatgpt"]:
+                adapter = mgr.get_adapter(h)
+                if adapter:
+                    info = adapter.check_status()
+                    safe_hosts.append({
+                        "host": h,
+                        "display_name": getattr(adapter, "display_name", h.title()),
+                        "is_configured": bool(info.get("is_configured", False)),
+                        "status": "CONFIGURED" if info.get("is_configured") else "NOT_CONFIGURED"
+                    })
+        except Exception as he:
+            logger.debug("Failed compiling AI host integrations summary: %s", he)
+
+        # Sanitize metadata if online
+        safe_metadata = None
+        if metadata and isinstance(metadata, dict):
+            safe_metadata = {
+                "resource": metadata.get("resource"),
+                "authorization_servers": metadata.get("authorization_servers", []),
+                "scopes_supported": metadata.get("scopes_supported", []),
+            }
+
+        return web.json_response({
+            "success": True,
+            "status": "SUCCESS",
+            "data": {
+                "gateway_status": gw_status,
+                "endpoint": f"http://{gw_host}:{gw_port}/mcp",
+                "metadata": safe_metadata,
+                "ai_hosts": safe_hosts,
+            }
+        })
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -591,6 +661,7 @@ class SnowWebServer:
         app.router.add_post("/api/approvals/resolve", self.handle_api_approvals_resolve)
         app.router.add_get("/api/activity", self.handle_api_activity)
         app.router.add_get("/api/relay/status", self.handle_api_relay_status)
+        app.router.add_get("/api/mcp-gateway/status", self.handle_api_mcp_gateway_status)
 
         return app
 

@@ -45,6 +45,7 @@ class SettingsFragment : Fragment() {
         setupDeviceIdentity()
         setupNotificationSyncAccess()
         refreshStorageAccessStatus()
+        setupRemoteRelayControls()
         setupTrustControls()
         setupDiagnostics()
         observeLogs()
@@ -242,6 +243,56 @@ class SettingsFragment : Fragment() {
                 }
                 .setNegativeButton("Cancel", null)
                 .show()
+        }
+    }
+
+    private fun setupRemoteRelayControls() {
+        val enabled = viewModel.isRemoteRelayEnabled()
+        val endpoint = viewModel.getRemoteRelayEndpoint()
+
+        binding.swRemoteRelay.isChecked = enabled
+        binding.etRemoteRelayEndpoint.setText(endpoint)
+        updateRemoteRelayStatusText(enabled, endpoint)
+
+        binding.swRemoteRelay.setOnCheckedChangeListener { _, isChecked ->
+            val curEndpoint = binding.etRemoteRelayEndpoint.text?.toString()?.trim() ?: ""
+            updateRemoteRelayStatusText(isChecked, curEndpoint)
+        }
+
+        binding.btnSaveRemoteRelay.setOnClickListener {
+            val isChecked = binding.swRemoteRelay.isChecked
+            val curEndpoint = binding.etRemoteRelayEndpoint.text?.toString()?.trim() ?: ""
+
+            if (isChecked) {
+                if (curEndpoint.isBlank()) {
+                    Toast.makeText(requireContext(), "Please enter a valid relay endpoint URL (e.g. wss://example.com:8770/v1/tunnel)", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                if (!curEndpoint.startsWith("wss://") && !curEndpoint.startsWith("ws://")) {
+                    Toast.makeText(requireContext(), "Relay endpoint must start with wss:// or ws://", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+            }
+
+            viewModel.saveRemoteRelayConfig(isChecked, curEndpoint)
+            updateRemoteRelayStatusText(isChecked, curEndpoint)
+            Toast.makeText(requireContext(), "Relay configuration updated", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun updateRemoteRelayStatusText(enabled: Boolean, endpoint: String) {
+        if (_binding == null) return
+        if (enabled) {
+            val displayEp = if (endpoint.isNotBlank()) endpoint else "No endpoint specified"
+            binding.tvRemoteRelayStatus.text = "Status: Enabled ($displayEp)"
+            binding.tvRemoteRelayStatus.setTextColor(
+                ContextCompat.getColor(requireContext(), R.color.status_connected)
+            )
+        } else {
+            binding.tvRemoteRelayStatus.text = "Status: Disabled (Local-Only Mode)"
+            binding.tvRemoteRelayStatus.setTextColor(
+                ContextCompat.getColor(requireContext(), R.color.secondary_text)
+            )
         }
     }
 

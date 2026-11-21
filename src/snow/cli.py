@@ -861,6 +861,13 @@ def run_doctor(
     onboarding_mgr = HostOnboardingManager()
     host_statuses = onboarding_mgr.check_all_hosts()
     configured_hosts = [h for h, st in host_statuses.items() if st.get("is_configured")]
+    try:
+        from snow.mcp.remote_gateway import RemoteMcpGateway
+        from snow.mcp.oauth import OAuthServer
+        remote_gw_ready = True
+    except Exception:
+        remote_gw_ready = False
+
     if configured_hosts:
         status = "OK"
         msg = f"Configured in {len(configured_hosts)} AI host(s): {', '.join(configured_hosts)}"
@@ -876,6 +883,7 @@ def run_doctor(
         "message": msg,
         "remediation": remed,
         "hosts": host_statuses,
+        "remote_gateway_ready": remote_gw_ready,
     })
 
     # Summary calculation
@@ -1056,6 +1064,13 @@ def build_parser() -> argparse.ArgumentParser:
     relay_sub = relay_parser.add_subparsers(dest="relay_action", help="Relay action")
     relay_sub.add_parser("status", help="Display current remote relay configuration and presence status")
 
+    # 11. mcp-gateway (Phase 23 Remote MCP Streamable HTTP Gateway)
+    mcp_gw_parser = subparsers.add_parser(
+        "mcp-gateway", help="Launch Remote MCP Streamable HTTP Gateway (Phase 23)"
+    )
+    mcp_gw_parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    mcp_gw_parser.add_argument("--port", type=int, default=8771, help="Gateway port (default: 8771)")
+
     # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")
     start_parser.add_argument("--daemon", action="store_true", default=True)
@@ -1167,6 +1182,12 @@ def main(args: Optional[list[str]] = None) -> int:
     elif parsed.command == "relay":
         action = getattr(parsed, "relay_action", "status") or "status"
         return run_relay(action=action)
+    elif parsed.command == "mcp-gateway":
+        from snow.mcp.remote_gateway import create_gateway_app
+        from aiohttp import web
+        app = create_gateway_app(host=parsed.host, port=parsed.port)
+        web.run_app(app, host=parsed.host, port=parsed.port)
+        return 0
     elif parsed.command == "start":
         return run_daemon_start()
     elif parsed.command == "stop":

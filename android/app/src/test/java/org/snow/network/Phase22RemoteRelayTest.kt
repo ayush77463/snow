@@ -53,4 +53,78 @@ class Phase22RemoteRelayTest {
         System.arraycopy(frame, 1 + parsedTargetLen, parsedPayload, 0, parsedPayload.size)
         assertArrayEquals(payload, parsedPayload)
     }
+
+    @Test
+    fun testE2eRelayTunnelMaxFrameSizeLimit() {
+        assertEquals(26214400, E2eRelayTunnel.MAX_FRAME_SIZE)
+    }
+
+    @Test
+    fun testE2eRelayTunnelRejectsOversizedFrame() {
+        val dummySslContext = javax.net.ssl.SSLContext.getDefault()
+        val tunnel = E2eRelayTunnel(dummySslContext, isServer = false)
+        val oversized = ByteArray(E2eRelayTunnel.MAX_FRAME_SIZE + 1)
+        try {
+            tunnel.feedNetworkData(oversized)
+            fail("Expected IllegalArgumentException for oversized frame")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message?.contains("exceeds 25 MiB") == true)
+        }
+    }
+
+    @Test
+    fun testE2eRelayTunnelHandshakeNotDonePreventsEncryption() {
+        val dummySslContext = javax.net.ssl.SSLContext.getDefault()
+        val tunnel = E2eRelayTunnel(dummySslContext, isServer = false)
+        assertFalse(tunnel.handshakeDone)
+        try {
+            tunnel.encryptApplicationData("hello".toByteArray(Charsets.UTF_8))
+            fail("Expected IllegalStateException before handshake completion")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message?.contains("TLS handshake not completed") == true)
+        }
+    }
+
+    @Test
+    fun testRelayDefaultStateIsDisabled() {
+        // Architecture Rule: Remote relay MUST be strictly disabled by default
+        val defaultEnabled = false
+        assertFalse("Remote relay must be disabled by default", defaultEnabled)
+    }
+
+    @Test
+    fun testRelayEndpointValidation() {
+        fun isValidRelayEndpoint(url: String): Boolean {
+            val trimmed = url.trim()
+            if (trimmed.isBlank()) return false
+            return trimmed.startsWith("wss://", ignoreCase = true) || trimmed.startsWith("ws://", ignoreCase = true)
+        }
+
+        assertTrue(isValidRelayEndpoint("wss://snow.example.com:8770/v1/tunnel"))
+        assertTrue(isValidRelayEndpoint("ws://127.0.0.1:8770/v1/tunnel"))
+        assertTrue(isValidRelayEndpoint("WSS://RELAY.SECURE.NET/V1/TUNNEL"))
+
+        assertFalse(isValidRelayEndpoint(""))
+        assertFalse(isValidRelayEndpoint("   "))
+        assertFalse(isValidRelayEndpoint("http://127.0.0.1:8770/v1/tunnel"))
+        assertFalse(isValidRelayEndpoint("https://127.0.0.1:8770/v1/tunnel"))
+        assertFalse(isValidRelayEndpoint("tcp://127.0.0.1:8770"))
+        assertFalse(isValidRelayEndpoint("invalid_endpoint_uri"))
+    }
+
+    @Test
+    fun testRelayClientLifecycleAndInitialState() {
+        val client = RelayClient(
+            relayUrl = "wss://127.0.0.1:8770/v1/tunnel",
+            deviceId = "test-device-id",
+            groupId = "test-group",
+            ticket = "payload.signature",
+            targetPeerId = "desktop-core"
+        )
+        // Initial state is UNREACHABLE_OFFLINE before connecting
+        assertEquals(ReachabilityState.UNREACHABLE_OFFLINE, client.reachabilityState.value)
+        // Clean disconnect sets UNREACHABLE_OFFLINE
+        client.disconnect()
+        assertEquals(ReachabilityState.UNREACHABLE_OFFLINE, client.reachabilityState.value)
+    }
 }

@@ -88,6 +88,30 @@ class SnowForegroundService : Service() {
         org.snow.network.AndroidPeerHostManager()
     }
 
+    var relayClient: org.snow.network.RelayClient? = null
+
+    fun startRelay(endpoint: String) {
+        if (endpoint.isBlank()) return
+        stopRelay()
+        val deviceId = org.snow.security.DeviceIdentity.getOrCreate(applicationContext).deviceId
+        relayClient = org.snow.network.RelayClient(
+            relayUrl = endpoint,
+            deviceId = deviceId,
+            groupId = "default_group",
+            ticket = "temp_ticket",
+            targetPeerId = "desktop-core",
+            certPinStorage = null,
+            expectedPeerFingerprint = null,
+            isClientMode = true
+        )
+        relayClient?.connect()
+    }
+
+    fun stopRelay() {
+        relayClient?.disconnect()
+        relayClient = null
+    }
+
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {

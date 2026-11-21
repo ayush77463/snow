@@ -47,4 +47,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun clearLogs() {
         repository.clearLogs()
     }
+
+    fun isRemoteRelayEnabled(): Boolean = repository.isRemoteRelayEnabled()
+    fun getRemoteRelayEndpoint(): String = repository.getRemoteRelayEndpoint()
+    fun saveRemoteRelayConfig(enabled: Boolean, endpoint: String) {
+        repository.updateRemoteRelayConfig(enabled, endpoint)
+    }
 }

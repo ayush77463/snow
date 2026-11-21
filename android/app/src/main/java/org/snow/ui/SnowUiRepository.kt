@@ -54,6 +54,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         const val PREFS_SETTINGS = "snow_settings"
         const val PREF_KEY_INSTANT_SYNC = "instant_clipboard_sync"
         const val PREF_KEY_AUTO_SYNC_SCREENSHOTS = "auto_sync_screenshots"
+        const val PREF_KEY_REMOTE_RELAY_ENABLED = "remote_relay_enabled"
+        const val PREF_KEY_REMOTE_RELAY_ENDPOINT = "remote_relay_endpoint"
 
         @Volatile
         private var instance: SnowUiRepository? = null
@@ -1013,6 +1015,36 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
         client.sendRequest("desktop_clipboard_sync_toggle", mapOf("enabled" to enabled)) { resp ->
             onComplete?.invoke(resp.isSuccess)
+        }
+    }
+
+    fun isRemoteRelayEnabled(): Boolean {
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        return prefs.getBoolean(PREF_KEY_REMOTE_RELAY_ENABLED, false)
+    }
+
+    fun setRemoteRelayEnabled(enabled: Boolean) {
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        prefs.edit().putBoolean(PREF_KEY_REMOTE_RELAY_ENABLED, enabled).apply()
+    }
+
+    fun getRemoteRelayEndpoint(): String {
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        return prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "") ?: ""
+    }
+
+    fun setRemoteRelayEndpoint(endpoint: String) {
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        prefs.edit().putString(PREF_KEY_REMOTE_RELAY_ENDPOINT, endpoint.trim()).apply()
+    }
+
+    fun updateRemoteRelayConfig(enabled: Boolean, endpoint: String) {
+        setRemoteRelayEnabled(enabled)
+        setRemoteRelayEndpoint(endpoint)
+        if (enabled && endpoint.isNotBlank()) {
+            serviceRef?.startRelay(endpoint)
+        } else {
+            serviceRef?.stopRelay()
         }
     }
 

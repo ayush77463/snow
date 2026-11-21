@@ -18,7 +18,7 @@ class Phase22StorageTest {
 
     @Before
     fun setUp() {
-        fileHandler = AndroidFileHandler(dummyContext) { null }
+        fileHandler = AndroidFileHandler(dummyContext, transferClientProvider = { null })
     }
 
     @Test
@@ -103,5 +103,109 @@ class Phase22StorageTest {
         child.mkdirs()
         assertTrue("Subfolder must be contained", AndroidFileHandler.isPathContained(child, root))
         assertTrue("Root itself must be contained", AndroidFileHandler.isPathContained(root, root))
+    }
+
+    @Test
+    fun testHandleFileReceiveMissingPayloadReturnsError() = kotlinx.coroutines.runBlocking {
+        val res = fileHandler.handleFileReceiveRequest(null, "127.0.0.1", 8766)
+        assertEquals("error", res["status"])
+    }
+
+    @Test
+    fun testHandleFileReceiveBlankFileNameReturnsError() = kotlinx.coroutines.runBlocking {
+        val res = fileHandler.handleFileReceiveRequest(mapOf("file_name" to ""), "127.0.0.1", 8766)
+        assertEquals("error", res["status"])
+    }
+
+    @Test
+    fun testHandleFileReceiveNonExistentFileReturnsStructuredError() = kotlinx.coroutines.runBlocking {
+        val res = fileHandler.handleFileReceiveRequest(
+            mapOf("file_name" to "non_existent_file_12345.pdf", "scope" to "full", "principal" to "OWNER_MANUAL"),
+            "127.0.0.1",
+            8766
+        )
+        assertEquals("error", res["status"])
+        assertEquals("FILE_NOT_FOUND", res["error"])
+    }
+
+    @Test
+    fun testPositiveFullStorageDownloadHandoff() = kotlinx.coroutines.runBlocking {
+        val fakeClient = FakeTestFileTransferClient(dummyContext)
+        val downloadFolder = tempFolder.newFolder("Download")
+        val reportFile = java.io.File(downloadFolder, "report.pdf")
+        reportFile.writeText("PDF-Mock-Content-For-Testing")
+
+        val handler = AndroidFileHandler(
+            context = dummyContext,
+            storageRootDirProvider = { tempFolder.root },
+            allFilesAccessProvider = { true },
+            transferClientProvider = { fakeClient }
+        )
+
+        val res = handler.handleFileReceiveRequest(
+            mapOf(
+                "file_name" to "report.pdf",
+                "subpath" to "Download",
+                "scope" to "full",
+                "principal" to "OWNER_MANUAL"
+            ),
+            "127.0.0.1",
+            8766
+        )
+
+        assertEquals("success", res["status"])
+        assertEquals("report.pdf", res["file_name"])
+        assertEquals(1, fakeClient.uploadCount)
+        assertEquals(reportFile.canonicalPath, fakeClient.lastUploadedFile?.canonicalPath)
+    }
+
+    @Test
+    fun testAiMcpForbiddenFromFullStorageDownload() = kotlinx.coroutines.runBlocking {
+        val fakeClient = FakeTestFileTransferClient(dummyContext)
+        val downloadFolder = tempFolder.newFolder("SecretDocs")
+        val secretFile = java.io.File(downloadFolder, "passwords.txt")
+        secretFile.writeText("SECRET_DATA")
+
+        val handler = AndroidFileHandler(
+            context = dummyContext,
+            storageRootDirProvider = { tempFolder.root },
+            allFilesAccessProvider = { true },
+            transferClientProvider = { fakeClient }
+        )
+
+        // AI_MCP principal must NOT resolve via shared storage, falling back to SAF (which fails as not found)
+        val res = handler.handleFileReceiveRequest(
+            mapOf(
+                "file_name" to "passwords.txt",
+                "subpath" to "SecretDocs",
+                "scope" to "full",
+                "principal" to "AI_MCP"
+            ),
+            "127.0.0.1",
+            8766
+        )
+
+        assertEquals("error", res["status"])
+        assertEquals(0, fakeClient.uploadCount)
+    }
+
+    private class FakeTestFileTransferClient(ctx: Context) : org.snow.transfer.FileTransferClient(
+        context = ctx,
+        deviceId = "fake-device",
+        useTls = false
+    ) {
+        var uploadCount = 0
+        var lastUploadedFile: java.io.File? = null
+
+        override suspend fun uploadFile(
+            serverHost: String,
+            transferPort: Int,
+            file: java.io.File,
+            onProgress: ((org.snow.transfer.FileTransferClient.TransferProgress) -> Unit)?
+        ): TransferResult {
+            uploadCount++
+            lastUploadedFile = file
+            return TransferResult.Success("test-transfer-id-999", "mock-sha256-hash", file)
+        }
     }
 }

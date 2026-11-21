@@ -36,7 +36,7 @@ import java.util.concurrent.TimeUnit
  * - 3.4: Resumable chunked upload (Content-Range), resumable download (HTTP Range),
  *        and duplicate detection.
  */
-class FileTransferClient(
+open class FileTransferClient(
     private val context: Context,
     private val deviceId: String,
     private val certPinStorage: CertPinStorage? = null,
@@ -214,7 +214,7 @@ class FileTransferClient(
      * Upload a local File to the desktop server with 64 KiB chunk streaming,
      * resume support, and progress reporting.
      */
-    suspend fun uploadFile(
+    open suspend fun uploadFile(
         serverHost: String,
         transferPort: Int,
         file: File,

@@ -206,6 +206,9 @@
             loadApprovalsList();
         } else if (currentTab === "activity") {
             loadActivityHistory();
+        } else if (currentTab === "settings") {
+            loadRelayStatus();
+            loadMcpGatewayStatus();
         }
     }
 
@@ -1349,22 +1352,120 @@
         const btnRefreshActivity = document.getElementById("btn-refresh-activity");
         if (btnRefreshActivity) btnRefreshActivity.addEventListener("click", loadActivityHistory);
 
-        // Initial Data Load
-        refreshActiveTab();
+    async function loadRelayStatus() {
+        const valEl = document.getElementById("relay-status-val");
+        const epEl = document.getElementById("relay-endpoint-val");
+        const frameEl = document.getElementById("relay-max-frame-val");
+        const resBox = document.getElementById("relay-test-result");
 
-        // Background Periodic Poller (every 4 seconds)
-        if (pollInterval) clearInterval(pollInterval);
-        pollInterval = setInterval(() => {
-            loadSystemStatus();
-            loadApprovalsCount();
-            if (currentTab === "overview") {
-                loadOverview();
-            } else if (currentTab === "devices") {
-                loadDevices();
-            } else if (currentTab === "notifications") {
-                loadNotifications();
+        const res = await apiRequest("/api/relay/status");
+        if (res && res.success && res.data) {
+            const d = res.data;
+            if (valEl) {
+                valEl.innerHTML = d.enabled
+                    ? `<span class="badge badge-success">Active Tunnel</span>`
+                    : `<span class="badge badge-muted">Disabled (Default)</span>`;
             }
-        }, 4000);
+            if (epEl) epEl.textContent = d.endpoint || "Not Configured";
+            if (frameEl) frameEl.textContent = `${d.max_frame_size_mib || 25} MiB (${d.quota_mib_hr || 100} MiB/hr quota)`;
+            if (resBox) resBox.textContent = d.enabled ? "Relay tunnel configured." : "Operating in local-first zero-trust mode.";
+        } else {
+            if (valEl) valEl.innerHTML = `<span class="badge badge-danger">Unavailable</span>`;
+            if (resBox) resBox.textContent = (res && res.error) ? res.error : "Failed fetching relay status.";
+        }
+    }
+
+    async function loadMcpGatewayStatus() {
+        const statusEl = document.getElementById("mcp-gateway-status");
+        const epEl = document.getElementById("mcp-endpoint-val");
+        const hostsEl = document.getElementById("mcp-hosts-val");
+        const resBox = document.getElementById("mcp-test-result");
+
+        if (resBox) resBox.textContent = "Checking Remote MCP Gateway status...";
+
+        const res = await apiRequest("/api/mcp-gateway/status");
+        if (res && res.success && res.data) {
+            const d = res.data;
+            const st = d.gateway_status;
+            if (statusEl) {
+                if (st === "online") {
+                    statusEl.innerHTML = `<span class="badge badge-success">Online (8771)</span>`;
+                } else if (st === "offline") {
+                    statusEl.innerHTML = `<span class="badge badge-muted">Offline (Not Started)</span>`;
+                } else if (st === "timeout") {
+                    statusEl.innerHTML = `<span class="badge badge-warning">Probe Timed Out</span>`;
+                } else {
+                    statusEl.innerHTML = `<span class="badge badge-warning">Unhealthy</span>`;
+                }
+            }
+            if (epEl && d.endpoint) epEl.textContent = d.endpoint;
+
+            if (hostsEl && Array.isArray(d.ai_hosts)) {
+                if (d.ai_hosts.length === 0) {
+                    hostsEl.innerHTML = `<span class="text-muted">None</span>`;
+                } else {
+                    hostsEl.innerHTML = d.ai_hosts.map(h => {
+                        const cls = h.is_configured ? "badge-success" : "badge-muted";
+                        return `<span class="badge ${cls}" style="margin-right: 4px;">${h.display_name || h.host}</span>`;
+                    }).join("");
+                }
+            }
+
+            if (resBox) {
+                if (st === "online") {
+                    resBox.innerHTML = `<span class="text-success">✓ Gateway Online at ${d.endpoint} (OAuth 2.1 Protected)</span>`;
+                } else if (st === "offline") {
+                    resBox.innerHTML = `<span class="text-muted">Gateway is offline. Start in terminal with: <code>python -m snow mcp-gateway</code></span>`;
+                } else {
+                    resBox.innerHTML = `<span class="text-warning">Gateway responding with status: ${st}</span>`;
+                }
+            }
+        } else {
+            if (statusEl) statusEl.innerHTML = `<span class="badge badge-danger">Error</span>`;
+            if (resBox) resBox.innerHTML = `<span class="text-danger">${(res && res.error) ? res.error : "Failed querying MCP gateway status"}</span>`;
+        }
+    }
+
+    // Phase 23 Remote MCP Gateway Card Bindings
+    const btnCopyMcp = document.getElementById("btn-copy-mcp-url");
+    if (btnCopyMcp) {
+        btnCopyMcp.addEventListener("click", () => {
+            navigator.clipboard.writeText("http://127.0.0.1:8771/mcp").then(() => {
+                btnCopyMcp.textContent = "Copied!";
+                setTimeout(() => { btnCopyMcp.textContent = "Copy Endpoint URL"; }, 2000);
+            });
+        });
+    }
+
+    const btnTestMcp = document.getElementById("btn-test-mcp-health");
+    if (btnTestMcp) {
+        btnTestMcp.addEventListener("click", () => loadMcpGatewayStatus());
+    }
+
+    const btnRefreshRelay = document.getElementById("btn-refresh-relay-status");
+    if (btnRefreshRelay) {
+        btnRefreshRelay.addEventListener("click", () => loadRelayStatus());
+    }
+
+    // Initial Data Load
+    refreshActiveTab();
+
+    // Background Periodic Poller (every 4 seconds)
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = setInterval(() => {
+        loadSystemStatus();
+        loadApprovalsCount();
+        if (currentTab === "overview") {
+            loadOverview();
+        } else if (currentTab === "devices") {
+            loadDevices();
+        } else if (currentTab === "notifications") {
+            loadNotifications();
+        } else if (currentTab === "settings") {
+            loadRelayStatus();
+            loadMcpGatewayStatus();
+        }
+    }, 4000);
     }
 
     // Boot entry point

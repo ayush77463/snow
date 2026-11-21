@@ -19,7 +19,9 @@ import java.io.File
  */
 class AndroidFileHandler(
     private val context: Context,
-    private val transferClientProvider: () -> FileTransferClient?
+    private val transferClientProvider: () -> FileTransferClient?,
+    private val storageRootDirProvider: (() -> File?)? = null,
+    private val allFilesAccessProvider: (() -> Boolean)? = null
 ) {
     companion object {
         private const val TAG = "AndroidFileHandler"
@@ -152,11 +154,6 @@ class AndroidFileHandler(
             return@withContext mapOf("status" to "error", "error" to "Invalid filename requested.")
         }
 
-        val client = transferClientProvider()
-        if (client == null) {
-            return@withContext mapOf("status" to "error", "error" to "FileTransferClient not initialized.")
-        }
-
         val requestedScope = data["scope"] as? String
         val principal = data["principal"] as? String ?: "AI_MCP"
         val subpath = data["subpath"] as? String
@@ -167,6 +164,10 @@ class AndroidFileHandler(
         if (isFullStorageEligible) {
             val sharedFile = resolveSharedStorageFile(subpath, safeFileName)
             if (sharedFile != null && sharedFile.exists() && sharedFile.isFile) {
+                val client = transferClientProvider()
+                if (client == null) {
+                    return@withContext mapOf("status" to "error", "error" to "FileTransferClient not initialized.")
+                }
                 SafeLog.i(TAG, "Uploading full storage file '$safeFileName' (${sharedFile.length()} bytes) to desktop core...")
                 val result = client.uploadFile(
                     serverHost = serverHost,
@@ -208,6 +209,10 @@ class AndroidFileHandler(
         // 2. Resolve from user-configured SAF DocumentFile tree
         val safDoc = resolveSafDocument(subpath, safeFileName)
         if (safDoc != null && safDoc.exists() && safDoc.isFile) {
+            val client = transferClientProvider()
+            if (client == null) {
+                return@withContext mapOf("status" to "error", "error" to "FileTransferClient not initialized.")
+            }
             SafeLog.i(TAG, "Uploading SAF file '$safeFileName' (${safDoc.length()} bytes) to desktop core...")
             val result = client.uploadUri(
                 serverHost = serverHost,
@@ -259,6 +264,9 @@ class AndroidFileHandler(
      * Check whether Android 11+ All Files Access (MANAGE_EXTERNAL_STORAGE) is granted.
      */
     fun isAllFilesAccessGranted(): Boolean {
+        if (allFilesAccessProvider != null) {
+            return allFilesAccessProvider.invoke()
+        }
         return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             Environment.isExternalStorageManager()
         } else {
@@ -297,7 +305,7 @@ class AndroidFileHandler(
     }
 
     private fun listFullSharedStorage(subpath: String?, showHidden: Boolean): Map<String, Any?> {
-        val rootDir = Environment.getExternalStorageDirectory()
+        val rootDir = storageRootDirProvider?.invoke() ?: Environment.getExternalStorageDirectory()
         if (rootDir == null || !rootDir.exists() || !rootDir.canRead()) {
             return mapOf(
                 "status" to "STORAGE_UNAVAILABLE",
@@ -496,8 +504,16 @@ class AndroidFileHandler(
      * Resolve a file DocumentFile safely within the persisted SAF tree.
      */
     fun resolveSafDocument(subpath: String?, fileName: String): androidx.documentfile.provider.DocumentFile? {
-        val safManager = org.snow.ui.files.SafFolderManager(context)
-        val treeUri = safManager.getDestinationUri() ?: return null
+        val safManager = try {
+            org.snow.ui.files.SafFolderManager(context)
+        } catch (_: Exception) {
+            null
+        }
+        val treeUri = try {
+            safManager?.getDestinationUri()
+        } catch (_: Exception) {
+            null
+        } ?: return null
         val rootDoc = try {
             androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
         } catch (_: Exception) {
@@ -527,7 +543,7 @@ class AndroidFileHandler(
      */
     fun resolveSharedStorageFile(subpath: String?, fileName: String): File? {
         if (!isAllFilesAccessGranted()) return null
-        val rootDir = Environment.getExternalStorageDirectory() ?: return null
+        val rootDir = storageRootDirProvider?.invoke() ?: Environment.getExternalStorageDirectory() ?: return null
         val canonicalRoot = rootDir.canonicalFile
 
         val safeFileName = File(fileName).name
