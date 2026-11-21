@@ -7,6 +7,7 @@ import org.snow.network.AuthState
 import org.snow.network.ConnectionState
 import org.snow.ui.ActiveTransferInfo
 import org.snow.ui.PcTelemetry
+import org.snow.ui.PendingApprovalItem
 import org.snow.ui.PhoneTelemetry
 import org.snow.ui.SnowUiRepository
 
@@ -64,5 +65,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun cancelActiveTransfer() {
         repository.cancelActiveTransfer()
+    }
+
+    fun fetchPendingApprovals(callback: (Result<List<PendingApprovalItem>>) -> Unit) {
+        repository.fetchPendingApprovals(callback)
+    }
+
+    fun resolveApproval(requestId: String, decision: String, callback: (Result<String>) -> Unit) {
+        repository.resolveApproval(requestId, decision, callback)
     }
 }

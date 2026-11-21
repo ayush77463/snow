@@ -239,6 +239,8 @@
         }
     }
 
+    let approvalsCountdownTimer = null;
+
     async function loadApprovalsCount() {
         const data = await apiRequest("/api/approvals");
         const approvals = (data && Array.isArray(data.requests)) ? data.requests : ((data && Array.isArray(data.approvals)) ? data.approvals : ((data && data.data && Array.isArray(data.data.requests)) ? data.data.requests : []));
@@ -247,6 +249,19 @@
         const statApprovals = document.getElementById("stat-pending-approvals");
         if (badge) badge.textContent = count.toString();
         if (statApprovals) statApprovals.textContent = count.toString();
+
+        const banner = document.getElementById("pending-approval-banner");
+        const bannerText = document.getElementById("pending-approval-banner-text");
+        if (banner) {
+            if (count > 0) {
+                banner.classList.remove("d-none");
+                if (bannerText) {
+                    bannerText.textContent = `${count} pending AI request${count > 1 ? "s" : ""} require${count === 1 ? "s" : ""} your approval`;
+                }
+            } else {
+                banner.classList.add("d-none");
+            }
+        }
     }
 
     function isLocalNode(dev) {
@@ -1044,6 +1059,11 @@
         const feed = document.getElementById("approvals-list");
         if (!feed) return;
 
+        if (approvalsCountdownTimer) {
+            clearInterval(approvalsCountdownTimer);
+            approvalsCountdownTimer = null;
+        }
+
         feed.innerHTML = '<div class="empty-state"><div class="spinner"></div> Querying authorization queue...</div>';
         const res = await apiRequest("/api/approvals");
         feed.innerHTML = "";
@@ -1054,70 +1074,133 @@
             empty.className = "empty-state";
             empty.textContent = "No pending approval requests. System is secure.";
             feed.appendChild(empty);
+            loadApprovalsCount();
             return;
         }
 
         requests.forEach(req => {
             const card = document.createElement("div");
             card.className = "approval-card";
+            card.id = `approval-card-${req.request_id}`;
 
             const header = document.createElement("div");
             header.className = "approval-header";
 
+            const titleRow = document.createElement("div");
+            titleRow.className = "d-flex align-items-center gap-2";
+
             const opName = document.createElement("h4");
-            opName.textContent = req.action || req.operation || "Sensitive Operation";
+            opName.textContent = req.capability || req.action || req.operation || "Sensitive Operation";
+
+            const riskLevel = (req.risk_level || "MEDIUM").toUpperCase();
+            const riskBadge = document.createElement("span");
+            riskBadge.className = `badge ${getRiskBadgeClass(riskLevel)}`;
+            riskBadge.textContent = riskLevel;
+
+            titleRow.appendChild(opName);
+            titleRow.appendChild(riskBadge);
 
             const reqId = document.createElement("span");
             reqId.className = "text-xs text-muted";
             reqId.textContent = req.request_id;
 
-            header.appendChild(opName);
+            header.appendChild(titleRow);
             header.appendChild(reqId);
 
             const details = document.createElement("div");
             details.className = "approval-details";
             details.appendChild(createDetailRow("Principal:", req.principal || "AI Assistant"));
-            details.appendChild(createDetailRow("Target:", req.target_device || "Windows Host"));
-            details.appendChild(createDetailRow("Risk Level:", req.risk_level || "standard"));
-            if (req.reason) details.appendChild(createDetailRow("Reason:", req.reason));
-            details.appendChild(createDetailRow("Params:", JSON.stringify(req.params || {})));
+            details.appendChild(createDetailRow("Target Device:", req.target_device || "Windows Host"));
+            details.appendChild(createDetailRow("Requested At:", formatTimestamp(req.created_at)));
+
+            // Live TTL Countdown
+            const ttlRow = document.createElement("div");
+            ttlRow.className = "device-detail-row";
+            const ttlLabel = document.createElement("span");
+            ttlLabel.className = "label";
+            ttlLabel.textContent = "Time-to-Live:";
+            const ttlSpan = document.createElement("span");
+            ttlSpan.className = "ttl-countdown";
+            const initialRemaining = Math.max(0, Math.round(Number(req.time_remaining_seconds != null ? req.time_remaining_seconds : (req.expires_at || 0))));
+            const deadlineMs = Date.now() + (initialRemaining * 1000);
+            ttlSpan.setAttribute("data-deadline", deadlineMs.toString());
+            ttlSpan.textContent = initialRemaining > 0 ? `⏳ ${initialRemaining}s remaining` : "⛔ Expired";
+            ttlRow.appendChild(ttlLabel);
+            ttlRow.appendChild(ttlSpan);
+            details.appendChild(ttlRow);
+
+            if (req.reason) {
+                details.appendChild(createDetailRow("Reason:", req.reason));
+            }
+
+            // Secret-redacted parameter preview
+            const paramsBox = document.createElement("div");
+            paramsBox.className = "mt-2";
+            const paramsLabel = document.createElement("span");
+            paramsLabel.className = "label text-xs font-semibold text-muted";
+            paramsLabel.textContent = "Sanitized Parameters (Preview):";
+            const paramsPre = document.createElement("div");
+            paramsPre.className = "sanitized-params-pre";
+            const safeParams = req.sanitized_params || req.params || {};
+            paramsPre.textContent = JSON.stringify(safeParams, null, 2);
+            paramsBox.appendChild(paramsLabel);
+            paramsBox.appendChild(paramsPre);
+            details.appendChild(paramsBox);
 
             const actions = document.createElement("div");
             actions.className = "approval-actions mt-3";
 
             const btnApprove = document.createElement("button");
             btnApprove.className = "btn-success";
-            btnApprove.textContent = "Approve Operation";
+            btnApprove.textContent = "✓ Approve Operation";
+            if (remSecs <= 0) btnApprove.disabled = true;
+
             btnApprove.addEventListener("click", async () => {
                 btnApprove.disabled = true;
-                const r = await apiRequest("/api/approvals/resolve", "POST", {
+                btnApprove.textContent = "Approving...";
+                const r = await apiRequest(`/api/approvals/${encodeURIComponent(req.request_id)}/resolve`, "POST", {
                     request_id: req.request_id,
                     decision: "approve",
                 });
                 if (r && r.success) {
-                    card.remove();
-                    loadApprovalsCount();
+                    card.style.opacity = "0.4";
+                    setTimeout(() => {
+                        card.remove();
+                        loadApprovalsCount();
+                        if (feed.querySelectorAll(".approval-card").length === 0) {
+                            feed.innerHTML = '<div class="empty-state">No pending approval requests. System is secure.</div>';
+                        }
+                    }, 200);
                 } else {
-                    alert("Approval failed: " + (r.error || r.status));
+                    alert("Approval failed: " + (r.error || r.status || "Unknown error"));
                     btnApprove.disabled = false;
+                    btnApprove.textContent = "✓ Approve Operation";
                 }
             });
 
             const btnDeny = document.createElement("button");
             btnDeny.className = "btn-danger";
-            btnDeny.textContent = "Deny";
+            btnDeny.textContent = "✕ Deny";
             btnDeny.addEventListener("click", async () => {
                 btnDeny.disabled = true;
-                const r = await apiRequest("/api/approvals/resolve", "POST", {
+                btnDeny.textContent = "Denying...";
+                const r = await apiRequest(`/api/approvals/${encodeURIComponent(req.request_id)}/resolve`, "POST", {
                     request_id: req.request_id,
                     decision: "deny",
                 });
                 if (r && r.success) {
-                    card.remove();
-                    loadApprovalsCount();
+                    card.style.opacity = "0.4";
+                    setTimeout(() => {
+                        card.remove();
+                        loadApprovalsCount();
+                        if (feed.querySelectorAll(".approval-card").length === 0) {
+                            feed.innerHTML = '<div class="empty-state">No pending approval requests. System is secure.</div>';
+                        }
+                    }, 200);
                 } else {
-                    alert("Denial failed: " + (r.error || r.status));
+                    alert("Denial failed: " + (r.error || r.status || "Unknown error"));
                     btnDeny.disabled = false;
+                    btnDeny.textContent = "✕ Deny";
                 }
             });
 
@@ -1129,6 +1212,31 @@
             card.appendChild(actions);
             feed.appendChild(card);
         });
+
+        // Start live 1-second countdown ticker
+        approvalsCountdownTimer = setInterval(() => {
+            const countdowns = feed.querySelectorAll(".ttl-countdown");
+            if (countdowns.length === 0) {
+                clearInterval(approvalsCountdownTimer);
+                approvalsCountdownTimer = null;
+                return;
+            }
+            const nowMs = Date.now();
+            countdowns.forEach(span => {
+                const deadline = Number(span.getAttribute("data-deadline") || 0);
+                const left = Math.max(0, Math.round((deadline - nowMs) / 1000));
+                if (left > 0) {
+                    span.textContent = `⏳ ${left}s remaining`;
+                } else {
+                    span.textContent = "⛔ Expired";
+                    const card = span.closest(".approval-card");
+                    if (card) {
+                        const appBtn = card.querySelector(".btn-success");
+                        if (appBtn) appBtn.disabled = true;
+                    }
+                }
+            });
+        }, 1000);
     }
 
     // 4H. Activity Audit
@@ -1217,6 +1325,24 @@
     // 6. Utility Functions
     // =========================================================================
 
+    function escapeHtml(str) {
+        if (str === null || str === undefined) return "";
+        return String(str)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function getRiskBadgeClass(riskLevel) {
+        const lvl = (riskLevel || "").toUpperCase();
+        if (lvl === "CRITICAL") return "badge-risk-critical";
+        if (lvl === "HIGH") return "badge-risk-high";
+        if (lvl === "MEDIUM") return "badge-risk-medium";
+        return "badge-risk-low";
+    }
+
     function createDetailRow(label, value) {
         const row = document.createElement("div");
         row.className = "device-detail-row";
@@ -1247,6 +1373,237 @@
         const sizes = ["B", "KB", "MB", "GB"];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+    }
+
+    async function loadRelayStatus() {
+        const valEl = document.getElementById("relay-status-val");
+        const epEl = document.getElementById("relay-endpoint-val");
+        const frameEl = document.getElementById("relay-max-frame-val");
+        const resBox = document.getElementById("relay-test-result");
+
+        const res = await apiRequest("/api/relay/status");
+        if (res && res.success && res.data) {
+            const d = res.data;
+            if (valEl) {
+                valEl.innerHTML = d.enabled
+                    ? `<span class="badge badge-success">Active Tunnel</span>`
+                    : `<span class="badge badge-muted">Disabled (Default)</span>`;
+            }
+            if (epEl) epEl.textContent = d.endpoint || "Not Configured";
+            if (frameEl) frameEl.textContent = `${d.max_frame_size_mib || 25} MiB (${d.quota_mib_hr || 100} MiB/hr quota)`;
+            if (resBox) resBox.textContent = d.enabled ? "Relay tunnel configured." : "Operating in local-first zero-trust mode.";
+        } else {
+            if (valEl) valEl.innerHTML = `<span class="badge badge-danger">Unavailable</span>`;
+            if (resBox) resBox.textContent = (res && res.error) ? res.error : "Failed fetching relay status.";
+        }
+    }
+
+    async function loadMcpGatewayStatus() {
+        const statusEl = document.getElementById("mcp-gateway-status");
+        const epEl = document.getElementById("mcp-endpoint-val");
+        const hostsEl = document.getElementById("mcp-hosts-val");
+        const resBox = document.getElementById("mcp-test-result");
+
+        if (resBox) resBox.textContent = "Checking Remote MCP Gateway status...";
+
+        const res = await apiRequest("/api/mcp-gateway/status");
+        if (res && res.success && res.data) {
+            const d = res.data;
+            const st = d.gateway_status;
+            if (statusEl) {
+                if (st === "online") {
+                    statusEl.innerHTML = `<span class="badge badge-success">Online (8771)</span>`;
+                } else if (st === "offline") {
+                    statusEl.innerHTML = `<span class="badge badge-muted">Offline (Not Started)</span>`;
+                } else if (st === "timeout") {
+                    statusEl.innerHTML = `<span class="badge badge-warning">Probe Timed Out</span>`;
+                } else {
+                    statusEl.innerHTML = `<span class="badge badge-warning">Unhealthy</span>`;
+                }
+            }
+            if (epEl && d.endpoint) epEl.textContent = d.endpoint;
+
+            if (hostsEl && Array.isArray(d.ai_hosts)) {
+                if (d.ai_hosts.length === 0) {
+                    hostsEl.innerHTML = `<span class="text-muted">None</span>`;
+                } else {
+                    hostsEl.innerHTML = d.ai_hosts.map(h => {
+                        const cls = h.is_configured ? "badge-success" : "badge-muted";
+                        return `<span class="badge ${cls}" style="margin-right: 4px;">${h.display_name || h.host}</span>`;
+                    }).join("");
+                }
+            }
+
+            if (resBox) {
+                if (st === "online") {
+                    resBox.innerHTML = `<span class="text-success">✓ Gateway Online at ${d.endpoint} (OAuth 2.1 Protected)</span>`;
+                } else if (st === "offline") {
+                    resBox.innerHTML = `<span class="text-muted">Gateway is offline. Start in terminal with: <code>python -m snow mcp-gateway</code></span>`;
+                } else {
+                    resBox.innerHTML = `<span class="text-warning">Gateway responding with status: ${st}</span>`;
+                }
+            }
+        } else {
+            if (statusEl) statusEl.innerHTML = `<span class="badge badge-danger">Error</span>`;
+            if (resBox) resBox.innerHTML = `<span class="text-danger">${(res && res.error) ? res.error : "Failed querying MCP gateway status"}</span>`;
+        }
+    }
+
+    // =========================================================================
+    // 6B. Workflows & Visual Capture (Phase 24)
+    // =========================================================================
+
+    function setupWorkflows() {
+        const btnCapturePc = document.getElementById("btn-wf-capture-pc");
+        const btnHealth = document.getElementById("btn-wf-health");
+        const btnPcToPhone = document.getElementById("btn-wf-pc-to-phone");
+        const btnClipboard = document.getElementById("btn-wf-clipboard");
+
+        if (btnCapturePc) {
+            btnCapturePc.addEventListener("click", () => runWorkflow("pc_screenshot", "🖥️ Capture PC Screen"));
+        }
+        if (btnHealth) {
+            btnHealth.addEventListener("click", () => runWorkflow("device_health_snapshot", "🩺 Device Health Snapshot"));
+        }
+        if (btnPcToPhone) {
+            btnPcToPhone.addEventListener("click", () => runWorkflow("capture_pc_to_phone", "📲 Capture PC → Phone"));
+        }
+        if (btnClipboard) {
+            btnClipboard.addEventListener("click", () => runWorkflow("share_clipboard_and_notify", "📋 Sync Clipboard & Notify"));
+        }
+    }
+
+    async function runWorkflow(workflowId, displayName) {
+        const runBox = document.getElementById("workflow-run-box");
+        const nameDisplay = document.getElementById("workflow-name-display");
+        const statusBadge = document.getElementById("workflow-status-badge");
+        const stepsList = document.getElementById("workflow-steps-list");
+        const outputBox = document.getElementById("workflow-output-box");
+        const outputPre = document.getElementById("workflow-output-pre");
+        const previewBox = document.getElementById("capture-preview-box");
+        const previewImg = document.getElementById("capture-preview-img");
+
+        if (!runBox) return;
+
+        runBox.classList.remove("d-none");
+        if (nameDisplay) nameDisplay.textContent = displayName || workflowId;
+        if (statusBadge) {
+            statusBadge.className = "badge badge-info";
+            statusBadge.textContent = "RUNNING...";
+        }
+        if (stepsList) stepsList.innerHTML = '<div class="spinner"></div> Executing workflow steps through CapabilityEngine...';
+        if (outputBox) outputBox.classList.add("d-none");
+        if (previewBox) previewBox.classList.add("d-none");
+
+        const res = await apiRequest("/api/workflows/run", "POST", { workflow_id: workflowId });
+
+        if (stepsList) stepsList.innerHTML = "";
+
+        if (!res || !res.success) {
+            if (statusBadge) {
+                statusBadge.className = "badge badge-danger";
+                statusBadge.textContent = "FAILED";
+            }
+            if (stepsList) {
+                const errDiv = document.createElement("div");
+                errDiv.className = "empty-state text-danger";
+                errDiv.textContent = `Execution failed: ${res.error || res.status || 'Unknown error'}`;
+                stepsList.appendChild(errDiv);
+            }
+            return;
+        }
+
+        const report = res.data || res;
+        const status = report.status || "COMPLETED";
+
+        if (statusBadge) {
+            if (status === "COMPLETED") {
+                statusBadge.className = "badge badge-success";
+                statusBadge.textContent = "COMPLETED";
+            } else if (status === "PARTIAL") {
+                statusBadge.className = "badge badge-warning";
+                statusBadge.textContent = "PARTIAL";
+            } else if (status === "PENDING_APPROVAL") {
+                statusBadge.className = "badge badge-warning";
+                statusBadge.textContent = "PAUSED (APPROVAL REQUIRED)";
+            } else {
+                statusBadge.className = "badge badge-danger";
+                statusBadge.textContent = status;
+            }
+        }
+
+        const steps = Array.isArray(report.step_results) ? report.step_results : [];
+        let capturedFileName = null;
+
+        steps.forEach((step, idx) => {
+            const item = document.createElement("div");
+            item.className = "workflow-step-item";
+
+            const header = document.createElement("div");
+            header.className = "workflow-step-header";
+
+            const nameEl = document.createElement("span");
+            nameEl.className = "workflow-step-name";
+            nameEl.textContent = `${idx + 1}. ${step.name || step.capability}`;
+
+            const badge = document.createElement("span");
+            const st = step.status || "UNKNOWN";
+            if (st === "SUCCESS") {
+                badge.className = "badge badge-success";
+                badge.textContent = "✓ Success";
+            } else if (st === "SKIPPED" || st === "PARTIAL") {
+                badge.className = "badge badge-warning";
+                badge.textContent = `⚠ ${st === "SKIPPED" ? "Skipped (Offline)" : "Partial"}`;
+            } else if (st === "PENDING_APPROVAL") {
+                badge.className = "badge badge-warning";
+                badge.textContent = "⏳ Approval Needed";
+            } else {
+                badge.className = "badge badge-danger";
+                badge.textContent = `✕ ${st}`;
+            }
+
+            header.appendChild(nameEl);
+            header.appendChild(badge);
+            item.appendChild(header);
+
+            const meta = document.createElement("div");
+            meta.className = "workflow-step-meta";
+            meta.textContent = `Capability: ${step.capability} | Duration: ${(step.duration_seconds || 0).toFixed(2)}s`;
+            item.appendChild(meta);
+
+            if (step.data && typeof step.data === "object") {
+                if (step.data.file_name) {
+                    capturedFileName = step.data.file_name;
+                }
+            }
+
+            if (step.error) {
+                const errEl = document.createElement("div");
+                errEl.className = "text-xs text-danger mt-1";
+                errEl.textContent = `Error: ${step.error}`;
+                item.appendChild(errEl);
+            }
+
+            stepsList.appendChild(item);
+        });
+
+        if (report.final_output && Object.keys(report.final_output).length > 0) {
+            if (outputBox && outputPre) {
+                outputBox.classList.remove("d-none");
+                outputPre.textContent = JSON.stringify(report.final_output, null, 2);
+            }
+            if (report.final_output.file_name) {
+                capturedFileName = report.final_output.file_name;
+            }
+        }
+
+        if (capturedFileName && previewBox && previewImg) {
+            previewBox.classList.remove("d-none");
+            previewImg.src = `/api/captures/${encodeURIComponent(capturedFileName)}`;
+            previewImg.alt = `Screenshot: ${capturedFileName}`;
+        }
+
+        loadApprovalsCount();
     }
 
     // =========================================================================
@@ -1352,81 +1709,7 @@
         const btnRefreshActivity = document.getElementById("btn-refresh-activity");
         if (btnRefreshActivity) btnRefreshActivity.addEventListener("click", loadActivityHistory);
 
-    async function loadRelayStatus() {
-        const valEl = document.getElementById("relay-status-val");
-        const epEl = document.getElementById("relay-endpoint-val");
-        const frameEl = document.getElementById("relay-max-frame-val");
-        const resBox = document.getElementById("relay-test-result");
-
-        const res = await apiRequest("/api/relay/status");
-        if (res && res.success && res.data) {
-            const d = res.data;
-            if (valEl) {
-                valEl.innerHTML = d.enabled
-                    ? `<span class="badge badge-success">Active Tunnel</span>`
-                    : `<span class="badge badge-muted">Disabled (Default)</span>`;
-            }
-            if (epEl) epEl.textContent = d.endpoint || "Not Configured";
-            if (frameEl) frameEl.textContent = `${d.max_frame_size_mib || 25} MiB (${d.quota_mib_hr || 100} MiB/hr quota)`;
-            if (resBox) resBox.textContent = d.enabled ? "Relay tunnel configured." : "Operating in local-first zero-trust mode.";
-        } else {
-            if (valEl) valEl.innerHTML = `<span class="badge badge-danger">Unavailable</span>`;
-            if (resBox) resBox.textContent = (res && res.error) ? res.error : "Failed fetching relay status.";
-        }
-    }
-
-    async function loadMcpGatewayStatus() {
-        const statusEl = document.getElementById("mcp-gateway-status");
-        const epEl = document.getElementById("mcp-endpoint-val");
-        const hostsEl = document.getElementById("mcp-hosts-val");
-        const resBox = document.getElementById("mcp-test-result");
-
-        if (resBox) resBox.textContent = "Checking Remote MCP Gateway status...";
-
-        const res = await apiRequest("/api/mcp-gateway/status");
-        if (res && res.success && res.data) {
-            const d = res.data;
-            const st = d.gateway_status;
-            if (statusEl) {
-                if (st === "online") {
-                    statusEl.innerHTML = `<span class="badge badge-success">Online (8771)</span>`;
-                } else if (st === "offline") {
-                    statusEl.innerHTML = `<span class="badge badge-muted">Offline (Not Started)</span>`;
-                } else if (st === "timeout") {
-                    statusEl.innerHTML = `<span class="badge badge-warning">Probe Timed Out</span>`;
-                } else {
-                    statusEl.innerHTML = `<span class="badge badge-warning">Unhealthy</span>`;
-                }
-            }
-            if (epEl && d.endpoint) epEl.textContent = d.endpoint;
-
-            if (hostsEl && Array.isArray(d.ai_hosts)) {
-                if (d.ai_hosts.length === 0) {
-                    hostsEl.innerHTML = `<span class="text-muted">None</span>`;
-                } else {
-                    hostsEl.innerHTML = d.ai_hosts.map(h => {
-                        const cls = h.is_configured ? "badge-success" : "badge-muted";
-                        return `<span class="badge ${cls}" style="margin-right: 4px;">${h.display_name || h.host}</span>`;
-                    }).join("");
-                }
-            }
-
-            if (resBox) {
-                if (st === "online") {
-                    resBox.innerHTML = `<span class="text-success">✓ Gateway Online at ${d.endpoint} (OAuth 2.1 Protected)</span>`;
-                } else if (st === "offline") {
-                    resBox.innerHTML = `<span class="text-muted">Gateway is offline. Start in terminal with: <code>python -m snow mcp-gateway</code></span>`;
-                } else {
-                    resBox.innerHTML = `<span class="text-warning">Gateway responding with status: ${st}</span>`;
-                }
-            }
-        } else {
-            if (statusEl) statusEl.innerHTML = `<span class="badge badge-danger">Error</span>`;
-            if (resBox) resBox.innerHTML = `<span class="text-danger">${(res && res.error) ? res.error : "Failed querying MCP gateway status"}</span>`;
-        }
-    }
-
-    // Phase 23 Remote MCP Gateway Card Bindings
+        // Phase 23 Remote MCP Gateway Card Bindings
     const btnCopyMcp = document.getElementById("btn-copy-mcp-url");
     if (btnCopyMcp) {
         btnCopyMcp.addEventListener("click", () => {
@@ -1446,6 +1729,13 @@
     if (btnRefreshRelay) {
         btnRefreshRelay.addEventListener("click", () => loadRelayStatus());
     }
+
+    const btnJumpApprovals = document.getElementById("btn-jump-approvals");
+    if (btnJumpApprovals) {
+        btnJumpApprovals.addEventListener("click", () => switchTab("approvals"));
+    }
+
+    setupWorkflows();
 
     // Initial Data Load
     refreshActiveTab();

@@ -1675,9 +1675,78 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun clearLogs() {
         _logs.value = emptyList()
     }
+
+    // --- Approvals Feed (Phase 24) ---
+
+    fun fetchPendingApprovals(callback: (Result<List<PendingApprovalItem>>) -> Unit) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            callback(Result.failure(IllegalStateException("Not connected to SNOW Desktop Core.")))
+            return
+        }
+
+        client.sendRequest("approval_list", emptyMap()) { resp ->
+            repoScope.launch {
+                if (resp.isSuccess) {
+                    val rawList = resp.payload?.get("requests") as? List<*> ?: emptyList<Any>()
+                    val items = rawList.filterIsInstance<Map<String, Any?>>().map { m ->
+                        PendingApprovalItem(
+                            requestId = m["request_id"] as? String ?: "",
+                            principal = m["principal"] as? String ?: "AI_MCP",
+                            action = m["action"] as? String ?: "",
+                            targetDevice = m["target_device"] as? String ?: "local",
+                            riskLevel = m["risk_level"] as? String ?: "MEDIUM",
+                            reason = m["reason"] as? String ?: "",
+                            timeRemainingSeconds = (m["time_remaining_seconds"] as? Number)?.toDouble() ?: 0.0,
+                            sanitizedParams = (m["sanitized_params"] as? Map<*, *>)?.entries?.associate {
+                                it.key.toString() to it.value
+                            } ?: emptyMap()
+                        )
+                    }
+                    callback(Result.success(items))
+                } else {
+                    val err = resp.error?.message ?: (resp.payload?.get("error") as? String) ?: "Failed fetching approvals"
+                    callback(Result.failure(RuntimeException(err)))
+                }
+            }
+        }
+    }
+
+    fun resolveApproval(requestId: String, decision: String, callback: (Result<String>) -> Unit) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            callback(Result.failure(IllegalStateException("Not connected to SNOW Desktop Core.")))
+            return
+        }
+
+        val cleanDecision = decision.trim().uppercase()
+        val data = mapOf("request_id" to requestId, "decision" to cleanDecision)
+        client.sendRequest("approval_resolve", data) { resp ->
+            repoScope.launch {
+                if (resp.isSuccess) {
+                    val msg = resp.payload?.get("message") as? String ?: cleanDecision
+                    callback(Result.success(msg))
+                } else {
+                    val err = resp.error?.message ?: (resp.payload?.get("message") as? String) ?: "Resolution failed"
+                    callback(Result.failure(RuntimeException(err)))
+                }
+            }
+        }
+    }
 }
 
 // --- Data Models ---
+
+data class PendingApprovalItem(
+    val requestId: String,
+    val principal: String,
+    val action: String,
+    val targetDevice: String,
+    val riskLevel: String,
+    val reason: String,
+    val timeRemainingSeconds: Double,
+    val sanitizedParams: Map<String, Any?> = emptyMap()
+)
 
 data class DeviceEndpoint(
     val host: String,

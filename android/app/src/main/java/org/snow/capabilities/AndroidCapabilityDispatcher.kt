@@ -32,6 +32,8 @@ class AndroidCapabilityDispatcher(
     val messagingHandler = MessagingHandler(context)
     val mediaControlHandler = MediaControlHandler(context)
     val linkShareHandler = LinkShareHandler(context)
+    val screenCaptureHandler = ScreenCaptureHandler(context, transferClientProvider)
+    val cameraCaptureHandler = CameraCaptureHandler(context, transferClientProvider)
 
     /**
      * Centralized pre-execution contract check validating OS constraints, runtime
@@ -42,6 +44,34 @@ class AndroidCapabilityDispatcher(
      */
     fun validateExecutionContract(action: String, data: Map<String, Any?>?): Map<String, Any?>? {
         when (action) {
+            "android_screenshot", "screen_capture" -> {
+                if (!screenCaptureHandler.hasConsent()) {
+                    return mapOf(
+                        "success" to false,
+                        "status" to "SCREEN_CAPTURE_CONSENT_REQUIRED",
+                        "error" to "MediaProjection consent has not been granted by user.",
+                        "remediation_hint" to "Open SNOW on your Android phone and initiate screen capture."
+                    )
+                }
+            }
+            "android_camera_capture", "camera_capture" -> {
+                if (!cameraCaptureHandler.hasCameraPermission()) {
+                    return mapOf(
+                        "success" to false,
+                        "status" to "CAMERA_PERMISSION_REQUIRED",
+                        "error" to "Camera runtime permission has not been granted by user.",
+                        "remediation_hint" to "Grant Camera permission in Android Settings."
+                    )
+                }
+                if (!cameraCaptureHandler.isInteractionPermitted() && CameraCaptureHandler.mockBitmapProvider == null) {
+                    return mapOf(
+                        "success" to false,
+                        "status" to "FOREGROUND_USER_INTERACTION_REQUIRED",
+                        "error" to "Camera capture requires SNOW to be in the foreground with active visible user interaction.",
+                        "remediation_hint" to "Open SNOW on your Android phone and confirm camera capture."
+                    )
+                }
+            }
             "clipboard_pull" -> {
                 if (!ClipboardHandler.isAppInForeground) {
                     return mapOf(
@@ -109,7 +139,13 @@ class AndroidCapabilityDispatcher(
             val errorMsg = contractViolation["error"] as? String ?: "Execution contract check failed."
             val hint = contractViolation["remediation_hint"] as? String ?: ""
             val code = when (status) {
-                "FOREGROUND_REQUIRED", "RUNTIME_PERMISSION_REQUIRED", "PERMISSION_DENIED", "USER_CONFIRMATION_REQUIRED" -> ErrorCode.UNAUTHORIZED
+                "FOREGROUND_REQUIRED",
+                "RUNTIME_PERMISSION_REQUIRED",
+                "PERMISSION_DENIED",
+                "USER_CONFIRMATION_REQUIRED",
+                "SCREEN_CAPTURE_CONSENT_REQUIRED",
+                "CAMERA_PERMISSION_REQUIRED",
+                "FOREGROUND_USER_INTERACTION_REQUIRED" -> ErrorCode.UNAUTHORIZED
                 else -> ErrorCode.INVALID_PAYLOAD
             }
             return Pair(null, SnowError(code = code, message = "$status: $errorMsg ($hint)"))
@@ -117,7 +153,7 @@ class AndroidCapabilityDispatcher(
 
         // 2. Handler execution
         return when (action) {
-            "battery_status" -> {
+            "battery_status", "android_battery", "android_battery_status", "snow_android_battery" -> {
                 val res = batteryHandler.getBatteryStatus()
                 Pair(res, null)
             }
@@ -306,6 +342,47 @@ class AndroidCapabilityDispatcher(
                 val text = data?.get("text") as? String
                 val res = linkShareHandler.handleShareLink(url, text)
                 Pair(res, null)
+            }
+            "android_screenshot", "screen_capture" -> {
+                val res = screenCaptureHandler.captureScreen(serverHost = serverHost, transferPort = defaultTransferPort)
+                if (res["success"] == true) {
+                    Pair(res, null)
+                } else {
+                    val code = if (res["status"] == "SCREEN_CAPTURE_CONSENT_REQUIRED") ErrorCode.UNAUTHORIZED else ErrorCode.INTERNAL_ERROR
+                    Pair(null, SnowError(code = code, message = "${res["status"]}: ${res["error"] ?: "Screen capture failed"}"))
+                }
+            }
+            "android_camera_capture", "camera_capture" -> {
+                val res = cameraCaptureHandler.capturePhoto(serverHost = serverHost, transferPort = defaultTransferPort)
+                if (res["success"] == true) {
+                    Pair(res, null)
+                } else {
+                    val code = when (res["status"]) {
+                        "CAMERA_PERMISSION_REQUIRED", "FOREGROUND_USER_INTERACTION_REQUIRED" -> ErrorCode.UNAUTHORIZED
+                        else -> ErrorCode.INTERNAL_ERROR
+                    }
+                    Pair(null, SnowError(code = code, message = "${res["status"]}: ${res["error"] ?: "Camera capture failed"}"))
+                }
+            }
+            "approval_event" -> {
+                val eventType = data?.get("event_type") as? String ?: ""
+                val appReq = data?.get("request") as? Map<*, *>
+                val reqId = appReq?.get("request_id") as? String ?: ""
+                if (eventType == "APPROVAL_REQUESTED" && reqId.isNotBlank() && appReq != null) {
+                    val principal = appReq["principal"] as? String ?: "AI Assistant"
+                    val operation = appReq["action"] as? String ?: "Operation"
+                    val riskLevel = appReq["risk_level"] as? String ?: "MEDIUM"
+                    ActionNotificationHelper.postApprovalNotification(
+                        context = context,
+                        requestId = reqId,
+                        principal = principal,
+                        operation = operation,
+                        riskLevel = riskLevel,
+                    )
+                } else if (eventType == "APPROVAL_RESOLVED" && reqId.isNotBlank()) {
+                    ActionNotificationHelper.cancelApprovalNotification(context, reqId)
+                }
+                Pair(mapOf("status" to "success"), null)
             }
             else -> {
                 Pair(

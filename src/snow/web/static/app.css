@@ -1111,3 +1111,142 @@ body.theme-dark .data-table tr:hover td {
     cursor: pointer;
     margin-right: 0.5rem;
 }
+
+/* Phase 24 Utilities & Approval UX */
+.d-none {
+    display: none !important;
+}
+
+.topbar-approval-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid var(--danger-color);
+    padding: 0.35rem 0.85rem;
+    border-radius: 8px;
+    animation: pulseGlow 2s infinite ease-in-out;
+}
+
+@keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.2); }
+    50% { box-shadow: 0 0 8px 2px rgba(239, 68, 68, 0.35); }
+}
+
+.banner-badge {
+    background: var(--danger-color);
+    color: #FFFFFF;
+    font-size: 0.65rem;
+    font-weight: 800;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    letter-spacing: 0.5px;
+}
+
+.banner-text {
+    font-size: 0.825rem;
+    font-weight: 600;
+    color: var(--danger-color);
+}
+
+.badge-info {
+    background: rgba(56, 189, 248, 0.15);
+    color: #0284c7;
+    border: 1px solid #38bdf8;
+}
+
+.badge-risk-low {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10B981;
+    border: 1px solid #10B981;
+    font-weight: 700;
+}
+
+.badge-risk-medium {
+    background: rgba(245, 158, 11, 0.15);
+    color: #F59E0B;
+    border: 1px solid #F59E0B;
+    font-weight: 700;
+}
+
+.badge-risk-high {
+    background: rgba(239, 68, 68, 0.15);
+    color: #EF4444;
+    border: 1px solid #EF4444;
+    font-weight: 700;
+}
+
+.badge-risk-critical {
+    background: #EF4444;
+    color: #FFFFFF;
+    border: 1px solid #DC2626;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.ttl-countdown {
+    font-family: monospace;
+    font-weight: 700;
+    color: var(--danger-color);
+}
+
+.sanitized-params-pre {
+    background: var(--bg-app);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.5rem;
+    font-size: 0.775rem;
+    font-family: monospace;
+    max-height: 120px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: 0.25rem;
+}
+
+/* Phase 24 Workflows & Capture Preview */
+.workflow-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.workflow-step-item {
+    background: var(--bg-app);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.6rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.workflow-step-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.workflow-step-name {
+    font-weight: 600;
+    font-size: 0.875rem;
+}
+
+.workflow-step-meta {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.preview-img-wrapper {
+    background: #000000;
+    border-radius: 8px;
+    padding: 0.5rem;
+    text-align: center;
+}
+
+.preview-img-wrapper img {
+    max-width: 100%;
+    max-height: 480px;
+    border-radius: 4px;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+}

@@ -95,6 +95,11 @@ class SnowCoreServer:
         )
         self.ws_server.node_registry = self.node_registry
         self.capability_engine.node_registry = self.node_registry
+        self.capability_engine.db_manager = self.db_manager
+        self.capability_engine.transfer_manager = self.transfer_manager
+        self.capability_engine.storage_manager = self.storage_manager
+        self.capability_engine.http_transfer_server = self.http_transfer_server
+        self.capability_engine.core_server = self
 
         from snow.network.router import SessionRouter
 
@@ -106,6 +111,19 @@ class SnowCoreServer:
             db_manager=self.db_manager,
             wake_grace_period=getattr(self.config, "device_connect_grace_period", 6.0),
         )
+        self.capability_engine.session_router = self.session_router
+
+        # Attach approval notification broadcast listener to approval engine
+        app_engine = getattr(self.capability_engine, "approval_engine", None)
+        if app_engine and hasattr(app_engine, "add_listener"):
+            def _approval_event_listener(event_type: str, data: dict) -> None:
+                if self.ws_server and hasattr(self.ws_server, "broadcast_approval_event"):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self.ws_server.broadcast_approval_event(event_type, data))
+                    except RuntimeError:
+                        pass
+            app_engine.add_listener(_approval_event_listener)
 
         self.ipc_server: SnowIpcServer = SnowIpcServer(core_server=self, config=self.config)
         self.ipc_server.capability_engine = self.capability_engine
@@ -194,6 +212,7 @@ class SnowCoreServer:
             ssl_context=self.ws_server.ssl_context,
         )
         self.ws_server.http_transfer_server = self.http_transfer_server
+        self.capability_engine.http_transfer_server = self.http_transfer_server
         await self.http_transfer_server.start()
 
         # Start the authenticated loopback IPC server for MCP subprocess communication

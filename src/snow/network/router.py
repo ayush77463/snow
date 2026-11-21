@@ -49,7 +49,10 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "desktop_app_launch": "desktop.apps.launch",
     "mesh_list_peers": "mesh.list_peers",
     "peer_relay_request": "mesh.peer_relay",
-    "android_battery": "android.battery.get",
+    "android_battery": "android.telemetry.get",
+    "snow_android_battery": "android.telemetry.get",
+    "android_battery_status": "android.telemetry.get",
+    "snow_android_battery_status": "android.telemetry.get",
     "android_clipboard_get": "android.clipboard.get",
     "android_clipboard_set": "android.clipboard.set",
     "android_notification": "android.notification.post",
@@ -71,6 +74,39 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "notification_reply": "android.notifications.push",
     "media_control": "android.ringer.ring",
     "share_link": "android.apps.launch",
+    "android_screenshot": "android.media.projection",
+    "snow_android_screenshot": "android.media.projection",
+    "android_camera_capture": "android.camera.capture",
+    "snow_android_camera_capture": "android.camera.capture",
+}
+
+# Mapping from high-level unified actions to physical peer wire actions
+ACTION_TO_WIRE_ACTION: dict[str, str] = {
+    "snow_android_battery": "battery_status",
+    "android_battery_status": "battery_status",
+    "snow_android_battery_status": "battery_status",
+    "android_ring": "ring_phone",
+    "snow_android_ring": "ring_phone",
+    "android_list_apps": "list_apps",
+    "snow_android_list_apps": "list_apps",
+    "android_launch_app": "launch_app",
+    "snow_android_launch_app": "launch_app",
+    "android_send_message": "send_message",
+    "snow_android_send_message": "send_message",
+    "android_clipboard_push": "clipboard_push",
+    "snow_android_clipboard_push": "clipboard_push",
+    "android_clipboard_pull": "clipboard_pull",
+    "snow_android_clipboard_pull": "clipboard_pull",
+    "android_notifications_list": "notifications_list",
+    "snow_android_notifications_list": "notifications_list",
+    "android_notification_dismiss": "notification_dismiss",
+    "snow_android_notification_dismiss": "notification_dismiss",
+    "android_notification_reply": "notification_reply",
+    "snow_android_notification_reply": "notification_reply",
+    "android_file_list": "file_list",
+    "snow_android_file_list": "file_list",
+    "android_file_receive": "file_receive_request",
+    "snow_android_file_receive": "file_receive_request",
 }
 
 # Alias for backward-compatible routing lookups
@@ -368,10 +404,11 @@ class SessionRouter:
                 "attempted_transports": attempted_transports,
             }
 
+        wire_action = ACTION_TO_WIRE_ACTION.get(action, action)
         try:
             response = await self.ws_server.send_request(
                 connection_id=connection_id,
-                action=action,
+                action=wire_action,
                 payload=data,
                 timeout=timeout,
             )
@@ -445,8 +482,9 @@ class SessionRouter:
         attempted_transports: list[str],
     ) -> dict[str, Any]:
         """Dispatch a request over an active outbound SnowPeerClient connection."""
+        wire_action = ACTION_TO_WIRE_ACTION.get(action, action)
         try:
-            req = SnowMessage.create_request(action=action, data=data)
+            req = SnowMessage.create_request(action=wire_action, data=data)
             response = await client.send_message(req, timeout=timeout)
 
             is_ok = response.type == MessageType.RESPONSE and (

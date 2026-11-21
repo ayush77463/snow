@@ -629,3 +629,79 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "error": result.get("error", "Failed querying activity history."),
             }, indent=2)
         return json.dumps(result.get("data", {}) or result, indent=2)
+
+    # =========================================================================
+    # 7. Capture & Workflow Tools (Phase 24)
+    # =========================================================================
+
+    @server.tool(
+        name="snow_windows_screenshot",
+        description="Capture the primary Windows desktop screen as an authenticated, bounded PNG image staged in captures directory.",
+    )
+    async def snow_windows_screenshot(approval_id: str = "") -> str:
+        """Capture the primary Windows screen via native Win32 GDI/GDI+."""
+        result = await bridge.windows_screenshot(approval_id=approval_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed capturing Windows screen."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_android_screenshot",
+        description="Capture the connected Android phone screen via OS-mediated MediaProjection user consent.",
+    )
+    async def snow_android_screenshot(device_id: str = "", approval_id: str = "") -> str:
+        """Capture the connected Android phone screen via MediaProjection consent."""
+        result = await bridge.android_screenshot(device_id=device_id, approval_id=approval_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed capturing Android screen."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_android_camera_capture",
+        description="Capture a photograph using the connected Android device camera requiring foreground user confirmation.",
+    )
+    async def snow_android_camera_capture(device_id: str = "", approval_id: str = "") -> str:
+        """Capture a photograph using the connected Android camera."""
+        result = await bridge.android_camera_capture(device_id=device_id, approval_id=approval_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed capturing Android camera photograph."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_workflow_run",
+        description="Execute an authorized declarative multi-step workflow with bounded step execution and approval checks.",
+    )
+    async def snow_workflow_run(
+        workflow_id: str,
+        arguments: Optional[dict[str, Any]] = None,
+        approval_id: str = "",
+    ) -> str:
+        """Execute a predefined declarative multi-step workflow."""
+        result = await bridge.workflow_run(
+            workflow_id=workflow_id,
+            arguments=arguments,
+            approval_id=approval_id,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", f"Failed running workflow '{workflow_id}'."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)

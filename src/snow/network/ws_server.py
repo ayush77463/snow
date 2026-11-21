@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import hashlib
+import ipaddress
 import json
 import logging
 from pathlib import Path
@@ -394,7 +395,9 @@ class SnowWebSocketServer:
                     self._clipboard_watchdog_task = None
             session = self.session_manager.get_session_by_connection(client.connection_id)
             if session and getattr(self, "node_registry", None):
-                self.node_registry.on_session_disconnected(session.device_id)
+                self.node_registry.on_session_disconnected(
+                    session.device_id, connection_id=client.connection_id
+                )
             self.session_manager.cleanup_connection(client.connection_id)
             self.connection_manager.unregister(client.connection_id)
             for req_id, (cid, fut) in list(self._pending_requests.items()):
@@ -688,6 +691,10 @@ class SnowWebSocketServer:
                 await self._handle_mesh_list_peers(client, message, data, session)
             elif action == "peer_relay_request":
                 await self._handle_peer_relay_request(client, message, data, session)
+            elif action == "approval_list":
+                await self._handle_approval_list(client, message, data, session, ctx)
+            elif action == "approval_resolve":
+                await self._handle_approval_resolve(client, message, data, session, ctx)
             else:
                 logger.warning("Rejected unsupported action '%s' from client [%s]",
                                action, client.connection_id)
@@ -1023,6 +1030,16 @@ class SnowWebSocketServer:
         """
         clean_host = (client_host or "").strip().lower()
         is_loopback = clean_host in ("127.0.0.1", "::1", "localhost")
+        if not is_loopback:
+            try:
+                ip = ipaddress.ip_address(clean_host)
+                if ip.is_loopback:
+                    is_loopback = True
+                elif getattr(ip, "ipv4_mapped", None) and ip.ipv4_mapped.is_loopback:
+                    is_loopback = True
+            except ValueError:
+                pass
+
         clean_decl = (client_declaration or "").strip().lower()
 
         if not is_loopback:
@@ -1048,6 +1065,125 @@ class SnowWebSocketServer:
             return "unknown"
 
         return "loopback"
+
+    async def _handle_approval_list(
+        self, client: Any, message: SnowMessage, data: dict, session: Any, ctx: ExecutionContext
+    ) -> None:
+        """Handle approval_list request from an authenticated, trusted owner companion device."""
+        if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+            logger.warning("Rejected approval_list: device [%s] lacks OWNER_MANUAL trust.", session.device_id if session else "unknown")
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Only authenticated owner devices may inspect pending approvals.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        app_engine = getattr(self.capability_engine, "approval_engine", None)
+        if not app_engine:
+            err = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Approval engine is unavailable.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        pending = [r.to_dict() for r in app_engine.list_pending_requests()]
+        resp = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "approval_list",
+                "requests": pending,
+                "count": len(pending),
+            },
+        )
+        await client.websocket.send(resp.to_json())
+
+    async def _handle_approval_resolve(
+        self, client: Any, message: SnowMessage, data: dict, session: Any, ctx: ExecutionContext
+    ) -> None:
+        """Handle approval_resolve request (APPROVE or DENY) from authenticated owner companion."""
+        if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+            logger.warning("Rejected approval_resolve: device [%s] lacks OWNER_MANUAL trust.", session.device_id if session else "unknown")
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Only authenticated owner devices may resolve pending approvals.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        app_engine = getattr(self.capability_engine, "approval_engine", None)
+        if not app_engine:
+            err = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message="Approval engine is unavailable.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        request_id = str(data.get("request_id", "")).strip()
+        decision = str(data.get("decision", "")).strip().upper()
+
+        if not request_id or decision not in ("APPROVE", "DENY"):
+            err = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Valid 'request_id' and decision ('APPROVE' or 'DENY') are required.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        if decision == "APPROVE":
+            ok, msg = app_engine.approve_request(
+                request_id=request_id,
+                approver_principal=ExecutionPrincipal.OWNER_MANUAL,
+            )
+        else:
+            ok, msg = app_engine.deny_request(
+                request_id=request_id,
+                approver_principal=ExecutionPrincipal.OWNER_MANUAL,
+            )
+
+        resp = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success" if ok else "error",
+                "action": "approval_resolve",
+                "request_id": request_id,
+                "decision": decision,
+                "resolved": ok,
+                "message": msg,
+            },
+        )
+        await client.websocket.send(resp.to_json())
+
+    async def broadcast_approval_event(self, event_type: str, approval_data: dict) -> None:
+        """Broadcast an approval event (REQUESTED, RESOLVED, EXPIRED) to connected OWNER_MANUAL devices."""
+        for conn_id in self.connection_manager.all_connections():
+            client = self.connection_manager.get(conn_id)
+            if not client or not client.websocket or getattr(client.websocket, "state", 1) != 1:
+                continue
+            session = self.session_manager.get_session_by_connection(conn_id)
+            if session is None or session.trust_tier != "owner":
+                continue
+
+            push_msg = SnowMessage.create_request(
+                action="approval_event",
+                data={
+                    "event_type": event_type,
+                    "request": approval_data,
+                },
+            )
+            try:
+                await client.websocket.send(push_msg.to_json())
+                logger.debug("Broadcast approval event '%s' to device [%s]", event_type, session.device_id)
+            except Exception as exc:
+                logger.debug("Failed sending approval event to client [%s]: %s", conn_id, exc)
 
     async def _handle_auth_request(
         self, client, message: SnowMessage, data: dict[str, Any]

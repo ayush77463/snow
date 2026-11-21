@@ -127,8 +127,8 @@ def validate_registry() -> tuple[bool, list[str]]:
         if not isinstance(meta.tier, str) or not meta.tier.strip():
             errors.append(f"Capability '{name}': tier must be non-empty string.")
 
-    if len(_CAPABILITY_REGISTRY) != 30:
-        errors.append(f"Expected exactly 30 registered capabilities (24 V2 baseline + 6 P1), found {len(_CAPABILITY_REGISTRY)}.")
+    if len(_CAPABILITY_REGISTRY) != 34:
+        errors.append(f"Expected exactly 34 registered capabilities (24 V2 baseline + 6 P1 + 4 Phase 24), found {len(_CAPABILITY_REGISTRY)}.")
 
     return (len(errors) == 0, errors)
 
@@ -449,6 +449,46 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         os_classification="windows",
         description="Query the secret-redacted audit activity log of capability executions and approval decisions.",
     ),
+    CapabilityMetadata(
+        name="snow_windows_screenshot",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="windows",
+        description="Capture the primary Windows desktop screen as an authenticated, bounded PNG image staged in captures directory.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_screenshot",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="android",
+        description="Capture the connected Android phone screen via OS-mediated MediaProjection user consent.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_camera_capture",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="android",
+        description="Capture a photograph using the connected Android device camera requiring foreground user confirmation.",
+    ),
+    CapabilityMetadata(
+        name="snow_workflow_run",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=True,
+        os_classification="cross_platform",
+        description="Execute an authorized declarative multi-step workflow with bounded step execution and approval checks.",
+    ),
 ]
 
 for _meta in _INITIAL_CAPABILITIES:
@@ -490,6 +530,7 @@ class _ToolRegistryDict(dict):
 
 # Backward-compatible TOOL_REGISTRY proxy
 TOOL_REGISTRY: dict[str, ToolCategory] = _ToolRegistryDict()
+CAPABILITY_REGISTRY: dict[str, CapabilityMetadata] = _CAPABILITY_REGISTRY
 
 
 def get_tool_category(tool_name: str) -> Optional[ToolCategory]:

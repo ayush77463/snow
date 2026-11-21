@@ -111,4 +111,70 @@ object ActionNotificationHelper {
             false
         }
     }
+
+    private val activeApprovalNotifications = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /**
+     * Post a high-priority approval notification for an AI_MCP request requiring human authorization.
+     */
+    fun postApprovalNotification(
+        context: Context,
+        requestId: String,
+        principal: String,
+        operation: String,
+        riskLevel: String
+    ): Boolean {
+        if (!canPostNotifications(context)) {
+            SafeLog.w(TAG, "Cannot post approval notification: notifications disabled.")
+            return false
+        }
+        createActionChannel(context)
+
+        val notificationId = nextNotificationId.getAndIncrement()
+        activeApprovalNotifications[requestId] = notificationId
+
+        val launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName) ?: Intent()
+        launchIntent.putExtra("APPROVAL_REQUEST_ID", requestId)
+        val contentPendingIntent = PendingIntent.getActivity(
+            context,
+            notificationId,
+            launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setContentTitle("🛡️ AI Authorization Request")
+            .setContentText("[$riskLevel] $principal requests $operation")
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentIntent(contentPendingIntent)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            ?: return false
+
+        return try {
+            manager.notify(notificationId, notification)
+            SafeLog.i(TAG, "Posted approval notification id=$notificationId for req=$requestId")
+            true
+        } catch (e: Exception) {
+            SafeLog.e(TAG, "Failed posting approval notification: ${e.message}", e)
+            false
+        }
+    }
+
+    /**
+     * Cancel an active approval notification upon resolution or expiration.
+     */
+    fun cancelApprovalNotification(context: Context, requestId: String) {
+        val notificationId = activeApprovalNotifications.remove(requestId) ?: return
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        try {
+            manager?.cancel(notificationId)
+            SafeLog.i(TAG, "Cancelled approval notification id=$notificationId for req=$requestId")
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Failed cancelling approval notification: ${e.message}")
+        }
+    }
 }

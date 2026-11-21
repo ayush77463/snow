@@ -98,6 +98,8 @@ CAPABILITY_ALIASES: dict[str, str] = {
     "file.transfer": "desktop.file.transfer",
     "android.ring_phone": "android.ringer.ring",
     "android.ringer.ring": "android.ring_phone",
+    "android.battery.get": "android.telemetry.get",
+    "android.telemetry.get": "android.battery.get",
 }
 
 
@@ -274,7 +276,11 @@ class DeviceNode:
         """Check whether this node advertises support for the requested capability."""
         if self.capabilities:
             return self.capabilities.supports_capability(capability)
-        return capability.strip() in self.supported_capabilities
+        clean = capability.strip()
+        if clean in self.supported_capabilities:
+            return True
+        alias = CAPABILITY_ALIASES.get(clean)
+        return bool(alias and alias in self.supported_capabilities)
 
     def to_dict(self, include_endpoints: bool = True) -> dict[str, Any]:
         """Convert DeviceNode to dictionary for serialization."""

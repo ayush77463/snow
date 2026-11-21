@@ -185,9 +185,20 @@ class NodeRegistry:
                         device_id, len(manifest.supported_capabilities))
             return self.get_node(device_id)
 
-    def on_session_disconnected(self, device_id: str) -> None:
+    def on_session_disconnected(
+        self, device_id: str, connection_id: Optional[str] = None
+    ) -> None:
         """Update runtime reachability when an active session terminates."""
         with self._lock:
+            active = self._active_sessions.get(device_id)
+            if active and connection_id and active.get("connection_id") != connection_id:
+                logger.debug(
+                    "Ignoring stale disconnect for device [%s] (active conn: %s, disconnecting conn: %s)",
+                    device_id,
+                    active.get("connection_id"),
+                    connection_id,
+                )
+                return
             self._active_sessions.pop(device_id, None)
             logger.debug("Active session disconnected for device [%s]", device_id)
 
@@ -501,5 +512,26 @@ class NodeRegistry:
                 return resolved, None
             elif len(partial_matches) > 1:
                 return None, "AMBIGUOUS_DEVICE"
+
+            # 4. Semantic platform / device type match (e.g. query is "android" or "phone")
+            if query in ("android", "phone"):
+                android_matches = [
+                    n for n in all_nodes
+                    if (getattr(n, "platform", "") or "").lower() == "android"
+                    or (getattr(n, "device_type", "") or "").lower() in ("android", "phone")
+                ]
+                connected_android = [n for n in android_matches if n.is_connected]
+                if len(connected_android) == 1:
+                    resolved = connected_android[0]
+                    if required_capability and not resolved.supports_capability(required_capability):
+                        return None, "CAPABILITY_NOT_SUPPORTED"
+                    return resolved, None
+                elif len(android_matches) == 1:
+                    resolved = android_matches[0]
+                    if required_capability and not resolved.supports_capability(required_capability):
+                        return None, "CAPABILITY_NOT_SUPPORTED"
+                    return resolved, None
+                elif len(android_matches) > 1:
+                    return None, "AMBIGUOUS_DEVICE"
 
             return None, "DEVICE_NOT_FOUND"

@@ -84,6 +84,7 @@ class ApprovalRequest:
             "risk_level": self.risk_level,
             "consumed": self.consumed,
             "approved_by": self.approved_by,
+            "sanitized_params": self.sanitized_params or {},
         }
 
 
@@ -93,6 +94,26 @@ class ApprovalPolicyEngine:
     def __init__(self, db_manager: Optional[Any] = None) -> None:
         self.db_manager = db_manager
         self._requests: dict[str, ApprovalRequest] = {}
+        self._listeners: list[Any] = []
+
+    def add_listener(self, listener: Any) -> None:
+        """Register a callback for approval lifecycle events (REQUESTED, RESOLVED)."""
+        self._listeners.append(listener)
+
+    def _notify_listeners(self, event_type: str, data: dict[str, Any]) -> None:
+        """Deliver approval events asynchronously to registered listeners."""
+        import asyncio
+        for listener in list(self._listeners):
+            try:
+                res = listener(event_type, data)
+                if asyncio.iscoroutine(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(res)
+                    except RuntimeError:
+                        pass
+            except Exception as exc:
+                logger.debug("Approval listener execution error: %s", exc)
 
     def is_catastrophic(self, action: str, params: dict[str, Any]) -> bool:
         """Check if action or command violates hard-blocked catastrophic invariants."""
@@ -147,8 +168,37 @@ class ApprovalPolicyEngine:
             if ctx and ctx.device_id:
                 return False, None, "LOW"
 
-            # Least Privilege Rules for AI:
-            # Read-only operations are auto-allowed
+            # Visual capture operations ALWAYS require explicit owner approval for AI callers
+            if canonical_action in (
+                "windows_screenshot",
+                "snow_windows_screenshot",
+                "android_screenshot",
+                "snow_android_screenshot",
+                "android_camera_capture",
+                "snow_android_camera_capture",
+            ):
+                return (
+                    True,
+                    f"Visual capture capability '{canonical_action}' exposes sensitive visual information and requires explicit owner approval.",
+                    "HIGH",
+                )
+
+            # Workflow execution approval evaluation
+            if canonical_action in ("workflow_run", "snow_workflow_run"):
+                wf_id = str(params.get("workflow_id", "")).strip()
+                try:
+                    from snow.capabilities.workflows import WORKFLOW_REGISTRY
+                    wf = WORKFLOW_REGISTRY.get(wf_id)
+                    if wf and wf.requires_approval:
+                        return (
+                            True,
+                            f"Workflow '{wf.name}' involves mutating or capture actions and requires owner approval.",
+                            "HIGH",
+                        )
+                except Exception:
+                    return True, "Workflow requires owner approval.", "HIGH"
+
+            # Read-only operations are auto-allowed (except visual capture above)
             if meta and meta.read_only_hint:
                 return False, None, "LOW"
 
@@ -187,6 +237,22 @@ class ApprovalPolicyEngine:
         # Default fallback
         return False, None, "LOW"
 
+    @staticmethod
+    def _sanitize_params_for_preview(params: dict[str, Any]) -> dict[str, Any]:
+        """Produce a bounded, secret-redacted preview of parameters for the approval UI."""
+        from snow.security.db import redact_sensitive_data
+        clean = dict(params or {})
+        clean.pop("approval_id", None)
+        clean.pop("confirmation_ticket", None)
+        redacted = redact_sensitive_data(clean)
+        preview: dict[str, Any] = {}
+        for k, v in redacted.items():
+            if isinstance(v, str) and len(v) > 200:
+                preview[k] = v[:197] + "..."
+            else:
+                preview[k] = v
+        return preview
+
     def create_request(
         self,
         principal: str | ExecutionPrincipal,
@@ -217,6 +283,7 @@ class ApprovalPolicyEngine:
             risk_level=risk_level,
             consumed=False,
             approved_by=None,
+            sanitized_params=self._sanitize_params_for_preview(params),
         )
         self._requests[req_id] = request
 
@@ -232,6 +299,8 @@ class ApprovalPolicyEngine:
                 )
             except Exception as exc:
                 logger.debug("Failed logging approval requested activity: %s", exc)
+
+        self._notify_listeners("APPROVAL_REQUESTED", request.to_dict())
 
         return request
 
@@ -271,6 +340,8 @@ class ApprovalPolicyEngine:
             except Exception as exc:
                 logger.debug("Failed logging approval approved activity: %s", exc)
 
+        self._notify_listeners("APPROVAL_RESOLVED", req.to_dict())
+
         return True, "APPROVED"
 
     def deny_request(
@@ -301,6 +372,8 @@ class ApprovalPolicyEngine:
                 )
             except Exception as exc:
                 logger.debug("Failed logging approval denied activity: %s", exc)
+
+        self._notify_listeners("APPROVAL_RESOLVED", req.to_dict())
 
         return True, "DENIED"
 

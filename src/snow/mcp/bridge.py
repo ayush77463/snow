@@ -694,6 +694,39 @@ class SnowMcpBridge:
         }
         return await self._execute_local_or_ipc("activity_history", payload)
 
+    async def windows_screenshot(self, approval_id: str = "") -> dict[str, Any]:
+        """Capture the primary Windows screen via Win32 GDI/GDI+."""
+        payload = {"approval_id": approval_id} if approval_id else {}
+        return await self._execute_local_or_ipc("windows_screenshot", payload)
+
+    async def android_screenshot(self, device_id: str = "", approval_id: str = "") -> dict[str, Any]:
+        """Capture the connected Android phone screen via MediaProjection consent."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        data = {"approval_id": approval_id} if approval_id else {}
+        return await self.send_device_request(device_id=target_id, action="android_screenshot", data=data)
+
+    async def android_camera_capture(self, device_id: str = "", approval_id: str = "") -> dict[str, Any]:
+        """Capture a photograph using the connected Android camera."""
+        target_id = device_id or await self._resolve_target_device_id()
+        if not target_id:
+            return {"success": False, "status": "DEVICE_OFFLINE", "error": "No connected Android device found."}
+        data = {"approval_id": approval_id} if approval_id else {}
+        return await self.send_device_request(device_id=target_id, action="android_camera_capture", data=data)
+
+    async def workflow_run(
+        self, workflow_id: str, arguments: Optional[dict[str, Any]] = None, approval_id: str = ""
+    ) -> dict[str, Any]:
+        """Execute an authorized declarative multi-step workflow."""
+        payload: dict[str, Any] = {
+            "workflow_id": workflow_id,
+            "params": arguments or {},
+        }
+        if approval_id:
+            payload["approval_id"] = approval_id
+        return await self._execute_local_or_ipc("workflow_run", payload)
+
     async def sync_clipboard(
         self,
         direction: str = "laptop_to_phone",

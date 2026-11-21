@@ -23,11 +23,16 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.snow.R
+import org.snow.capabilities.CameraCaptureHandler
 import org.snow.capabilities.ClipboardHandler
+import org.snow.capabilities.ScreenCaptureHandler
 import org.snow.databinding.FragmentDashboardBinding
 import org.snow.network.ConnectionState
 import org.snow.ui.MainActivity
+import org.snow.ui.PendingApprovalItem
 import org.snow.ui.SnowUiRepository
+import androidx.core.content.FileProvider
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -61,6 +66,61 @@ class DashboardFragment : Fragment() {
                 Toast.makeText(requireContext(), "Media permission denied for screenshot sync", Toast.LENGTH_SHORT).show()
             }
         }
+
+    private val mediaProjectionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
+                val projectionManager =
+                    requireContext().getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
+                val projection = projectionManager?.getMediaProjection(result.resultCode, result.data!!)
+                ScreenCaptureHandler.isConsentGranted = true
+                ScreenCaptureHandler.activeMediaProjection = projection
+                Toast.makeText(requireContext(), "Screen capture consent granted 🛡️", Toast.LENGTH_SHORT).show()
+            } else {
+                ScreenCaptureHandler.isConsentGranted = false
+                ScreenCaptureHandler.activeMediaProjection = null
+                Toast.makeText(requireContext(), "Screen capture consent cancelled", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    private var pendingCameraCaptureFile: File? = null
+
+    private val takePhotoLauncher =
+        registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+            val capturedFile = pendingCameraCaptureFile
+            if (success && capturedFile != null && capturedFile.exists() && capturedFile.length() > 0) {
+                CameraCaptureHandler.stagedPhotoFile = capturedFile
+                CameraCaptureHandler.isUserInteractionActive = true
+                Toast.makeText(requireContext(), "Photo captured and staged 📸", Toast.LENGTH_SHORT).show()
+            } else {
+                CameraCaptureHandler.isUserInteractionActive = false
+                capturedFile?.delete()
+                pendingCameraCaptureFile = null
+                Toast.makeText(requireContext(), "Photo capture cancelled", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    private val requestCameraPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+            if (isGranted) {
+                launchCameraCapture()
+            } else {
+                Toast.makeText(requireContext(), "Camera permission required to capture photos", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    private fun launchCameraCapture() {
+        val cacheDir = File(requireContext().cacheDir, "camera_captures").apply { mkdirs() }
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val file = File(cacheDir, "manual_photo_${timeStamp}.jpg")
+        pendingCameraCaptureFile = file
+        val uri = FileProvider.getUriForFile(
+            requireContext(),
+            "${requireContext().packageName}.fileprovider",
+            file
+        )
+        takePhotoLauncher.launch(uri)
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -175,6 +235,28 @@ class DashboardFragment : Fragment() {
                     }
                 }
             }
+        }
+
+        binding.btnScreenConsent.setOnClickListener {
+            val projectionManager =
+                requireContext().getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
+            if (projectionManager != null) {
+                mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+            } else {
+                Toast.makeText(requireContext(), "MediaProjection service unavailable", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        binding.btnCameraCapture.setOnClickListener {
+            if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                launchCameraCapture()
+            } else {
+                requestCameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+        }
+
+        binding.btnRefreshApprovals.setOnClickListener {
+            refreshPendingApprovals()
         }
     }
 
@@ -295,6 +377,7 @@ class DashboardFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
+        refreshPendingApprovals()
     }
 
     private fun startTelemetryPolling() {
@@ -303,6 +386,7 @@ class DashboardFragment : Fragment() {
                 while (isActive) {
                     if (viewModel.connectionState.value == ConnectionState.CONNECTED && !isRefreshingTelemetry) {
                         isRefreshingTelemetry = true
+                        refreshPendingApprovals()
                         viewModel.refreshTelemetry {
                             isRefreshingTelemetry = false
                         }
@@ -391,6 +475,7 @@ class DashboardFragment : Fragment() {
                 binding.tvHeroStatusPill.text = if (isUsb) "CONNECTED • USB" else if (cleanEndpoint.isNotBlank()) "CONNECTED • WI-FI" else "CONNECTED"
                 binding.tvHeroStatusPill.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
                 binding.btnGotoDevices.visibility = View.GONE
+                refreshPendingApprovals()
             }
             ConnectionState.CONNECTING -> {
                 binding.tvHeroStatusPill.text = "CONNECTING..."
@@ -408,6 +493,89 @@ class DashboardFragment : Fragment() {
                 binding.tvHeroPeerName.text = getString(R.string.desc_no_connected_device)
                 binding.btnGotoDevices.visibility = View.VISIBLE
             }
+        }
+    }
+
+    private fun refreshPendingApprovals() {
+        if (_binding == null) return
+        if (viewModel.connectionState.value != ConnectionState.CONNECTED) {
+            binding.cardPendingApprovals.visibility = View.GONE
+            return
+        }
+        viewModel.fetchPendingApprovals { result ->
+            activity?.runOnUiThread {
+                result.onSuccess { items ->
+                    renderPendingApprovals(items)
+                }.onFailure {
+                    binding.cardPendingApprovals.visibility = View.GONE
+                }
+            }
+        }
+    }
+
+    private fun renderPendingApprovals(items: List<PendingApprovalItem>) {
+        if (_binding == null) return
+        if (items.isEmpty()) {
+            binding.cardPendingApprovals.visibility = View.GONE
+            return
+        }
+        binding.cardPendingApprovals.visibility = View.VISIBLE
+        binding.tvApprovalsCount.text = items.size.toString()
+        binding.layoutApprovalsItems.removeAllViews()
+
+        val inflater = LayoutInflater.from(requireContext())
+        for (item in items) {
+            val itemView = inflater.inflate(R.layout.item_pending_approval, binding.layoutApprovalsItems, false)
+            val tvOp = itemView.findViewById<android.widget.TextView>(R.id.tv_approval_op)
+            val tvRisk = itemView.findViewById<android.widget.TextView>(R.id.tv_approval_risk)
+            val tvPrincipal = itemView.findViewById<android.widget.TextView>(R.id.tv_approval_principal)
+            val tvReason = itemView.findViewById<android.widget.TextView>(R.id.tv_approval_reason)
+            val tvTtl = itemView.findViewById<android.widget.TextView>(R.id.tv_approval_ttl)
+            val btnApprove = itemView.findViewById<com.google.android.material.button.MaterialButton>(R.id.btn_approve)
+            val btnDeny = itemView.findViewById<com.google.android.material.button.MaterialButton>(R.id.btn_deny)
+
+            tvOp.text = item.action
+            tvRisk.text = item.riskLevel.uppercase(Locale.US)
+            tvPrincipal.text = "Caller: ${item.principal} • Target: ${item.targetDevice}"
+            tvReason.text = item.reason
+            val remSec = item.timeRemainingSeconds.toInt()
+            tvTtl.text = if (remSec > 0) "⏳ ${remSec}s remaining" else "⛔ Expired"
+
+            btnApprove.setOnClickListener {
+                btnApprove.isEnabled = false
+                btnDeny.isEnabled = false
+                viewModel.resolveApproval(item.requestId, "APPROVE") { res ->
+                    activity?.runOnUiThread {
+                        res.onSuccess {
+                            Toast.makeText(requireContext(), "Approved request ${item.action} 🛡️", Toast.LENGTH_SHORT).show()
+                            refreshPendingApprovals()
+                        }.onFailure { err ->
+                            Toast.makeText(requireContext(), "Approval failed: ${err.message}", Toast.LENGTH_SHORT).show()
+                            btnApprove.isEnabled = true
+                            btnDeny.isEnabled = true
+                        }
+                    }
+                }
+            }
+
+            btnDeny.setOnClickListener {
+                btnApprove.isEnabled = false
+                btnDeny.isEnabled = false
+                viewModel.resolveApproval(item.requestId, "DENY") { res ->
+                    activity?.runOnUiThread {
+                        res.onSuccess {
+                            Toast.makeText(requireContext(), "Denied request ${item.action}", Toast.LENGTH_SHORT).show()
+                            refreshPendingApprovals()
+                        }.onFailure { err ->
+                            Toast.makeText(requireContext(), "Deny failed: ${err.message}", Toast.LENGTH_SHORT).show()
+                            btnApprove.isEnabled = true
+                            btnDeny.isEnabled = true
+                        }
+                    }
+                }
+            }
+
+            binding.layoutApprovalsItems.addView(itemView)
         }
     }
 

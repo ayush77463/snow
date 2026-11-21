@@ -505,7 +505,7 @@ class SnowWebServer:
         except Exception:
             return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
 
-        request_id = body.get("request_id", "")
+        request_id = request.match_info.get("request_id") or body.get("request_id", "")
         decision = (body.get("decision") or "").strip().lower()
 
         if not request_id or decision not in ("approve", "deny"):
@@ -517,6 +517,85 @@ class SnowWebServer:
         op = "approval_approve" if decision == "approve" else "approval_deny"
         res = await self.bridge.call(op, payload={"request_id": request_id})
         return web.json_response(res)
+
+    async def handle_api_capture_preview(self, request: web.Request) -> web.Response:
+        """Secure, authenticated preview endpoint for captured screenshots."""
+        session = self._get_valid_session(request)
+        if not session:
+            return web.Response(status=401, text="Unauthorized: Authentication required.")
+
+        file_name = request.match_info.get("file_name", "").strip()
+
+        # Strict filename traversal and path validation
+        if not file_name or "/" in file_name or "\\" in file_name or ".." in file_name or "\0" in file_name:
+            logger.warning("Rejected traversal attempt in capture preview: '%s'", file_name)
+            return web.Response(status=404, text="File not found.")
+
+        raw_tail = request.rel_url.raw_path.rsplit("/", 1)[-1]
+        if "%2f" in raw_tail.lower() or "%5c" in raw_tail.lower() or "%2e" in raw_tail.lower():
+            logger.warning("Rejected encoded traversal in capture preview: '%s'", raw_tail)
+            return web.Response(status=404, text="File not found.")
+
+        ext = Path(file_name).suffix.lower()
+        if ext not in (".png", ".jpg", ".jpeg"):
+            return web.Response(status=404, text="File not found.")
+
+        from snow.capabilities.windows.screenshot import DEFAULT_CAPTURES_DIR
+        captures_dir = DEFAULT_CAPTURES_DIR.resolve()
+        target_path = (captures_dir / file_name).resolve()
+
+        # Canonical path containment verification
+        if not target_path.is_relative_to(captures_dir) or not target_path.is_file():
+            return web.Response(status=404, text="File not found.")
+
+        content_type = "image/png" if ext == ".png" else "image/jpeg"
+        try:
+            with open(target_path, "rb") as f:
+                data = f.read()
+            return web.Response(
+                body=data,
+                content_type=content_type,
+                headers={
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "private, no-cache, must-revalidate",
+                },
+            )
+        except Exception as exc:
+            logger.error("Error reading capture file '%s': %s", file_name, exc)
+            return web.Response(status=500, text="Internal error reading capture.")
+
+    async def handle_api_workflow_run(self, request: web.Request) -> web.Response:
+        """Run an authorized declarative multi-step workflow from dashboard."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        workflow_id = str(body.get("workflow_id", "")).strip()
+        from snow.capabilities.workflows import WORKFLOW_REGISTRY
+        if not workflow_id or workflow_id not in WORKFLOW_REGISTRY:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "UNKNOWN_WORKFLOW",
+                    "error": f"Unknown workflow ID '{workflow_id}'. Allowed: {list(WORKFLOW_REGISTRY.keys())}",
+                },
+                status=400,
+            )
+
+        args = body.get("arguments") or body.get("params") or {}
+        res = await self.bridge.workflow_run(workflow_id, arguments=args)
+        return web.json_response(res)
+
+    async def handle_api_workflows_list(self, request: web.Request) -> web.Response:
+        """List available workflow presets."""
+        from snow.capabilities.workflows import WorkflowOrchestrator
+        orchestrator = WorkflowOrchestrator(capability_engine=None)
+        return web.json_response({
+            "success": True,
+            "status": "SUCCESS",
+            "workflows": orchestrator.list_workflows(),
+        })
 
     async def handle_api_activity(self, request: web.Request) -> web.Response:
         """Query secret-redacted audit activity history."""
@@ -659,6 +738,10 @@ class SnowWebServer:
         app.router.add_post("/api/share", self.handle_api_share)
         app.router.add_get("/api/approvals", self.handle_api_approvals)
         app.router.add_post("/api/approvals/resolve", self.handle_api_approvals_resolve)
+        app.router.add_post("/api/approvals/{request_id}/resolve", self.handle_api_approvals_resolve)
+        app.router.add_get("/api/captures/{file_name}", self.handle_api_capture_preview)
+        app.router.add_get("/api/workflows", self.handle_api_workflows_list)
+        app.router.add_post("/api/workflows/run", self.handle_api_workflow_run)
         app.router.add_get("/api/activity", self.handle_api_activity)
         app.router.add_get("/api/relay/status", self.handle_api_relay_status)
         app.router.add_get("/api/mcp-gateway/status", self.handle_api_mcp_gateway_status)

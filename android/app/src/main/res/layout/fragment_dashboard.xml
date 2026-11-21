@@ -12,6 +12,83 @@
         android:orientation="vertical"
         android:padding="16dp">
 
+        <!-- Section 0: Pending AI Approvals Card (Conditionally Visible) -->
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/card_pending_approvals"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="14dp"
+            android:visibility="gone"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="2dp"
+            app:cardBackgroundColor="@color/card_surface"
+            app:strokeColor="@color/status_connecting"
+            app:strokeWidth="1.5dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <!-- Header Row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:textSize="16sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/primary_text"
+                        android:text="🛡️ Pending Approvals" />
+
+                    <TextView
+                        android:id="@+id/tv_approvals_count"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:paddingHorizontal="8dp"
+                        android:paddingVertical="2dp"
+                        android:textSize="12sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/status_connecting_dark"
+                        android:background="@drawable/bg_pill_status"
+                        android:text="0" />
+
+                    <ImageView
+                        android:id="@+id/btn_refresh_approvals"
+                        android:layout_width="28dp"
+                        android:layout_height="28dp"
+                        android:layout_marginStart="8dp"
+                        android:padding="4dp"
+                        android:background="?android:attr/selectableItemBackgroundBorderless"
+                        android:src="@drawable/ic_pc_refresh"
+                        app:tint="@color/primary_text"
+                        android:contentDescription="Refresh Approvals" />
+                </LinearLayout>
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textSize="12sp"
+                    android:textColor="@color/secondary_text"
+                    android:text="AI requests awaiting your explicit authorization." />
+
+                <LinearLayout
+                    android:id="@+id/layout_approvals_items"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:orientation="vertical" />
+
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
         <!-- Section A: Connected PC Hero & Live Telemetry Card -->
         <com.google.android.material.card.MaterialCardView
             android:id="@+id/card_hero"
@@ -488,6 +565,36 @@
                         android:layout_weight="1"
                         android:layout_marginStart="6dp"
                         android:text="Send File"
+                        android:singleLine="true"
+                        android:ellipsize="end"
+                        style="@style/Widget.Material3.Button.OutlinedButton" />
+                </LinearLayout>
+
+                <!-- Grid Row 3: Screen Consent | Camera Photo -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_screen_consent"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="6dp"
+                        android:text="Screen Consent"
+                        android:singleLine="true"
+                        android:ellipsize="end"
+                        style="@style/Widget.Material3.Button.OutlinedButton" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_camera_capture"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="6dp"
+                        android:text="Camera Photo"
                         android:singleLine="true"
                         android:ellipsize="end"
                         style="@style/Widget.Material3.Button.OutlinedButton" />

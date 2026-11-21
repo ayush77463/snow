@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 from dataclasses import dataclass, field
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -94,6 +95,15 @@ ENGINE_ACTION_MAP: dict[str, str] = {
     "share_link": "share_link",
     "windows_share_link": "share_link",
     "activity_history": "activity_history",
+    # Capture & Workflows (Phase 24)
+    "windows_screenshot": "windows_screenshot",
+    "snow_windows_screenshot": "windows_screenshot",
+    "android_screenshot": "android_screenshot",
+    "snow_android_screenshot": "android_screenshot",
+    "android_camera_capture": "android_camera_capture",
+    "snow_android_camera_capture": "android_camera_capture",
+    "workflow_run": "workflow_run",
+    "snow_workflow_run": "workflow_run",
 }
 
 
@@ -142,6 +152,11 @@ class CapabilityEngine:
         approval_engine: Optional[ApprovalPolicyEngine] = None,
         media_controller: Optional[WindowsMediaController] = None,
         db_manager: Optional[Any] = None,
+        session_router: Optional[Any] = None,
+        transfer_manager: Optional[Any] = None,
+        storage_manager: Optional[Any] = None,
+        http_transfer_server: Optional[Any] = None,
+        core_server: Optional[Any] = None,
     ) -> None:
         self.telemetry = telemetry or WindowsTelemetry()
         self.processes = processes or WindowsProcessMonitor()
@@ -155,6 +170,11 @@ class CapabilityEngine:
         self.db_manager = db_manager
         self.approval_engine = approval_engine or ApprovalPolicyEngine(db_manager=db_manager)
         self.media_controller = media_controller or WindowsMediaController()
+        self.session_router = session_router
+        self.transfer_manager = transfer_manager
+        self.storage_manager = storage_manager
+        self.http_transfer_server = http_transfer_server
+        self.core_server = core_server
 
         # Confirmation ticket registry for trusted two-step confirmation
         self._tickets: dict[str, dict[str, Any]] = {}
@@ -639,13 +659,280 @@ class CapabilityEngine:
                 return CapabilityResponse(
                     success=True,
                     status="SUCCESS",
-                    data={"events": events, "count": len(events)},
+                    data={"events": events, "history": events, "count": len(events)},
                 )
             return CapabilityResponse(
                 success=False,
                 status="DATABASE_UNAVAILABLE",
                 error="Database manager is not configured for activity history queries.",
             )
+
+        # --- Screen Capture (Phase 24 Repair A2) ---
+        if action in ("windows_screenshot", "snow_windows_screenshot"):
+            from snow.capabilities.windows.screenshot import WindowsScreenshotCapture
+            cap = WindowsScreenshotCapture()
+            try:
+                res = await asyncio.to_thread(cap.capture_screen)
+            except Exception as exc:
+                logger.error("Async Windows screenshot execution failed: %s", exc, exc_info=True)
+                return CapabilityResponse(
+                    success=False,
+                    status="CAPTURE_FAILED",
+                    error=f"Screenshot thread exception: {exc}",
+                )
+            is_ok = res.get("success", False)
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "ERROR"),
+                data=res,
+                error=res.get("error"),
+            )
+
+        # --- Workflows (Phase 24 Repair A1) ---
+        if action in ("workflow_run", "snow_workflow_run"):
+            workflow_id = str(params.get("workflow_id", "")).strip()
+            wf_params = params.get("arguments") or params.get("params") or {}
+            from snow.capabilities.workflows import WorkflowOrchestrator
+            orchestrator = WorkflowOrchestrator(capability_engine=self)
+            rep = await orchestrator.run_workflow(workflow_id, params=wf_params, ctx=ctx)
+            rep_dict = rep.to_dict()
+            is_ok = rep.status in ("COMPLETED", "PARTIAL")
+            return CapabilityResponse(
+                success=is_ok,
+                status=rep.status,
+                data=rep_dict,
+                error=rep.error,
+            )
+
+        # --- File Delivery to Peer Device (Phase 24 Repair B4) ---
+        if action in ("android_file_send", "snow_android_file_send"):
+            raw_path = params.get("file_path") or params.get("path") or ""
+            target_device = (
+                params.get("device_id")
+                or params.get("target")
+                or getattr(request, "target_device", None)
+                or "android"
+            )
+            timeout = float(params.get("timeout", 30.0))
+
+            if not raw_path or not isinstance(raw_path, str):
+                return CapabilityResponse(
+                    success=False,
+                    status="INVALID_ARGUMENT",
+                    error="file_path parameter is required for file delivery.",
+                )
+
+            # Prevent traversal or null byte injection
+            if "\0" in raw_path:
+                return CapabilityResponse(
+                    success=False,
+                    status="INVALID_ARGUMENT",
+                    error="Path traversal or invalid characters detected in file_path.",
+                )
+
+            safe_path = Path(raw_path).resolve()
+            if not safe_path.is_file():
+                return CapabilityResponse(
+                    success=False,
+                    status="FILE_NOT_FOUND",
+                    error=f"File not found on local system: '{safe_path.name}'.",
+                )
+
+            file_size = safe_path.stat().st_size
+            hasher = hashlib.sha256()
+            try:
+                with open(safe_path, "rb") as f:
+                    while chunk := f.read(65536):
+                        hasher.update(chunk)
+            except Exception as read_err:
+                return CapabilityResponse(
+                    success=False,
+                    status="READ_ERROR",
+                    error=f"Failed reading file for transfer: {read_err}",
+                )
+            file_sha256 = hasher.hexdigest()
+
+            # Dynamic resolution of target Android device ID if generic
+            if target_device in ("android", "phone", ""):
+                if self.node_registry and hasattr(self.node_registry, "resolve_target"):
+                    resolved_node, _ = self.node_registry.resolve_target("android")
+                    if resolved_node:
+                        target_device = resolved_node.device_id
+                elif self.session_router and hasattr(self.session_router, "node_registry"):
+                    sr_reg = getattr(self.session_router, "node_registry", None)
+                    if sr_reg and hasattr(sr_reg, "resolve_target"):
+                        resolved_node, _ = sr_reg.resolve_target("android")
+                        if resolved_node:
+                            target_device = resolved_node.device_id
+
+            from snow.transfer.manager import TransferDirection, TransferState
+
+            tm = self.transfer_manager
+            # Pre-check SHA-256 duplicate for already completed transfer
+            if tm and hasattr(tm, "list_transfers_for_device"):
+                for t in tm.list_transfers_for_device(target_device):
+                    if (
+                        getattr(t, "sha256", None) == file_sha256
+                        and getattr(t, "status", None) == TransferState.COMPLETED
+                        and getattr(t, "direction", None) == TransferDirection.DOWNLOAD
+                    ):
+                        logger.info(
+                            "File '%s' (sha256: %s) already transferred to [%s]; skipping duplicate.",
+                            safe_path.name,
+                            file_sha256[:12],
+                            target_device,
+                        )
+                        return CapabilityResponse(
+                            success=True,
+                            status="ALREADY_EXISTS",
+                            data={
+                                "success": True,
+                                "status": "ALREADY_EXISTS",
+                                "transfer_id": getattr(t, "transfer_id", ""),
+                                "file_name": safe_path.name,
+                                "sha256": file_sha256,
+                                "bytes_transferred": 0,
+                                "skipped_duplicate": True,
+                                "message": f"File '{safe_path.name}' already exists on destination; transfer skipped.",
+                            },
+                        )
+
+            # Ensure file is staged in storage manager so HTTPS transfer route can serve it
+            if self.storage_manager and hasattr(self.storage_manager, "resolve_destination_path"):
+                try:
+                    dest_path = self.storage_manager.resolve_destination_path(safe_path.name)
+                    if dest_path.resolve() != safe_path.resolve():
+                        import shutil
+                        shutil.copy2(safe_path, dest_path)
+                except Exception as sc_err:
+                    logger.warning("Failed staging transfer file '%s': %s", safe_path.name, sc_err)
+
+            record = None
+            if tm and hasattr(tm, "create_transfer"):
+                record = tm.create_transfer(
+                    device_id=target_device,
+                    file_name=safe_path.name,
+                    file_size=file_size,
+                    sha256=file_sha256,
+                    direction=TransferDirection.DOWNLOAD,
+                )
+                transfer_id = record.transfer_id
+            else:
+                transfer_id = params.get("transfer_id") or secrets.token_hex(16)
+
+            transfer_port = 8766
+            if self.http_transfer_server and hasattr(self.http_transfer_server, "bound_port"):
+                transfer_port = self.http_transfer_server.bound_port or 8766
+            elif self.core_server and hasattr(self.core_server, "config"):
+                transfer_port = getattr(self.core_server.config, "transfer_port", 8766)
+
+            req_data = {
+                "transfer_id": transfer_id,
+                "file_name": safe_path.name,
+                "file_size": file_size,
+                "sha256": file_sha256,
+                "transfer_port": transfer_port,
+            }
+
+            router = getattr(self, "session_router", None)
+            if not router or not hasattr(router, "route_request"):
+                if tm and record and hasattr(tm, "fail_transfer"):
+                    tm.fail_transfer(transfer_id, "Router unavailable")
+                return CapabilityResponse(
+                    success=False,
+                    status="ROUTER_UNAVAILABLE",
+                    error="No SessionRouter configured for file delivery to peer.",
+                )
+
+            route_res = await router.route_request(
+                action="file_send_request",
+                target=target_device,
+                data=req_data,
+                timeout=timeout,
+                ctx=ctx,
+            )
+
+            if route_res.get("success"):
+                if tm and record and hasattr(tm, "complete_transfer"):
+                    tm.complete_transfer(transfer_id)
+                return CapabilityResponse(
+                    success=True,
+                    status="SUCCESS",
+                    data={
+                        "transfer_id": transfer_id,
+                        "file_name": safe_path.name,
+                        "sha256": file_sha256,
+                        "bytes_transferred": file_size,
+                        "skipped_duplicate": False,
+                        "target_device": target_device,
+                        "data": route_res.get("data"),
+                    },
+                )
+            else:
+                err_msg = route_res.get("error") or "File transfer failed on target device."
+                if tm and record and hasattr(tm, "fail_transfer"):
+                    tm.fail_transfer(transfer_id, err_msg)
+                return CapabilityResponse(
+                    success=False,
+                    status=route_res.get("status") or "TRANSFER_FAILED",
+                    error=err_msg,
+                    data={
+                        "transfer_id": transfer_id,
+                        "file_name": safe_path.name,
+                        "sha256": file_sha256,
+                        "bytes_transferred": 0,
+                        "skipped_duplicate": False,
+                    },
+                )
+
+        # --- Cross-Device Capabilities Dispatch via SessionRouter (Phase 24 Repair B3) ---
+        CROSS_DEVICE_ACTIONS = {
+            "android_battery", "snow_android_battery", "battery_status",
+            "android_screenshot", "snow_android_screenshot",
+            "android_camera_capture", "snow_android_camera_capture",
+            "file_send_request",
+            "android_file_receive", "snow_android_file_receive", "file_receive_request",
+            "android_file_list", "snow_android_file_list", "file_list",
+            "android_notifications_list", "snow_android_notifications_list", "notifications_list",
+            "android_notification_dismiss", "snow_android_notification_dismiss", "notification_dismiss",
+            "android_notification_reply", "snow_android_notification_reply", "notification_reply",
+            "android_launch_app", "snow_android_launch_app", "launch_app",
+            "android_list_apps", "snow_android_list_apps", "list_apps",
+            "android_send_message", "snow_android_send_message", "send_message",
+            "android_ring", "snow_android_ring", "ring_phone",
+            "android_clipboard_push", "snow_android_clipboard_push", "clipboard_push",
+        }
+        if action in CROSS_DEVICE_ACTIONS:
+            router = getattr(self, "session_router", None)
+            target = params.get("target") or params.get("device_id") or "android"
+            if router and hasattr(router, "route_request"):
+                try:
+                    route_res = await router.route_request(
+                        action=action,
+                        target=target,
+                        data=params,
+                        ctx=ctx,
+                    )
+                    is_ok = route_res.get("success", False)
+                    return CapabilityResponse(
+                        success=is_ok,
+                        status=route_res.get("status", "SUCCESS" if is_ok else "ERROR"),
+                        data=route_res.get("data") if "data" in route_res else route_res,
+                        error=route_res.get("error"),
+                    )
+                except Exception as r_exc:
+                    logger.warning("SessionRouter dispatch error for '%s': %s", action, r_exc)
+                    return CapabilityResponse(
+                        success=False,
+                        status="ROUTING_ERROR",
+                        error=f"Cross-device dispatch failed: {r_exc}",
+                    )
+            else:
+                return CapabilityResponse(
+                    success=False,
+                    status="DEVICE_OFFLINE",
+                    error=f"No SessionRouter available to route cross-device action '{action}'.",
+                )
 
         # Unsupported Action
         return CapabilityResponse(

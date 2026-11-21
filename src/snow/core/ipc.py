@@ -192,6 +192,12 @@ class SnowIpcServer:
             ("windows_terminal", "terminal"),
             ("windows_clipboard", "clipboard"),
             ("capability_policy", "policy"),
+            ("db_manager", "db_manager"),
+            ("node_registry", "node_registry"),
+            ("session_router", "session_router"),
+            ("transfer_manager", "transfer_manager"),
+            ("storage_manager", "storage_manager"),
+            ("http_transfer_server", "http_transfer_server"),
         ]:
             val = getattr(self.core_server, attr, None)
             if val is not None and not type(val).__name__.endswith("Mock"):
@@ -496,6 +502,10 @@ class SnowIpcServer:
             "share_link",
             "windows_share_link",
             "activity_history",
+            "windows_screenshot",
+            "snow_windows_screenshot",
+            "workflow_run",
+            "snow_workflow_run",
         }
         if op in LOCAL_WINDOWS_OPS:
             req = CapabilityRequest(action=op, params=payload)
@@ -672,6 +682,36 @@ class SnowIpcServer:
                 "status": res.get("status", "ERROR"),
                 "data": res.get("data"),
                 "error": res.get("error"),
+            }, now_authed
+
+        if op in ("android_screenshot", "snow_android_screenshot"):
+            dev_resp = await self._handle_device_request({
+                "device_id": payload.get("device_id"),
+                "action": "android_screenshot",
+                "data": payload,
+            }, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": dev_resp.get("data"),
+                "error": dev_resp.get("error"),
+            }, now_authed
+
+        if op in ("android_camera_capture", "snow_android_camera_capture"):
+            dev_resp = await self._handle_device_request({
+                "device_id": payload.get("device_id"),
+                "action": "android_camera_capture",
+                "data": payload,
+            }, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": dev_resp.get("success", False),
+                "status": dev_resp.get("status", "ERROR"),
+                "data": dev_resp.get("data"),
+                "error": dev_resp.get("error"),
             }, now_authed
 
         if op == "device_trust":
@@ -1024,6 +1064,63 @@ class SnowIpcServer:
                 "status": "APPROVAL_REQUIRED",
                 "error": "AI-originated remote terminal execution is restricted; requires a human-in-the-loop approval workflow.",
             }
+
+        # Enforce declarative approval policy check for AI callers invoking cross-device capture
+        if action in (
+            "android_screenshot",
+            "snow_android_screenshot",
+            "android_camera_capture",
+            "snow_android_camera_capture",
+        ):
+            effective_ctx = ctx or ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="ipc")
+            app_engine = getattr(self.capability_engine, "approval_engine", None)
+            if app_engine:
+                request_data = data if isinstance(data, dict) else {}
+                requires_approval, reason, risk_level = app_engine.evaluate_policy(
+                    action=action,
+                    params=request_data,
+                    ctx=effective_ctx,
+                    target_device=device_id,
+                )
+                if requires_approval:
+                    approval_id = request_data.get("approval_id")
+                    if approval_id:
+                        ok, msg = app_engine.consume_approval(
+                            request_id=approval_id,
+                            principal=effective_ctx.principal,
+                            action=action,
+                            target_device=device_id,
+                            params=request_data,
+                        )
+                        if not ok:
+                            logger.warning(
+                                "Approval consumption rejected for '%s' on device [%s]: %s",
+                                action, device_id, msg,
+                            )
+                            return {
+                                "success": False,
+                                "status": "UNAUTHORIZED",
+                                "error": f"Approval validation failed: {msg}",
+                            }
+                    else:
+                        app_req = app_engine.create_request(
+                            principal=effective_ctx.principal,
+                            action=action,
+                            target_device=device_id,
+                            params=request_data,
+                            reason=reason or "Visual capture requires explicit owner approval.",
+                            risk_level=risk_level or "HIGH",
+                        )
+                        logger.info(
+                            "Approval required for '%s' on [%s] [request_id=%s, risk=%s]",
+                            action, device_id, app_req.request_id, risk_level,
+                        )
+                        return {
+                            "success": False,
+                            "status": "APPROVAL_REQUIRED",
+                            "data": app_req.to_dict(),
+                            "error": "Action requires human owner approval.",
+                        }
 
         router = getattr(self, "session_router", None) or (
             getattr(self.core_server, "session_router", None) if self.core_server else None

@@ -219,6 +219,10 @@ class SnowForegroundService : Service() {
         discoveryObserverJob?.cancel()
         discoveryObserverJob = serviceScope.launch {
             discoveryManager.peers.collectLatest { _ ->
+                val currentHost = client.currentTargetHost.trim().lowercase()
+                if (currentHost in setOf("127.0.0.1", "localhost", "::1")) {
+                    return@collectLatest
+                }
                 val candidate = discoveryManager.getCandidateForPairedDesktop()
                 if (candidate != null) {
                     client.updateTargetEndpoint(candidate.ipAddress, candidate.port)
