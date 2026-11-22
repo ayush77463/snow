@@ -1219,6 +1219,150 @@ class SnowWebServer:
         return web.json_response(res)
 
     # =========================================================================
+    # Distribution & Onboarding (Phase 29)
+    # =========================================================================
+
+    async def handle_api_install_android_apk(self, request: web.Request) -> web.Response:
+        """Serve the compiled Android APK for local download (authenticated session required)."""
+        candidates = []
+        env_apk = os.environ.get("SNOW_ANDROID_APK_PATH")
+        if env_apk:
+            candidates.append(Path(env_apk).resolve())
+
+        repo_root = Path(__file__).resolve().parent.parent.parent.parent
+        candidates.append(repo_root / "android" / "app" / "build" / "outputs" / "apk" / "release" / "app-release.apk")
+        candidates.append(repo_root / "android" / "app" / "build" / "outputs" / "apk" / "release" / "app-release-unsigned.apk")
+        candidates.append(repo_root / "android" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk")
+
+        allowed_dirs = [os.path.realpath(str(repo_root / "android"))]
+        if env_apk:
+            allowed_dirs.append(os.path.realpath(os.path.dirname(os.path.abspath(env_apk))))
+
+        apk_path = None
+        for candidate in candidates:
+            if candidate.is_file():
+                real_path = os.path.realpath(str(candidate))
+                if real_path.lower().endswith(".apk") and os.path.isfile(real_path):
+                    if any(real_path.startswith(ad + os.sep) or real_path == ad for ad in allowed_dirs):
+                        apk_path = Path(real_path)
+                        break
+
+        if not apk_path:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "APK_NOT_FOUND",
+                    "error": (
+                        "Android APK has not been compiled yet. "
+                        "Build it by running './gradlew assembleRelease' or './gradlew assembleDebug' in android/."
+                    ),
+                },
+                status=404,
+            )
+
+        return web.FileResponse(
+            apk_path,
+            headers={"Content-Disposition": 'attachment; filename="snow-mobile.apk"'},
+        )
+
+    async def handle_api_onboarding_status(self, request: web.Request) -> web.Response:
+        """Query consumer onboarding status and authoritative network identity."""
+        try:
+            from snow.network.network_model import SnowNetworkManager
+            cap_engine = getattr(self.bridge, "capability_engine", None)
+            db_mgr = getattr(cap_engine, "db_manager", None) if cap_engine else None
+            if db_mgr is None:
+                from snow.security.db import DatabaseManager
+                db_mgr = DatabaseManager()
+            net_mgr = SnowNetworkManager(db_manager=db_mgr)
+            ident = net_mgr.get_network_identity()
+            completed = str(db_mgr.get_setting("onboarding_completed", "false")).lower() in ("true", "1", "yes")
+            devices = db_mgr.list_paired_devices()
+
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "completed": completed,
+                "network_name": ident.network_name,
+                "network_id": ident.network_id,
+                "device_count": len(devices),
+            })
+        except Exception as exc:
+            logger.error("Failed querying onboarding status: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_onboarding_complete(self, request: web.Request) -> web.Response:
+        """Mark first-run consumer onboarding wizard as completed and update network identity."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        try:
+            from snow.network.network_model import SnowNetworkManager
+            cap_engine = getattr(self.bridge, "capability_engine", None)
+            db_mgr = getattr(cap_engine, "db_manager", None) if cap_engine else None
+            if db_mgr is None:
+                from snow.security.db import DatabaseManager
+                db_mgr = DatabaseManager()
+            net_mgr = SnowNetworkManager(db_manager=db_mgr)
+
+            network_name = (body.get("network_name") or "").strip()
+            if network_name:
+                if len(network_name) > 64:
+                    network_name = network_name[:64]
+                ident = net_mgr.update_network_name(network_name)
+            else:
+                ident = net_mgr.get_network_identity()
+
+            db_mgr.set_setting("onboarding_completed", "true")
+
+            return web.json_response({
+                "success": True,
+                "status": "ONBOARDING_COMPLETED",
+                "network_name": ident.network_name,
+                "network_id": ident.network_id,
+            })
+        except Exception as exc:
+            logger.error("Failed completing onboarding: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_account_discovery_status(self, request: web.Request) -> web.Response:
+        """Query status of the strictly opt-in account discovery layer."""
+        from snow.network.account_discovery import AccountDiscoveryService
+        svc = AccountDiscoveryService()
+        return web.json_response({
+            "success": True,
+            **svc.get_status(),
+        })
+
+    async def handle_api_account_discovery_config(self, request: web.Request) -> web.Response:
+        """Configure or toggle the strictly opt-in account discovery layer."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        from snow.network.account_discovery import AccountDiscoveryService
+        svc = AccountDiscoveryService()
+
+        enabled = body.get("enabled")
+        if enabled is not None:
+            svc.set_enabled(bool(enabled))
+
+        issuer = body.get("issuer")
+        audience = body.get("audience")
+        account_id = body.get("account_id")
+        if issuer and audience:
+            svc.configure(issuer=issuer, audience=audience, account_id=account_id)
+
+        return web.json_response({
+            "success": True,
+            "status": "UPDATED",
+            **svc.get_status(),
+        })
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
 
@@ -1285,6 +1429,13 @@ class SnowWebServer:
         app.router.add_post("/api/apps/windows/launch", self.handle_api_apps_windows_launch)
         app.router.add_get("/api/apps/android", self.handle_api_apps_android)
         app.router.add_post("/api/apps/android/launch", self.handle_api_apps_android_launch)
+
+        # Distribution & Onboarding (Phase 29)
+        app.router.add_get("/api/install/android-apk", self.handle_api_install_android_apk)
+        app.router.add_get("/api/onboarding/status", self.handle_api_onboarding_status)
+        app.router.add_post("/api/onboarding/complete", self.handle_api_onboarding_complete)
+        app.router.add_get("/api/account-discovery/status", self.handle_api_account_discovery_status)
+        app.router.add_post("/api/account-discovery/config", self.handle_api_account_discovery_config)
 
         return app
 

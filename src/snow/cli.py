@@ -1106,6 +1106,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Connect to an already running external Remote MCP Gateway instead of managing one",
     )
 
+    # Windows System Tray Companion (Phase 29)
+    tray_parser = subparsers.add_parser("tray", help="Launch the lightweight Windows system tray companion")
+    tray_parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8769,
+        help="Target web dashboard port (default: 8769)",
+    )
+    tray_parser.add_argument(
+        "--core-port",
+        type=int,
+        default=8767,
+        help="Core daemon IPC port (default: 8767)",
+    )
+    tray_parser.add_argument(
+        "--no-auto-start",
+        action="store_true",
+        default=False,
+        help="Do not automatically spawn the background core daemon",
+    )
+    tray_parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Run in headless test mode without creating a Win32 taskbar icon",
+    )
+
     # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")
     start_parser.add_argument("--daemon", action="store_true", default=True)
@@ -1140,6 +1167,23 @@ def run_ui() -> int:
     print("[!] Notice: 'snow ui' (Textual TUI) has been retired in favor of the lightweight SNOW Web Dashboard.", file=sys.stderr)
     print("    Please run 'snow web' to launch the dashboard on http://127.0.0.1:8769.\n", file=sys.stderr)
     return 0
+
+
+def run_tray(
+    dashboard_port: int = 8769,
+    core_port: int = 8767,
+    auto_start_core: bool = True,
+    headless: bool = False,
+) -> int:
+    """Launch the lightweight Windows system tray companion."""
+    from snow.tray.app import SnowTrayApp
+    app = SnowTrayApp(
+        dashboard_port=dashboard_port,
+        core_port=core_port,
+        auto_start_core=auto_start_core,
+        headless=headless,
+    )
+    return app.run()
 
 
 def run_relay(action: str = "status") -> int:
@@ -1238,6 +1282,13 @@ def main(args: Optional[list[str]] = None) -> int:
             external_gateway=getattr(parsed, "external_gateway", False),
             trusted_proxies=getattr(parsed, "trusted_proxies", None),
         )
+    elif parsed.command == "tray":
+        return run_tray(
+            dashboard_port=parsed.dashboard_port,
+            core_port=parsed.core_port,
+            auto_start_core=not parsed.no_auto_start,
+            headless=parsed.headless,
+        )
     elif parsed.command == "start":
         return run_daemon_start()
     elif parsed.command == "stop":
@@ -1248,4 +1299,6 @@ def main(args: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 1 and "snow-tray" in sys.argv[0].lower():
+        sys.exit(main(["tray"] + sys.argv[1:]))
     sys.exit(main())

@@ -18,6 +18,87 @@
         </div>
     </div>
 
+    <!-- Guided Consumer Onboarding Wizard (Phase 29) -->
+    <div id="onboarding-overlay" class="overlay" style="display: none; z-index: 9998; background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(8px);">
+        <div class="overlay-card" style="max-width: 580px; width: 90%; text-align: left; padding: 2rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
+                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                    <span style="font-size: 1.5rem;">❄</span>
+                    <h2 style="margin: 0; font-size: 1.25rem;">Welcome to SNOW</h2>
+                </div>
+                <button id="btn-skip-onboarding" class="btn btn-secondary" style="font-size: 0.8rem; padding: 0.25rem 0.6rem;">Skip Setup</button>
+            </div>
+
+            <!-- Step Progress Indicator -->
+            <div style="display: flex; justify-content: space-between; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.75rem;">
+                <div id="step-tab-1" class="step-pill" style="font-size: 0.85rem; font-weight: 600; color: var(--accent-primary);">1. Network Name</div>
+                <div id="step-tab-2" class="step-pill" style="font-size: 0.85rem; font-weight: 600; color: var(--text-muted);">2. Connect Phone</div>
+                <div id="step-tab-3" class="step-pill" style="font-size: 0.85rem; font-weight: 600; color: var(--text-muted);">3. Connect AI</div>
+            </div>
+
+            <!-- Step 1: Network Name -->
+            <div id="wizard-step-1" class="wizard-step">
+                <h3 style="font-size: 1.1rem; margin-bottom: 0.5rem;">Name Your SNOW Network</h3>
+                <p class="text-muted" style="font-size: 0.9rem; margin-bottom: 1rem;">Choose a friendly name for your personal multi-device mesh (e.g., "Home Mesh", "Ayush's Network").</p>
+                <div class="form-group" style="margin-bottom: 1.5rem;">
+                    <label for="wizard-network-name" style="display: block; font-weight: 500; margin-bottom: 0.4rem;">Network Name</label>
+                    <input type="text" id="wizard-network-name" class="form-control" value="My SNOW Network" placeholder="Enter network name..." style="width: 100%; padding: 0.5rem; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-surface); color: var(--text-primary);">
+                </div>
+                <div style="display: flex; justify-content: flex-end;">
+                    <button id="btn-wizard-next-1" class="btn btn-primary">Next: Connect Phone →</button>
+                </div>
+            </div>
+
+            <!-- Step 2: QR Pairing -->
+            <div id="wizard-step-2" class="wizard-step" style="display: none;">
+                <h3 style="font-size: 1.1rem; margin-bottom: 0.5rem;">Connect Your Android Device</h3>
+                <p class="text-muted" style="font-size: 0.9rem; margin-bottom: 1rem;">Install SNOW on your phone, open the app, and scan this QR code or enter the pairing PIN below.</p>
+
+                <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; background: var(--bg-surface); border: 1px solid var(--border-color); padding: 1rem; border-radius: 8px;">
+                    <div id="wizard-qr-container" style="min-width: 130px; height: 130px; background: #fff; display: flex; align-items: center; justify-content: center; border-radius: 4px; overflow: hidden; border: 1px solid var(--border-color);">
+                        <img id="wizard-qr-img" src="" alt="Pairing QR Code" style="width: 100%; height: 100%; object-fit: contain;">
+                    </div>
+                    <div style="flex: 1;">
+                        <div style="font-size: 0.85rem; font-weight: 600; margin-bottom: 0.25rem;">Pairing PIN:</div>
+                        <div id="wizard-pin-display" style="font-size: 1.4rem; font-family: monospace; font-weight: bold; letter-spacing: 2px; color: var(--accent-primary);">------</div>
+                        <div style="margin-top: 0.5rem;">
+                            <a id="btn-wizard-download-apk" href="/api/install/android-apk" target="_blank" class="btn btn-secondary" style="font-size: 0.8rem; padding: 0.3rem 0.6rem;">📱 Download Android App</a>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="wizard-device-status-box" style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem;">
+                    Checking for connected devices...
+                </div>
+
+                <div style="display: flex; justify-content: space-between;">
+                    <button id="btn-wizard-back-2" class="btn btn-secondary">← Back</button>
+                    <button id="btn-wizard-next-2" class="btn btn-primary">Next: Connect AI →</button>
+                </div>
+            </div>
+
+            <!-- Step 3: Optional AI Connect -->
+            <div id="wizard-step-3" class="wizard-step" style="display: none;">
+                <h3 style="font-size: 1.1rem; margin-bottom: 0.5rem;">Connect Your AI Assistants</h3>
+                <p class="text-muted" style="font-size: 0.9rem; margin-bottom: 1rem;">SNOW gives Claude, Gemini, ChatGPT, or Cursor permissioned access to your devices via MCP.</p>
+
+                <div style="background: var(--bg-surface); border: 1px solid var(--border-color); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
+                    <div style="font-size: 0.85rem; font-weight: 600; margin-bottom: 0.5rem;">Quick One-Click Integration:</div>
+                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Run this command in PowerShell to automatically configure Claude Desktop or Gemini:</p>
+                    <div style="background: var(--chip-bg); padding: 0.5rem; border-radius: 4px; font-family: monospace; font-size: 0.8rem; display: flex; justify-content: space-between; align-items: center;">
+                        <code id="wizard-cli-setup-cmd">snow setup</code>
+                        <button id="btn-wizard-copy-cmd" class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;">Copy</button>
+                    </div>
+                </div>
+
+                <div style="display: flex; justify-content: space-between;">
+                    <button id="btn-wizard-back-3" class="btn btn-secondary">← Back</button>
+                    <button id="btn-wizard-finish" class="btn btn-primary">Complete Setup & Open Dashboard ✓</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="app-container">
         <!-- Sidebar Navigation -->
         <aside class="sidebar">
@@ -60,6 +141,9 @@
                 </button>
                 <button class="nav-item" data-tab="activity">
                     <span class="nav-icon">📜</span> Activity Audit
+                </button>
+                <button class="nav-item" id="nav-btn-wizard">
+                    <span class="nav-icon">🧙‍♂️</span> Setup Wizard
                 </button>
                 <button class="nav-item" data-tab="settings">
                     <span class="nav-icon">⚙️</span> Settings
@@ -288,6 +372,7 @@
                     <div class="section-toolbar">
                         <h2>Connected & Paired Devices</h2>
                         <div class="toolbar-actions">
+                            <a id="btn-devices-download-apk" href="/api/install/android-apk" target="_blank" class="btn btn-secondary" title="Download Android APK">📱 Download App</a>
                             <button id="btn-clean-ghosts" class="btn-secondary"
                                 title="Remove all disconnected ghost devices">Clean Offline Ghosts</button>
                             <button id="btn-device-pair-qr" class="btn-primary">Generate Pairing QR</button>

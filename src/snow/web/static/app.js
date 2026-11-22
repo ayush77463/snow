@@ -2762,7 +2762,157 @@
 
         bindHubAction("btn-apps-refresh-android", () => loadAndroidApps());
 
+        // Guided Consumer Onboarding Wizard (Phase 29)
+        let wizardStep = 1;
+
+        async function checkOnboardingStatus() {
+            try {
+                const data = await apiRequest("/api/onboarding/status");
+                if (data && data.success && !data.completed) {
+                    openOnboardingWizard(data.network_name || "My SNOW Network");
+                }
+            } catch (e) {
+                console.debug("Failed checking onboarding status:", e);
+            }
+        }
+
+        function setWizardStep(step) {
+            wizardStep = step;
+            const s1 = document.getElementById("wizard-step-1");
+            const s2 = document.getElementById("wizard-step-2");
+            const s3 = document.getElementById("wizard-step-3");
+            const t1 = document.getElementById("step-tab-1");
+            const t2 = document.getElementById("step-tab-2");
+            const t3 = document.getElementById("step-tab-3");
+
+            if (s1) s1.style.display = step === 1 ? "block" : "none";
+            if (s2) s2.style.display = step === 2 ? "block" : "none";
+            if (s3) s3.style.display = step === 3 ? "block" : "none";
+
+            if (t1) t1.style.color = step === 1 ? "var(--accent-primary)" : "var(--text-muted)";
+            if (t2) t2.style.color = step === 2 ? "var(--accent-primary)" : "var(--text-muted)";
+            if (t3) t3.style.color = step === 3 ? "var(--accent-primary)" : "var(--text-muted)";
+
+            if (step === 2) {
+                loadWizardPairing();
+            }
+        }
+
+        async function loadWizardPairing() {
+            const qrImg = document.getElementById("wizard-qr-img");
+            const pinDisplay = document.getElementById("wizard-pin-display");
+            const statusBox = document.getElementById("wizard-device-status-box");
+
+            try {
+                const res = await apiRequest("/api/pair/qr", "POST", { tier: "owner" });
+                if (res && res.success && res.qr_svg) {
+                    if (qrImg) qrImg.src = "data:image/svg+xml;utf8," + encodeURIComponent(res.qr_svg);
+                    if (pinDisplay) pinDisplay.textContent = res.pin || "------";
+                } else {
+                    const st = await apiRequest("/api/pair/state");
+                    if (st && st.data) {
+                        if (pinDisplay) pinDisplay.textContent = st.data.owner_pin || st.data.pin || "------";
+                    }
+                }
+
+                const devData = await apiRequest("/api/devices");
+                const count = (devData && devData.devices) ? devData.devices.length : 0;
+                if (statusBox) {
+                    if (count > 0) {
+                        statusBox.textContent = `✓ ${count} device(s) connected! Ready for AI capabilities.`;
+                        statusBox.style.color = "var(--success-color)";
+                    } else {
+                        statusBox.textContent = "Waiting for phone to scan QR code or enter PIN...";
+                        statusBox.style.color = "var(--text-muted)";
+                    }
+                }
+            } catch (e) {
+                console.error("Wizard pairing load failed:", e);
+            }
+        }
+
+        function openOnboardingWizard(defaultNetworkName = "My SNOW Network") {
+            const overlay = document.getElementById("onboarding-overlay");
+            const inputName = document.getElementById("wizard-network-name");
+            if (inputName && defaultNetworkName) {
+                inputName.value = defaultNetworkName;
+            }
+            setWizardStep(1);
+            if (overlay) overlay.style.display = "flex";
+        }
+
+        function closeOnboardingWizard() {
+            const overlay = document.getElementById("onboarding-overlay");
+            if (overlay) overlay.style.display = "none";
+        }
+
+        function setupOnboardingWizard() {
+            const navWizard = document.getElementById("nav-btn-wizard");
+            if (navWizard) {
+                navWizard.addEventListener("click", () => {
+                    openOnboardingWizard();
+                });
+            }
+
+            const btnSkip = document.getElementById("btn-skip-onboarding");
+            if (btnSkip) {
+                btnSkip.addEventListener("click", async () => {
+                    await apiRequest("/api/onboarding/complete", "POST", { network_name: "My SNOW Network" });
+                    closeOnboardingWizard();
+                    refreshActiveTab();
+                });
+            }
+
+            const btnNext1 = document.getElementById("btn-wizard-next-1");
+            if (btnNext1) {
+                btnNext1.addEventListener("click", async () => {
+                    const nameInput = document.getElementById("wizard-network-name");
+                    const netName = (nameInput ? nameInput.value : "").trim() || "My SNOW Network";
+                    await apiRequest("/api/network/identity", "POST", { network_name: netName });
+                    setWizardStep(2);
+                });
+            }
+
+            const btnBack2 = document.getElementById("btn-wizard-back-2");
+            if (btnBack2) {
+                btnBack2.addEventListener("click", () => setWizardStep(1));
+            }
+            const btnNext2 = document.getElementById("btn-wizard-next-2");
+            if (btnNext2) {
+                btnNext2.addEventListener("click", () => setWizardStep(3));
+            }
+
+            const btnBack3 = document.getElementById("btn-wizard-back-3");
+            if (btnBack3) {
+                btnBack3.addEventListener("click", () => setWizardStep(2));
+            }
+            const btnFinish = document.getElementById("btn-wizard-finish");
+            if (btnFinish) {
+                btnFinish.addEventListener("click", async () => {
+                    const nameInput = document.getElementById("wizard-network-name");
+                    const netName = (nameInput ? nameInput.value : "").trim() || "My SNOW Network";
+                    await apiRequest("/api/onboarding/complete", "POST", { network_name: netName });
+                    closeOnboardingWizard();
+                    refreshActiveTab();
+                });
+            }
+
+            const btnCopyCmd = document.getElementById("btn-wizard-copy-cmd");
+            if (btnCopyCmd) {
+                btnCopyCmd.addEventListener("click", () => {
+                    const cmdEl = document.getElementById("wizard-cli-setup-cmd");
+                    const text = cmdEl ? cmdEl.textContent : "snow setup";
+                    navigator.clipboard.writeText(text).then(() => {
+                        btnCopyCmd.textContent = "Copied!";
+                        setTimeout(() => { btnCopyCmd.textContent = "Copy"; }, 2000);
+                    });
+                });
+            }
+        }
+
         setupWorkflows();
+        setupOnboardingWizard();
+        checkOnboardingStatus();
 
         // Initial Data Load
         refreshActiveTab();

@@ -42,6 +42,10 @@ ipc.secret
 # Local logs
 *.log
 
+# Packaging and distribution
+dist/
+packaging/output/
+
 # IDE, Editor, and temporary files
 .idea/
 .vscode/

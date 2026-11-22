@@ -267,6 +267,14 @@ class DatabaseManager:
                     ON activity_history(principal);
                 """)
 
+                # Phase 29: Application configuration and onboarding settings
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                """)
+
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
             # Guarantee connection_mode exists even on already-versioned Schema v5 databases
@@ -275,6 +283,14 @@ class DatabaseManager:
             if existing_cols and "connection_mode" not in existing_cols:
                 logger.info("Ensuring connection_mode column in paired_devices")
                 conn.execute("ALTER TABLE paired_devices ADD COLUMN connection_mode TEXT NOT NULL DEFAULT 'auto';")
+
+            # Guarantee app_settings table exists on existing databases
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            """)
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> PairedDeviceRecord:
@@ -449,6 +465,10 @@ class DatabaseManager:
             for row in cursor.fetchall():
                 devices.append(self._row_to_record(row))
         return devices
+
+    def get_all_paired_devices(self) -> List[PairedDeviceRecord]:
+        """Alias for list_paired_devices."""
+        return self.list_paired_devices()
 
     def update_device_endpoint(self, device_id: str, host: str, port: int) -> bool:
         """Update last known host and port for a paired device."""
@@ -777,6 +797,31 @@ class DatabaseManager:
                 (device_id, limit),
             )
             return [dict(r) for r in cur.fetchall()]
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Retrieve a persistent configuration setting by key."""
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT value FROM app_settings WHERE key = ?;", (key,))
+            row = cur.fetchone()
+            return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Persist or update a configuration setting by key."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (key, str(value)),
+            )
+
+    def delete_setting(self, key: str) -> bool:
+        """Remove a configuration setting by key."""
+        with self._get_connection() as conn:
+            cur = conn.execute("DELETE FROM app_settings WHERE key = ?;", (key,))
+            return cur.rowcount > 0
 
 
 SENSITIVE_KEY_PATTERNS = {
