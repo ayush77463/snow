@@ -119,6 +119,28 @@ class SnowForegroundService : Service() {
         relayClient = null
     }
 
+    fun startPeerHost() {
+        peerHostManager.setHostModeSettingEnabled(true)
+        val tokenStorage = SharedPreferencesTokenStorage(applicationContext)
+        val success = peerHostManager.enableHostMode(
+            port = org.snow.network.AndroidPeerHostManager.DEFAULT_HOST_PORT,
+            tokenStorage = tokenStorage,
+            dispatcher = capabilityDispatcher,
+            localDeviceId = org.snow.security.DeviceIdentity.getOrCreate(applicationContext).deviceId,
+            manifestProvider = { org.snow.network.DeviceNode.buildAndroidManifest(applicationContext).toMap() },
+            parentScope = serviceScope
+        )
+        if (success) {
+            updateNotification("Peer Host Active on Port ${peerHostManager.activePort}")
+        }
+    }
+
+    fun stopPeerHost() {
+        peerHostManager.setHostModeSettingEnabled(false)
+        peerHostManager.disableHostMode()
+        updateNotification("Peer Host Stopped")
+    }
+
     private val binder = LocalBinder()
 
     inner class LocalBinder : Binder() {
@@ -216,6 +238,18 @@ class SnowForegroundService : Service() {
                 val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
                 liveScreenHandler.stopStreaming(host, 8766)
                 demoteScreenShareNotification()
+            }
+            ACTION_START_PEER_HOST -> {
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildNotification("Direct Phone-to-Phone Host Mode Active"),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+                startPeerHost()
+            }
+            ACTION_STOP_PEER_HOST -> {
+                stopPeerHost()
             }
             ACTION_DISCONNECT -> {
                 handleDisconnect()
@@ -462,6 +496,8 @@ class SnowForegroundService : Service() {
         const val ACTION_DISCONNECT = "org.snow.action.DISCONNECT"
         const val ACTION_START_SCREEN_SHARE = "org.snow.action.START_SCREEN_SHARE"
         const val ACTION_STOP_SCREEN_SHARE = "org.snow.action.STOP_SCREEN_SHARE"
+        const val ACTION_START_PEER_HOST = "org.snow.action.START_PEER_HOST"
+        const val ACTION_STOP_PEER_HOST = "org.snow.action.STOP_PEER_HOST"
         const val EXTRA_HOST = "org.snow.extra.HOST"
         const val EXTRA_PORT = "org.snow.extra.PORT"
         const val EXTRA_RESULT_CODE = "org.snow.extra.RESULT_CODE"

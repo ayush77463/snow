@@ -160,7 +160,7 @@ class SnowPeerClient:
             if pin:
                 pair_req = SnowMessage.create_request(
                     action="pair_request",
-                    payload={
+                    data={
                         "pin": pin.strip(),
                         "device_id": self.identity.device_id,
                         "device_name": self.identity.device_name,
@@ -203,7 +203,7 @@ class SnowPeerClient:
             elif auth_token:
                 auth_req = SnowMessage.create_request(
                     action="auth_request",
-                    payload={
+                    data={
                         "device_id": self.identity.device_id,
                         "auth_token": auth_token.strip(),
                         "manifest": build_windows_manifest().to_dict(),
@@ -309,7 +309,7 @@ class SnowPeerClient:
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
         """Execute a capability request on the remote peer and return structured response."""
-        req = SnowMessage.create_request(action=action, payload=data or {})
+        req = SnowMessage.create_request(action=action, data=data or {})
         try:
             resp = await self.send_message(req, timeout=timeout)
             is_ok = resp.type == MessageType.RESPONSE and (

@@ -773,6 +773,17 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
             }, indent=2)
         return json.dumps(result.get("data", {}) or result, indent=2)
 
+    @server.tool(
+        name="snow_mesh_topology",
+        description="Inspect reachable SNOW network nodes, transport status, and effective principal permissions.",
+    )
+    async def snow_mesh_topology() -> str:
+        """Inspect reachable SNOW network topology and principal-scoped capabilities."""
+        from snow.security.context import ExecutionContext, ExecutionPrincipal
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="fastmcp_stdio")
+        result = await bridge.snow_mesh_topology(ctx=ctx)
+        return json.dumps(result, indent=2)
+
 
 def register_clipboard_buffer_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
     """Register Phase 26B shared clipboard buffer tools independently if needed."""

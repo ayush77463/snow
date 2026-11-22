@@ -39,8 +39,16 @@ def create_snow_mcp_server(
     # Attach bridge reference
     server.bridge = mcp_bridge  # type: ignore[attr-defined]
 
-    # Register all 24 static tools
+    # Register all static tools
     register_all_tools(server, mcp_bridge)
 
-    logger.debug("SNOW FastMCP server created and 24 static tools registered.")
+    @server.resource("snow://mesh/topology")
+    async def mesh_topology_resource() -> str:
+        import json
+        from snow.security.context import ExecutionContext, ExecutionPrincipal
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="fastmcp_resource")
+        result = await mcp_bridge.snow_mesh_topology(ctx=ctx)
+        return json.dumps(result, indent=2)
+
+    logger.debug("SNOW FastMCP server created and static tools/resources registered.")
     return server

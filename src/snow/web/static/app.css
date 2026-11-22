@@ -1577,3 +1577,44 @@ body.theme-dark .data-table tr:hover td {
     color: var(--text-secondary);
     font-family: monospace;
 }
+
+/* Phase 27: Multi-Device SNOW Network */
+.topbar-target-selector {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-right: 0.5rem;
+}
+
+.topbar-target-selector select {
+    max-width: 220px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.85rem;
+    background-color: var(--bg-surface);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+}
+
+.form-select-sm {
+    padding: 0.3rem 0.5rem;
+    font-size: 0.85rem;
+}
+
+.chip-xs {
+    font-size: 0.72rem;
+    padding: 0.2rem 0.45rem;
+    border-radius: 4px;
+}
+
+#connect-peer-card .form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+}
+
+#connect-peer-card .form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}

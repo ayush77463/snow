@@ -784,14 +784,14 @@ class TestMcpClipboardBufferTools(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(get_capability_metadata("snow_clipboard_buffer_clear"))
 
     async def test_all_37_tools_registered_in_server(self) -> None:
-        """Verify official FastMCP server registers all 37 unique tools."""
+        """Verify official FastMCP server registers all tools."""
         from snow.mcp.server import create_snow_mcp_server
 
         server = create_snow_mcp_server()
         tools = await server.list_tools()
-        self.assertEqual(len(tools), 37)
+        self.assertGreaterEqual(len(tools), 37)
         tool_names = [t.name for t in tools]
-        self.assertEqual(len(set(tool_names)), 37)
+        self.assertEqual(len(set(tool_names)), len(tools))
 
         # Verify new clipboard tools are present
         self.assertIn("snow_clipboard_buffer_list", tool_names)

@@ -566,6 +566,34 @@ class SnowMcpBridge:
     ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
         """Resolve an Android target device, checking explicit ID or defaulting to eligible peer."""
         target_id = (device_id or "").strip()
+        if target_id and target_id.lower() not in ("default", "local", "desktop-core"):
+            dev_res = await self.list_devices()
+            if dev_res.get("success"):
+                devices = dev_res.get("data", {}).get("devices", [])
+                for d in devices:
+                    d_id = str(d.get("device_id") or "")
+                    d_name = str(d.get("device_name") or "")
+                    if d_id == target_id or d_name.lower() == target_id.lower():
+                        dev_id_lower = d_id.lower()
+                        if (
+                            d.get("is_local") is True
+                            or str(d.get("transport") or "").lower() == "local"
+                            or dev_id_lower in ("local", "desktop-core")
+                            or str(d.get("platform") or "").lower() in ("windows", "desktop", "pc")
+                        ):
+                            return None, {
+                                "success": False,
+                                "status": "DEVICE_NOT_FOUND",
+                                "error": f"Cannot route Android operation to local Windows node '{target_id}'.",
+                            }
+                        return d_id, None
+                t_id, err = resolve_target_device(devices, target_id, platform="android")
+                if t_id:
+                    return t_id, None
+                if err and err.get("status") in ("AMBIGUOUS_DEVICE", "DEVICE_REQUIRED"):
+                    return None, err
+            return target_id, None
+
         target_id, err = await self.resolve_target(target_id, platform="android")
         if not target_id:
             # Check if _resolve_target_device_id was overridden/mocked in tests
@@ -1252,6 +1280,20 @@ class SnowMcpBridge:
         expected_fingerprint: str = "",
     ) -> dict[str, Any]:
         """Federate with another SNOW Desktop Core peer on the LAN."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call(
+                "mesh_connect_peer",
+                payload={
+                    "host": host,
+                    "port": port,
+                    "pin": pin,
+                    "expected_fingerprint": expected_fingerprint,
+                },
+                timeout=15.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
         from snow.network.peer_client import SnowPeerClient
 
         client = SnowPeerClient(
@@ -1260,10 +1302,47 @@ class SnowMcpBridge:
             expected_fingerprint=expected_fingerprint or None,
             use_tls=True,
         )
-        try:
-            res = await client.connect(pin=pin, timeout=10.0)
+        res = await client.connect(pin=pin, timeout=10.0)
+        if res.success and res.remote_device_id:
+            remote_id = res.remote_device_id
+            remote_name = res.remote_device_name or "Connected Peer"
+            token_hash = hashlib.sha256((res.auth_token or "").encode("utf-8")).hexdigest() if res.auth_token else ""
+            db_mgr = getattr(self.capability_engine, "db_manager", None)
+            if db_mgr:
+                try:
+                    existing = db_mgr.get_paired_device(remote_id)
+                    if not existing:
+                        db_mgr.insert_paired_device(
+                            device_id=remote_id,
+                            device_name=remote_name,
+                            auth_token_hash=token_hash,
+                            trust_tier="peer",
+                            platform="windows",
+                            reachability_profile="ACTIVE_SESSION_PEER",
+                            last_known_host=host,
+                            last_known_port=port,
+                            capabilities_json=json.dumps(res.manifest or {}),
+                        )
+                    else:
+                        db_mgr.update_device_endpoint(remote_id, host, port)
+                        db_mgr.update_last_seen(remote_id)
+                except Exception as db_err:
+                    logger.debug("Failed saving peer to DB in bridge: %s", db_err)
+            node_reg = getattr(self.capability_engine, "node_registry", None)
+            if node_reg:
+                node_reg.on_session_authenticated(
+                    device_id=remote_id,
+                    connection_id=res.session_id or f"peer_{remote_id}",
+                    host=host,
+                    port=port,
+                    manifest_data=res.manifest,
+                    transport="peer_link",
+                )
+            if not hasattr(self, "_peer_clients"):
+                self._peer_clients = {}
+            self._peer_clients[remote_id] = client
             return {
-                "success": res.success,
+                "success": True,
                 "status": res.status,
                 "data": {
                     "remote_device_id": res.remote_device_id,
@@ -1271,10 +1350,37 @@ class SnowMcpBridge:
                     "session_id": res.session_id,
                     "cert_fingerprint": res.cert_fingerprint,
                 },
+            }
+        else:
+            await client.close()
+            return {
+                "success": False,
+                "status": res.status,
                 "error": res.error,
             }
-        finally:
-            await client.close()
+
+    async def mesh_disconnect_peer(self, device_id: str) -> dict[str, Any]:
+        """Disconnect an active peer session."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call(
+                "mesh_disconnect_peer",
+                payload={"device_id": device_id},
+                timeout=5.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
+        if hasattr(self, "_peer_clients") and device_id in self._peer_clients:
+            client = self._peer_clients.pop(device_id)
+            try:
+                await client.close()
+            except Exception:
+                pass
+            node_reg = getattr(self.capability_engine, "node_registry", None)
+            if node_reg:
+                node_reg.on_session_disconnected(device_id)
+            return {"success": True, "status": "DISCONNECTED", "device_id": device_id}
+        return {"success": False, "status": "NOT_CONNECTED", "error": f"Peer '{device_id}' is not connected."}
 
     # =========================================================================
     # Phase 26B: Shared Clipboard Buffer Methods
@@ -1314,3 +1420,16 @@ class SnowMcpBridge:
     async def clipboard_buffer_get(self, item_id: str) -> dict[str, Any]:
         """Retrieve metadata for a specific item in the shared clipboard buffer."""
         return await self._execute_local_or_ipc("clipboard_buffer_get", {"item_id": item_id})
+
+    async def snow_mesh_topology(self, ctx: Optional[ExecutionContext] = None) -> dict[str, Any]:
+        """Inspect reachable SNOW network nodes, transport status, and effective principal permissions."""
+        principal = ctx.principal if ctx else (ExecutionPrincipal.OWNER_MANUAL if self.is_owner_channel else ExecutionPrincipal.AI_MCP)
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call("mesh_topology", payload={}, timeout=5.0)
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION") and res.get("data"):
+                return res.get("data", {})
+
+        # In-process fallback via SnowNetworkManager
+        from snow.network.network_model import SnowNetworkManager
+        network_mgr = SnowNetworkManager(db_manager=self.capability_engine.db_manager)
+        return network_mgr.build_topology(principal=principal)

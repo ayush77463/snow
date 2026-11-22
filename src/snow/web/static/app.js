@@ -111,7 +111,7 @@
                         const stData = await st.json();
                         if (stData && stData.csrf_token) csrfToken = stData.csrf_token;
                     }
-                } catch (_) {}
+                } catch (_) { }
             }
             return await res.json();
         } catch (err) {
@@ -218,6 +218,7 @@
         } else if (currentTab === "settings") {
             loadRelayStatus();
             loadMcpGatewayStatus();
+            loadNetworkIdentity();
         }
     }
 
@@ -284,6 +285,105 @@
         return dev.transport === "local" || dev.is_local === true || dev.platform === "windows" || dev.device_id === "local" || dev.device_id === "desktop-core";
     }
 
+    function formatTransportLabel(tr) {
+        if (!tr) return "Unknown";
+        if (tr === "wifi_lan" || tr === "Wi-Fi LAN") return "🟢 Wi-Fi LAN";
+        if (tr === "usb_adb" || tr === "USB ADB") return "🔌 USB ADB";
+        if (tr === "loopback" || tr === "Loopback") return "🔁 Loopback";
+        if (tr === "peer_link" || tr === "mesh_peer" || tr === "Peer Link") return "🔗 Peer Link";
+        if (tr === "remote_relay" || tr === "Remote Relay") return "☁️ Remote Relay";
+        return tr;
+    }
+
+    function getTransportChipClass(tr) {
+        if (!tr) return "chip-neutral";
+        if (tr === "wifi_lan" || tr === "Wi-Fi LAN") return "chip-wifi";
+        if (tr === "usb_adb" || tr === "USB ADB") return "chip-usb";
+        if (tr === "loopback" || tr === "Loopback") return "chip-loopback";
+        if (tr === "peer_link" || tr === "mesh_peer" || tr === "Peer Link") return "chip-peer";
+        if (tr === "remote_relay" || tr === "Remote Relay") return "chip-relay";
+        return "chip-neutral";
+    }
+
+    let lastKnownPeerDevices = [];
+
+    function populateGlobalTargetSelector(peerDevices) {
+        lastKnownPeerDevices = Array.isArray(peerDevices) ? peerDevices : [];
+        const peers = lastKnownPeerDevices.filter(d => !isLocalNode(d));
+        const globalSelect = document.getElementById("global-target-select");
+        const transportChip = document.getElementById("global-target-transport-chip");
+        const fileDevSelect = document.getElementById("files-device-select");
+
+        // Maintain selection if the device is still known
+        if (activeDeviceId && !peers.some(d => d.device_id === activeDeviceId)) {
+            // Do not silently switch to another device if explicit target disconnected
+        } else if (!activeDeviceId && peers.length > 0) {
+            const firstConnected = peers.find(d => d.is_connected);
+            if (firstConnected) {
+                activeDeviceId = firstConnected.device_id;
+            } else if (peers.length > 0) {
+                activeDeviceId = peers[0].device_id;
+            }
+        }
+
+        if (globalSelect) {
+            globalSelect.innerHTML = "";
+            if (peers.length === 0) {
+                const opt = document.createElement("option");
+                opt.value = "";
+                opt.textContent = "No Connected Peer";
+                globalSelect.appendChild(opt);
+            } else {
+                peers.forEach(dev => {
+                    const opt = document.createElement("option");
+                    opt.value = dev.device_id;
+                    const statusText = dev.is_connected ? formatTransportLabel(dev.transport) : "Offline";
+                    opt.textContent = `${dev.device_name || dev.device_id} (${statusText})`;
+                    if (dev.device_id === activeDeviceId) {
+                        opt.selected = true;
+                    }
+                    globalSelect.appendChild(opt);
+                });
+            }
+            if (activeDeviceId) {
+                globalSelect.value = activeDeviceId;
+            }
+        }
+
+        if (fileDevSelect) {
+            fileDevSelect.innerHTML = "";
+            const placeholder = document.createElement("option");
+            placeholder.value = "";
+            placeholder.textContent = "Select target Android device...";
+            fileDevSelect.appendChild(placeholder);
+            peers.forEach(dev => {
+                const opt = document.createElement("option");
+                opt.value = dev.device_id;
+                const statusText = dev.is_connected ? formatTransportLabel(dev.transport) : "Offline";
+                opt.textContent = `${dev.device_name || dev.device_id} (${statusText})`;
+                if (dev.device_id === activeDeviceId) {
+                    opt.selected = true;
+                }
+                fileDevSelect.appendChild(opt);
+            });
+            if (activeDeviceId) {
+                fileDevSelect.value = activeDeviceId;
+            }
+        }
+
+        // Update transport chip for the active device
+        if (transportChip) {
+            const activeDev = peers.find(d => d.device_id === activeDeviceId);
+            if (activeDev && activeDev.is_connected) {
+                transportChip.textContent = formatTransportLabel(activeDev.transport);
+                transportChip.className = "chip " + getTransportChipClass(activeDev.transport);
+            } else {
+                transportChip.textContent = "Offline";
+                transportChip.className = "chip chip-neutral";
+            }
+        }
+    }
+
     // 4A. Overview
     async function loadOverview() {
         const devRes = await apiRequest("/api/devices");
@@ -297,24 +397,16 @@
         const devList = (devRes && Array.isArray(devRes.devices)) ? devRes.devices : ((devRes && devRes.data && Array.isArray(devRes.data.devices)) ? devRes.data.devices : []);
         if (devRes && devRes.success && devList.length > 0) {
             const peerDevices = devList.filter(d => !isLocalNode(d));
+            populateGlobalTargetSelector(peerDevices);
             const connected = peerDevices.filter(d => d.is_connected);
             activeCount = connected.length;
             if (activeCount > 0) {
                 const tr = connected[0].transport || "unknown";
-                if (tr === "wifi_lan") {
-                    primaryTransport = "🟢 Wi-Fi LAN";
-                    chipClass = "chip-wifi";
-                } else if (tr === "usb_adb") {
-                    primaryTransport = "🔌 USB Cable (ADB)";
-                    chipClass = "chip-usb";
-                } else if (tr === "loopback") {
-                    primaryTransport = "🔁 Loopback";
-                    chipClass = "chip-loopback";
-                } else {
-                    primaryTransport = "⚪ " + tr;
-                    chipClass = "chip-neutral";
-                }
+                primaryTransport = formatTransportLabel(tr);
+                chipClass = getTransportChipClass(tr);
             }
+        } else {
+            populateGlobalTargetSelector([]);
         }
 
         if (devCountEl) devCountEl.textContent = activeCount.toString();
@@ -486,7 +578,7 @@
 
         const res = await apiRequest("/api/clipboard/buffer");
         const items = (res && res.data && Array.isArray(res.data.items)) ? res.data.items :
-                      (res && Array.isArray(res.items)) ? res.items : [];
+            (res && Array.isArray(res.items)) ? res.items : [];
         const count = items.length;
         const pinnedCount = items.filter(it => it.is_pinned).length;
 
@@ -637,7 +729,7 @@
         // Resolve target Android device
         const devData = await apiRequest("/api/devices");
         const devList = (devData && Array.isArray(devData.devices)) ? devData.devices :
-                        ((devData && devData.data && Array.isArray(devData.data.devices)) ? devData.data.devices : []);
+            ((devData && devData.data && Array.isArray(devData.data.devices)) ? devData.data.devices : []);
         const androidDevs = devList.filter(d => !isLocalNode(d) && d.is_connected && (d.platform === "android" || !d.platform));
 
         let targetId = activeDeviceId;
@@ -666,7 +758,7 @@
         container.innerHTML = "";
 
         const apps = (res && res.data && Array.isArray(res.data.apps)) ? res.data.apps :
-                     (res && Array.isArray(res.apps)) ? res.apps : [];
+            (res && Array.isArray(res.apps)) ? res.apps : [];
 
         if (apps.length === 0) {
             const empty = document.createElement("div");
@@ -760,10 +852,11 @@
 
         const isCoreOnline = Boolean(data && data.success);
         const devices = (data && Array.isArray(data.devices)) ? data.devices : ((data && data.data && Array.isArray(data.data.devices)) ? data.data.devices : []);
-        
+
         // Partition into local desktop host node vs peer mobile devices
         const localNodes = devices.filter(isLocalNode);
         const peerDevices = devices.filter(d => !isLocalNode(d));
+        populateGlobalTargetSelector(peerDevices);
 
         // 1. Render Local Host Node
         const hostCard = document.createElement("div");
@@ -788,7 +881,7 @@
         hostBody.appendChild(createDetailRow("Device ID:", (localNodes[0] && localNodes[0].device_id) || "desktop-core"));
         hostBody.appendChild(createDetailRow("Platform:", "Windows 11 (Headless Core)"));
         hostBody.appendChild(createDetailRow("Trust Tier:", "Owner (Protected Host)"));
-        
+
         const hostTrRow = document.createElement("div");
         hostTrRow.className = "device-detail-row";
         const hostTrLabel = document.createElement("span");
@@ -928,18 +1021,6 @@
             card.appendChild(header);
             card.appendChild(body);
             container.appendChild(card);
-
-            // Populate file selector option
-            if (fileDevSelect && dev.is_connected) {
-                const opt = document.createElement("option");
-                opt.value = dev.device_id;
-                opt.textContent = `${dev.device_name || dev.device_id} (${trChip.textContent})`;
-                fileDevSelect.appendChild(opt);
-                if (!activeDeviceId) {
-                    activeDeviceId = dev.device_id;
-                    opt.selected = true;
-                }
-            }
         });
     }
 
@@ -1851,6 +1932,16 @@
         }
     }
 
+    async function loadNetworkIdentity() {
+        const res = await apiRequest("/api/network/identity");
+        if (res && res.success && res.identity) {
+            const input = document.getElementById("input-network-name");
+            if (input && document.activeElement !== input) {
+                input.value = res.identity.network_name || "";
+            }
+        }
+    }
+
     // =========================================================================
     // 6B. Workflows & Visual Capture (Phase 24)
     // =========================================================================
@@ -2283,13 +2374,74 @@
             });
         });
 
+        const globalTargetSelect = document.getElementById("global-target-select");
+        if (globalTargetSelect) {
+            globalTargetSelect.addEventListener("change", () => {
+                activeDeviceId = globalTargetSelect.value;
+                const fileSelect = document.getElementById("files-device-select");
+                if (fileSelect) fileSelect.value = activeDeviceId;
+                populateGlobalTargetSelector(lastKnownPeerDevices);
+                if (currentTab === "files") {
+                    currentSubpath = "";
+                    updateBreadcrumbs();
+                    loadSafFiles();
+                } else if (currentTab === "notifications") {
+                    loadNotifications();
+                } else if (currentTab === "apps") {
+                    loadAndroidApps();
+                }
+            });
+        }
+
         const fileSelect = document.getElementById("files-device-select");
         if (fileSelect) {
             fileSelect.addEventListener("change", () => {
                 activeDeviceId = fileSelect.value;
+                const globalSelect = document.getElementById("global-target-select");
+                if (globalSelect) globalSelect.value = activeDeviceId;
+                populateGlobalTargetSelector(lastKnownPeerDevices);
                 currentSubpath = "";
                 updateBreadcrumbs();
                 loadSafFiles();
+            });
+        }
+
+        const btnSaveNetName = document.getElementById("btn-save-network-name");
+        if (btnSaveNetName) {
+            btnSaveNetName.addEventListener("click", async () => {
+                const input = document.getElementById("input-network-name");
+                const statusEl = document.getElementById("network-name-status");
+                const newName = (input ? input.value : "").trim();
+                if (!newName) {
+                    if (statusEl) {
+                        statusEl.textContent = "Network name cannot be empty.";
+                        statusEl.className = "text-xs text-danger mt-1 d-block";
+                    }
+                    return;
+                }
+                if (newName.length > 64) {
+                    if (statusEl) {
+                        statusEl.textContent = "Network name cannot exceed 64 characters.";
+                        statusEl.className = "text-xs text-danger mt-1 d-block";
+                    }
+                    return;
+                }
+                btnSaveNetName.disabled = true;
+                const res = await apiRequest("/api/network/identity", "POST", { network_name: newName });
+                btnSaveNetName.disabled = false;
+                if (res && res.success) {
+                    if (statusEl) {
+                        statusEl.textContent = "Network name saved!";
+                        statusEl.className = "text-xs text-success mt-1 d-block";
+                        setTimeout(() => { if (statusEl) statusEl.textContent = ""; }, 2500);
+                    }
+                    loadOverview();
+                } else {
+                    if (statusEl) {
+                        statusEl.textContent = `Error: ${res ? (res.error || res.status) : 'Failed to save'}`;
+                        statusEl.className = "text-xs text-danger mt-1 d-block";
+                    }
+                }
             });
         }
 
@@ -2303,25 +2455,25 @@
         if (btnRefreshActivity) btnRefreshActivity.addEventListener("click", loadActivityHistory);
 
         // Phase 23 Remote MCP Gateway Card Bindings
-    const btnCopyMcp = document.getElementById("btn-copy-mcp-url");
-    if (btnCopyMcp) {
-        btnCopyMcp.addEventListener("click", () => {
-            navigator.clipboard.writeText("http://127.0.0.1:8771/mcp").then(() => {
-                btnCopyMcp.textContent = "Copied!";
-                setTimeout(() => { btnCopyMcp.textContent = "Copy Endpoint URL"; }, 2000);
+        const btnCopyMcp = document.getElementById("btn-copy-mcp-url");
+        if (btnCopyMcp) {
+            btnCopyMcp.addEventListener("click", () => {
+                navigator.clipboard.writeText("http://127.0.0.1:8771/mcp").then(() => {
+                    btnCopyMcp.textContent = "Copied!";
+                    setTimeout(() => { btnCopyMcp.textContent = "Copy Endpoint URL"; }, 2000);
+                });
             });
-        });
-    }
+        }
 
-    const btnTestMcp = document.getElementById("btn-test-mcp-health");
-    if (btnTestMcp) {
-        btnTestMcp.addEventListener("click", () => loadMcpGatewayStatus());
-    }
+        const btnTestMcp = document.getElementById("btn-test-mcp-health");
+        if (btnTestMcp) {
+            btnTestMcp.addEventListener("click", () => loadMcpGatewayStatus());
+        }
 
-    const btnRefreshRelay = document.getElementById("btn-refresh-relay-status");
-    if (btnRefreshRelay) {
-        btnRefreshRelay.addEventListener("click", () => loadRelayStatus());
-    }
+        const btnRefreshRelay = document.getElementById("btn-refresh-relay-status");
+        if (btnRefreshRelay) {
+            btnRefreshRelay.addEventListener("click", () => loadRelayStatus());
+        }
 
         const btnJumpApprovals = document.getElementById("btn-jump-approvals");
         if (btnJumpApprovals) {
@@ -2476,29 +2628,30 @@
 
         bindHubAction("btn-apps-refresh-android", () => loadAndroidApps());
 
-    setupWorkflows();
+        setupWorkflows();
 
-    // Initial Data Load
-    refreshActiveTab();
+        // Initial Data Load
+        refreshActiveTab();
 
-    // Background Periodic Poller (every 4 seconds)
-    if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(() => {
-        loadSystemStatus();
-        loadApprovalsCount();
-        if (currentTab === "overview") {
-            loadOverview();
-        } else if (currentTab === "devices") {
-            loadDevices();
-        } else if (currentTab === "notifications") {
-            loadNotifications();
-        } else if (currentTab === "clipboard") {
-            loadClipboardBuffer();
-        } else if (currentTab === "settings") {
-            loadRelayStatus();
-            loadMcpGatewayStatus();
-        }
-    }, 4000);
+        // Background Periodic Poller (every 4 seconds)
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(() => {
+            loadSystemStatus();
+            loadApprovalsCount();
+            if (currentTab === "overview") {
+                loadOverview();
+            } else if (currentTab === "devices") {
+                loadDevices();
+            } else if (currentTab === "notifications") {
+                loadNotifications();
+            } else if (currentTab === "clipboard") {
+                loadClipboardBuffer();
+            } else if (currentTab === "settings") {
+                loadRelayStatus();
+                loadMcpGatewayStatus();
+                loadNetworkIdentity();
+            }
+        }, 4000);
     }
 
     // Boot entry point

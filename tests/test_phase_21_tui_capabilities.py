@@ -98,15 +98,15 @@ class TestPillar1DynamicCapabilityRegistry(unittest.IsolatedAsyncioTestCase):
 
     def test_tool_registry_backward_compatibility_dict(self) -> None:
         """TOOL_REGISTRY proxy dict provides backward compatible access."""
-        self.assertEqual(len(TOOL_REGISTRY), 37)
+        self.assertEqual(len(TOOL_REGISTRY), 38)
         self.assertEqual(TOOL_REGISTRY["snow_windows_battery"], ToolCategory.LOCAL_WINDOWS)
         self.assertEqual(TOOL_REGISTRY["snow_android_file_list"], ToolCategory.CROSS_DEVICE)
         self.assertTrue("snow_activity_history" in TOOL_REGISTRY)
 
     def test_exact_30_tools_and_prohibited_names_absent(self) -> None:
-        """Catalog has exactly 37 tools (24 baseline + 6 P1 + 4 Phase 24 + 3 Phase 26B) with zero fabricated names."""
-        self.assertEqual(len(ALL_TOOL_NAMES), 37)
-        self.assertEqual(len(list_capabilities()), 37)
+        """Catalog has exactly 38 tools (24 baseline + 6 P1 + 4 Phase 24 + 3 Phase 26B + 1 Phase 27) with zero fabricated names."""
+        self.assertEqual(len(ALL_TOOL_NAMES), 38)
+        self.assertEqual(len(list_capabilities()), 38)
         prohibited = [
             "snow_android_send_sms",
             "snow_android_take_photo",
@@ -126,7 +126,7 @@ class TestPillar1DynamicCapabilityRegistry(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(len(meta.tier) > 0, f"{meta.name}: tier is empty")
 
     async def test_fastmcp_list_tools_exposes_annotations(self) -> None:
-        """FastMCP tool registration attaches ToolAnnotations (readOnlyHint, destructiveHint) to all 30 tools."""
+        """FastMCP tool registration attaches ToolAnnotations (readOnlyHint, destructiveHint) to all 38 tools."""
         from mcp.server.fastmcp import FastMCP
         from snow.mcp.bridge import SnowMcpBridge
         from snow.mcp.tools import register_all_tools
@@ -136,7 +136,7 @@ class TestPillar1DynamicCapabilityRegistry(unittest.IsolatedAsyncioTestCase):
         register_all_tools(server, bridge)
 
         tools = await server.list_tools()
-        self.assertEqual(len(tools), 37)
+        self.assertEqual(len(tools), 38)
         for t in tools:
             self.assertIsNotNone(t.annotations, f"Tool '{t.name}' is missing MCP ToolAnnotations")
             self.assertIs(type(t.annotations.readOnlyHint), bool, f"Tool '{t.name}': readOnlyHint not bool")

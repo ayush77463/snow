@@ -53,4 +53,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun saveRemoteRelayConfig(enabled: Boolean, endpoint: String) {
         repository.updateRemoteRelayConfig(enabled, endpoint)
     }
+
+    // --- Direct Phone-to-Phone Host Mode (Phase 27) ---
+    fun isPeerHostEnabled(): Boolean = repository.isPeerHostEnabled()
+    fun isPeerHostActive(): Boolean = repository.isPeerHostActive()
+    fun getPeerHostPort(): Int = repository.getPeerHostManager()?.activePort ?: 8767
+    fun getPeerHostConnectionCount(): Int = repository.getPeerHostManager()?.activeConnectionCount ?: 0
+    fun startPeerHost() = repository.startPeerHost()
+    fun stopPeerHost() = repository.stopPeerHost()
+    fun generatePeerHostPin(): String? = repository.generatePeerHostPin()
+    fun getPeerHostPinInfo(): Pair<String, Long>? = repository.getPeerHostManager()?.getCurrentEphemeralPinInfo()
 }

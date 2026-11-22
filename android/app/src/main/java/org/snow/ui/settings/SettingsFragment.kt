@@ -46,6 +46,7 @@ class SettingsFragment : Fragment() {
         setupNotificationSyncAccess()
         refreshStorageAccessStatus()
         setupRemoteRelayControls()
+        setupPeerHostControls()
         setupTrustControls()
         setupDiagnostics()
         observeLogs()
@@ -55,6 +56,7 @@ class SettingsFragment : Fragment() {
         super.onResume()
         refreshNotificationAccessStatus()
         refreshStorageAccessStatus()
+        updatePeerHostUi()
     }
 
     fun isAllFilesAccessGranted(): Boolean {
@@ -277,6 +279,75 @@ class SettingsFragment : Fragment() {
             viewModel.saveRemoteRelayConfig(isChecked, curEndpoint)
             updateRemoteRelayStatusText(isChecked, curEndpoint)
             Toast.makeText(requireContext(), "Relay configuration updated", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun setupPeerHostControls() {
+        val enabled = viewModel.isPeerHostEnabled()
+        binding.swPeerHostMode.isChecked = enabled
+        updatePeerHostUi()
+
+        binding.swPeerHostMode.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                viewModel.startPeerHost()
+            } else {
+                viewModel.stopPeerHost()
+            }
+            updatePeerHostUi()
+        }
+
+        binding.btnGeneratePeerPin.setOnClickListener {
+            if (!viewModel.isPeerHostActive()) {
+                Toast.makeText(requireContext(), "Enable Host Mode first to generate a pairing PIN", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val pin = viewModel.generatePeerHostPin()
+            if (pin != null) {
+                binding.tvPeerHostPin.text = "PIN: $pin"
+                binding.tvPeerHostPinExpiry.text = "Validity: 5 minutes"
+                binding.tvPeerHostPin.visibility = View.VISIBLE
+                binding.tvPeerHostPinExpiry.visibility = View.VISIBLE
+                Toast.makeText(requireContext(), "Generated temporary 6-digit PIN", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        binding.btnStopPeerHost.setOnClickListener {
+            binding.swPeerHostMode.isChecked = false
+            viewModel.stopPeerHost()
+            updatePeerHostUi()
+        }
+    }
+
+    private fun updatePeerHostUi() {
+        if (_binding == null) return
+        val enabled = viewModel.isPeerHostEnabled()
+        val isActive = viewModel.isPeerHostActive()
+        val port = viewModel.getPeerHostPort()
+        val connCount = viewModel.getPeerHostConnectionCount()
+
+        if (isActive) {
+            binding.tvPeerHostStatus.text = "Status: ACTIVE"
+            binding.tvPeerHostStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
+            binding.tvPeerHostEndpoint.text = "Endpoint: Port $port (TLS/WSS)"
+            binding.tvPeerHostConnections.text = "Connected Peers: $connCount"
+            binding.btnStopPeerHost.visibility = View.VISIBLE
+            binding.btnGeneratePeerPin.isEnabled = true
+        } else if (enabled) {
+            binding.tvPeerHostStatus.text = "Status: STARTING"
+            binding.tvPeerHostStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+            binding.tvPeerHostEndpoint.text = "Endpoint: Starting on port $port..."
+            binding.tvPeerHostConnections.text = "Connected Peers: 0"
+            binding.btnStopPeerHost.visibility = View.VISIBLE
+            binding.btnGeneratePeerPin.isEnabled = false
+        } else {
+            binding.tvPeerHostStatus.text = "Status: OFF"
+            binding.tvPeerHostStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+            binding.tvPeerHostEndpoint.text = "Endpoint: --"
+            binding.tvPeerHostConnections.text = "Connected Peers: 0"
+            binding.btnStopPeerHost.visibility = View.GONE
+            binding.btnGeneratePeerPin.isEnabled = false
+            binding.tvPeerHostPin.visibility = View.GONE
+            binding.tvPeerHostPinExpiry.visibility = View.GONE
         }
     }
 

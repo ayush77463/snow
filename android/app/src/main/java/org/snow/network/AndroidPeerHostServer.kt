@@ -19,6 +19,8 @@ import org.snow.security.TokenStorage
 import java.net.InetSocketAddress
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLContext
 
@@ -73,9 +75,11 @@ class AndroidPeerHostServer(
         }
 
         return try {
+            val startLatch = CountDownLatch(1)
             val address = InetSocketAddress(requestedPort)
             val server = object : WebSocketServer(address) {
                 override fun onStart() {
+                    startLatch.countDown()
                     SafeLog.i(TAG, "WebSocket peer host listening on port $boundPort")
                 }
 
@@ -105,11 +109,10 @@ class AndroidPeerHostServer(
 
             server.start()
 
-            // Wait briefly for port binding if 0 (ephemeral port)
-            var attempts = 0
-            while (server.port <= 0 && attempts < 25) {
-                Thread.sleep(20)
-                attempts++
+            // Wait until onStart() has fired and server socket is bound
+            val started = startLatch.await(2000, TimeUnit.MILLISECONDS)
+            if (!started) {
+                SafeLog.w(TAG, "AndroidPeerHostServer startLatch timed out waiting for onStart on port $requestedPort")
             }
 
             boundPort = if (server.port > 0) server.port else requestedPort
@@ -143,6 +146,8 @@ class AndroidPeerHostServer(
     }
 
     fun isListening(): Boolean = isRunning.get() && wsServer != null
+
+    fun getActiveConnectionCount(): Int = wsServer?.connections?.size ?: 0
 
     private fun handleIncomingMessage(conn: WebSocket, rawMessage: String) {
         if (rawMessage.length > MAX_FRAME_SIZE) {

@@ -298,6 +298,108 @@ class SnowWebServer:
         res = await self.bridge.call("device_revoke", {"device_id": device_id})
         return web.json_response(res)
 
+    async def handle_api_devices_connect_peer(self, request: web.Request) -> web.Response:
+        """Federate with another SNOW Core or Android Peer Host on the local network."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        host = (body.get("host") or "").strip()
+        port_raw = body.get("port", 8765)
+        pin = (body.get("pin") or "").strip()
+        expected_fingerprint = (body.get("expected_fingerprint") or "").strip()
+
+        if not host:
+            return web.json_response({"success": False, "error": "Missing required field 'host'."}, status=400)
+
+        try:
+            port = int(port_raw)
+            if port <= 0 or port > 65535:
+                raise ValueError()
+        except (ValueError, TypeError):
+            return web.json_response({"success": False, "error": "Invalid port number."}, status=400)
+
+        # Call bridge to connect peer (Never log PINs or secret tokens)
+        res = await self.bridge.mesh_connect_peer(
+            host=host,
+            port=port,
+            pin=pin,
+            expected_fingerprint=expected_fingerprint,
+        )
+
+        # If successful, record endpoint in SnowNetworkManager
+        if res.get("success") and res.get("data"):
+            remote_dev_id = res["data"].get("remote_device_id")
+            if remote_dev_id:
+                try:
+                    from snow.network.network_model import SnowNetworkManager
+                    db_mgr = self.bridge.capability_engine.db_manager
+                    net_mgr = SnowNetworkManager(db_manager=db_mgr)
+                    net_mgr.record_endpoint(device_id=remote_dev_id, host=host, port=port)
+                except Exception as ex:
+                    logger.debug("Failed recording connected peer endpoint: %s", ex)
+
+        return web.json_response(res)
+
+    async def handle_api_network_identity(self, request: web.Request) -> web.Response:
+        """Query local SNOW Network identity."""
+        try:
+            from snow.network.network_model import SnowNetworkManager
+            db_mgr = self.bridge.capability_engine.db_manager
+            net_mgr = SnowNetworkManager(db_manager=db_mgr)
+            ident = net_mgr.get_network_identity()
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "identity": ident.to_dict(),
+            })
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_network_identity_update(self, request: web.Request) -> web.Response:
+        """Update local SNOW Network name."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        name = (body.get("network_name") or "").strip()
+        if not name:
+            return web.json_response({"success": False, "error": "Network name cannot be empty."}, status=400)
+        if len(name) > 64:
+            return web.json_response({"success": False, "error": "Network name cannot exceed 64 characters."}, status=400)
+
+        try:
+            from snow.network.network_model import SnowNetworkManager
+            db_mgr = self.bridge.capability_engine.db_manager
+            net_mgr = SnowNetworkManager(db_manager=db_mgr)
+            ident = net_mgr.update_network_name(name)
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "identity": ident.to_dict(),
+            })
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_network_topology(self, request: web.Request) -> web.Response:
+        """Query mesh topology with OWNER_MANUAL principal view."""
+        try:
+            if await self.bridge.daemon_manager.is_ipc_ready(timeout=0.1):
+                res = await self.bridge.call("mesh_topology", payload={}, timeout=5.0)
+                if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION") and res.get("data"):
+                    return web.json_response(res)
+
+            from snow.network.network_model import SnowNetworkManager
+            from snow.security.context import ExecutionPrincipal
+            db_mgr = self.bridge.capability_engine.db_manager
+            net_mgr = SnowNetworkManager(db_manager=db_mgr)
+            topo = net_mgr.build_topology(principal=ExecutionPrincipal.OWNER_MANUAL)
+            return web.json_response(topo)
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
     async def handle_api_pair_qr(self, request: web.Request) -> web.Response:
         """Generate temporary pairing PIN, QR code metadata, and vector SVG."""
         trust_tier = "owner"
@@ -1074,6 +1176,10 @@ class SnowWebServer:
         app.router.add_get("/api/status", self.handle_api_status)
         app.router.add_get("/api/devices", self.handle_api_devices)
         app.router.add_post("/api/devices/revoke", self.handle_api_devices_revoke)
+        app.router.add_post("/api/devices/connect-peer", self.handle_api_devices_connect_peer)
+        app.router.add_get("/api/network/identity", self.handle_api_network_identity)
+        app.router.add_post("/api/network/identity", self.handle_api_network_identity_update)
+        app.router.add_get("/api/network/topology", self.handle_api_network_topology)
         app.router.add_get("/api/pair/state", self.handle_api_pair_state)
         app.router.add_get("/api/pair/qr", self.handle_api_pair_qr)
         app.router.add_post("/api/pair/qr", self.handle_api_pair_qr)

@@ -1970,6 +1970,34 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             }
         }
     }
+
+    // --- Direct Phone-to-Phone Host Mode (Phase 27) ---
+
+    fun isPeerHostEnabled(): Boolean = serviceRef?.peerHostManager?.isHostModeSettingEnabled() ?: false
+    fun isPeerHostActive(): Boolean = serviceRef?.peerHostManager?.isHostModeActive() ?: false
+    fun getPeerHostManager(): org.snow.network.AndroidPeerHostManager? = serviceRef?.peerHostManager
+
+    fun startPeerHost() {
+        val intent = Intent(appContext, SnowForegroundService::class.java).apply {
+            action = SnowForegroundService.ACTION_START_PEER_HOST
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            appContext.startForegroundService(intent)
+        } else {
+            appContext.startService(intent)
+        }
+    }
+
+    fun stopPeerHost() {
+        val intent = Intent(appContext, SnowForegroundService::class.java).apply {
+            action = SnowForegroundService.ACTION_STOP_PEER_HOST
+        }
+        appContext.startService(intent)
+    }
+
+    fun generatePeerHostPin(): String? {
+        return serviceRef?.peerHostManager?.generatePairingPin()
+    }
 }
 
 // --- Data Models ---

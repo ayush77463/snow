@@ -27,9 +27,10 @@ import uuid
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_FILENAME = "snow_devices.db"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 VALID_TRUST_TIERS = ("owner", "peer")
+VALID_CONNECTION_MODES = ("auto", "local_only", "remote_only")
 
 
 def current_utc_timestamp() -> str:
@@ -57,6 +58,10 @@ class PairedDeviceRecord:
     last_known_host: Optional[str] = None
     last_known_port: Optional[int] = 8765
     capabilities_json: str = "{}"
+    role: str = "member"
+    cert_fingerprint: Optional[str] = None
+    endpoints_json: str = "[]"
+    connection_mode: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -142,7 +147,8 @@ class DatabaseManager:
                         reachability_profile TEXT NOT NULL DEFAULT 'ACTIVE_SESSION_PEER',
                         last_known_host TEXT,
                         last_known_port INTEGER DEFAULT 8765,
-                        capabilities_json TEXT NOT NULL DEFAULT '{}'
+                        capabilities_json TEXT NOT NULL DEFAULT '{}',
+                        connection_mode TEXT NOT NULL DEFAULT 'auto'
                     );
                 """)
                 conn.execute("""
@@ -171,10 +177,47 @@ class DatabaseManager:
                 if "capabilities_json" not in columns:
                     logger.info("Migrating paired_devices table: adding capabilities_json column")
                     conn.execute("ALTER TABLE paired_devices ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{}';")
+                if "role" not in columns:
+                    logger.info("Migrating paired_devices table: adding role column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN role TEXT NOT NULL DEFAULT 'member';")
+                if "cert_fingerprint" not in columns:
+                    logger.info("Migrating paired_devices table: adding cert_fingerprint column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN cert_fingerprint TEXT;")
+                if "endpoints_json" not in columns:
+                    logger.info("Migrating paired_devices table: adding endpoints_json column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN endpoints_json TEXT NOT NULL DEFAULT '[]';")
+                if "connection_mode" not in columns:
+                    logger.info("Migrating paired_devices table: adding connection_mode column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN connection_mode TEXT NOT NULL DEFAULT 'auto';")
 
                 conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_paired_devices_trust_tier
                     ON paired_devices(trust_tier);
+                """)
+
+                # Phase 27: Network identity and persistent endpoints
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS network_identity (
+                        network_id TEXT PRIMARY KEY,
+                        network_name TEXT NOT NULL,
+                        owner_id TEXT NOT NULL,
+                        created_timestamp TEXT NOT NULL
+                    );
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS network_endpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        device_id TEXT NOT NULL,
+                        host TEXT NOT NULL,
+                        port INTEGER NOT NULL,
+                        success_count INTEGER DEFAULT 1,
+                        last_success_timestamp TEXT NOT NULL,
+                        UNIQUE(device_id, host, port)
+                    );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_network_endpoints_device
+                    ON network_endpoints(device_id);
                 """)
 
                 # Security audit log table (intentionally independent of paired_devices foreign key
@@ -226,6 +269,13 @@ class DatabaseManager:
 
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
+            # Guarantee connection_mode exists even on already-versioned Schema v5 databases
+            col_cursor = conn.execute("PRAGMA table_info(paired_devices);")
+            existing_cols = [row["name"] for row in col_cursor.fetchall()]
+            if existing_cols and "connection_mode" not in existing_cols:
+                logger.info("Ensuring connection_mode column in paired_devices")
+                conn.execute("ALTER TABLE paired_devices ADD COLUMN connection_mode TEXT NOT NULL DEFAULT 'auto';")
+
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> PairedDeviceRecord:
         """Convert a database row into an immutable PairedDeviceRecord."""
@@ -242,6 +292,10 @@ class DatabaseManager:
             last_known_host=row["last_known_host"] if "last_known_host" in keys else None,
             last_known_port=row["last_known_port"] if "last_known_port" in keys else 8765,
             capabilities_json=row["capabilities_json"] if "capabilities_json" in keys else "{}",
+            role=row["role"] if "role" in keys else "member",
+            cert_fingerprint=row["cert_fingerprint"] if "cert_fingerprint" in keys else None,
+            endpoints_json=row["endpoints_json"] if "endpoints_json" in keys else "[]",
+            connection_mode=row["connection_mode"] if "connection_mode" in keys else "auto",
         )
 
     def insert_paired_device(
@@ -257,6 +311,7 @@ class DatabaseManager:
         last_known_host: Optional[str] = None,
         last_known_port: Optional[int] = 8765,
         capabilities_json: str = "{}",
+        connection_mode: str = "auto",
     ) -> PairedDeviceRecord:
         """Insert a newly paired device record.
 
@@ -272,17 +327,22 @@ class DatabaseManager:
             last_known_host: Optional IP or host.
             last_known_port: Optional port number.
             capabilities_json: Serialized JSON capability manifest.
+            connection_mode: Connection mode ('auto', 'local_only', 'remote_only').
 
         Returns:
             The created PairedDeviceRecord.
 
         Raises:
-            ValueError: If trust_tier is not 'owner' or 'peer'.
+            ValueError: If trust_tier or connection_mode is invalid.
             sqlite3.IntegrityError: If device_id or auth_token_hash is not unique.
         """
         if trust_tier not in VALID_TRUST_TIERS:
             raise ValueError(
                 f"Invalid trust_tier '{trust_tier}'. Must be one of: {', '.join(VALID_TRUST_TIERS)}"
+            )
+        if connection_mode not in VALID_CONNECTION_MODES:
+            raise ValueError(
+                f"Invalid connection_mode '{connection_mode}'. Must be one of: {', '.join(VALID_CONNECTION_MODES)}"
             )
 
         now = current_utc_timestamp()
@@ -292,8 +352,9 @@ class DatabaseManager:
         query = """
             INSERT INTO paired_devices (
                 device_id, device_name, pairing_timestamp, last_seen_timestamp, auth_token_hash,
-                trust_tier, platform, reachability_profile, last_known_host, last_known_port, capabilities_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                trust_tier, platform, reachability_profile, last_known_host, last_known_port, capabilities_json,
+                connection_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         with self._get_connection() as conn:
             conn.execute(
@@ -310,6 +371,7 @@ class DatabaseManager:
                     last_known_host,
                     last_known_port,
                     capabilities_json,
+                    connection_mode,
                 ),
             )
 
@@ -325,7 +387,21 @@ class DatabaseManager:
             last_known_host=last_known_host,
             last_known_port=last_known_port,
             capabilities_json=capabilities_json,
+            connection_mode=connection_mode,
         )
+
+    def update_device_connection_mode(self, device_id: str, connection_mode: str) -> bool:
+        """Update connection mode ('auto', 'local_only', 'remote_only') for a paired device."""
+        if connection_mode not in VALID_CONNECTION_MODES:
+            raise ValueError(
+                f"Invalid connection_mode '{connection_mode}'. Must be one of: {', '.join(VALID_CONNECTION_MODES)}"
+            )
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE paired_devices SET connection_mode = ? WHERE device_id = ?;",
+                (connection_mode, device_id),
+            )
+            return cursor.rowcount > 0
 
     def get_paired_device(self, device_id: str) -> Optional[PairedDeviceRecord]:
         """Retrieve a paired device record by device_id."""
@@ -624,6 +700,66 @@ class DatabaseManager:
                     "details": det,
                 })
         return results
+
+    def get_network_identity(self) -> Optional[dict[str, Any]]:
+        """Retrieve the local SNOW Network identity record if present."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT network_id, network_name, owner_id, created_timestamp FROM network_identity LIMIT 1;"
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    def save_network_identity(
+        self, network_id: str, network_name: str, owner_id: str, created_timestamp: str
+    ) -> None:
+        """Persist or update the SNOW Network identity."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO network_identity (network_id, network_name, owner_id, created_timestamp)
+                VALUES (?, ?, ?, ?);
+                """,
+                (network_id, network_name, owner_id, created_timestamp),
+            )
+
+    def update_network_name(self, network_name: str) -> None:
+        """Update the user-facing network name."""
+        with self._get_connection() as conn:
+            conn.execute("UPDATE network_identity SET network_name = ?;", (network_name,))
+
+    def record_endpoint(
+        self, device_id: str, host: str, port: int, last_success_timestamp: str
+    ) -> None:
+        """Record or refresh a successfully reached endpoint for a device."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO network_endpoints (device_id, host, port, success_count, last_success_timestamp)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(device_id, host, port) DO UPDATE SET
+                    success_count = success_count + 1,
+                    last_success_timestamp = excluded.last_success_timestamp;
+                """,
+                (device_id, host, port, last_success_timestamp),
+            )
+
+    def get_endpoints(self, device_id: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Retrieve bounded endpoint history for a device, newest first."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT host, port, success_count, last_success_timestamp
+                FROM network_endpoints
+                WHERE device_id = ?
+                ORDER BY last_success_timestamp DESC
+                LIMIT ?;
+                """,
+                (device_id, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
 
 
 SENSITIVE_KEY_PATTERNS = {

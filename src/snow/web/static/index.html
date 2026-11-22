@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SNOW — Multi-Device AI Platform</title>
     <link rel="stylesheet" href="/static/app.css">
 </head>
+
 <body class="theme-light">
     <div id="auth-overlay" class="overlay">
         <div class="overlay-card">
@@ -53,7 +55,8 @@
                     <span class="nav-icon">🚀</span> Remote Apps
                 </button>
                 <button class="nav-item" data-tab="approvals">
-                    <span class="nav-icon">🛡️</span> Approvals <span id="badge-approvals" class="badge" style="display: none;">0</span>
+                    <span class="nav-icon">🛡️</span> Approvals <span id="badge-approvals" class="badge"
+                        style="display: none;">0</span>
                 </button>
                 <button class="nav-item" data-tab="activity">
                     <span class="nav-icon">📜</span> Activity Audit
@@ -79,10 +82,17 @@
                 </div>
                 <div id="pending-approval-banner" class="topbar-approval-banner d-none">
                     <span class="banner-badge">SECURITY</span>
-                    <span id="pending-approval-banner-text" class="banner-text">1 pending AI request requires your approval</span>
+                    <span id="pending-approval-banner-text" class="banner-text">1 pending AI request requires your
+                        approval</span>
                     <button id="btn-jump-approvals" class="btn-xs btn-primary">Review & Resolve →</button>
                 </div>
                 <div class="topbar-actions">
+                    <div class="topbar-target-selector" id="topbar-target-selector-container">
+                        <select id="global-target-select" class="form-select form-select-sm" title="Active Target Peer Device">
+                            <option value="">No Active Peer</option>
+                        </select>
+                        <span id="global-target-transport-chip" class="chip chip-neutral" style="margin-left: 0.5rem; font-size: 0.75rem;">Offline</span>
+                    </div>
                     <button id="btn-theme-toggle" class="btn-secondary" title="Toggle Theme">🌓 Theme</button>
                     <button id="btn-global-refresh" class="btn-primary" title="Refresh Live State">🔄 Refresh</button>
                 </div>
@@ -120,7 +130,8 @@
                             <div class="conn-item">
                                 <span class="conn-label">💻 Desktop Host LAN IP:</span>
                                 <code id="overview-lan-ip" class="conn-ip">Checking LAN...</code>
-                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋 Copy</button>
+                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋
+                                    Copy</button>
                             </div>
                             <div class="conn-item">
                                 <span class="conn-label">🔌 USB ADB Reverse:</span>
@@ -147,7 +158,8 @@
                             <h2>📸 Capture & Workflows</h2>
                         </div>
                         <div class="card-body">
-                            <p class="text-sm text-muted">Execute bounded multi-step operations and consent-gated visual captures.</p>
+                            <p class="text-sm text-muted">Execute bounded multi-step operations and consent-gated visual
+                                captures.</p>
                             <div class="action-bar mt-3">
                                 <button id="btn-wf-capture-pc" class="btn-secondary">🖥️ Capture PC Screen</button>
                                 <button id="btn-wf-health" class="btn-secondary">🩺 Device Health Snapshot</button>
@@ -169,9 +181,11 @@
                                     <div id="capture-summary-banner" class="capture-summary-banner mb-2"></div>
                                     <h4>Screenshot Preview</h4>
                                     <div class="preview-img-wrapper mt-2">
-                                        <img id="capture-preview-img" src="" alt="Capture Preview" style="max-width: 100%; border-radius: 6px; border: 1px solid var(--border-color);" />
+                                        <img id="capture-preview-img" src="" alt="Capture Preview"
+                                            style="max-width: 100%; border-radius: 6px; border: 1px solid var(--border-color);" />
                                     </div>
-                                    <div id="capture-error-box" class="empty-state text-danger mt-2 d-none">Failed loading preview image.</div>
+                                    <div id="capture-error-box" class="empty-state text-danger mt-2 d-none">Failed
+                                        loading preview image.</div>
                                 </div>
                                 <div id="workflow-output-box" class="mt-3 d-none">
                                     <details class="workflow-technical-details">
@@ -191,7 +205,8 @@
                             <h2>📱 Live Phone Screen</h2>
                             <div class="screen-controls">
                                 <span id="screen-status-badge" class="badge badge-muted">IDLE</span>
-                                <button id="btn-stop-screen-share" class="btn-danger btn-sm d-none">Stop Sharing</button>
+                                <button id="btn-stop-screen-share" class="btn-danger btn-sm d-none">Stop
+                                    Sharing</button>
                             </div>
                         </div>
                         <div class="card-body">
@@ -199,7 +214,8 @@
                                 <div id="screen-idle-message" class="empty-state">
                                     No active screen sharing session. Tap "Share Screen" on your Android phone.
                                 </div>
-                                <img id="screen-frame-img" src="" alt="Live Phone Screen" class="screen-frame-img d-none" />
+                                <img id="screen-frame-img" src="" alt="Live Phone Screen"
+                                    class="screen-frame-img d-none" />
                             </div>
                             <div id="screen-stats-bar" class="screen-stats-bar d-none">
                                 <span id="screen-stat-fps">FPS: --</span>
@@ -220,7 +236,8 @@
                                 No camera photos delivered yet. Tap "Camera Photo" on your Android phone.
                             </div>
                             <div id="camera-preview-container" class="camera-preview-container d-none">
-                                <img id="camera-latest-img" src="" alt="Latest Camera Photo" class="camera-latest-img" />
+                                <img id="camera-latest-img" src="" alt="Latest Camera Photo"
+                                    class="camera-latest-img" />
                                 <div id="camera-delivery-info" class="text-sm text-muted mt-2"></div>
                             </div>
                         </div>
@@ -236,11 +253,16 @@
                         </div>
                         <div class="card-body">
                             <div class="action-bar hub-quick-actions">
-                                <button id="btn-hub-cap-pc-clip" class="btn-secondary" title="Capture text or image from Windows clipboard">📋 Capture PC Clip</button>
-                                <button id="btn-hub-pull-phone" class="btn-secondary" title="Pull clipboard from connected phone">📲 Pull from Phone</button>
-                                <button id="btn-hub-apply-pc" class="btn-primary" title="Apply newest item to PC clipboard">⚡ Apply Latest to PC</button>
-                                <button id="btn-hub-cap-screen" class="btn-secondary" title="Take a PC screenshot and add to buffer">🖥️ Capture PC Screen</button>
-                                <button id="btn-hub-clear-unpinned" class="btn-danger" title="Clear all unpinned buffer items">🗑️ Clear Unpinned</button>
+                                <button id="btn-hub-cap-pc-clip" class="btn-secondary"
+                                    title="Capture text or image from Windows clipboard">📋 Capture PC Clip</button>
+                                <button id="btn-hub-pull-phone" class="btn-secondary"
+                                    title="Pull clipboard from connected phone">📲 Pull from Phone</button>
+                                <button id="btn-hub-apply-pc" class="btn-primary"
+                                    title="Apply newest item to PC clipboard">⚡ Apply Latest to PC</button>
+                                <button id="btn-hub-cap-screen" class="btn-secondary"
+                                    title="Take a PC screenshot and add to buffer">🖥️ Capture PC Screen</button>
+                                <button id="btn-hub-clear-unpinned" class="btn-danger"
+                                    title="Clear all unpinned buffer items">🗑️ Clear Unpinned</button>
                             </div>
                             <div id="hub-overview-status" class="hub-status-text text-sm text-muted mt-2"></div>
                             <div id="hub-overview-timeline" class="clipboard-timeline mt-3">
@@ -266,7 +288,8 @@
                     <div class="section-toolbar">
                         <h2>Connected & Paired Devices</h2>
                         <div class="toolbar-actions">
-                            <button id="btn-clean-ghosts" class="btn-secondary" title="Remove all disconnected ghost devices">Clean Offline Ghosts</button>
+                            <button id="btn-clean-ghosts" class="btn-secondary"
+                                title="Remove all disconnected ghost devices">Clean Offline Ghosts</button>
                             <button id="btn-device-pair-qr" class="btn-primary">Generate Pairing QR</button>
                         </div>
                     </div>
@@ -277,7 +300,8 @@
                             <div class="conn-item">
                                 <span class="conn-label">💻 Desktop Host LAN IP:</span>
                                 <code id="devices-lan-ip" class="conn-ip">Checking LAN...</code>
-                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋 Copy</button>
+                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋
+                                    Copy</button>
                             </div>
                             <div class="conn-item">
                                 <span class="conn-label">🔌 USB ADB Reverse:</span>
@@ -320,10 +344,12 @@
                                     <div id="pending-device-alert" class="pending-device-badge hidden">
                                         📲 <span id="pending-device-name">Phone</span> connected, awaiting PIN entry...
                                     </div>
-                                    <p class="text-sm mt-2">Scan with SNOW on Android (Devices &gt; Scan QR) or enter the 6-digit PIN manually into the pairing card on your phone.</p>
+                                    <p class="text-sm mt-2">Scan with SNOW on Android (Devices &gt; Scan QR) or enter
+                                        the 6-digit PIN manually into the pairing card on your phone.</p>
                                     <p class="text-xs text-muted mt-1" id="qr-meta-text"></p>
                                     <div class="qr-actions mt-3">
-                                        <button id="btn-regenerate-pin" class="btn-secondary btn-sm" type="button">🔄 Generate Fresh PIN</button>
+                                        <button id="btn-regenerate-pin" class="btn-secondary btn-sm" type="button">🔄
+                                            Generate Fresh PIN</button>
                                     </div>
                                 </div>
                             </div>
@@ -343,7 +369,8 @@
                                 <h2>Phone Storage Explorer</h2>
                                 <span id="files-storage-badge" class="badge badge-muted">Checking Storage...</span>
                             </div>
-                            <p class="text-sm text-muted">Browse and download files from your phone's accessible storage (Full Shared Storage or SAF folder).</p>
+                            <p class="text-sm text-muted">Browse and download files from your phone's accessible storage
+                                (Full Shared Storage or SAF folder).</p>
                         </div>
                         <div class="toolbar-actions">
                             <select id="files-device-select" class="form-select">
@@ -398,7 +425,8 @@
                     <div class="section-toolbar">
                         <div>
                             <h2>Android Notification Mirror</h2>
-                            <p class="text-sm text-muted">Real-time non-sensitive notifications mirrored from your connected Android phone.</p>
+                            <p class="text-sm text-muted">Real-time non-sensitive notifications mirrored from your
+                                connected Android phone.</p>
                         </div>
                         <div class="toolbar-actions">
                             <button id="btn-refresh-notifs" class="btn-secondary">Refresh</button>
@@ -427,13 +455,16 @@
 
                         <div class="media-card mt-4">
                             <div class="media-controls-row">
-                                <button class="btn-media" data-action="prev_track" title="Previous Track">⏮ Previous</button>
-                                <button class="btn-media btn-primary" data-action="play_pause" title="Play / Pause">⏯ Play / Pause</button>
+                                <button class="btn-media" data-action="prev_track" title="Previous Track">⏮
+                                    Previous</button>
+                                <button class="btn-media btn-primary" data-action="play_pause" title="Play / Pause">⏯
+                                    Play / Pause</button>
                                 <button class="btn-media" data-action="next_track" title="Next Track">⏭ Next</button>
                             </div>
 
                             <div class="volume-controls-row mt-4">
-                                <button class="btn-media" data-action="volume_down" title="Volume Down">🔉 Vol -</button>
+                                <button class="btn-media" data-action="volume_down" title="Volume Down">🔉 Vol
+                                    -</button>
                                 <button class="btn-media" data-action="mute" title="Toggle Mute">🔇 Mute</button>
                                 <button class="btn-media" data-action="volume_up" title="Volume Up">🔊 Vol +</button>
                             </div>
@@ -465,7 +496,8 @@
 
                         <div class="form-group mt-3">
                             <label for="share-text-input">Text Note / Snippet:</label>
-                            <textarea id="share-text-input" class="form-textarea" rows="3" placeholder="Enter text or note to share..."></textarea>
+                            <textarea id="share-text-input" class="form-textarea" rows="3"
+                                placeholder="Enter text or note to share..."></textarea>
                         </div>
 
                         <div class="mt-4">
@@ -480,7 +512,8 @@
                     <div class="section-toolbar">
                         <div>
                             <h2>Security Approval Queue</h2>
-                            <p class="text-sm text-muted">Human-in-the-loop authorization for sensitive AI or remote operations.</p>
+                            <p class="text-sm text-muted">Human-in-the-loop authorization for sensitive AI or remote
+                                operations.</p>
                         </div>
                         <button id="btn-refresh-approvals" class="btn-secondary">Refresh</button>
                     </div>
@@ -495,7 +528,8 @@
                     <div class="section-toolbar">
                         <div>
                             <h2>Activity Audit Log</h2>
-                            <p class="text-sm text-muted">Cryptographic, secret-redacted audit history from Core SQLite storage.</p>
+                            <p class="text-sm text-muted">Cryptographic, secret-redacted audit history from Core SQLite
+                                storage.</p>
                         </div>
                         <button id="btn-refresh-activity" class="btn-secondary">Refresh</button>
                     </div>
@@ -550,9 +584,11 @@
                         </div>
                         <div class="card-body">
                             <div class="form-group">
-                                <textarea id="input-clipboard-text" class="form-control" rows="3" placeholder="Enter text to push to shared buffer (max 64 KiB)..."></textarea>
+                                <textarea id="input-clipboard-text" class="form-control" rows="3"
+                                    placeholder="Enter text to push to shared buffer (max 64 KiB)..."></textarea>
                             </div>
-                            <div class="form-actions mt-2" style="display: flex; align-items: center; justify-content: space-between;">
+                            <div class="form-actions mt-2"
+                                style="display: flex; align-items: center; justify-content: space-between;">
                                 <label class="checkbox-label">
                                     <input type="checkbox" id="check-clipboard-pin"> Pin this item
                                 </label>
@@ -563,7 +599,8 @@
                     </div>
 
                     <div class="card mt-4">
-                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                        <div class="card-header"
+                            style="display: flex; justify-content: space-between; align-items: center;">
                             <h3>Shared Timeline (Latest 10 Items)</h3>
                             <span id="clipboard-detail-count" class="badge badge-info">0 / 10 items (0 pinned)</span>
                         </div>
@@ -589,7 +626,8 @@
                             <h3>💻 Authorized Windows Applications</h3>
                         </div>
                         <div class="card-body">
-                            <p class="text-sm text-muted">Allowlisted Windows utilities executed securely with strict parameter validation.</p>
+                            <p class="text-sm text-muted">Allowlisted Windows utilities executed securely with strict
+                                parameter validation.</p>
                             <div id="windows-apps-grid" class="apps-grid mt-3">
                                 <button class="btn-app" data-win-app="notepad">📝 Notepad</button>
                                 <button class="btn-app" data-win-app="calc">🧮 Calculator</button>
@@ -605,14 +643,18 @@
                     </div>
 
                     <div class="card mt-4">
-                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                        <div class="card-header"
+                            style="display: flex; justify-content: space-between; align-items: center;">
                             <h3>📱 Android Applications</h3>
-                            <input type="text" id="android-app-filter" class="form-control-sm" placeholder="Filter apps..." style="max-width: 200px;" />
+                            <input type="text" id="android-app-filter" class="form-control-sm"
+                                placeholder="Filter apps..." style="max-width: 200px;" />
                         </div>
                         <div class="card-body">
-                            <p class="text-sm text-muted">User-launchable applications discovered on the connected Android phone.</p>
+                            <p class="text-sm text-muted">User-launchable applications discovered on the connected
+                                Android phone.</p>
                             <div id="android-apps-container" class="apps-list mt-3">
-                                <div class="empty-state">Connect an Android device and tap "Refresh Android Apps" to load applications.</div>
+                                <div class="empty-state">Connect an Android device and tap "Refresh Android Apps" to
+                                    load applications.</div>
                             </div>
                             <div id="android-app-status" class="text-sm mt-2"></div>
                         </div>
@@ -682,10 +724,12 @@
                             <h3>Remote Relay (Zero-Trust Tunnel)</h3>
                         </div>
                         <div class="card-body">
-                            <p class="text-muted">Direct TLS 1.3 MemoryBIO fallback tunnel for mobile reachability when off local Wi-Fi.</p>
+                            <p class="text-muted">Direct TLS 1.3 MemoryBIO fallback tunnel for mobile reachability when
+                                off local Wi-Fi.</p>
                             <div class="diag-row mt-2">
                                 <span class="diag-label">Relay Mode:</span>
-                                <span class="diag-val" id="relay-status-val"><span class="badge badge-muted">Checking...</span></span>
+                                <span class="diag-val" id="relay-status-val"><span
+                                        class="badge badge-muted">Checking...</span></span>
                             </div>
                             <div class="diag-row">
                                 <span class="diag-label">Relay Endpoint:</span>
@@ -700,7 +744,8 @@
                                 <span class="diag-val">Local Wi-Fi → USB ADB → Remote Relay</span>
                             </div>
                             <div class="mt-3">
-                                <button class="btn btn-secondary btn-sm" id="btn-refresh-relay-status">Refresh Relay Status</button>
+                                <button class="btn btn-secondary btn-sm" id="btn-refresh-relay-status">Refresh Relay
+                                    Status</button>
                             </div>
                             <div id="relay-test-result" class="mt-2 text-muted" style="font-size: 0.85rem;"></div>
                         </div>
@@ -712,18 +757,22 @@
                             <h3>AI Connectors & Remote MCP Gateway</h3>
                         </div>
                         <div class="card-body">
-                            <p class="text-muted">Connect external AI assistants and IDEs to SNOW via standardized Streamable HTTP & OAuth 2.1.</p>
+                            <p class="text-muted">Connect external AI assistants and IDEs to SNOW via standardized
+                                Streamable HTTP & OAuth 2.1.</p>
                             <div class="diag-row mt-2">
                                 <span class="diag-label">MCP Gateway Status:</span>
-                                <span class="diag-val" id="mcp-gateway-status"><span class="badge badge-muted">Checking...</span></span>
+                                <span class="diag-val" id="mcp-gateway-status"><span
+                                        class="badge badge-muted">Checking...</span></span>
                             </div>
                             <div class="diag-row">
                                 <span class="diag-label">MCP Endpoint:</span>
-                                <span class="diag-val"><code id="mcp-endpoint-val">http://127.0.0.1:8771/mcp</code></span>
+                                <span class="diag-val"><code
+                                        id="mcp-endpoint-val">http://127.0.0.1:8771/mcp</code></span>
                             </div>
                             <div class="diag-row">
                                 <span class="diag-label">OAuth 2.1 Discovery:</span>
-                                <span class="diag-val"><code>http://127.0.0.1:8771/.well-known/oauth-authorization-server</code></span>
+                                <span
+                                    class="diag-val"><code>http://127.0.0.1:8771/.well-known/oauth-authorization-server</code></span>
                             </div>
                             <div class="diag-row">
                                 <span class="diag-label">Protocol Version:</span>
@@ -731,17 +780,39 @@
                             </div>
                             <div class="diag-row">
                                 <span class="diag-label">Available Tools:</span>
-                                <span class="diag-val">30 capabilities (Security: <code>AI_MCP</code> least privilege)</span>
+                                <span class="diag-val">30 capabilities (Security: <code>AI_MCP</code> least
+                                    privilege)</span>
                             </div>
                             <div class="diag-row">
                                 <span class="diag-label">Configured AI Hosts:</span>
-                                <span class="diag-val" id="mcp-hosts-val"><span class="badge badge-muted">Checking...</span></span>
+                                <span class="diag-val" id="mcp-hosts-val"><span
+                                        class="badge badge-muted">Checking...</span></span>
                             </div>
                             <div class="mt-3">
-                                <button class="btn btn-secondary btn-sm" id="btn-copy-mcp-url">Copy Endpoint URL</button>
-                                <button class="btn btn-secondary btn-sm" id="btn-test-mcp-health">Verify Gateway</button>
+                                <button class="btn btn-secondary btn-sm" id="btn-copy-mcp-url">Copy Endpoint
+                                    URL</button>
+                                <button class="btn btn-secondary btn-sm" id="btn-test-mcp-health">Verify
+                                    Gateway</button>
                             </div>
                             <div id="mcp-test-result" class="mt-2 text-muted" style="font-size: 0.85rem;"></div>
+                        </div>
+                    </div>
+
+                    <!-- SNOW Network Identity Card (Phase 27) -->
+                    <div class="card mt-4" id="card-network-identity">
+                        <div class="card-header">
+                            <h3>🌐 SNOW Network Identity</h3>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-muted">Configure the human-readable display name for this local mesh network.</p>
+                            <div class="form-group mt-3" style="max-width: 450px;">
+                                <label for="input-network-name">Network Name:</label>
+                                <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.25rem;">
+                                    <input type="text" id="input-network-name" class="form-control" placeholder="My SNOW Network" maxlength="64" />
+                                    <button id="btn-save-network-name" class="btn btn-secondary btn-sm">Save</button>
+                                </div>
+                                <span id="network-name-status" class="text-xs text-muted mt-1 d-block"></span>
+                            </div>
                         </div>
                     </div>
                 </section>
@@ -751,4 +822,5 @@
 
     <script src="/static/app.js"></script>
 </body>
+
 </html>

@@ -1,10 +1,12 @@
 """Asynchronous core server lifecycle for SNOW."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from snow.capabilities.engine import CapabilityEngine
 from snow.capabilities.windows import (
@@ -23,6 +25,7 @@ from snow.network.discovery import SnowDiscoveryService
 from snow.network.registry import NodeRegistry
 from snow.network.ws_server import SnowWebSocketServer
 from snow.security.db import DatabaseManager
+from snow.security.identity import DeviceIdentity
 from snow.security.policy import PeerCapabilityPolicy
 from snow.transfer.http_server import SnowHttpTransferServer
 from snow.transfer.manager import TransferManager
@@ -42,6 +45,7 @@ class SnowCoreServer:
         self,
         config: Optional[CoreConfig] = None,
         db_manager: Optional[DatabaseManager] = None,
+        device_identity: Optional[DeviceIdentity] = None,
     ) -> None:
         self.config = config or CoreConfig.from_env()
         self._is_running = False
@@ -56,6 +60,7 @@ class SnowCoreServer:
             transfer_manager=self.transfer_manager,
             storage_manager=self.storage_manager,
             db_manager=db_manager,
+            device_identity=device_identity,
         )
         self.http_transfer_server: Optional[SnowHttpTransferServer] = None
         self.windows_telemetry = WindowsTelemetry()
@@ -132,6 +137,111 @@ class SnowCoreServer:
         self.ipc_server.node_registry = self.node_registry
         self.ipc_server.session_router = self.session_router
         self.discovery_service: Optional[SnowDiscoveryService] = None
+
+        from snow.network.network_model import SnowNetworkManager
+        self.network_manager = SnowNetworkManager(
+            db_manager=self.db_manager,
+            local_identity=self.device_identity,
+            node_registry=self.node_registry,
+        )
+        self.peer_clients: dict[str, Any] = {}
+
+    async def connect_peer(
+        self,
+        host: str,
+        port: int = 8765,
+        pin: str = "",
+        expected_fingerprint: str = "",
+    ) -> dict[str, Any]:
+        """Establish outbound TLS/WSS peer connection, register in NodeRegistry and DB, and retain session."""
+        from snow.network.peer_client import SnowPeerClient
+
+        client = SnowPeerClient(
+            host=host,
+            port=port,
+            identity=self.device_identity,
+            expected_fingerprint=expected_fingerprint or None,
+            use_tls=True,
+        )
+        res = await client.connect(pin=pin, timeout=10.0)
+        if not res.success or not res.remote_device_id:
+            await client.close()
+            return {
+                "success": False,
+                "status": res.status,
+                "error": res.error or "Failed connecting to peer.",
+            }
+
+        remote_id = res.remote_device_id
+        remote_name = res.remote_device_name or "Connected Peer"
+        session_id = res.session_id or f"peer_{remote_id}"
+        auth_token = res.auth_token or ""
+        cert_fp = res.cert_fingerprint or ""
+
+        # Close existing client for this device if any
+        old_client = self.peer_clients.get(remote_id)
+        if old_client:
+            try:
+                await old_client.close()
+            except Exception:
+                pass
+
+        self.peer_clients[remote_id] = client
+
+        # 1. Register in NodeRegistry
+        self.node_registry.on_session_authenticated(
+            device_id=remote_id,
+            connection_id=session_id,
+            host=host,
+            port=port,
+            manifest_data=res.manifest,
+            transport="peer_link",
+        )
+
+        # 2. Persist in paired_devices
+        token_hash = hashlib.sha256(auth_token.encode("utf-8")).hexdigest() if auth_token else hashlib.sha256(remote_id.encode("utf-8")).hexdigest()
+        existing = self.db_manager.get_paired_device(remote_id)
+        if not existing:
+            self.db_manager.insert_paired_device(
+                device_id=remote_id,
+                device_name=remote_name,
+                auth_token_hash=token_hash,
+                trust_tier="peer",
+                platform="windows",
+                reachability_profile="ACTIVE_SESSION_PEER",
+                last_known_host=host,
+                last_known_port=port,
+                capabilities_json=json.dumps(res.manifest or {}),
+            )
+        else:
+            self.db_manager.update_device_endpoint(remote_id, host, port)
+            self.db_manager.update_last_seen(remote_id)
+
+        # 3. Record in network_endpoints ring buffer
+        self.network_manager.record_endpoint(device_id=remote_id, host=host, port=port)
+
+        return {
+            "success": True,
+            "status": res.status,
+            "data": {
+                "remote_device_id": remote_id,
+                "remote_device_name": remote_name,
+                "session_id": session_id,
+                "cert_fingerprint": cert_fp,
+            },
+        }
+
+    async def disconnect_peer(self, device_id: str) -> dict[str, Any]:
+        """Disconnect an active peer session, updating registry without forgetting pairing."""
+        client = self.peer_clients.pop(device_id, None)
+        if client:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            self.node_registry.on_session_disconnected(device_id)
+            return {"success": True, "status": "DISCONNECTED", "device_id": device_id}
+        return {"success": False, "status": "NOT_CONNECTED", "error": f"Peer '{device_id}' is not connected."}
 
     @property
     def is_running(self) -> bool:
@@ -302,6 +412,15 @@ class SnowCoreServer:
         if self.http_transfer_server:
             await self.http_transfer_server.stop()
             self.http_transfer_server = None
+
+        # Close all active peer clients
+        if hasattr(self, "peer_clients"):
+            for p_id, p_client in list(self.peer_clients.items()):
+                try:
+                    await p_client.close()
+                except Exception:
+                    pass
+            self.peer_clients.clear()
 
         # Stop WebSocket server and close client connections
         await self.ws_server.stop()

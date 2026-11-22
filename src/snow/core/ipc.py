@@ -475,6 +475,93 @@ class SnowIpcServer:
                 "data": {"devices": devices_data},
             }, now_authed
 
+        if op == "mesh_topology":
+            principal = ctx.principal
+            network_mgr = getattr(self.core_server, "network_manager", None)
+            if not network_mgr:
+                from snow.network.network_model import SnowNetworkManager
+                db_mgr = getattr(self.core_server, "db_manager", None) or getattr(self, "db_manager", None)
+                if not db_mgr and self.capability_engine:
+                    db_mgr = self.capability_engine.db_manager
+                node_reg = getattr(self.core_server, "node_registry", None) or getattr(self, "node_registry", None)
+                network_mgr = SnowNetworkManager(db_manager=db_mgr, node_registry=node_reg)
+            topo = network_mgr.build_topology(principal=principal)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SUCCESS",
+                "data": topo,
+            }, now_authed
+
+        if op == "mesh_connect_peer":
+            host = payload.get("host")
+            port = payload.get("port", 8765)
+            pin = payload.get("pin", "")
+            expected_fingerprint = payload.get("expected_fingerprint", "")
+            if not host:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing 'host' field in mesh_connect_peer payload.",
+                }, now_authed
+
+            if hasattr(self.core_server, "connect_peer"):
+                res = await self.core_server.connect_peer(
+                    host=host,
+                    port=port,
+                    pin=pin,
+                    expected_fingerprint=expected_fingerprint,
+                )
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": res.get("success", False),
+                    "status": res.get("status", "ERROR"),
+                    "data": res.get("data"),
+                    "error": res.get("error"),
+                }, now_authed
+            else:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "UNSUPPORTED_OPERATION",
+                    "error": "Peer client manager unavailable on this Core instance.",
+                }, now_authed
+
+        if op == "mesh_disconnect_peer":
+            device_id = payload.get("device_id")
+            if not device_id:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing 'device_id' field in mesh_disconnect_peer payload.",
+                }, now_authed
+
+            if hasattr(self.core_server, "disconnect_peer"):
+                res = await self.core_server.disconnect_peer(device_id)
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": res.get("success", False),
+                    "status": res.get("status", "ERROR"),
+                    "data": res if res.get("success") else None,
+                    "error": res.get("error"),
+                }, now_authed
+            else:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "UNSUPPORTED_OPERATION",
+                    "error": "Peer client manager unavailable on this Core instance.",
+                }, now_authed
+
         if op == "device_request":
             dev_resp = await self._handle_device_request(payload, ctx=ctx)
             return {

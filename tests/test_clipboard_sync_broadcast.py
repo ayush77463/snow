@@ -125,6 +125,9 @@ class TestWindowsClipboardManager(unittest.TestCase):
         if sys.platform != "win32":
             self.skipTest("WindowsClipboardManager requires Windows")
         self.clipboard = WindowsClipboardManager()
+        if not self.clipboard._is_windows or not self.clipboard._user32 or not self.clipboard._open_clipboard_with_retry():
+            self.skipTest("Interactive desktop window station clipboard unavailable in current session")
+        self.clipboard._user32.CloseClipboard()
 
     def test_text_roundtrip(self) -> None:
         """Test reading and writing text to Windows clipboard."""
