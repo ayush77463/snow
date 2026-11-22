@@ -122,6 +122,27 @@ class AndroidPeerHostManager {
         return pinVal
     }
 
+    /**
+     * Generate standard SNOW Device Protocol v1 QR pairing payload for peer devices.
+     */
+    @Synchronized
+    fun generatePairingQrJson(localDeviceId: String): String? {
+        val state = _hostState.value
+        val hostIp = if (state.ipAddress != "--" && state.ipAddress.isNotBlank()) state.ipAddress else getLocalIpv4Address()
+        if (hostIp.isNullOrBlank()) return null
+
+        val pin = state.pairingPin ?: generatePairingPin()
+        val json = org.json.JSONObject().apply {
+            put("v", 1)
+            put("id", localDeviceId)
+            put("ips", org.json.JSONArray().put(hostIp))
+            put("port", activePort)
+            put("fp", state.certFingerprint.replace(":", "").replace(" ", "").trim())
+            put("pin", pin)
+        }
+        return json.toString()
+    }
+
     @Synchronized
     fun getCurrentEphemeralPinInfo(): Pair<String, Long>? {
         val p = currentEphemeralPin ?: return null

@@ -1092,6 +1092,35 @@
             modeRow.appendChild(modeSelect);
             body.appendChild(modeRow);
 
+            // Permission Profile Selector (Stage 2B)
+            const permRow = document.createElement("div");
+            permRow.className = "device-detail-row mt-2";
+            const permLabel = document.createElement("span");
+            permLabel.className = "label";
+            permLabel.textContent = "Profile:";
+            const permSelect = document.createElement("select");
+            permSelect.className = "device-permission-profile-select";
+            permSelect.innerHTML = `
+                <option value="full_control">🛡️ Full Control</option>
+                <option value="files_and_clipboard">📁 Files & Clipboard</option>
+                <option value="clipboard_only">📋 Clipboard Only</option>
+            `;
+            permSelect.value = dev.permission_profile || "full_control";
+            permSelect.addEventListener("change", async () => {
+                const newProfile = permSelect.value;
+                const res = await apiRequest("/api/devices/permission-profile", "POST", {
+                    device_id: dev.device_id,
+                    profile: newProfile,
+                });
+                if (!res || !res.success) {
+                    alert("Failed to update permission profile: " + (res?.error || "Unknown error"));
+                    permSelect.value = dev.permission_profile || "full_control";
+                }
+            });
+            permRow.appendChild(permLabel);
+            permRow.appendChild(permSelect);
+            body.appendChild(permRow);
+
             // Actions row
             const actionsRow = document.createElement("div");
             actionsRow.className = "device-card-actions mt-3";

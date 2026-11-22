@@ -160,6 +160,9 @@ class MainActivity : AppCompatActivity() {
         super.onStart()
         val intent = Intent(this, SnowForegroundService::class.java)
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        if (!SnowForegroundService.isDisconnectedByUser(this)) {
+            SnowForegroundService.startAutoConnect(this)
+        }
     }
 
     override fun onStop() {

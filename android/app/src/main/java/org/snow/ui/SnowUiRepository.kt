@@ -390,7 +390,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Saved Devices (Phase 20 Identity-First Mesh & Endpoint History) ---
 
-    private fun loadSavedDevices() {
+    fun loadSavedDevices() {
         val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
         val rawJson = prefsV2.getString("devices_json", null)
         if (!rawJson.isNullOrBlank()) {

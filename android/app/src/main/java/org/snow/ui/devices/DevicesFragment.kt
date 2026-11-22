@@ -71,11 +71,17 @@ class DevicesFragment : Fragment() {
     }
 
     private fun setupListeners() {
+        binding.swipeRefresh.setOnRefreshListener {
+            viewModel.refreshDevices()
+            binding.swipeRefresh.isRefreshing = false
+        }
+
         binding.btnScanQr.setOnClickListener {
             val options = com.journeyapps.barcodescanner.ScanOptions().apply {
-                setPrompt("Scan SNOW Desktop QR Code")
+                setPrompt("Scan SNOW Pairing QR Code")
                 setBeepEnabled(false)
-                setOrientationLocked(false)
+                setOrientationLocked(true)
+                setCaptureActivity(org.snow.ui.PortraitCaptureActivity::class.java)
                 setBarcodeImageEnabled(false)
                 setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
             }

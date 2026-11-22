@@ -262,6 +262,7 @@ class DeviceNode:
     transport: str = "unknown"
     connection_mode: str = "auto"
     telemetry: Optional[dict[str, Any]] = None
+    permission_profile: str = "full_control"
 
     def __post_init__(self) -> None:
         if self.capabilities and not self.supported_capabilities:
@@ -299,6 +300,10 @@ class DeviceNode:
             "transport": self.transport,
             "connection_mode": self.connection_mode,
             "telemetry": self.telemetry,
+            "permission_profile": self.permission_profile,
+            "display_name": self.device_name,
+            "online_state": str(self.reachability_state),
+            "active_transport": self.transport,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,
@@ -327,6 +332,10 @@ class DeviceNode:
             "transport": self.transport,
             "connection_mode": self.connection_mode,
             "telemetry": self.telemetry,
+            "permission_profile": self.permission_profile,
+            "display_name": self.device_name,
+            "online_state": str(self.reachability_state),
+            "active_transport": self.transport,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,
@@ -381,4 +390,5 @@ class DeviceNode:
             transport=str(data.get("transport", "unknown")),
             connection_mode=str(data.get("connection_mode", "auto")),
             telemetry=data.get("telemetry"),
+            permission_profile=str(data.get("permission_profile", "full_control")),
         )

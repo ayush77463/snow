@@ -51,6 +51,7 @@ class SettingsFragment : Fragment() {
         setupPeerHostControls()
         setupTrustControls()
         setupDiagnostics()
+        setupQuickSettingsTileControl()
         observeLogs()
     }
 
@@ -58,6 +59,7 @@ class SettingsFragment : Fragment() {
         super.onResume()
         refreshNotificationAccessStatus()
         refreshStorageAccessStatus()
+        refreshPermissionsChecklist()
         updatePeerHostUi()
     }
 
@@ -153,6 +155,64 @@ class SettingsFragment : Fragment() {
 
     private fun setupNotificationSyncAccess() {
         refreshNotificationAccessStatus()
+    }
+
+    fun refreshPermissionsChecklist() {
+        if (_binding == null) return
+        val ctx = context ?: return
+
+        val notifGranted = isNotificationServiceEnabled()
+        val storageGranted = isAllFilesAccessGranted()
+        val cameraGranted = ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val powerMgr = ctx.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+        val batteryIgnored = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            powerMgr?.isIgnoringBatteryOptimizations(ctx.packageName) == true
+        } else true
+
+        val sb = StringBuilder()
+        sb.append("• Background Connectivity: Active (Foreground Service)\n")
+        sb.append("• Notification Sync: ").append(if (notifGranted) "✓ Active (Granted)" else "○ Optional (Disabled)").append("\n")
+        sb.append("• All Files Access: ").append(if (storageGranted) "✓ Granted (Shared Storage)" else "○ SAF Fallback Mode").append("\n")
+        sb.append("• Camera Capability: ").append(if (cameraGranted) "✓ Granted" else "○ Optional (Tap Camera in Dashboard)").append("\n")
+        sb.append("• Battery Optimization: ").append(if (batteryIgnored) "✓ Unrestricted" else "○ Standard (Optimized)")
+
+        binding.tvPermissionsChecklist.text = sb.toString()
+    }
+
+    private fun setupQuickSettingsTileControl() {
+        binding.btnAddQsTile.setOnClickListener {
+            requestAddQuickSettingsTile()
+        }
+    }
+
+    private fun requestAddQuickSettingsTile() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val statusBarManager = requireContext().getSystemService(android.app.StatusBarManager::class.java)
+            val componentName = android.content.ComponentName(
+                requireContext(),
+                org.snow.service.AutoConnectTileService::class.java
+            )
+            val executor = ContextCompat.getMainExecutor(requireContext())
+            statusBarManager?.requestAddTileService(
+                componentName,
+                "SNOW Connect",
+                android.graphics.drawable.Icon.createWithResource(requireContext(), R.drawable.ic_qs_snow),
+                executor
+            ) { resultCode ->
+                val msg = when (resultCode) {
+                    android.app.StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ADDED -> "SNOW Tile added to Quick Settings!"
+                    android.app.StatusBarManager.TILE_ADD_REQUEST_RESULT_TILE_ALREADY_ADDED -> "SNOW Tile is already in Quick Settings."
+                    else -> "Tile request dismissed."
+                }
+                Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            Toast.makeText(
+                requireContext(),
+                "Swipe down twice from top of screen, tap Edit (pencil), and drag SNOW Connect tile into your panel.",
+                Toast.LENGTH_LONG
+            ).show()
+        }
     }
 
     companion object {

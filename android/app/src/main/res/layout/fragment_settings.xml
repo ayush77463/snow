@@ -146,12 +146,21 @@
                     android:text="@string/title_manifest_permissions" />
 
                 <TextView
+                    android:id="@+id/tv_permissions_checklist"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:textSize="13sp"
                     android:textColor="@color/primary_text"
                     android:text="• Battery Telemetry: Active (Granted)\n• Ringer Capability: Active (Granted)\n• Clipboard Bridge: Active (Foreground &amp; User Intent Required)\n• App Launcher: Active (Allowlist Policy Enforced)\n• Messaging Compose: Active (Intent-Only via smsto:)\n• File Transfer: Active (WSS / HTTPS Client)\n• Terminal Console: Active (Owner Confirmation Tickets Enforced)" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_add_qs_tile"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="Add Quick Settings Tile"
+                    style="@style/Widget.Material3.Button.OutlinedButton" />
 
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>

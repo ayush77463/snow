@@ -150,6 +150,11 @@ class DashboardFragment : Fragment() {
     }
 
     private fun setupListeners() {
+        binding.swipeRefresh.setOnRefreshListener {
+            viewModel.refreshTelemetry()
+            binding.swipeRefresh.isRefreshing = false
+        }
+
         binding.btnRefreshTelemetry.setOnClickListener {
             viewModel.refreshTelemetry()
         }

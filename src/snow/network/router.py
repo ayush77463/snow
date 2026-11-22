@@ -75,6 +75,11 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "notification_dismiss": "android.notifications.push",
     "notification_reply": "android.notifications.push",
     "media_control": "android.ringer.ring",
+    "desktop_media_control": "desktop.media.control",
+    "windows_media_control": "desktop.media.control",
+    "windows_screenshot": "desktop.media.capture",
+    "snow_windows_screenshot": "desktop.media.capture",
+    "desktop_screenshot": "desktop.media.capture",
     "share_link": "android.apps.launch",
     "android_screenshot": "android.media.projection",
     "snow_android_screenshot": "android.media.projection",
@@ -119,10 +124,151 @@ ACTION_TO_WIRE_ACTION: dict[str, str] = {
     "snow_android_file_list": "file_list",
     "android_file_receive": "file_receive_request",
     "snow_android_file_receive": "file_receive_request",
+    "windows_screenshot": "windows_screenshot",
+    "snow_windows_screenshot": "windows_screenshot",
+    "desktop_screenshot": "windows_screenshot",
+    "desktop_media_control": "media_control",
+    "windows_media_control": "media_control",
+    "media_control": "media_control",
 }
 
 # Alias for backward-compatible routing lookups
 ACTION_ROUTING = ROUTER_ACTION_TO_CAPABILITY
+
+# Permission Profile Presets (Stage 2B)
+PERMISSION_PROFILES: dict[str, dict[str, Any]] = {
+    "full_control": {
+        "name": "Full Control",
+        "description": "Full access to all capabilities.",
+        "allowed_categories": {"telemetry", "clipboard", "files", "apps", "execution", "media", "system"},
+    },
+    "files_and_clipboard": {
+        "name": "Files & Clipboard",
+        "description": "Access to file transfers, clipboard sync, and device telemetry. Execution, apps, screen and camera are blocked.",
+        "allowed_categories": {"telemetry", "clipboard", "files"},
+    },
+    "clipboard_only": {
+        "name": "Clipboard Only",
+        "description": "Access restricted strictly to clipboard synchronization and telemetry.",
+        "allowed_categories": {"telemetry", "clipboard"},
+    },
+}
+
+CAPABILITY_CATEGORY_MAP: dict[str, str] = {
+    # Telemetry
+    "desktop_status": "telemetry",
+    "desktop.status": "telemetry",
+    "desktop_battery": "telemetry",
+    "desktop.battery": "telemetry",
+    "android_battery": "telemetry",
+    "snow_android_battery": "telemetry",
+    "android_battery_status": "telemetry",
+    "snow_android_battery_status": "telemetry",
+    "battery_status": "telemetry",
+    "ring_phone": "telemetry",
+    "android_ring": "telemetry",
+    "snow_android_ring": "telemetry",
+    "mesh_list_peers": "telemetry",
+    "android.telemetry.get": "telemetry",
+    "android.ringer.ring": "telemetry",
+    # Clipboard
+    "desktop_clipboard_get": "clipboard",
+    "desktop_clipboard_set": "clipboard",
+    "desktop.clipboard.read": "clipboard",
+    "desktop.clipboard.write": "clipboard",
+    "android_clipboard_get": "clipboard",
+    "android_clipboard_set": "clipboard",
+    "android_clipboard_push": "clipboard",
+    "snow_android_clipboard_push": "clipboard",
+    "android_clipboard_pull": "clipboard",
+    "snow_android_clipboard_pull": "clipboard",
+    "clipboard_pull": "clipboard",
+    "clipboard_push": "clipboard",
+    "android.clipboard.get": "clipboard",
+    "android.clipboard.set": "clipboard",
+    "clipboard_buffer_list": "clipboard",
+    "clipboard_buffer_get": "clipboard",
+    "clipboard_buffer_add": "clipboard",
+    "clipboard_buffer_apply": "clipboard",
+    # Files
+    "desktop_file_list": "files",
+    "desktop_file_stage_download": "files",
+    "desktop.file.list": "files",
+    "desktop.file.read": "files",
+    "desktop.file.write": "files",
+    "desktop.file.search": "files",
+    "desktop.file.transfer": "files",
+    "android_file_list": "files",
+    "snow_android_file_list": "files",
+    "android_file_receive": "files",
+    "snow_android_file_receive": "files",
+    "file_list": "files",
+    "file_send_request": "files",
+    "file_receive_request": "files",
+    "android.files.transfer": "files",
+    # Apps
+    "desktop_app_launch": "apps",
+    "desktop.apps.launch": "apps",
+    "android_list_apps": "apps",
+    "snow_android_list_apps": "apps",
+    "list_apps": "apps",
+    "android.apps.list": "apps",
+    "android_launch_app": "apps",
+    "snow_android_launch_app": "apps",
+    "launch_app": "apps",
+    "android.apps.launch": "apps",
+    "share_link": "apps",
+    # Execution
+    "desktop_exec": "execution",
+    "desktop.exec": "execution",
+    "windows_terminal": "execution",
+    "windows_terminal_exec": "execution",
+    # Media
+    "media_control": "media",
+    "desktop_media_control": "media",
+    "windows_media_control": "media",
+    "desktop.media.control": "media",
+    "windows_screenshot": "media",
+    "snow_windows_screenshot": "media",
+    "desktop_screenshot": "media",
+    "desktop.media.capture": "media",
+    "android_screenshot": "media",
+    "snow_android_screenshot": "media",
+    "screen_stream_stop": "media",
+    "android_screen_stream_stop": "media",
+    "android.media.projection": "media",
+    "android_camera_capture": "media",
+    "snow_android_camera_capture": "media",
+    "android.camera.capture": "media",
+    # System
+    "android_notification": "system",
+    "android.notification.post": "system",
+    "android_notifications_list": "system",
+    "snow_android_notifications_list": "system",
+    "notifications_list": "system",
+    "android_notification_dismiss": "system",
+    "snow_android_notification_dismiss": "system",
+    "notification_dismiss": "system",
+    "android_notification_reply": "system",
+    "snow_android_notification_reply": "system",
+    "notification_reply": "system",
+    "android_sms_send": "system",
+    "android.telephony.sms": "system",
+    "send_message": "system",
+    "android_send_message": "system",
+    "snow_android_send_message": "system",
+    "android.messaging.send_intent": "system",
+}
+
+
+def is_action_allowed_by_profile(profile: str, action: str) -> bool:
+    """Determine whether an action is permitted under the given permission profile."""
+    clean_prof = (profile or "full_control").strip().lower()
+    if clean_prof not in PERMISSION_PROFILES:
+        clean_prof = "full_control"
+    allowed_cats = PERMISSION_PROFILES[clean_prof]["allowed_categories"]
+    cat = CAPABILITY_CATEGORY_MAP.get(action, "system")
+    return cat in allowed_cats
 
 
 class SessionRouter:
@@ -227,6 +373,25 @@ class SessionRouter:
         target_name = node.device_name
         last_state = str(node.reachability_state)
         last_endpoint = f"{node.host}:{node.wss_port}" if node.host else None
+
+        # Step 1B: Permission Profile Backend Enforcement
+        profile = getattr(node, "permission_profile", "full_control") or "full_control"
+        if not is_action_allowed_by_profile(profile, action):
+            logger.warning(
+                "Action '%s' blocked for device [%s] by permission profile '%s'",
+                action,
+                device_id,
+                profile,
+            )
+            return {
+                "success": False,
+                "status": "PERMISSION_DENIED",
+                "error": f"Operation '{action}' is blocked by device permission profile '{profile}'.",
+                "target_device_id": device_id,
+                "attempted_transports": attempted_transports,
+                "last_reachability_state": last_state,
+                "last_known_endpoint": last_endpoint,
+            }
 
         # Clean payload: strip caller-supplied authority overrides
         clean_data = dict(data) if isinstance(data, dict) else {}

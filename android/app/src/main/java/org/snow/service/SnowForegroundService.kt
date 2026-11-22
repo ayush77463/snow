@@ -22,8 +22,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.snow.R
 import org.snow.capabilities.AndroidCapabilityDispatcher
 import org.snow.network.AuthState
@@ -104,6 +108,7 @@ class SnowForegroundService : Service() {
     var relayClient: org.snow.network.RelayClient? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile internal var userDisconnected = false
+    private var autoConnectJob: Job? = null
 
     fun startRelay(endpoint: String) {
         if (endpoint.isBlank()) return
@@ -249,8 +254,35 @@ class SnowForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_AUTO_CONNECT -> {
+                userDisconnected = false
+                isUserDisconnected = false
+                getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(PREF_USER_DISCONNECTED, false)
+                    .apply()
+
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildNotification("Auto-connecting to SNOW desktop..."),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+
+                discoveryManager.startListening()
+                startObservingState()
+                startObservingDiscovery()
+                startObservingAuth()
+                executeAutoConnectCascade()
+            }
             ACTION_CONNECT -> {
                 userDisconnected = false
+                isUserDisconnected = false
+                getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(PREF_USER_DISCONNECTED, false)
+                    .apply()
+                autoConnectJob?.cancel()
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, Constants.DEFAULT_PORT)
 
@@ -451,6 +483,14 @@ class SnowForegroundService : Service() {
 
     internal fun handleDisconnect() {
         userDisconnected = true
+        isUserDisconnected = true
+        getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_USER_DISCONNECTED, true)
+            .apply()
+        autoConnectJob?.cancel()
+        autoConnectJob = null
+
         // 0. Stop live screen sharing if active
         liveScreenHandler.stopStreaming(client.currentTargetHost, 8766)
 
@@ -478,6 +518,74 @@ class SnowForegroundService : Service() {
 
         // 6. Stop the service
         stopSelf()
+    }
+
+    private fun executeAutoConnectCascade() {
+        autoConnectJob?.cancel()
+        autoConnectJob = serviceScope.launch {
+            SafeLog.i("SnowForegroundService", "Starting auto-connect cascade...")
+
+            if (client.connectionState.value == ConnectionState.CONNECTED) {
+                return@launch
+            }
+
+            // Step 1: USB Loopback (127.0.0.1:8765)
+            SafeLog.i("SnowForegroundService", "AutoConnect Step 1: Probing USB loopback 127.0.0.1:8765...")
+            client.connect("127.0.0.1", Constants.DEFAULT_PORT)
+            val usbConnected = withTimeoutOrNull(1500) {
+                client.connectionState.first { it == ConnectionState.CONNECTED }
+            }
+            if (usbConnected != null) {
+                SafeLog.i("SnowForegroundService", "Connected via USB loopback.")
+                return@launch
+            }
+
+            if (userDisconnected) return@launch
+
+            // Step 2: Saved trusted Wi-Fi endpoint from PREFS_ENDPOINT
+            val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+            val savedHost = prefs.getString(PREF_SAVED_HOST, null)
+            val savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
+            if (!savedHost.isNullOrBlank() && savedHost != "127.0.0.1" && savedHost != "localhost") {
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 2: Connecting to saved endpoint $savedHost:$savedPort...")
+                client.connect(savedHost, savedPort)
+                val wifiConnected = withTimeoutOrNull(2500) {
+                    client.connectionState.first { it == ConnectionState.CONNECTED }
+                }
+                if (wifiConnected != null) {
+                    SafeLog.i("SnowForegroundService", "Connected via saved Wi-Fi endpoint.")
+                    return@launch
+                }
+            }
+
+            if (userDisconnected) return@launch
+
+            // Step 3: Bounded UDP discovery burst (12s)
+            SafeLog.i("SnowForegroundService", "AutoConnect Step 3: Starting bounded UDP discovery (12s)...")
+            discoveryManager.startListening()
+            val discoveryConnected = withTimeoutOrNull(12000) {
+                while (isActive) {
+                    val candidate = discoveryManager.getCandidateForPairedDesktop()
+                    if (candidate != null) {
+                        SafeLog.i("SnowForegroundService", "AutoConnect: Discovered desktop candidate ${candidate.ipAddress}:${candidate.port}")
+                        client.connect(candidate.ipAddress, candidate.port)
+                        val connected = withTimeoutOrNull(3000) {
+                            client.connectionState.first { it == ConnectionState.CONNECTED }
+                        }
+                        if (connected != null) return@withTimeoutOrNull true
+                    }
+                    delay(1000)
+                }
+                false
+            }
+            if (discoveryConnected == true) {
+                SafeLog.i("SnowForegroundService", "Connected via UDP discovery.")
+                return@launch
+            }
+
+            // Step 4: Passive NetworkCallback remains registered (via registerNetworkCallback in onCreate)
+            SafeLog.i("SnowForegroundService", "AutoConnect cascade completed; passive network callback active.")
+        }
     }
 
     private fun createNotificationChannel() {
@@ -610,11 +718,13 @@ class SnowForegroundService : Service() {
         const val PREFS_ENDPOINT = "snow_endpoint_prefs"
         const val PREF_SAVED_HOST = "saved_host"
         const val PREF_SAVED_PORT = "saved_port"
+        const val PREF_USER_DISCONNECTED = "user_disconnected"
 
         const val CHANNEL_ID = "snow_connection_channel"
         const val NOTIFICATION_ID = 1001
 
         const val ACTION_CONNECT = "org.snow.action.CONNECT"
+        const val ACTION_AUTO_CONNECT = "org.snow.action.AUTO_CONNECT"
         const val ACTION_DISCONNECT = "org.snow.action.DISCONNECT"
         const val ACTION_START_SCREEN_SHARE = "org.snow.action.START_SCREEN_SHARE"
         const val ACTION_STOP_SCREEN_SHARE = "org.snow.action.STOP_SCREEN_SHARE"
@@ -625,6 +735,25 @@ class SnowForegroundService : Service() {
         const val EXTRA_PORT = "org.snow.extra.PORT"
         const val EXTRA_RESULT_CODE = "org.snow.extra.RESULT_CODE"
         const val EXTRA_RESULT_DATA = "org.snow.extra.RESULT_DATA"
+
+        @Volatile
+        var isUserDisconnected: Boolean = false
+
+        fun isDisconnectedByUser(context: Context): Boolean {
+            val prefs = context.getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+            return isUserDisconnected || prefs.getBoolean(PREF_USER_DISCONNECTED, false)
+        }
+
+        fun startAutoConnect(context: Context) {
+            val intent = Intent(context, SnowForegroundService::class.java).apply {
+                action = ACTION_AUTO_CONNECT
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
 
         fun startConnect(context: Context, host: String, port: Int) {
             val intent = Intent(context, SnowForegroundService::class.java).apply {

@@ -441,6 +441,60 @@ class SnowWebServer:
         res = await self.bridge.set_device_connection_mode(device_id, conn_mode)
         return web.json_response(res)
 
+    async def handle_api_devices_permission_profile(self, request: web.Request) -> web.Response:
+        """Update permission profile preset for a device."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        device_id = (body.get("device_id") or "").strip()
+        profile = (body.get("profile") or "").strip().lower()
+
+        if not device_id:
+            return web.json_response({"success": False, "error": "Missing required field 'device_id'."}, status=400)
+
+        if profile not in ("full_control", "files_and_clipboard", "clipboard_only"):
+            return web.json_response(
+                {"success": False, "error": f"Invalid permission profile '{profile}'. Must be 'full_control', 'files_and_clipboard', or 'clipboard_only'."},
+                status=400,
+            )
+
+        # Check if Core IPC daemon is running
+        daemon_online = await self.bridge.daemon_manager.is_ipc_ready(timeout=0.2)
+        if daemon_online:
+            res = await self.bridge.call("set_permission_profile", {"device_id": device_id, "profile": profile})
+            if not res.get("success"):
+                err_status = res.get("status")
+                http_status = 403 if err_status == "POLICY_DENIED" else 400 if err_status in ("INVALID_ARGUMENT", "DEVICE_NOT_FOUND") else 500
+                return web.json_response(res, status=http_status)
+            node_reg = getattr(self.bridge, "node_registry", None)
+            if not node_reg and hasattr(self.bridge, "capability_engine"):
+                node_reg = getattr(self.bridge.capability_engine, "node_registry", None)
+            if node_reg:
+                node_reg.set_permission_profile(device_id, profile)
+            return web.json_response(res)
+        else:
+            paired = self.db_manager.get_paired_device(device_id)
+            if not paired:
+                return web.json_response({
+                    "success": False,
+                    "status": "DEVICE_NOT_FOUND",
+                    "error": f"Device [{device_id}] not found in database.",
+                }, status=404)
+            self.db_manager.set_setting(f"device_profile:{device_id}", profile)
+            node_reg = getattr(self.bridge, "node_registry", None)
+            if not node_reg and hasattr(self.bridge, "capability_engine"):
+                node_reg = getattr(self.bridge.capability_engine, "node_registry", None)
+            if node_reg:
+                node_reg.set_permission_profile(device_id, profile)
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "device_id": device_id,
+                "permission_profile": profile,
+            })
+
     async def handle_api_network_identity(self, request: web.Request) -> web.Response:
         """Query local SNOW Network identity."""
         try:
@@ -1784,6 +1838,7 @@ class SnowWebServer:
         app.router.add_post("/api/devices/revoke", self.handle_api_devices_revoke)
         app.router.add_post("/api/devices/connect-peer", self.handle_api_devices_connect_peer)
         app.router.add_post("/api/devices/connection-mode", self.handle_api_devices_connection_mode)
+        app.router.add_post("/api/devices/permission-profile", self.handle_api_devices_permission_profile)
         app.router.add_get("/api/network/identity", self.handle_api_network_identity)
         app.router.add_post("/api/network/identity", self.handle_api_network_identity_update)
         app.router.add_get("/api/network/topology", self.handle_api_network_topology)

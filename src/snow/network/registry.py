@@ -61,6 +61,16 @@ class NodeRegistry:
         self._discovered_candidates: dict[str, dict[str, Any]] = {}  # device_id -> candidate info
         self._manifest_cache: dict[str, CapabilityManifest] = {}  # device_id -> manifest
         self._registered_nodes: dict[str, DeviceNode] = {}  # device_id -> explicit DeviceNode
+        self._permission_profiles: dict[str, str] = {}  # device_id -> profile preset
+
+        # Hydrate persisted permission profiles from database
+        try:
+            for p in self.db_manager.list_paired_devices():
+                saved_prof = self.db_manager.get_setting(f"device_profile:{p.device_id}")
+                if saved_prof and saved_prof in ("full_control", "files_and_clipboard", "clipboard_only"):
+                    self._permission_profiles[p.device_id] = saved_prof
+        except Exception as exc:
+            logger.debug("Failed hydrating permission profiles: %s", exc)
 
         # Register local node
         self.local_node = DeviceNode(
@@ -253,6 +263,37 @@ class NodeRegistry:
             self._discovered_candidates.pop(device_id, None)
             self._manifest_cache.pop(device_id, None)
             self._registered_nodes.pop(device_id, None)
+            self._permission_profiles.pop(device_id, None)
+            try:
+                self.db_manager.delete_setting(f"device_profile:{device_id}")
+            except Exception:
+                pass
+
+    def set_permission_profile(self, device_id: str, profile: str) -> None:
+        """Set and persist the active permission profile for a device."""
+        with self._lock:
+            clean = (profile or "full_control").strip().lower()
+            if clean not in ("full_control", "files_and_clipboard", "clipboard_only"):
+                clean = "full_control"
+            self._permission_profiles[device_id] = clean
+            try:
+                self.db_manager.set_setting(f"device_profile:{device_id}", clean)
+            except Exception as exc:
+                logger.warning("Failed persisting device profile for [%s]: %s", device_id, exc)
+
+    def get_permission_profile(self, device_id: str) -> str:
+        """Get the active permission profile for a device (hydrating from DB if needed, defaults to full_control)."""
+        with self._lock:
+            if device_id in self._permission_profiles:
+                return self._permission_profiles[device_id]
+            try:
+                saved = self.db_manager.get_setting(f"device_profile:{device_id}")
+                if saved and saved in ("full_control", "files_and_clipboard", "clipboard_only"):
+                    self._permission_profiles[device_id] = saved
+                    return saved
+            except Exception:
+                pass
+            return "full_control"
 
     def get_node(self, device_id: str) -> Optional[DeviceNode]:
         """Synthesize and return the current state of a node by device_id."""
@@ -369,6 +410,7 @@ class NodeRegistry:
                 is_paired=is_paired,
                 transport=active_session.get("transport", "unknown") if active_session else "offline",
                 connection_mode=getattr(paired_record, "connection_mode", "auto") if paired_record else "auto",
+                permission_profile=self._permission_profiles.get(device_id, "full_control"),
             )
 
     def list_nodes(

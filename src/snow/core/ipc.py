@@ -1338,6 +1338,62 @@ class SnowIpcServer:
                     "error": str(exc),
                 }, now_authed
 
+        if op == "set_permission_profile":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            payload_data = payload if isinstance(payload, dict) else {}
+            device_id = payload_data.get("device_id")
+            profile = (payload_data.get("profile") or "").strip().lower()
+
+            if not device_id or profile not in ("full_control", "files_and_clipboard", "clipboard_only"):
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing or invalid 'device_id' or 'profile' ('full_control'/'files_and_clipboard'/'clipboard_only' required).",
+                }, now_authed
+
+            paired_dev = self.core_server.db_manager.get_paired_device(device_id)
+            if not paired_dev:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "DEVICE_NOT_FOUND",
+                    "error": f"Device [{device_id}] not found in paired database.",
+                }, now_authed
+
+            try:
+                self.core_server.db_manager.set_setting(f"device_profile:{device_id}", profile)
+                if getattr(self.core_server, "node_registry", None):
+                    self.core_server.node_registry.set_permission_profile(device_id, profile)
+                if getattr(self, "node_registry", None):
+                    self.node_registry.set_permission_profile(device_id, profile)
+
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"device_id": device_id, "permission_profile": profile},
+                }, now_authed
+            except Exception as exc:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "ERROR",
+                    "error": str(exc),
+                }, now_authed
+
         if op == "device_revoke":
             if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
                 return {
@@ -1589,6 +1645,7 @@ class SnowIpcServer:
                 "session_id": session_id[:8] + "..." if session_id else None,
                 "paired_at": p.pairing_timestamp,
                 "last_seen": p.last_seen_timestamp,
+                "permission_profile": cs.db_manager.get_setting(f"device_profile:{p.device_id}", "full_control"),
             })
 
         # Append discovered LAN candidates if discovery service is active

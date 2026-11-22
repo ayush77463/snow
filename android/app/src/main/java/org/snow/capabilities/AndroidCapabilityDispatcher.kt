@@ -36,6 +36,30 @@ class AndroidCapabilityDispatcher(
     val screenCaptureHandler = ScreenCaptureHandler(context, transferClientProvider)
     val cameraCaptureHandler = CameraCaptureHandler(context, transferClientProvider)
 
+    var activePermissionProfile: String = "full_control"
+
+    fun isActionAllowedByProfile(action: String): Boolean {
+        return when (activePermissionProfile.lowercase()) {
+            "clipboard_only" -> {
+                action in setOf(
+                    "battery_status", "android_battery", "android_battery_status",
+                    "clipboard_pull", "clipboard_push", "android_clipboard_pull",
+                    "android_clipboard_push", "android_clipboard_get", "android_clipboard_set"
+                )
+            }
+            "files_and_clipboard" -> {
+                action in setOf(
+                    "battery_status", "android_battery", "android_battery_status",
+                    "clipboard_pull", "clipboard_push", "android_clipboard_pull",
+                    "android_clipboard_push", "android_clipboard_get", "android_clipboard_set",
+                    "file_list", "android_file_list", "file_send_request", "file_receive_request",
+                    "android_file_receive", "ring_phone", "android_ring"
+                )
+            }
+            else -> true // full_control
+        }
+    }
+
     /**
      * Centralized pre-execution contract check validating OS constraints, runtime
      * permissions, and foreground requirements before invoking any handler.
@@ -44,6 +68,14 @@ class AndroidCapabilityDispatcher(
      * Returns a structured rejection map if any requirement fails.
      */
     fun validateExecutionContract(action: String, data: Map<String, Any?>?): Map<String, Any?>? {
+        if (!isActionAllowedByProfile(action)) {
+            return mapOf(
+                "success" to false,
+                "status" to "PERMISSION_DENIED",
+                "error" to "Action '$action' is blocked by permission profile '$activePermissionProfile'.",
+                "remediation_hint" to "Switch permission profile to 'Full Control' in SNOW device settings."
+            )
+        }
         when (action) {
             "android_screenshot", "screen_capture" -> {
                 if (!screenCaptureHandler.hasConsent()) {

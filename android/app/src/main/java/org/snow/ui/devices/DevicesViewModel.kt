@@ -83,4 +83,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun updateConnectionMode(deviceId: String, mode: String) {
         repository.updateDeviceConnectionMode(deviceId, mode)
     }
+
+    fun refreshDevices() {
+        repository.loadSavedDevices()
+    }
 }
