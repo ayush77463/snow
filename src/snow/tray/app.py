@@ -516,6 +516,9 @@ class SnowTrayApp:
             if cmd:
                 self.dispatch_command(cmd)
 
+            # Prevent stuck popup menu on Windows by forcing focus release
+            user32.PostMessageW(self._hwnd, 0, 0, 0)
+
         finally:
             user32.DestroyMenu(hmenu)
 
@@ -530,6 +533,11 @@ class SnowTrayApp:
 
         elif msg == WM_COMMAND:
             self.dispatch_command(wparam)
+            return 0
+
+        elif msg == 0x0010:  # WM_CLOSE
+            self._cleanup_icon()
+            ctypes.windll.user32.DestroyWindow(hwnd)
             return 0
 
         elif msg == WM_DESTROY:
@@ -586,6 +594,15 @@ class SnowTrayApp:
         kernel32 = ctypes.windll.kernel32
         shell32 = ctypes.windll.shell32
 
+        # Ensure current thread is attached to the interactive user desktop if running in an isolated session
+        try:
+            import win32service, win32con
+            h_default = win32service.OpenDesktop("Default", 0, False, win32con.GENERIC_ALL)
+            if h_default:
+                user32.SetThreadDesktop(int(h_default))
+        except Exception as desk_err:
+            logger.debug("Desktop switch to Default: %s", desk_err)
+
         # 1. Register Window Class
         class_name = f"SNOW_Tray_Window_{os.getpid()}"
         hinstance = kernel32.GetModuleHandleW(None)
@@ -618,7 +635,7 @@ class SnowTrayApp:
             logger.error("Failed creating tray window.")
             return 1
 
-        # 3. Add Notification Icon
+        # 3. Add Notification Icon with bounded retry and actionable failure diagnostics
         self._nid = NOTIFYICONDATAW()
         self._nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
         self._nid.hWnd = self._hwnd
@@ -628,14 +645,28 @@ class SnowTrayApp:
         self._nid.hIcon = wcex.hIcon
         self._nid.szTip = self.compute_tooltip()
 
-        res = shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid))
-        if not res:
-            logger.warning("Shell_NotifyIconW NIM_ADD returned False. Tray icon may not be visible.")
+        add_ok = False
+        for _ in range(3):
+            if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
+                add_ok = True
+                break
+            time.sleep(0.2)
+
+        if not add_ok:
+            err = kernel32.GetLastError()
+            logger.error(
+                "Failed adding tray icon via Shell_NotifyIconW (Win32 error %d / 0x%08X). "
+                "Ensure Windows Explorer is running and an interactive desktop session is active.",
+                err, err
+            )
+            self.stop()
+            return 1
 
         # 4. Start background monitor thread
         self._status_thread = threading.Thread(target=self._background_monitor, daemon=True)
         self._status_thread.start()
 
+        logger.info("SNOW Tray active in system tray...")
         logger.info("SNOW System Tray Companion is active.")
 
         # 5. Win32 Message Loop
@@ -664,6 +695,6 @@ class SnowTrayApp:
         self._stop_event.set()
         self._is_running = False
         if self._hwnd and sys.platform == "win32":
-            ctypes.windll.user32.DestroyWindow(self._hwnd)
+            ctypes.windll.user32.PostMessageW(self._hwnd, 0x0010, 0, 0)
             self._hwnd = None
         self._cleanup_icon()

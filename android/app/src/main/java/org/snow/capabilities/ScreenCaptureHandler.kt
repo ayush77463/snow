@@ -174,6 +174,10 @@ class ScreenCaptureHandler(
             if (tempFile.exists()) {
                 tempFile.delete()
             }
+            // For a one-time screenshot, immediately release and stop the MediaProjection session
+            if (mockBitmapWriter == null && mockBitmapProvider == null) {
+                resetConsent()
+            }
         }
     }
 

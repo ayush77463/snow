@@ -29,6 +29,58 @@ DEFAULT_SEARCH_LIMIT: int = 50
 MAX_SEARCH_LIMIT: int = 200
 MAX_SEARCH_SCAN_ENTRIES: int = 10000  # Cap directory entries scanned to prevent DoS
 
+# Windows File Attributes (Win32 GetFileAttributesW)
+FILE_ATTRIBUTE_READONLY: int = 0x01
+FILE_ATTRIBUTE_HIDDEN: int = 0x02
+FILE_ATTRIBUTE_SYSTEM: int = 0x04
+FILE_ATTRIBUTE_DIRECTORY: int = 0x10
+FILE_ATTRIBUTE_REPARSE_POINT: int = 0x0400
+
+# Legacy Windows junction points and system locations to filter from browsing
+KNOWN_SYSTEM_JUNCTIONS = {
+    "appdata",
+    "application data",
+    "cookies",
+    "local settings",
+    "nethood",
+    "printhood",
+    "recent",
+    "sendto",
+    "start menu",
+    "templates",
+    "my documents",
+}
+
+
+def is_windows_hidden_or_system(entry: Path) -> bool:
+    """Check if a filesystem entry is hidden, system, or a Windows legacy junction.
+
+    Preserves normal user directories and files while filtering system clutter,
+    hidden metadata, and recursive reparse junctions.
+    """
+    name_lower = entry.name.lower()
+    if name_lower.startswith("."):
+        return True
+    if name_lower in KNOWN_SYSTEM_JUNCTIONS:
+        return True
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(entry))
+            if attrs != 0xFFFFFFFF and attrs != -1:
+                # Hidden or System files/folders (e.g., desktop.ini, ntuser.dat, AppData)
+                if attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM):
+                    return True
+                # Windows directory reparse points (e.g., junctions like Application Data)
+                if (attrs & FILE_ATTRIBUTE_DIRECTORY) and (attrs & FILE_ATTRIBUTE_REPARSE_POINT):
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
 # Forbidden sensitive filenames, extensions, and directory names
 FORBIDDEN_NAME_PATTERNS = {
     "ipc.secret",
@@ -366,6 +418,7 @@ class WindowsFileManager:
         directory_path: str = "",
         limit: int = DEFAULT_LIST_LIMIT,
         ctx: Optional[ExecutionContext] = None,
+        hide_hidden: bool = True,
     ) -> dict[str, Any]:
         """Synchronously list immediate children of an approved directory."""
         if not isinstance(limit, int) or limit < 1:
@@ -396,6 +449,8 @@ class WindowsFileManager:
                 # Skip hidden/temporary items or forbidden names
                 name_lower = entry.name.lower()
                 if name_lower.startswith(".tmp_") or name_lower == ".parts":
+                    continue
+                if hide_hidden and is_windows_hidden_or_system(entry):
                     continue
                 # For AI_MCP, apply forbidden name filter; for OWNER_MANUAL, protect private keys/secrets
                 if ctx and ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
@@ -457,9 +512,10 @@ class WindowsFileManager:
         directory_path: str = "",
         limit: int = DEFAULT_LIST_LIMIT,
         ctx: Optional[ExecutionContext] = None,
+        hide_hidden: bool = True,
     ) -> dict[str, Any]:
         """Asynchronously list directory contents on a worker thread."""
-        return await asyncio.to_thread(self.list_files_sync, directory_path, limit, ctx)
+        return await asyncio.to_thread(self.list_files_sync, directory_path, limit, ctx, hide_hidden)
 
     def read_file_sync(
         self,
@@ -636,6 +692,7 @@ class WindowsFileManager:
         root_path: str = "",
         limit: int = DEFAULT_SEARCH_LIMIT,
         ctx: Optional[ExecutionContext] = None,
+        hide_hidden: bool = True,
     ) -> dict[str, Any]:
         """Synchronously search files recursively matching a query string or pattern."""
         if not query or not isinstance(query, str) or not query.strip():
@@ -678,6 +735,7 @@ class WindowsFileManager:
                     d for d in dirnames
                     if not d.startswith(".tmp_")
                     and not d.startswith(".")
+                    and not (hide_hidden and is_windows_hidden_or_system(Path(dirpath) / d))
                     and (
                         not self._is_private_security_material(Path(dirpath) / d)
                         if ctx and ctx.principal == ExecutionPrincipal.OWNER_MANUAL
@@ -689,6 +747,9 @@ class WindowsFileManager:
                     scanned_count += 1
                     if scanned_count > MAX_SEARCH_SCAN_ENTRIES:
                         break
+
+                    if hide_hidden and is_windows_hidden_or_system(Path(dirpath) / fname):
+                        continue
 
                     if normalized_query in fname.lower():
                         file_path = Path(dirpath) / fname
@@ -751,6 +812,7 @@ class WindowsFileManager:
         root_path: str = "",
         limit: int = DEFAULT_SEARCH_LIMIT,
         ctx: Optional[ExecutionContext] = None,
+        hide_hidden: bool = True,
     ) -> dict[str, Any]:
         """Asynchronously search files recursively on a worker thread."""
-        return await asyncio.to_thread(self.search_files_sync, query, root_path, limit, ctx)
+        return await asyncio.to_thread(self.search_files_sync, query, root_path, limit, ctx, hide_hidden)

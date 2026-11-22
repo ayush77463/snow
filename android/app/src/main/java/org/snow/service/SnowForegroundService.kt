@@ -309,6 +309,50 @@ class SnowForegroundService : Service() {
                 liveScreenHandler.stopStreaming(host, 8766)
                 demoteScreenShareNotification()
             }
+            ACTION_ONE_TIME_SCREEN_CAPTURE -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, android.app.Activity.RESULT_CANCELED)
+                val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                }
+
+                // 1. Elevate foreground service with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION first (Android 14+ prerequisite)
+                ServiceCompat.startForeground(
+                    this,
+                    NOTIFICATION_ID,
+                    buildScreenShareNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+
+                // 2. Only after foreground elevation, obtain MediaProjection
+                val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
+                val projection = if (resultCode == android.app.Activity.RESULT_OK && resultData != null) {
+                    projectionManager?.getMediaProjection(resultCode, resultData)
+                } else null
+
+                if (projection != null) {
+                    org.snow.capabilities.ScreenCaptureHandler.activeMediaProjection = projection
+                    org.snow.capabilities.ScreenCaptureHandler.isConsentGranted = true
+                    org.snow.security.SafeLog.i("SnowForegroundService", "MediaProjection one-time consent active and service elevated.")
+
+                    val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
+                    val handler = org.snow.capabilities.ScreenCaptureHandler(applicationContext) { transferClient }
+                    serviceScope.launch {
+                        try {
+                            handler.captureScreen(host, 8766)
+                        } finally {
+                            org.snow.capabilities.ScreenCaptureHandler.resetConsent()
+                            demoteScreenShareNotification()
+                        }
+                    }
+                } else {
+                    org.snow.security.SafeLog.w("SnowForegroundService", "Failed obtaining MediaProjection for one-time capture.")
+                    org.snow.capabilities.ScreenCaptureHandler.resetConsent()
+                    demoteScreenShareNotification()
+                }
+            }
             ACTION_START_PEER_HOST -> {
                 ServiceCompat.startForeground(
                     this,
@@ -574,6 +618,7 @@ class SnowForegroundService : Service() {
         const val ACTION_DISCONNECT = "org.snow.action.DISCONNECT"
         const val ACTION_START_SCREEN_SHARE = "org.snow.action.START_SCREEN_SHARE"
         const val ACTION_STOP_SCREEN_SHARE = "org.snow.action.STOP_SCREEN_SHARE"
+        const val ACTION_ONE_TIME_SCREEN_CAPTURE = "org.snow.action.ONE_TIME_SCREEN_CAPTURE"
         const val ACTION_START_PEER_HOST = "org.snow.action.START_PEER_HOST"
         const val ACTION_STOP_PEER_HOST = "org.snow.action.STOP_PEER_HOST"
         const val EXTRA_HOST = "org.snow.extra.HOST"
@@ -619,6 +664,19 @@ class SnowForegroundService : Service() {
                 action = ACTION_STOP_SCREEN_SHARE
             }
             context.startService(intent)
+        }
+
+        fun startOneTimeScreenCapture(context: Context, resultCode: Int, data: Intent) {
+            val intent = Intent(context, SnowForegroundService::class.java).apply {
+                action = ACTION_ONE_TIME_SCREEN_CAPTURE
+                putExtra(EXTRA_RESULT_CODE, resultCode)
+                putExtra(EXTRA_RESULT_DATA, data)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
     }
 }

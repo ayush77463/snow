@@ -1,16 +1,21 @@
 package org.snow.capabilities
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Environment
+import android.os.StatFs
 
 /**
  * Real Android battery and device telemetry capability handler.
  *
- * Implements Sub-Milestone 6.1:
+ * Implements Sub-Milestone 6.1 & Stage 2A Telemetry:
  * - Queries battery percentage, charging state, power source, and health.
+ * - Queries total and available RAM via ActivityManager.
+ * - Queries total and available internal storage via StatFs.
  * - Extracts battery temperature where available.
  * - Collects device manufacturer, model, and OS version info.
  * - Gracefully handles missing telemetry without fabricating values.
@@ -61,6 +66,30 @@ class BatteryHandler(private val context: Context) {
             null
         }
 
+        // Telemetry: RAM Metrics via ActivityManager
+        var ramTotalBytes: Long? = null
+        var ramAvailableBytes: Long? = null
+        try {
+            val actManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            if (actManager != null) {
+                val memInfo = ActivityManager.MemoryInfo()
+                actManager.getMemoryInfo(memInfo)
+                ramTotalBytes = memInfo.totalMem
+                ramAvailableBytes = memInfo.availMem
+            }
+        } catch (_: Exception) {
+        }
+
+        // Telemetry: Storage Metrics via StatFs
+        var storageTotalBytes: Long? = null
+        var storageAvailableBytes: Long? = null
+        try {
+            val stat = StatFs(Environment.getDataDirectory().path)
+            storageTotalBytes = stat.totalBytes
+            storageAvailableBytes = stat.availableBytes
+        } catch (_: Exception) {
+        }
+
         return mapOf(
             "status" to "success",
             "available" to (percent != null),
@@ -69,6 +98,10 @@ class BatteryHandler(private val context: Context) {
             "power_source" to powerSource,
             "health" to health,
             "temperature_celsius" to temperatureCelsius,
+            "ram_total_bytes" to ramTotalBytes,
+            "ram_available_bytes" to ramAvailableBytes,
+            "storage_total_bytes" to storageTotalBytes,
+            "storage_available_bytes" to storageAvailableBytes,
             "device_model" to Build.MODEL,
             "manufacturer" to Build.MANUFACTURER,
             "android_version" to Build.VERSION.RELEASE,

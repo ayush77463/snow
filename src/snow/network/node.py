@@ -261,6 +261,7 @@ class DeviceNode:
     is_paired: bool = False
     transport: str = "unknown"
     connection_mode: str = "auto"
+    telemetry: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.capabilities and not self.supported_capabilities:
@@ -297,6 +298,7 @@ class DeviceNode:
             "is_authenticated": self.is_authenticated,
             "transport": self.transport,
             "connection_mode": self.connection_mode,
+            "telemetry": self.telemetry,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,
@@ -324,6 +326,7 @@ class DeviceNode:
             "is_paired": self.is_paired,
             "transport": self.transport,
             "connection_mode": self.connection_mode,
+            "telemetry": self.telemetry,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,
@@ -377,4 +380,5 @@ class DeviceNode:
             is_paired=bool(data.get("is_paired", False)),
             transport=str(data.get("transport", "unknown")),
             connection_mode=str(data.get("connection_mode", "auto")),
+            telemetry=data.get("telemetry"),
         )

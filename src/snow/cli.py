@@ -1151,6 +1151,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_web(port: int = 8769, no_browser: bool = False) -> int:
     """Launch the local SNOW Web Dashboard server (snow web)."""
+    try:
+        from snow.daemon import CoreDaemonManager
+        asyncio.run(CoreDaemonManager().ensure_core_running())
+    except Exception as exc:
+        logging.getLogger("snow.cli").warning("Could not auto-start Core daemon: %s", exc)
     from snow.web.server import run_dashboard
     return run_dashboard(port=port, no_browser=no_browser)
 
@@ -1169,6 +1174,19 @@ def run_tray(
     headless: bool = False,
 ) -> int:
     """Launch the lightweight Windows system tray companion."""
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    if auto_start_core:
+        try:
+            from snow.daemon import CoreDaemonManager
+            asyncio.run(CoreDaemonManager(port=core_port).ensure_core_running())
+        except Exception as exc:
+            logging.getLogger("snow.cli").warning("Could not auto-start Core daemon from tray: %s", exc)
+    print("SNOW Tray active in system tray...")
     from snow.tray.app import SnowTrayApp
     app = SnowTrayApp(
         dashboard_port=dashboard_port,

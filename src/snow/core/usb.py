@@ -6,6 +6,7 @@ management for local USB tethered SNOW operations.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -231,3 +232,121 @@ def remove_usb_reverse(
         return True, f"Removed SNOW reverse port mappings from device {dev_name}."
     except Exception as exc:
         return False, f"Exception removing ADB reverse mappings: {exc}"
+
+
+class UsbWatcher:
+    """Background task monitoring connected ADB USB devices and establishing reverse tunnels.
+
+    Periodically checks for authorized ADB devices and ensures reverse socket mappings
+    for ports 8765 (WSS) and 8766 (HTTPS) exist. Uses an adaptive bounded polling interval
+    (8s idle, extending to 20s if no changes; drops back to 8s on state changes), avoids
+    redundant ADB status checks for already configured active serials, and runs off-thread.
+    """
+
+    MIN_POLL_INTERVAL: float = 8.0
+    MAX_POLL_INTERVAL: float = 20.0
+
+    def __init__(
+        self,
+        port: int = 8765,
+        poll_interval: Optional[float] = None,
+        adb_bin: Optional[Path] = None,
+    ) -> None:
+        self.port = port
+        self.base_interval = poll_interval if poll_interval is not None else self.MIN_POLL_INTERVAL
+        self.current_interval = self.base_interval
+        self.adb_bin = adb_bin or find_adb_binary()
+        self._task: Optional[asyncio.Task] = None
+        self._running: bool = False
+        self._configured_serials: set[str] = set()
+
+    async def start(self) -> None:
+        """Start the USB device monitoring background loop."""
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.create_task(self._monitor_loop(), name="snow_usb_watcher")
+        logger.info("UsbWatcher started (base_interval=%.1fs, port=%d)", self.base_interval, self.port)
+
+    async def stop(self) -> None:
+        """Stop the USB device monitoring loop cleanly."""
+        self._running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        self._configured_serials.clear()
+        logger.info("UsbWatcher stopped cleanly.")
+
+    async def _monitor_loop(self) -> None:
+        """Periodic non-blocking check of USB devices and reverse mappings with adaptive backoff."""
+        while self._running:
+            state_changed = False
+            try:
+                state_changed = await self._poll_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("UsbWatcher poll error: %s", exc)
+
+            if state_changed:
+                self.current_interval = self.base_interval
+            else:
+                self.current_interval = min(self.current_interval * 1.5, self.MAX_POLL_INTERVAL)
+
+            try:
+                await asyncio.sleep(self.current_interval)
+            except asyncio.CancelledError:
+                break
+
+    async def _poll_once(self) -> bool:
+        """Inspect connected devices and configure reverse mappings on authorized devices.
+
+        Returns True if a relevant USB device state change occurred.
+        """
+        bin_path = self.adb_bin or find_adb_binary()
+        if not bin_path:
+            return False
+        self.adb_bin = bin_path
+
+        state_changed = False
+
+        # Run ADB device check in thread pool to avoid blocking the event loop
+        devices = await asyncio.to_thread(get_connected_adb_devices, bin_path)
+        authorized = [d for d in devices if d.get("status") == "device"]
+        current_serials = {d["serial"] for d in authorized if "serial" in d}
+
+        # Clean up stale devices no longer connected
+        disconnected = self._configured_serials - current_serials
+        if disconnected:
+            state_changed = True
+            for s in disconnected:
+                logger.info("USB device disconnected: %s", s)
+            self._configured_serials -= disconnected
+
+        # Inspect and setup newly connected or unconfigured authorized devices
+        for dev in authorized:
+            serial = dev.get("serial")
+            if not serial:
+                continue
+
+            # If already configured and still connected, skip redundant status checks
+            if serial in self._configured_serials:
+                continue
+
+            state_changed = True
+            status = await asyncio.to_thread(get_usb_status, bin_path, serial, self.port)
+            if not status.get("reverse_active"):
+                success, msg = await asyncio.to_thread(setup_usb_reverse, serial, self.port, bin_path)
+                if success:
+                    self._configured_serials.add(serial)
+                    logger.info("Automatically established USB reverse mode: %s", msg)
+                else:
+                    logger.debug("Failed establishing USB reverse mode for %s: %s", serial, msg)
+            else:
+                self._configured_serials.add(serial)
+
+        return state_changed

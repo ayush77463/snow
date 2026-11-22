@@ -321,6 +321,22 @@ class SnowWebServer:
             devices = res["data"]["devices"]
         elif isinstance(res.get("devices"), list):
             devices = res["devices"]
+
+        # Populate live phone telemetry (battery, RAM, storage) for connected devices
+        for dev in devices:
+            if dev.get("is_connected") and (dev.get("platform") == "android" or not dev.get("platform") or dev.get("platform") == "generic"):
+                dev_id = dev.get("device_id")
+                if not dev.get("telemetry") and dev_id:
+                    try:
+                        bat_res = await asyncio.wait_for(
+                            self.bridge.android_battery(device_id=dev_id),
+                            timeout=2.0,
+                        )
+                        if bat_res.get("success") and isinstance(bat_res.get("data"), dict):
+                            dev["telemetry"] = bat_res["data"]
+                    except Exception as ex:
+                        logger.debug("Failed fetching live telemetry for device %s: %s", dev_id, ex)
+
         return web.json_response({
             "success": res.get("success", False),
             "status": res.get("status", "SUCCESS"),
@@ -815,6 +831,9 @@ class SnowWebServer:
         """Query remote relay status, endpoint, and enabled state."""
         from snow.relay.config import RelayConfig
         config = RelayConfig.from_env()
+        display_host = config.host
+        if display_host in ("0.0.0.0", "::"):
+            display_host = "127.0.0.1"
         return web.json_response({
             "success": True,
             "status": "SUCCESS",
@@ -822,7 +841,7 @@ class SnowWebServer:
                 "enabled": config.enabled,
                 "host": config.host,
                 "port": config.port,
-                "endpoint": f"wss://{config.host}:{config.port}/v1/tunnel" if config.host else None,
+                "endpoint": f"wss://{display_host}:{config.port}/v1/tunnel" if display_host else None,
                 "max_frame_size_mib": config.max_frame_size // (1024 * 1024),
                 "quota_mib_hr": config.max_transfer_quota_bytes // (1024 * 1024),
             },
@@ -863,26 +882,17 @@ class SnowWebServer:
         metadata = None
 
         try:
-            timeout = aiohttp.ClientTimeout(total=0.5, connect=0.5)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(metadata_url) as resp:
-                    if resp.status == 200:
-                        try:
-                            metadata = await resp.json()
-                            if isinstance(metadata, dict) and "resource" in metadata:
-                                gw_status = "online"
-                            else:
-                                gw_status = "unhealthy"
-                        except Exception:
-                            gw_status = "unhealthy"
-                    else:
-                        gw_status = "unhealthy"
-        except asyncio.TimeoutError:
-            gw_status = "timeout"
-        except (aiohttp.ClientConnectorError, OSError):
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(gw_host, gw_port),
+                timeout=0.15,
+            )
+            writer.close()
+            await writer.wait_closed()
+            gw_status = "online"
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
             gw_status = "offline"
         except Exception:
-            gw_status = "unhealthy"
+            gw_status = "offline"
 
         # Safe AI hosts summary from HostOnboardingManager (no secrets or sensitive paths)
         safe_hosts = []
@@ -929,6 +939,17 @@ class SnowWebServer:
                 "capabilities_count": caps_count,
             }
         })
+
+    async def handle_api_screen_capture_phone(self, request: web.Request) -> web.Response:
+        """One-time screen capture on target Android phone via HTTPS transfer plane."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = body.get("device_id", "")
+        approval_id = body.get("approval_id", "")
+        res = await self.bridge.android_screenshot(device_id=device_id, approval_id=approval_id)
+        return web.json_response(res)
 
     async def handle_api_screen_status(self, request: web.Request) -> web.Response:
         """Query live screen streaming session status for dashboard."""
@@ -1789,6 +1810,7 @@ class SnowWebServer:
         app.router.add_get("/api/mcp-gateway/status", self.handle_api_mcp_gateway_status)
 
         # Screen streaming & Camera delivery routes (Phase 26A)
+        app.router.add_post("/api/screen/capture-phone", self.handle_api_screen_capture_phone)
         app.router.add_get("/api/screen/status", self.handle_api_screen_status)
         app.router.add_get("/api/screen/frame", self.handle_api_screen_frame)
         app.router.add_post("/api/screen/stop", self.handle_api_screen_stop)

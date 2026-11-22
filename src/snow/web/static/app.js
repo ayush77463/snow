@@ -203,37 +203,75 @@
             });
         });
 
-        btnGlobalRefresh.addEventListener("click", () => {
-            refreshActiveTab();
-        });
+        if (btnGlobalRefresh) {
+            btnGlobalRefresh.addEventListener("click", () => {
+                refreshActiveTab();
+            });
+        }
     }
 
-    function refreshActiveTab() {
-        loadSystemStatus();
-        loadApprovalsCount();
+    let isRefreshing = false;
 
-        if (currentTab === "overview") {
-            loadOverview();
-        } else if (currentTab === "devices") {
-            loadDevices();
-        } else if (currentTab === "files") {
-            loadSafFiles();
-        } else if (currentTab === "notifications") {
-            loadNotifications();
-        } else if (currentTab === "approvals") {
-            loadApprovalsList();
-        } else if (currentTab === "activity") {
-            loadActivityHistory();
-        } else if (currentTab === "clipboard") {
-            loadClipboardBuffer();
-        } else if (currentTab === "apps") {
-            loadAndroidApps();
-        } else if (currentTab === "federation") {
-            loadFederationData();
-        } else if (currentTab === "settings") {
-            loadRelayStatus();
-            loadMcpGatewayStatus();
-            loadNetworkIdentity();
+    async function refreshActiveTab() {
+        if (isRefreshing) return;
+        isRefreshing = true;
+
+        const originalText = btnGlobalRefresh ? btnGlobalRefresh.innerHTML : "";
+        if (btnGlobalRefresh) {
+            btnGlobalRefresh.disabled = true;
+            btnGlobalRefresh.innerHTML = "⏳ Refreshing...";
+        }
+
+        try {
+            await Promise.allSettled([
+                loadSystemStatus(),
+                loadApprovalsCount()
+            ]);
+
+            const savedDeviceId = activeDeviceId;
+
+            if (currentTab === "overview") {
+                await loadOverview();
+            } else if (currentTab === "devices") {
+                await loadDevices();
+            } else if (currentTab === "files") {
+                await loadSafFiles();
+            } else if (currentTab === "notifications") {
+                await loadNotifications();
+            } else if (currentTab === "approvals") {
+                await loadApprovalsList();
+            } else if (currentTab === "activity") {
+                await loadActivityHistory();
+            } else if (currentTab === "clipboard") {
+                await loadClipboardBuffer();
+            } else if (currentTab === "apps") {
+                await loadAndroidApps();
+            } else if (currentTab === "federation") {
+                await loadFederationData();
+            } else if (currentTab === "settings") {
+                await Promise.allSettled([
+                    loadRelayStatus(),
+                    loadMcpGatewayStatus(),
+                    loadNetworkIdentity()
+                ]);
+            }
+
+            if (savedDeviceId && lastKnownPeerDevices.some(d => d.device_id === savedDeviceId)) {
+                activeDeviceId = savedDeviceId;
+                const globalSelect = document.getElementById("global-target-select");
+                if (globalSelect) globalSelect.value = savedDeviceId;
+                const fileDevSelect = document.getElementById("files-device-select");
+                if (fileDevSelect) fileDevSelect.value = savedDeviceId;
+            }
+        } catch (err) {
+            console.error("Dashboard refresh error:", err);
+            showNotificationToast("Refresh encountered error: " + (err.message || "Unknown error"), "error");
+        } finally {
+            if (btnGlobalRefresh) {
+                btnGlobalRefresh.disabled = false;
+                btnGlobalRefresh.innerHTML = originalText || "🔄 Refresh";
+            }
+            isRefreshing = false;
         }
     }
 
@@ -1004,6 +1042,26 @@
             trRow.appendChild(trLabel);
             trRow.appendChild(trChip);
             body.appendChild(trRow);
+
+            // Live Phone Telemetry (Stage 2A)
+            if (dev.is_connected && dev.telemetry) {
+                const tel = dev.telemetry;
+                if (tel.level !== undefined && tel.level !== null) {
+                    const chargingStr = tel.charging ? ` ⚡ Charging (${tel.power_source || 'Power'})` : "";
+                    const tempStr = tel.temperature_celsius ? ` · ${tel.temperature_celsius}°C` : "";
+                    body.appendChild(createDetailRow("Battery:", `${tel.level}%${chargingStr}${tempStr}`));
+                }
+                if (tel.ram_total_bytes && tel.ram_available_bytes) {
+                    const ramTotalGB = (tel.ram_total_bytes / (1024 * 1024 * 1024)).toFixed(1);
+                    const ramUsedGB = ((tel.ram_total_bytes - tel.ram_available_bytes) / (1024 * 1024 * 1024)).toFixed(1);
+                    body.appendChild(createDetailRow("RAM:", `${ramUsedGB} / ${ramTotalGB} GB`));
+                }
+                if (tel.storage_total_bytes && tel.storage_available_bytes) {
+                    const storageTotalGB = (tel.storage_total_bytes / (1024 * 1024 * 1024)).toFixed(1);
+                    const storageFreeGB = (tel.storage_available_bytes / (1024 * 1024 * 1024)).toFixed(1);
+                    body.appendChild(createDetailRow("Storage:", `${storageFreeGB} GB free / ${storageTotalGB} GB`));
+                }
+            }
 
             // Connection Mode Selector (Phase 28A)
             const modeRow = document.createElement("div");
@@ -2044,12 +2102,16 @@
 
     function setupWorkflows() {
         const btnCapturePc = document.getElementById("btn-wf-capture-pc");
+        const btnCapturePhone = document.getElementById("btn-wf-capture-phone");
         const btnHealth = document.getElementById("btn-wf-health");
         const btnPcToPhone = document.getElementById("btn-wf-pc-to-phone");
         const btnClipboard = document.getElementById("btn-wf-clipboard");
 
         if (btnCapturePc) {
             btnCapturePc.addEventListener("click", () => runWorkflow("pc_screenshot", "🖥️ Capture PC Screen"));
+        }
+        if (btnCapturePhone) {
+            btnCapturePhone.addEventListener("click", () => capturePhoneScreen());
         }
         if (btnHealth) {
             btnHealth.addEventListener("click", () => runWorkflow("device_health_snapshot", "🩺 Device Health Snapshot"));
@@ -2059,6 +2121,124 @@
         }
         if (btnClipboard) {
             btnClipboard.addEventListener("click", () => runWorkflow("share_clipboard_and_notify", "📋 Sync Clipboard & Notify"));
+        }
+    }
+
+    async function capturePhoneScreen() {
+        const targetDev = activeDeviceId;
+        if (!targetDev) {
+            showNotificationToast("Please select a connected Android device first.", "warning");
+            return;
+        }
+
+        const btnCapture = document.getElementById("btn-wf-capture-phone");
+        if (btnCapture) btnCapture.disabled = true;
+
+        const runBox = document.getElementById("workflow-run-box");
+        const nameDisplay = document.getElementById("workflow-name-display");
+        const statusBadge = document.getElementById("workflow-status-badge");
+        const stepsList = document.getElementById("workflow-steps-list");
+        const previewBox = document.getElementById("capture-preview-box");
+        const previewImg = document.getElementById("capture-preview-img");
+        const summaryCard = document.getElementById("workflow-summary-card");
+        const captureSummaryBanner = document.getElementById("capture-summary-banner");
+        const captureErrorBox = document.getElementById("capture-error-box");
+
+        try {
+            if (runBox) runBox.classList.remove("d-none");
+            if (summaryCard) {
+                summaryCard.classList.add("d-none");
+                summaryCard.innerHTML = "";
+            }
+            if (captureSummaryBanner) captureSummaryBanner.textContent = "";
+            if (captureErrorBox) captureErrorBox.classList.add("d-none");
+            if (nameDisplay) nameDisplay.textContent = "📱 One-Time Phone Screen Capture";
+            if (statusBadge) {
+                statusBadge.className = "badge badge-info";
+                statusBadge.textContent = "REQUESTING CONSENT...";
+            }
+            if (stepsList) {
+                stepsList.innerHTML = '<div class="spinner"></div> Requesting screen capture consent on Android device. Please check phone screen...';
+            }
+            if (previewBox) previewBox.classList.add("d-none");
+
+            let res = await apiRequest("/api/screen/capture-phone", "POST", { device_id: targetDev });
+
+            // Automatic bounded retry polling if consent was prompted on phone (Android 14+)
+            if (res && !res.success && (res.status === "SCREEN_CAPTURE_CONSENT_REQUIRED" || (res.error && res.error.toLowerCase().includes("consent")))) {
+                if (statusBadge) {
+                    statusBadge.className = "badge badge-warning";
+                    statusBadge.textContent = "WAITING FOR CONSENT";
+                }
+                if (stepsList) {
+                    stepsList.innerHTML = '<div class="spinner"></div> <strong>Check your phone and tap Start now to allow screen capture.</strong> (Waiting up to 30s)...';
+                }
+                const startTime = Date.now();
+                while (Date.now() - startTime < 30000) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    const pollRes = await apiRequest("/api/screen/capture-phone", "POST", { device_id: targetDev });
+                    if (pollRes && pollRes.success) {
+                        res = pollRes;
+                        break;
+                    } else if (pollRes && pollRes.status !== "SCREEN_CAPTURE_CONSENT_REQUIRED" && (!pollRes.error || !pollRes.error.toLowerCase().includes("consent"))) {
+                        res = pollRes;
+                        break;
+                    }
+                }
+            }
+
+            if (stepsList) stepsList.innerHTML = "";
+
+            if (!res || !res.success) {
+                if (statusBadge) {
+                    statusBadge.className = "badge badge-warning";
+                    statusBadge.textContent = res ? (res.status || "CONSENT REQUIRED") : "FAILED";
+                }
+                if (stepsList) {
+                    const errDiv = document.createElement("div");
+                    errDiv.className = "empty-state text-warning";
+                    const hint = res && res.remediation_hint ? ` Hint: ${res.remediation_hint}` : "";
+                    errDiv.textContent = `Screen capture request: ${res ? (res.error || res.status) : "Failed"}.${hint}`;
+                    stepsList.appendChild(errDiv);
+                }
+                return;
+            }
+
+            if (statusBadge) {
+                statusBadge.className = "badge badge-success";
+                statusBadge.textContent = "COMPLETED";
+            }
+
+            const data = res.data || res;
+            const fileName = data.file_name;
+
+            if (stepsList) {
+                const okDiv = document.createElement("div");
+                okDiv.className = "empty-state text-success";
+                okDiv.textContent = `Phone screen captured and uploaded successfully (${fileName || "image"}).`;
+                stepsList.appendChild(okDiv);
+            }
+
+            if (fileName && previewBox && previewImg) {
+                previewBox.classList.remove("d-none");
+                previewImg.classList.remove("d-none");
+                if (captureErrorBox) captureErrorBox.classList.add("d-none");
+                previewImg.src = `/api/captures/${encodeURIComponent(fileName)}`;
+                previewImg.alt = `Phone Screenshot: ${fileName}`;
+                previewImg.onerror = () => {
+                    previewImg.classList.add("d-none");
+                    if (captureErrorBox) {
+                        captureErrorBox.classList.remove("d-none");
+                        captureErrorBox.textContent = `Failed loading preview for: ${fileName}`;
+                    }
+                };
+                previewImg.onload = () => {
+                    previewImg.classList.remove("d-none");
+                    if (captureErrorBox) captureErrorBox.classList.add("d-none");
+                };
+            }
+        } finally {
+            if (btnCapture) btnCapture.disabled = false;
         }
     }
 
@@ -2252,6 +2432,21 @@
             const phoneCharging = phone.charging ? "⚡ Charging" : (phone.is_online ? "🔋 Battery Power" : "Disconnected");
             const phoneTransport = escapeHtml(phone.transport || (phone.is_online ? "Wi-Fi LAN / USB ADB" : "Offline"));
 
+            let phoneRam = "Unavailable";
+            if (phone.ram_total_bytes && phone.ram_available_bytes) {
+                const totalGb = (phone.ram_total_bytes / (1024 ** 3)).toFixed(1);
+                const availGb = (phone.ram_available_bytes / (1024 ** 3)).toFixed(1);
+                const usedGb = ((phone.ram_total_bytes - phone.ram_available_bytes) / (1024 ** 3)).toFixed(1);
+                phoneRam = `${usedGb} GB / ${totalGb} GB (${availGb} GB free)`;
+            }
+
+            let phoneStorage = "Unavailable";
+            if (phone.storage_total_bytes && phone.storage_available_bytes) {
+                const totalGb = (phone.storage_total_bytes / (1024 ** 3)).toFixed(1);
+                const availGb = (phone.storage_available_bytes / (1024 ** 3)).toFixed(1);
+                phoneStorage = `${availGb} GB free / ${totalGb} GB`;
+            }
+
             if (summaryCard) {
                 summaryCard.classList.remove("d-none");
                 summaryCard.innerHTML = `
@@ -2294,6 +2489,14 @@
                             <div class="health-stat-row">
                                 <span class="health-stat-label">Power State:</span>
                                 <span class="health-stat-val">${phoneCharging}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">RAM (Phone):</span>
+                                <span class="health-stat-val">${phoneRam}</span>
+                            </div>
+                            <div class="health-stat-row">
+                                <span class="health-stat-label">Storage (Phone):</span>
+                                <span class="health-stat-val">${phoneStorage}</span>
                             </div>
                             <div class="health-stat-row">
                                 <span class="health-stat-label">Transport:</span>

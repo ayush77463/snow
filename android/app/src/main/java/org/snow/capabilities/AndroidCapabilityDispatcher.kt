@@ -3,6 +3,7 @@ package org.snow.capabilities
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -46,11 +47,23 @@ class AndroidCapabilityDispatcher(
         when (action) {
             "android_screenshot", "screen_capture" -> {
                 if (!screenCaptureHandler.hasConsent()) {
+                    val reqIntent = Intent(context, org.snow.ui.MainActivity::class.java).apply {
+                        this.action = Intent.ACTION_MAIN
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        putExtra("request_screen_capture", true)
+                    }
+                    ActionNotificationHelper.postActionNotification(
+                        context = context,
+                        title = "Screen Capture Requested",
+                        content = "Your paired PC requested a one-time screen capture. Tap to review and grant permission.",
+                        intent = reqIntent
+                    )
                     return mapOf(
                         "success" to false,
                         "status" to "SCREEN_CAPTURE_CONSENT_REQUIRED",
-                        "error" to "MediaProjection consent has not been granted by user.",
-                        "remediation_hint" to "Open SNOW on your Android phone and initiate screen capture."
+                        "error" to "MediaProjection consent has not been granted by user. Action notification posted.",
+                        "remediation_hint" to "Tap the notification on your Android device to authorize one-time screen capture."
                     )
                 }
             }
@@ -184,11 +197,16 @@ class AndroidCapabilityDispatcher(
                     val transferId = data?.get("transfer_id") as? String
                     val sha256 = data?.get("sha256") as? String ?: ""
                     val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: defaultTransferPort
+                    val mimeType = (data?.get("mime_type") as? String)?.lowercase() ?: "image/png"
+                    val ext = if (mimeType.contains("jpeg") || mimeType.contains("jpg")) "jpg" else "png"
                     val host = serverHost
                     val transferClient = transferClientProvider()
                     if (transferClient != null && transferId != null && host.isNotBlank()) {
-                        val cacheDir = File(context.cacheDir, "clipboard").apply { mkdirs() }
-                        val localFile = File(cacheDir, "clip_${sha256.take(16)}.png")
+                        val cacheDir = ClipboardHandler.getClipboardCacheDir(context)
+                        val fileName = "clip_${sha256.take(16)}.$ext"
+                        val localFile = File(cacheDir, fileName)
+                        ClipboardHandler.pruneImageCache(cacheDir, preserveFileName = fileName)
+
                         val dlRes = transferClient.downloadFile(
                             serverHost = host,
                             transferPort = transferPort,
@@ -203,13 +221,26 @@ class AndroidCapabilityDispatcher(
                                     "${context.packageName}.fileprovider",
                                     dlRes.file
                                 )
+                                val resolvedMime = if (ext == "jpg") "image/jpeg" else "image/png"
                                 withContext(Dispatchers.Main) {
                                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    val clip = ClipData.newUri(context.contentResolver, "Image", contentUri)
+                                    val clip = android.content.ClipData(
+                                        android.content.ClipDescription("SNOW Image", arrayOf(resolvedMime)),
+                                        android.content.ClipData.Item(contentUri)
+                                    )
                                     cm.setPrimaryClip(clip)
                                 }
+                                ClipboardHandler.grantImeUriPermission(context, contentUri)
+                                val isUserInitiated = (data?.get("user_initiated") == true)
+                                ClipboardHandler.postShareFallbackNotification(
+                                    context,
+                                    contentUri,
+                                    resolvedMime,
+                                    isUserInitiated = isUserInitiated
+                                )
+
                                 org.snow.ui.SnowUiRepository.getInstance(context).recordIncomingClipboardText(sha256)
-                                SafeLog.i(TAG, "Pushed image to Android clipboard via FileProvider.")
+                                SafeLog.i(TAG, "Pushed image to Android clipboard via FileProvider ($resolvedMime).")
                                 Pair(mapOf("status" to "success", "type" to "image"), null)
                             } catch (e: Exception) {
                                 SafeLog.e(TAG, "Failed placing image on Android clipboard: ${e.message}", e)

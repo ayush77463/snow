@@ -64,6 +64,18 @@ class MainActivity : AppCompatActivity() {
     private var service: SnowForegroundService? = null
     private var isBound = false
 
+    private val screenCaptureLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
+            SafeLog.i(TAG, "MediaProjection screen capture consent granted by user; delegating to ForegroundService.")
+            org.snow.service.SnowForegroundService.startOneTimeScreenCapture(this, result.resultCode, result.data!!)
+        } else {
+            org.snow.capabilities.ScreenCaptureHandler.resetConsent()
+            SafeLog.w(TAG, "MediaProjection screen capture consent cancelled or denied.")
+        }
+    }
+
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val localBinder = binder as? SnowForegroundService.LocalBinder
@@ -96,6 +108,23 @@ class MainActivity : AppCompatActivity() {
         setupWindowInsets()
         setupBottomNavigation(savedInstanceState)
         observeGlobalState()
+        checkScreenCaptureRequest(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        checkScreenCaptureRequest(intent)
+    }
+
+    private fun checkScreenCaptureRequest(intent: Intent?) {
+        if (intent?.getBooleanExtra("request_screen_capture", false) == true) {
+            val projMgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
+            val captureIntent = projMgr?.createScreenCaptureIntent()
+            if (captureIntent != null) {
+                screenCaptureLauncher.launch(captureIntent)
+            }
+        }
     }
 
     override fun onResume() {

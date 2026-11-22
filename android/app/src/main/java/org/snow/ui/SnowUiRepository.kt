@@ -736,12 +736,39 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 val tempCelsius = if (tempTenths > 0) tempTenths / 10.0f else null
 
                 val pct = if (level >= 0 && scale > 0) (level * 100) / scale else 0
+
+                var ramTotal: Long? = null
+                var ramAvail: Long? = null
+                try {
+                    val actManager = appContext.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+                    if (actManager != null) {
+                        val memInfo = android.app.ActivityManager.MemoryInfo()
+                        actManager.getMemoryInfo(memInfo)
+                        ramTotal = memInfo.totalMem
+                        ramAvail = memInfo.availMem
+                    }
+                } catch (_: Exception) {
+                }
+
+                var storageTotal: Long? = null
+                var storageAvail: Long? = null
+                try {
+                    val stat = android.os.StatFs(android.os.Environment.getDataDirectory().path)
+                    storageTotal = stat.totalBytes
+                    storageAvail = stat.availableBytes
+                } catch (_: Exception) {
+                }
+
                 _phoneTelemetry.value = PhoneTelemetry(
                     batteryPercent = pct,
                     isCharging = isCharging,
                     temperatureCelsius = tempCelsius,
                     isAvailable = true,
-                    lastUpdated = System.currentTimeMillis()
+                    lastUpdated = System.currentTimeMillis(),
+                    ramTotalBytes = ramTotal,
+                    ramAvailableBytes = ramAvail,
+                    storageTotalBytes = storageTotal,
+                    storageAvailableBytes = storageAvail
                 )
                 return
             }
@@ -1586,10 +1613,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     val mimeType = data?.get("mime_type") as? String
                     if (transferId != null && targetHost.isNotBlank()) {
                         repoScope.launch(Dispatchers.IO) {
-                            val cacheDir = File(appContext.cacheDir, "clipboard").apply { mkdirs() }
-                            val ext = if (mimeType?.contains("jpeg") == true) "jpg" else "png"
+                            val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
+                            val ext = if (mimeType?.contains("jpeg") == true || mimeType?.contains("jpg") == true) "jpg" else "png"
                             val prefix = if (sha256.isNotBlank()) sha256.take(16) else item.itemId.take(16)
-                            val localFile = File(cacheDir, "clip_$prefix.$ext")
+                            val fileName = "clip_$prefix.$ext"
+                            val localFile = File(cacheDir, fileName)
+                            org.snow.capabilities.ClipboardHandler.pruneImageCache(cacheDir, preserveFileName = fileName)
+
                             val dlRes = transferClient.downloadFile(
                                 serverHost = targetHost,
                                 transferPort = transferPort,
@@ -1605,11 +1635,18 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                             "${appContext.packageName}.fileprovider",
                                             dlRes.file
                                         )
+                                        val resolvedMime = if (ext == "jpg") "image/jpeg" else "image/png"
                                         val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                        val clip = ClipData.newUri(appContext.contentResolver, "SNOW Shared Clipboard", contentUri)
+                                        val clip = ClipData(
+                                            android.content.ClipDescription("SNOW Shared Clipboard", arrayOf(resolvedMime)),
+                                            ClipData.Item(contentUri)
+                                        )
                                         cm.setPrimaryClip(clip)
+                                        org.snow.capabilities.ClipboardHandler.grantImeUriPermission(appContext, contentUri)
+                                        org.snow.capabilities.ClipboardHandler.postShareFallbackNotification(appContext, contentUri, resolvedMime)
+
                                         recordIncomingClipboardText(sha256)
-                                        appendLog("INFO", TAG, "Applied image buffer item to Android clipboard (${dlRes.file.length()} bytes).")
+                                        appendLog("INFO", TAG, "Applied image buffer item to Android clipboard (${dlRes.file.length()} bytes, $resolvedMime).")
                                         onComplete(true, "Copied image to Android clipboard")
                                     } catch (e: Exception) {
                                         SafeLog.e(TAG, "Failed applying image buffer item: ${e.message}", e)
@@ -2191,7 +2228,11 @@ data class PhoneTelemetry(
     val isCharging: Boolean,
     val temperatureCelsius: Float?,
     val isAvailable: Boolean,
-    val lastUpdated: Long
+    val lastUpdated: Long,
+    val ramTotalBytes: Long? = null,
+    val ramAvailableBytes: Long? = null,
+    val storageTotalBytes: Long? = null,
+    val storageAvailableBytes: Long? = null
 ) {
     companion object {
         val UNAVAILABLE = PhoneTelemetry(0, false, null, false, 0L)

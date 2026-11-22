@@ -26,6 +26,8 @@ object ActionNotificationHelper {
 
     private const val TAG = "ActionNotificationHelper"
     const val CHANNEL_ID = "snow_actions_channel"
+    const val SILENT_CHANNEL_ID = "snow_silent_actions_channel"
+    const val NOTIFICATION_ID_CLIPBOARD_FALLBACK = 2050
     private val nextNotificationId = AtomicInteger(2000)
 
     /**
@@ -39,6 +41,25 @@ object ActionNotificationHelper {
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = "Notifications for actions requiring user confirmation or interaction"
+            }
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.createNotificationChannel(channel)
+        }
+    }
+
+    /**
+     * Ensure the dedicated silent background notification channel is registered with the OS.
+     */
+    fun createSilentActionChannel(context: Context) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                SILENT_CHANNEL_ID,
+                "SNOW Background Updates",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "Silent background notifications for clipboard synchronization"
+                enableVibration(false)
+                enableLights(false)
             }
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             manager?.createNotificationChannel(channel)
@@ -73,16 +94,22 @@ object ActionNotificationHelper {
         context: Context,
         title: String,
         content: String,
-        intent: Intent
+        intent: Intent,
+        isSilent: Boolean = false,
+        customId: Int? = null,
     ): Boolean {
         if (!canPostNotifications(context)) {
             SafeLog.w(TAG, "Cannot post action notification: notification permission denied or disabled.")
             return false
         }
 
-        createActionChannel(context)
+        if (isSilent) {
+            createSilentActionChannel(context)
+        } else {
+            createActionChannel(context)
+        }
 
-        val notificationId = nextNotificationId.getAndIncrement()
+        val notificationId = customId ?: nextNotificationId.getAndIncrement()
         val pendingIntent = PendingIntent.getActivity(
             context,
             notificationId,
@@ -90,14 +117,22 @@ object ActionNotificationHelper {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+        val channel = if (isSilent) SILENT_CHANNEL_ID else CHANNEL_ID
+        val priority = if (isSilent) NotificationCompat.PRIORITY_LOW else NotificationCompat.PRIORITY_HIGH
+
+        val builder = NotificationCompat.Builder(context, channel)
             .setContentTitle(title)
             .setContentText(content)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
+            .setPriority(priority)
+
+        if (isSilent) {
+            builder.setSilent(true)
+        }
+
+        val notification = builder.build()
 
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return false

@@ -20,6 +20,7 @@ from snow.capabilities.windows import (
 from snow.core.config import CoreConfig
 from snow.core.ipc import SnowIpcServer
 from snow.core.network import NetworkInterfaceInfo, detect_usable_ipv4_addresses
+from snow.core.usb import UsbWatcher
 from snow.network.connection_manager import ConnectionManager
 from snow.network.discovery import SnowDiscoveryService
 from snow.network.registry import NodeRegistry
@@ -148,6 +149,7 @@ class SnowCoreServer:
             node_registry=self.node_registry,
         )
         self.peer_clients: dict[str, Any] = {}
+        self.usb_watcher = UsbWatcher(port=self.config.port)
         self.relay_client: Optional[Any] = None
         self.relay_enabled: bool = getattr(self.config, "relay_enabled", False)
         self.relay_url: str = getattr(self.config, "relay_url", "")
@@ -587,6 +589,13 @@ class SnowCoreServer:
         # F31: Start periodic background maintenance loop
         self._maintenance_task = asyncio.create_task(self._periodic_maintenance_loop())
 
+        # Start automatic USB ADB watcher
+        if getattr(self, "usb_watcher", None):
+            try:
+                await self.usb_watcher.start()
+            except Exception as exc:
+                logger.debug("UsbWatcher failed to start: %s", exc)
+
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port
         actual_http_port = self.http_transfer_server.bound_port or self.config.transfer_port
@@ -667,6 +676,13 @@ class SnowCoreServer:
             except asyncio.CancelledError:
                 pass
             self._maintenance_task = None
+
+        # Stop automatic USB ADB watcher
+        if getattr(self, "usb_watcher", None):
+            try:
+                await self.usb_watcher.stop()
+            except Exception as exc:
+                logger.debug("Error stopping UsbWatcher: %s", exc)
 
         # Stop IPC server first so external tool requests terminate cleanly before core shuts down
         if self.ipc_server:

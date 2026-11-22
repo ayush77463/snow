@@ -499,7 +499,8 @@ class CapabilityEngine:
         if action in ("windows_file_list", "desktop_file_list"):
             directory_path = params.get("directory_path", "")
             limit = int(params.get("limit", 50))
-            res = await self.files.list_files(directory_path=directory_path, limit=limit, ctx=ctx)
+            hide_hidden = bool(params.get("hide_hidden", True))
+            res = await self.files.list_files(directory_path=directory_path, limit=limit, ctx=ctx, hide_hidden=hide_hidden)
             is_ok = res.get("success", False)
             return CapabilityResponse(
                 success=is_ok,
@@ -512,7 +513,8 @@ class CapabilityEngine:
             query = params.get("query", "")
             root_path = params.get("root_path", "")
             limit = int(params.get("limit", 50))
-            res = await self.files.search_files(query=query, root_path=root_path, limit=limit, ctx=ctx)
+            hide_hidden = bool(params.get("hide_hidden", True))
+            res = await self.files.search_files(query=query, root_path=root_path, limit=limit, ctx=ctx, hide_hidden=hide_hidden)
             is_ok = res.get("success", False)
             return CapabilityResponse(
                 success=is_ok,

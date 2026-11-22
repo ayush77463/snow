@@ -638,6 +638,10 @@ class WorkflowOrchestrator:
                     "battery_percent": phone_battery.get("battery_level") or phone_battery.get("battery_percent") or phone_battery.get("level"),
                     "charging": phone_battery.get("is_charging") or phone_battery.get("charging"),
                     "transport": actual_trans or "USB ADB / Wi-Fi LAN",
+                    "ram_total_bytes": phone_battery.get("ram_total_bytes"),
+                    "ram_available_bytes": phone_battery.get("ram_available_bytes"),
+                    "storage_total_bytes": phone_battery.get("storage_total_bytes"),
+                    "storage_available_bytes": phone_battery.get("storage_available_bytes"),
                     "is_online": actual_id is not None and "step_phone_battery" in accumulated_data,
                 },
             }
