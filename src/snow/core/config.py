@@ -33,7 +33,7 @@ class CoreConfig:
     """
 
     app_name: str = "SNOW Desktop Core"
-    version: str = "0.1.0"
+    version: str = "4.1.0"
     bind_host: str = "0.0.0.0"
     port: int = 8765
     log_level: str = "INFO"

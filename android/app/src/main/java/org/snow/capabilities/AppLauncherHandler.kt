@@ -107,7 +107,9 @@ class AppLauncherHandler(private val context: Context) {
                             ?: pkgName
                         mapOf(
                             "package_name" to pkgName,
-                            "label" to label
+                            "label" to label,
+                            "app_name" to label,
+                            "name" to label
                         )
                     }
                 }
@@ -130,7 +132,7 @@ class AppLauncherHandler(private val context: Context) {
         }
     }
 
-    suspend fun launchApp(packageName: String?): Map<String, Any?> = withContext(Dispatchers.Main) {
+    suspend fun launchApp(packageName: String?, principal: String? = null): Map<String, Any?> = withContext(Dispatchers.Main) {
         if (packageName.isNullOrBlank()) {
             return@withContext mapOf(
                 "success" to false,
@@ -152,9 +154,12 @@ class AppLauncherHandler(private val context: Context) {
             )
         }
 
-        // 2. Allowlist authorization
-        if (!AppAllowlistPolicy.isAllowed(context, cleanPackage)) {
-            SafeLog.w(TAG, "Package '$cleanPackage' rejected by allowlist policy.")
+        // 2. Allowlist authorization (Bypassed if principal is explicitly OWNER_MANUAL)
+        val isOwner = principal == "OWNER_MANUAL"
+        if (isOwner) {
+            SafeLog.i(TAG, "Bypassing allowlist policy check for OWNER_MANUAL caller launching '$cleanPackage'.")
+        } else if (!AppAllowlistPolicy.isAllowed(context, cleanPackage)) {
+            SafeLog.w(TAG, "Package '$cleanPackage' rejected by allowlist policy (principal: $principal).")
             return@withContext mapOf(
                 "success" to false,
                 "status" to "POLICY_DENIED",

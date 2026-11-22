@@ -162,6 +162,11 @@ class CapabilityDispatcherTest {
         assertEquals("POLICY_DENIED", resUnapproved["status"])
         assertEquals("POLICY_DENIED", resUnapproved["error"])
 
+        // OWNER_MANUAL bypasses allowlist policy check (fails at package manager lookup in unit test, not POLICY_DENIED)
+        val resOwnerBypass = handler.launchApp("com.unapproved.arbitrary.app", principal = "OWNER_MANUAL")
+        assertEquals("error", resOwnerBypass["status"])
+        assertTrue((resOwnerBypass["error"] as String).contains("not found or is not launchable"))
+
         // Approved package syntax passes policy check (fails at package manager lookup in unit test)
         val resApproved = handler.launchApp("com.google.android.calculator")
         assertEquals("error", resApproved["status"])
@@ -205,6 +210,20 @@ class CapabilityDispatcherTest {
         assertNotNull(errDenied)
         assertEquals(ErrorCode.UNAUTHORIZED, errDenied?.code)
         assertTrue(errDenied?.message?.contains("POLICY_DENIED") == true)
+
+        // OWNER_MANUAL caller bypasses POLICY_DENIED allowlist rejection
+        val (resOwner, errOwner) = dispatcher.dispatch(
+            action = "launch_app",
+            data = mapOf("package_name" to "com.unapproved.app", "principal" to "OWNER_MANUAL"),
+            serverHost = "127.0.0.1",
+            defaultTransferPort = 8766
+        )
+        assertNull(resOwner)
+        assertNotNull(errOwner)
+        // Fails with FILE_NOT_FOUND / error due to missing mock package, NOT UNAUTHORIZED / POLICY_DENIED
+        assertEquals(ErrorCode.FILE_NOT_FOUND, errOwner?.code)
+        assertFalse(errOwner?.message?.contains("POLICY_DENIED") == true)
+        assertTrue(errOwner?.message?.contains("not found or is not launchable") == true)
     }
 
     @Test

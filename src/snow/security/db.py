@@ -692,14 +692,7 @@ class DatabaseManager:
             cursor = conn.execute(query)
             row = cursor.fetchone()
             if row:
-                return PairedDeviceRecord(
-                    device_id=row["device_id"],
-                    device_name=row["device_name"],
-                    pairing_timestamp=row["pairing_timestamp"],
-                    last_seen_timestamp=row["last_seen_timestamp"],
-                    auth_token_hash=row["auth_token_hash"],
-                    trust_tier=row["trust_tier"],
-                )
+                return self._row_to_record(row)
         return None
 
     def update_last_seen(self, device_id: str, last_seen_timestamp: Optional[str] = None) -> bool:

@@ -206,8 +206,30 @@ class SnowCoreServer:
             transport="peer_link",
         )
 
-        # 2. Persist in paired_devices
+        # 2. Persist in paired_devices with detected platform
         token_hash = hashlib.sha256(auth_token.encode("utf-8")).hexdigest() if auth_token else hashlib.sha256(remote_id.encode("utf-8")).hexdigest()
+        manifest_dict = res.manifest if isinstance(res.manifest, dict) else {}
+        caps = manifest_dict.get("supported_capabilities") or []
+        caps_str = " ".join(caps) if isinstance(caps, list) else str(caps)
+        raw_platform = str(
+            getattr(res, "platform", None)
+            or manifest_dict.get("platform")
+            or manifest_dict.get("os")
+            or manifest_dict.get("os_name")
+            or ""
+        ).strip().lower()
+
+        if "android" in raw_platform or ("android." in caps_str and "desktop." not in caps_str):
+            detected_platform = "android"
+        elif "win" in raw_platform or "desktop." in caps_str:
+            detected_platform = "windows"
+        elif "linux" in raw_platform:
+            detected_platform = "linux"
+        elif "mac" in raw_platform or "darwin" in raw_platform:
+            detected_platform = "macos"
+        else:
+            detected_platform = raw_platform or "windows"
+
         existing = self.db_manager.get_paired_device(remote_id)
         if not existing:
             self.db_manager.insert_paired_device(
@@ -215,7 +237,7 @@ class SnowCoreServer:
                 device_name=remote_name,
                 auth_token_hash=token_hash,
                 trust_tier="peer",
-                platform="windows",
+                platform=detected_platform,
                 reachability_profile="ACTIVE_SESSION_PEER",
                 last_known_host=host,
                 last_known_port=port,

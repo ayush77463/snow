@@ -233,7 +233,13 @@ class SessionRouter:
         clean_data.pop("principal", None)
         clean_data.pop("trust_tier", None)
         clean_data.pop("execution_principal", None)
-        if action in ("file_list", "file_receive_request") and effective_ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
+        if action in (
+            "file_list",
+            "file_receive_request",
+            "launch_app",
+            "android_launch_app",
+            "snow_android_launch_app",
+        ) and effective_ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
             clean_data["principal"] = effective_ctx.principal.value
 
         # Query persisted connection mode policy for target device

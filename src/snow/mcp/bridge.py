@@ -445,8 +445,11 @@ class SnowMcpBridge:
             if ipc_res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
                 return ipc_res
 
-        # In-process execution via shared CapabilityEngine (stamped as AI_MCP)
-        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
+        # In-process execution via shared CapabilityEngine
+        if self.is_owner_channel:
+            ctx = ExecutionContext(principal=ExecutionPrincipal.OWNER_MANUAL, origin="dashboard_owner")
+        else:
+            ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="mcp_in_process")
         req = CapabilityRequest(action=op, params=payload or {})
         res = await self.capability_engine.execute(req, ctx=ctx)
         return res.to_dict()

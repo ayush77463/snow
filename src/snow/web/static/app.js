@@ -164,6 +164,8 @@
             activity: "Activity Audit",
             federation: "Federation & Sharing",
             settings: "Settings & Diagnostics",
+            clipboard: "Clipboard History",
+            apps: "Android Applications",
         };
         activeTabTitle.textContent = titleMap[tabName] || "Dashboard";
 
@@ -786,7 +788,7 @@
             container.innerHTML = "";
             const lowerFilter = filterText.toLowerCase();
             const filtered = apps.filter(app => {
-                const name = (app.app_name || app.name || "").toLowerCase();
+                const name = (app.label || app.app_name || app.name || "").toLowerCase();
                 const pkg = (app.package_name || app.package || "").toLowerCase();
                 return name.includes(lowerFilter) || pkg.includes(lowerFilter);
             });
@@ -807,7 +809,7 @@
                 info.className = "app-info";
                 const nameSpan = document.createElement("span");
                 nameSpan.className = "app-name";
-                nameSpan.textContent = app.app_name || app.name || app.package_name;
+                nameSpan.textContent = app.label || app.app_name || app.name || app.package_name || "Unknown App";
                 const pkgSpan = document.createElement("span");
                 pkgSpan.className = "app-pkg";
                 pkgSpan.textContent = app.package_name || app.package || "";
@@ -2865,6 +2867,19 @@
             btnRefreshRelay.addEventListener("click", () => loadRelayStatus());
         }
 
+        const relayInputs = [
+            document.getElementById("relay-enable-toggle"),
+            document.getElementById("relay-url-input"),
+            document.getElementById("relay-group-input"),
+            document.getElementById("relay-ticket-input"),
+        ];
+        relayInputs.forEach(el => {
+            if (el) {
+                el.addEventListener("input", () => { el.dataset.userEdited = "true"; });
+                el.addEventListener("change", () => { el.dataset.userEdited = "true"; });
+            }
+        });
+
         const btnSaveRelay = document.getElementById("btn-save-relay-config");
         if (btnSaveRelay) {
             btnSaveRelay.addEventListener("click", async () => {
@@ -2890,9 +2905,73 @@
                 if (res && res.success) {
                     alert("Relay configuration updated successfully.");
                     if (ticketInput) ticketInput.value = "";
+                    if (toggleEl) delete toggleEl.dataset.userEdited;
+                    if (urlInput) delete urlInput.dataset.userEdited;
+                    if (groupInput) delete groupInput.dataset.userEdited;
                     loadRelayStatus();
                 } else {
                     alert("Failed to update relay config: " + (res?.error || "Unknown error"));
+                }
+            });
+        }
+
+        const btnConnectPeer = document.getElementById("btn-connect-peer-submit");
+        if (btnConnectPeer) {
+            btnConnectPeer.addEventListener("click", async () => {
+                const hostEl = document.getElementById("connect-peer-host");
+                const portEl = document.getElementById("connect-peer-port");
+                const pinEl = document.getElementById("connect-peer-pin");
+                const fpEl = document.getElementById("connect-peer-fp");
+                const statusEl = document.getElementById("connect-peer-status");
+
+                const host = hostEl ? hostEl.value.trim() : "";
+                const port = portEl ? parseInt(portEl.value.trim() || "8765", 10) : 8765;
+                const pin = pinEl ? pinEl.value.trim() : "";
+                const fingerprint = fpEl ? fpEl.value.trim() : "";
+
+                if (!host) {
+                    if (statusEl) {
+                        statusEl.textContent = "Host is required.";
+                        statusEl.className = "text-xs text-danger mt-1";
+                    }
+                    return;
+                }
+
+                btnConnectPeer.disabled = true;
+                btnConnectPeer.textContent = "Connecting...";
+                if (statusEl) {
+                    statusEl.textContent = `Connecting to ${host}:${port}...`;
+                    statusEl.className = "text-xs text-muted mt-1";
+                }
+
+                try {
+                    const res = await apiRequest("/api/devices/connect-peer", "POST", {
+                        host: host,
+                        port: port,
+                        pin: pin,
+                        expected_fingerprint: fingerprint,
+                    });
+                    if (res && res.success) {
+                        if (statusEl) {
+                            statusEl.textContent = `Connected successfully! Peer ID: ${res.data?.remote_device_id || 'peer'}`;
+                            statusEl.className = "text-xs text-success mt-1";
+                        }
+                        if (pinEl) pinEl.value = "";
+                        loadDevices();
+                    } else {
+                        if (statusEl) {
+                            statusEl.textContent = `Connection failed: ${res?.error || res?.status || 'Unknown error'}`;
+                            statusEl.className = "text-xs text-danger mt-1";
+                        }
+                    }
+                } catch (err) {
+                    if (statusEl) {
+                        statusEl.textContent = `Connection error: ${err}`;
+                        statusEl.className = "text-xs text-danger mt-1";
+                    }
+                } finally {
+                    btnConnectPeer.disabled = false;
+                    btnConnectPeer.textContent = "Connect to Peer";
                 }
             });
         }
@@ -2994,11 +3073,11 @@
         bindHubAction("btn-clipboard-refresh", () => loadClipboardBuffer());
 
         bindHubAction("btn-hub-cap-screen", async () => {
-            const res = await apiRequest("/api/workflows/run", "POST", { workflow_id: "workflow_capture_pc_to_phone" });
+            const res = await apiRequest("/api/workflows/run", "POST", { workflow_id: "capture_pc_to_phone" });
             loadClipboardBuffer();
         });
         bindHubAction("btn-hub-tab-cap-screen", async () => {
-            const res = await apiRequest("/api/workflows/run", "POST", { workflow_id: "workflow_capture_pc_to_phone" });
+            const res = await apiRequest("/api/workflows/run", "POST", { workflow_id: "capture_pc_to_phone" });
             loadClipboardBuffer();
         });
 
@@ -3092,10 +3171,12 @@
             const statusBox = document.getElementById("wizard-device-status-box");
 
             try {
-                const res = await apiRequest("/api/pair/qr", "POST", { tier: "owner" });
-                if (res && res.success && res.qr_svg) {
-                    if (qrImg) qrImg.src = "data:image/svg+xml;utf8," + encodeURIComponent(res.qr_svg);
-                    if (pinDisplay) pinDisplay.textContent = res.pin || "------";
+                const res = await apiRequest("/api/pair/qr", "POST", { trust_tier: "owner" });
+                const svgContent = res?.svg || res?.qr_svg || res?.data?.svg;
+                const pin = res?.data?.pin || res?.pin;
+                if (res && res.success && svgContent) {
+                    if (qrImg) qrImg.src = "data:image/svg+xml;utf8," + encodeURIComponent(svgContent);
+                    if (pinDisplay) pinDisplay.textContent = pin || "------";
                 } else {
                     const st = await apiRequest("/api/pair/state");
                     if (st && st.data) {
@@ -3104,7 +3185,9 @@
                 }
 
                 const devData = await apiRequest("/api/devices");
-                const count = (devData && devData.devices) ? devData.devices.length : 0;
+                const devList = (devData && Array.isArray(devData.devices)) ? devData.devices :
+                    ((devData && devData.data && Array.isArray(devData.data.devices)) ? devData.data.devices : []);
+                const count = devList.filter(d => !isLocalNode(d) && d.is_connected).length;
                 if (statusBox) {
                     if (count > 0) {
                         statusBox.textContent = `✓ ${count} device(s) connected! Ready for AI capabilities.`;

@@ -247,7 +247,8 @@ class AndroidCapabilityDispatcher(
             }
             "launch_app" -> {
                 val packageName = data?.get("package_name") as? String
-                val res = appLauncherHandler.launchApp(packageName)
+                val principal = data?.get("principal") as? String
+                val res = appLauncherHandler.launchApp(packageName, principal)
                 if (res["status"] == "success" || res["success"] == true) {
                     Pair(res, null)
                 } else {

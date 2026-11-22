@@ -449,6 +449,38 @@
                         </div>
                     </div>
 
+                    <!-- Connect to Peer Host Card (Phase 22 / Phase 30) -->
+                    <div class="card mt-4">
+                        <div class="card-header">
+                            <h3>🔗 Connect to Peer Host</h3>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-sm text-muted">Directly federate with another SNOW Core or Android Peer Host on your local network.</p>
+                            <div class="row mt-2" style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end;">
+                                <div style="flex: 2; min-width: 140px;">
+                                    <label for="connect-peer-host" class="label text-xs">Peer Host / IP:</label>
+                                    <input type="text" id="connect-peer-host" class="form-input form-input-sm" placeholder="192.168.1.X" />
+                                </div>
+                                <div style="flex: 1; min-width: 80px;">
+                                    <label for="connect-peer-port" class="label text-xs">Port:</label>
+                                    <input type="number" id="connect-peer-port" class="form-input form-input-sm" value="8765" />
+                                </div>
+                                <div style="flex: 1; min-width: 100px;">
+                                    <label for="connect-peer-pin" class="label text-xs">Pairing PIN:</label>
+                                    <input type="text" id="connect-peer-pin" class="form-input form-input-sm" placeholder="PIN (optional)" />
+                                </div>
+                                <div style="flex: 2; min-width: 160px;">
+                                    <label for="connect-peer-fp" class="label text-xs">Fingerprint (optional):</label>
+                                    <input type="text" id="connect-peer-fp" class="form-input form-input-sm" placeholder="SHA-256 fingerprint" />
+                                </div>
+                                <div>
+                                    <button id="btn-connect-peer-submit" class="btn btn-primary btn-sm" type="button">Connect to Peer</button>
+                                </div>
+                            </div>
+                            <div id="connect-peer-status" class="text-xs mt-1"></div>
+                        </div>
+                    </div>
+
                     <div id="devices-list" class="cards-grid mt-4">
                         <div class="empty-state">No devices found. Ensure SNOW Desktop Core is running.</div>
                     </div>

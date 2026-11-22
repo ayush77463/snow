@@ -717,18 +717,97 @@ class CapabilityEngine:
                 router = getattr(self, "session_router", None)
                 if not router or not hasattr(router, "route_request"):
                     return CapabilityResponse(success=False, status="DEVICE_OFFLINE", error="Session router not available.")
+
+                resolved_target = target
+                reg = self.node_registry or getattr(self.session_router, "node_registry", None)
+                if reg and hasattr(reg, "resolve_target"):
+                    try:
+                        res = reg.resolve_target(target if target not in ("pc", "windows", "local") else "")
+                        if isinstance(res, tuple) and len(res) == 2:
+                            node, err = res
+                            if node:
+                                resolved_target = node.device_id
+                            elif err and target in ("android", "phone", ""):
+                                return CapabilityResponse(success=False, status=err, error=f"Target device resolution failed: {err}")
+                    except Exception:
+                        pass
+                elif self.core_server and hasattr(self.core_server, "session_manager"):
+                    sm = self.core_server.session_manager
+                    if target in ("android", "phone", ""):
+                        sessions = sm.get_all_sessions()
+                        if len(sessions) == 1:
+                            resolved_target = list(sessions.values())[0].device_id
+                        elif len(sessions) > 1:
+                            return CapabilityResponse(success=False, status="DEVICE_REQUIRED", error="Multiple active devices. Explicit target required.")
+                        else:
+                            return CapabilityResponse(success=False, status="DEVICE_NOT_FOUND", error="No active connected device found.")
+
                 if c_type == "text":
                     route_res = await router.route_request(
                         action="clipboard_push",
-                        target=target,
+                        target=resolved_target,
                         data={"text": item.get("text_content", "")},
                         ctx=ctx,
                     )
                 else:
+                    img_path = self.clipboard_buffer.get_image_path(target_id)
+                    if not img_path or not img_path.exists():
+                        return CapabilityResponse(success=False, status="FILE_NOT_FOUND", error="Image file missing on disk.")
+
+                    file_size = img_path.stat().st_size
+                    file_sha256 = item.get("sha256")
+                    if not file_sha256:
+                        h = hashlib.sha256()
+                        with open(img_path, "rb") as f:
+                            while chunk := f.read(65536):
+                                h.update(chunk)
+                        file_sha256 = h.hexdigest()
+
+                    # Stage image into storage manager so HTTPS transfer route can serve it
+                    if self.storage_manager and hasattr(self.storage_manager, "resolve_destination_path"):
+                        try:
+                            dest_path = self.storage_manager.resolve_destination_path(img_path.name)
+                            if dest_path.resolve() != img_path.resolve():
+                                import shutil
+                                shutil.copy2(img_path, dest_path)
+                        except Exception as sc_err:
+                            logger.warning("Failed staging clipboard transfer file '%s': %s", img_path.name, sc_err)
+
+                    from snow.transfer.manager import TransferDirection
+                    tm = self.transfer_manager
+                    if tm and hasattr(tm, "create_transfer"):
+                        record = tm.create_transfer(
+                            device_id=resolved_target,
+                            file_name=img_path.name,
+                            file_size=file_size,
+                            sha256=file_sha256,
+                            direction=TransferDirection.DOWNLOAD,
+                        )
+                        transfer_id = record.transfer_id
+                    else:
+                        import secrets
+                        transfer_id = secrets.token_hex(16)
+
+                    transfer_port = 8766
+                    if self.http_transfer_server and hasattr(self.http_transfer_server, "bound_port"):
+                        transfer_port = self.http_transfer_server.bound_port or 8766
+                    elif self.core_server and hasattr(self.core_server, "config"):
+                        transfer_port = getattr(self.core_server.config, "transfer_port", 8766)
+
+                    push_data = {
+                        "type": "image",
+                        "transfer_id": transfer_id,
+                        "transfer_port": transfer_port,
+                        "sha256": file_sha256,
+                        "mime_type": item.get("mime_type") or "image/png",
+                        "file_name": img_path.name,
+                        "size": file_size,
+                    }
+
                     route_res = await router.route_request(
                         action="clipboard_push",
-                        target=target,
-                        data={"type": "image", "sha256": item.get("sha256"), "mime_type": item.get("mime_type")},
+                        target=resolved_target,
+                        data=push_data,
                         ctx=ctx,
                     )
                 is_ok = route_res.get("success", False)

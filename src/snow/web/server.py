@@ -294,7 +294,14 @@ class SnowWebServer:
             return web.json_response({"success": False, "error": "Missing required field 'device_id'."}, status=400)
 
         # Protection: Cannot revoke local desktop node
-        local_id = getattr(self.bridge.local_identity, "device_id", "desktop-core") if hasattr(self.bridge, "local_identity") else "desktop-core"
+        local_id = "desktop-core"
+        try:
+            from snow.security.identity import load_or_create_device_identity
+            local_ident = load_or_create_device_identity()
+            if local_ident and local_ident.device_id:
+                local_id = local_ident.device_id
+        except Exception:
+            pass
         if device_id in ("local", "desktop-core", local_id):
             return web.json_response({"success": False, "status": "FORBIDDEN", "error": "Cannot revoke the local desktop node."}, status=400)
 
@@ -436,11 +443,11 @@ class SnowWebServer:
             try:
                 body = await request.json()
                 if isinstance(body, dict):
-                    trust_tier = body.get("trust_tier", "owner")
+                    trust_tier = body.get("trust_tier") or body.get("tier", "owner")
             except Exception:
                 pass
         elif request.method == "GET":
-            trust_tier = request.query.get("trust_tier", "owner")
+            trust_tier = request.query.get("trust_tier") or request.query.get("tier", "owner")
 
         res = await self.bridge.call("generate_pairing_qr", {"trust_tier": trust_tier})
         if not res.get("success"):

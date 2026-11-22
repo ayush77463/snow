@@ -750,7 +750,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     val battery = data?.get("battery") as? Map<*, *>
                     val batteryPct = (battery?.get("percent") as? Number)?.toInt()
                     val charging = battery?.get("charging") as? Boolean
-                    val os = data?.get("os") as? String
+                    val os = (data?.get("os_name") as? String)?.takeIf { it.isNotBlank() }
+                        ?: (data?.get("os") as? String)?.takeIf { it.isNotBlank() }
+                        ?: (data?.get("platform") as? String)
                     val hostname = data?.get("hostname") as? String
                     val cpuPct = (data?.get("cpu_percent") as? Number)?.toDouble()
                     val memPct = (data?.get("memory_percent") as? Number)?.toDouble()

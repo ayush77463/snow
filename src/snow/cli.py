@@ -308,7 +308,7 @@ def run_devices_trust(
             print("\nOperation cancelled.")
             return 1
 
-    bridge = SnowMcpBridge(auto_start_core=False)
+    bridge = SnowMcpBridge(auto_start_core=False, is_owner_channel=True)
     daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
 
     if daemon_online:
@@ -359,7 +359,7 @@ def run_devices_revoke(
             print("\nRevocation cancelled.")
             return 1
 
-    bridge = SnowMcpBridge(auto_start_core=False)
+    bridge = SnowMcpBridge(auto_start_core=False, is_owner_channel=True)
     daemon_online = asyncio.run(bridge.daemon_manager.is_ipc_ready(timeout=0.2))
 
     if daemon_online:
@@ -406,15 +406,20 @@ def run_devices_connect(
 
     print(f"Connecting to peer at {clean_host}:{port}...")
 
-    import socket
     try:
-        s = socket.create_connection((clean_host, port), timeout=5.0)
-        s.close()
-        print(f"[+] TCP connection to {clean_host}:{port} successful.")
-        if pin:
-            print("    PIN provided for mutual pairing verification.")
-        print("    Peer endpoint is reachable and responsive.")
-        return 0
+        from snow.mcp.bridge import SnowMcpBridge
+        bridge = SnowMcpBridge(is_owner_channel=True)
+        res = asyncio.run(bridge.mesh_connect_peer(host=clean_host, port=port, pin=pin or ""))
+        if res.get("success"):
+            data = res.get("data") or {}
+            dev_id = data.get("remote_device_id", "peer")
+            dev_name = data.get("remote_device_name", clean_host)
+            print(f"[+] Successfully connected and federated with peer [{dev_id}] ({dev_name}) at {clean_host}:{port}.")
+            return 0
+        else:
+            err = res.get("error") or res.get("status") or "Unknown error"
+            print(f"[-] Connection failed to {clean_host}:{port}: {err}")
+            return 1
     except Exception as exc:
         print(f"[-] Connection failed to {clean_host}:{port}: {exc}")
         return 1
@@ -681,7 +686,7 @@ def run_doctor(
     try:
         import snow
         status = "OK"
-        msg = f"SNOW package importable (v{getattr(snow, '__version__', '2.0.0')})"
+        msg = f"SNOW package importable (v{getattr(snow, '__version__', '4.1.0')})"
         remed = None
     except Exception as exc:
         status = "FAILED"
@@ -930,7 +935,7 @@ def run_status() -> int:
     print("=" * 60)
     print("SNOW — System Status Overview")
     print("=" * 60)
-    print(f"  Version:           3.0.0")
+    print(f"  Version:           4.1.0")
     print(f"  Daemon Running:    {'YES' if status_data['daemon_running'] else 'NO'}")
     print(f"  IPC Endpoint:      {'READY (online)' if status_data['ipc_ready'] else 'OFFLINE'}")
     if status_data.get("pid"):

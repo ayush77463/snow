@@ -495,6 +495,15 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "mesh_connect_peer":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
             host = payload.get("host")
             port = payload.get("port", 8765)
             pin = payload.get("pin", "")
@@ -533,6 +542,15 @@ class SnowIpcServer:
                 }, now_authed
 
         if op == "mesh_disconnect_peer":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
             device_id = payload.get("device_id")
             if not device_id:
                 return {
@@ -615,6 +633,15 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "device_set_connection_mode":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
             device_id = payload.get("device_id")
             mode = payload.get("connection_mode")
             if not device_id or not mode:
@@ -690,6 +717,15 @@ class SnowIpcServer:
                 }, now_authed
 
         if op == "relay_config":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
             enabled = payload.get("enabled", False)
             relay_url = payload.get("relay_url")
             group_id = payload.get("group_id")
@@ -946,7 +982,53 @@ class SnowIpcServer:
                             "status": "NOT_FOUND",
                             "error": "Clipboard image file not found on disk.",
                         }, now_authed
+                    resolved_dev_id = dev_id
                     cs = getattr(self, "core_server", None)
+                    reg = getattr(self, "node_registry", None) or (getattr(cs, "node_registry", None) if cs else None)
+                    if reg and hasattr(reg, "resolve_target"):
+                        node, err = reg.resolve_target(dev_id or "")
+                        if node:
+                            resolved_dev_id = node.device_id
+                        elif err:
+                            return {
+                                "version": IPC_PROTOCOL_VERSION,
+                                "request_id": request_id,
+                                "success": False,
+                                "status": err,
+                                "error": f"Failed resolving target device: {err}",
+                            }, now_authed
+                    elif cs and hasattr(cs, "session_manager"):
+                        sm = cs.session_manager
+                        if not resolved_dev_id or resolved_dev_id in ("android", "phone"):
+                            sessions = sm.get_all_sessions()
+                            if len(sessions) == 1:
+                                resolved_dev_id = list(sessions.values())[0].device_id
+                            elif len(sessions) > 1:
+                                return {
+                                    "version": IPC_PROTOCOL_VERSION,
+                                    "request_id": request_id,
+                                    "success": False,
+                                    "status": "DEVICE_REQUIRED",
+                                    "error": "Multiple active devices. Explicit device_id required.",
+                                }, now_authed
+                            else:
+                                return {
+                                    "version": IPC_PROTOCOL_VERSION,
+                                    "request_id": request_id,
+                                    "success": False,
+                                    "status": "DEVICE_NOT_FOUND",
+                                    "error": "No active connected device found.",
+                                }, now_authed
+
+                    if not resolved_dev_id:
+                        return {
+                            "version": IPC_PROTOCOL_VERSION,
+                            "request_id": request_id,
+                            "success": False,
+                            "status": "DEVICE_NOT_FOUND",
+                            "error": "Target device could not be resolved.",
+                        }, now_authed
+
                     tm = getattr(cs, "transfer_manager", None) if cs else None
                     if not tm:
                         tm = getattr(self.capability_engine, "transfer_manager", None)
@@ -966,7 +1048,7 @@ class SnowIpcServer:
                     f_size = item_detail.get("size_bytes") or img_path.stat().st_size
                     f_name = img_path.name
                     record = tm.create_transfer(
-                        device_id=dev_id or "device",
+                        device_id=resolved_dev_id,
                         file_name=f_name,
                         file_size=f_size,
                         sha256=c_hash,
@@ -975,7 +1057,7 @@ class SnowIpcServer:
                     record.file_path = img_path
                     record.status = TransferState.IN_PROGRESS
                     dev_resp = await self._handle_device_request({
-                        "device_id": dev_id,
+                        "device_id": resolved_dev_id,
                         "action": "clipboard_push",
                         "data": {
                             "type": "image",
@@ -1093,7 +1175,7 @@ class SnowIpcServer:
                 "device_id": payload.get("device_id"),
                 "action": "notifications_list",
                 "data": {},
-            })
+            }, ctx=ctx)
             resp_data = dev_resp.get("data")
             if not isinstance(resp_data, dict):
                 resp_data = {"notifications": [], "count": 0}
@@ -1111,7 +1193,7 @@ class SnowIpcServer:
                 "device_id": payload.get("device_id"),
                 "action": "notification_dismiss",
                 "data": {"key": payload.get("key")},
-            })
+            }, ctx=ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -1126,7 +1208,7 @@ class SnowIpcServer:
                 "device_id": payload.get("device_id"),
                 "action": "notification_reply",
                 "data": {"key": payload.get("key"), "text": payload.get("text")},
-            })
+            }, ctx=ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -1217,6 +1299,15 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "device_trust":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
             payload_data = payload if isinstance(payload, dict) else {}
             device_id = payload_data.get("device_id")
             tier = payload_data.get("tier")
@@ -1248,6 +1339,15 @@ class SnowIpcServer:
                 }, now_authed
 
         if op == "device_revoke":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
             payload_data = payload if isinstance(payload, dict) else {}
             device_id = payload_data.get("device_id")
             if not device_id:
@@ -1259,11 +1359,26 @@ class SnowIpcServer:
                     "error": "Missing 'device_id'.",
                 }, now_authed
 
-            # 1. Terminate any active authenticated session for this device
+            # 1. Terminate any active authenticated session and active transport for this device
             session = self.core_server.session_manager.get_session_by_device(device_id)
             if session:
+                if session.connection_id and hasattr(self.core_server, "connection_manager"):
+                    client = self.core_server.connection_manager.unregister(session.connection_id)
+                    if client and hasattr(client, "websocket"):
+                        try:
+                            await client.websocket.close(code=1000, reason="Device revoked")
+                        except Exception as close_err:
+                            logger.debug("Error closing revoked client websocket: %s", close_err)
                 self.core_server.session_manager.revoke_session(session.session_id)
                 logger.info("Revoked active session [%s] for device [%s]", session.session_id, device_id)
+
+            if hasattr(self.core_server, "peer_clients") and device_id in self.core_server.peer_clients:
+                peer_client = self.core_server.peer_clients.pop(device_id, None)
+                if peer_client:
+                    try:
+                        await peer_client.close()
+                    except Exception as close_err:
+                        logger.debug("Error closing revoked peer client: %s", close_err)
 
             # 2. Delete paired credentials from SQLite database
             deleted = self.core_server.db_manager.delete_paired_device(device_id)
@@ -1555,6 +1670,14 @@ class SnowIpcServer:
                 "status": "INVALID_ARGUMENT",
                 "error": "Missing or non-string 'action'.",
             }
+
+        if action == "launch_app":
+            req_data = dict(data) if isinstance(data, dict) else {}
+            if ctx and ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
+                req_data["principal"] = "OWNER_MANUAL"
+            else:
+                req_data["principal"] = "AI_MCP"
+            data = req_data
 
         if action == "desktop_exec":
             logger.warning(
@@ -2174,7 +2297,7 @@ class SnowIpcServer:
         cert_path = (
             getattr(cs.http_transfer_server, "cert_path", None)
             if cs and getattr(cs, "http_transfer_server", None)
-            else (getattr(cs.config, "tls_cert_file", None) if cs and hasattr(cs, "config") else None)
+            else (getattr(cs.config, "tls_cert_path", None) or getattr(cs.config, "tls_cert_file", None) if cs and hasattr(cs, "config") else None)
         )
         return {
             **status_data,
