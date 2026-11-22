@@ -779,48 +779,89 @@
                         </div>
                     </div>
 
-                    <!-- AI Connectors & Remote MCP Card (Phase 23) -->
+                    <!-- AI Connectors & Remote MCP Card (Phase 23 & 28B) -->
                     <div class="card mt-4" id="card-mcp-gateway-status">
                         <div class="card-header">
-                            <h3>AI Connectors & Remote MCP Gateway</h3>
+                            <h3>🤖 Connect Your AI & Remote MCP Platform</h3>
                         </div>
                         <div class="card-body">
-                            <p class="text-muted">Connect external AI assistants and IDEs to SNOW via standardized
-                                Streamable HTTP & OAuth 2.1.</p>
-                            <div class="diag-row mt-2">
-                                <span class="diag-label">MCP Gateway Status:</span>
-                                <span class="diag-val" id="mcp-gateway-status"><span
-                                        class="badge badge-muted">Checking...</span></span>
+                            <p class="text-muted">Connect external AI assistants (Claude, ChatGPT, Gemini, IDEs) to SNOW via local stdio or secure Remote Streamable HTTP + OAuth 2.1.</p>
+
+                            <!-- Local stdio section -->
+                            <div class="mcp-section mt-3">
+                                <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;">💻 Local Integration (stdio)</h4>
+                                <div class="diag-row">
+                                    <span class="diag-label">Configured Local Hosts:</span>
+                                    <span class="diag-val" id="mcp-hosts-val"><span class="badge badge-muted">Checking...</span></span>
+                                </div>
+                                <div class="diag-row">
+                                    <span class="diag-label">stdio Command:</span>
+                                    <span class="diag-val"><code>py -3.13 -m snow.mcp</code></span>
+                                </div>
                             </div>
-                            <div class="diag-row">
-                                <span class="diag-label">MCP Endpoint:</span>
-                                <span class="diag-val"><code
-                                        id="mcp-endpoint-val">http://127.0.0.1:8771/mcp</code></span>
+
+                            <!-- Remote Streamable HTTP section -->
+                            <div class="mcp-section mt-3 pt-2" style="border-top: 1px solid var(--border-color);">
+                                <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;">🌐 Remote Integration (Streamable HTTP)</h4>
+                                <div class="diag-row">
+                                    <span class="diag-label">Gateway Service:</span>
+                                    <span class="diag-val" id="mcp-gateway-status"><span class="badge badge-muted">Checking...</span></span>
+                                </div>
+                                <div class="diag-row">
+                                    <span class="diag-label">Local MCP Endpoint:</span>
+                                    <span class="diag-val"><code id="mcp-endpoint-val">http://127.0.0.1:8771/mcp</code></span>
+                                </div>
+                                <div class="diag-row" id="row-public-mcp-endpoint" style="display: none;">
+                                    <span class="diag-label">Public HTTPS Endpoint:</span>
+                                    <span class="diag-val"><code id="mcp-public-endpoint-val" style="color: var(--accent-color);">Not Configured</code></span>
+                                </div>
+                                <div class="diag-row">
+                                    <span class="diag-label">OAuth 2.1 Discovery:</span>
+                                    <span class="diag-val"><code id="mcp-oauth-discovery-val">http://127.0.0.1:8771/.well-known/oauth-authorization-server</code></span>
+                                </div>
+                                <div class="diag-row">
+                                    <span class="diag-label">Available Tools:</span>
+                                    <span class="diag-val"><span id="mcp-capabilities-count">38</span> capabilities (Security: <code>AI_MCP</code> least privilege)</span>
+                                </div>
+                                <div class="diag-row">
+                                    <span class="diag-label">Public Tunnel Helper:</span>
+                                    <span class="diag-val"><code>snow expose --provider cloudflared</code></span>
+                                </div>
                             </div>
-                            <div class="diag-row">
-                                <span class="diag-label">OAuth 2.1 Discovery:</span>
-                                <span
-                                    class="diag-val"><code>http://127.0.0.1:8771/.well-known/oauth-authorization-server</code></span>
+
+                            <!-- Host Connection Instructions Tabs -->
+                            <div class="mcp-instructions mt-3 pt-2" style="border-top: 1px solid var(--border-color);">
+                                <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;">📖 Client Setup Instructions</h4>
+                                <div style="font-size: 0.85rem; color: var(--text-secondary); line-height: 1.5;">
+                                    <details class="mt-1" style="cursor: pointer;">
+                                        <summary><strong>Claude Desktop / Claude Web</strong></summary>
+                                        <p class="mt-1">
+                                            • <strong>Local stdio:</strong> Run <code>snow setup --host claude</code> to auto-configure.<br>
+                                            • <strong>Remote HTTP:</strong> Add MCP Server with URL <code class="mcp-url-copy">http://127.0.0.1:8771/mcp</code> (or your public HTTPS endpoint). OAuth 2.1 authentication initiates automatically.
+                                        </p>
+                                    </details>
+                                    <details class="mt-1" style="cursor: pointer;">
+                                        <summary><strong>ChatGPT (Custom Connectors / Developer Mode)</strong></summary>
+                                        <p class="mt-1">
+                                            • Requires a public HTTPS endpoint (use <code>snow expose</code> or Docker/Caddy).<br>
+                                            • Endpoint URL: <code class="mcp-url-copy">https://&lt;your-domain&gt;/mcp</code>.<br>
+                                            • Auth: OAuth 2.1 Code Flow with PKCE S256.
+                                        </p>
+                                    </details>
+                                    <details class="mt-1" style="cursor: pointer;">
+                                        <summary><strong>Gemini Antigravity / Cursor IDE</strong></summary>
+                                        <p class="mt-1">
+                                            • <strong>Gemini / Antigravity:</strong> Run <code>snow setup --host gemini</code> or connect to the Remote MCP endpoint.<br>
+                                            • <strong>Cursor:</strong> Run <code>snow setup --host cursor</code> to write configuration to <code>.cursor/mcp.json</code>.
+                                        </p>
+                                    </details>
+                                </div>
                             </div>
-                            <div class="diag-row">
-                                <span class="diag-label">Protocol Version:</span>
-                                <span class="diag-val">2024-11-05 (Streamable HTTP + SSE)</span>
-                            </div>
-                            <div class="diag-row">
-                                <span class="diag-label">Available Tools:</span>
-                                <span class="diag-val">30 capabilities (Security: <code>AI_MCP</code> least
-                                    privilege)</span>
-                            </div>
-                            <div class="diag-row">
-                                <span class="diag-label">Configured AI Hosts:</span>
-                                <span class="diag-val" id="mcp-hosts-val"><span
-                                        class="badge badge-muted">Checking...</span></span>
-                            </div>
+
                             <div class="mt-3">
-                                <button class="btn btn-secondary btn-sm" id="btn-copy-mcp-url">Copy Endpoint
-                                    URL</button>
-                                <button class="btn btn-secondary btn-sm" id="btn-test-mcp-health">Verify
-                                    Gateway</button>
+                                <button class="btn btn-secondary btn-sm" id="btn-copy-mcp-url">Copy Local Endpoint</button>
+                                <button class="btn btn-secondary btn-sm" id="btn-copy-public-mcp-url" style="display: none;">Copy Public Endpoint</button>
+                                <button class="btn btn-secondary btn-sm" id="btn-test-mcp-health">Verify Gateway</button>
                             </div>
                             <div id="mcp-test-result" class="mt-2 text-muted" style="font-size: 0.85rem;"></div>
                         </div>

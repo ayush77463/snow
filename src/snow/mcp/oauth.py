@@ -11,16 +11,75 @@ from __future__ import annotations
 import base64
 from dataclasses import asdict, dataclass
 import hashlib
+import http.client
+import ipaddress
+import json
 import logging
 import secrets
+import socket
+import ssl
 import time
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_AUTH_CODE_TTL_SECONDS: float = 600.0  # 10 minutes
 DEFAULT_ACCESS_TOKEN_TTL_SECONDS: float = 3600.0  # 1 hour
 DEFAULT_REFRESH_TOKEN_TTL_SECONDS: float = 86400.0 * 30.0  # 30 days
+DEFAULT_CIMD_CACHE_TTL_SECONDS: float = 600.0  # 10 minutes
+DEFAULT_CIMD_MAX_CACHE_SIZE: int = 500
+MAX_CIMD_BODY_SIZE_BYTES: int = 65536  # 64 KB
+
+# Cloud metadata and link-local service IPs strictly forbidden for CIMD resolution
+RESTRICTED_METADATA_IPS: set[str] = {
+    "169.254.169.254",  # AWS/GCP/Azure/OpenStack IMDS
+    "169.254.170.2",    # AWS ECS task metadata
+    "fd00:ec2::254",    # AWS IMDS IPv6
+}
+
+
+class PinnedIPHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that connects directly to a pre-validated IP while preserving SNI."""
+
+    def __init__(
+        self,
+        pinned_ip: str,
+        sni_hostname: str,
+        port: int = 443,
+        context: Optional[ssl.SSLContext] = None,
+        timeout: float = 5.0,
+    ) -> None:
+        super().__init__(pinned_ip, port=port, context=context, timeout=timeout)
+        self.sni_hostname = sni_hostname
+
+    def connect(self) -> None:
+        super(http.client.HTTPSConnection, self).connect()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.sni_hostname)
+
+
+def is_ip_restricted(ip_str: str) -> bool:
+    """Return True if an IP address belongs to any private, loopback, link-local,
+    multicast, reserved, unspecified, or cloud metadata range.
+    """
+    clean_ip = ip_str.strip()
+    if clean_ip in RESTRICTED_METADATA_IPS:
+        return True
+    try:
+        ip = ipaddress.ip_address(clean_ip)
+        # Check IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            return is_ip_restricted(str(ip.ipv4_mapped))
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    except ValueError:
+        return True
 
 
 @dataclass
@@ -82,6 +141,177 @@ class OAuthServer:
         self._refresh_tokens: dict[str, TokenRecord] = {}
         # family_id -> set of refresh_tokens
         self._token_families: dict[str, set[str]] = {}
+        # Cache for fetched Client ID Metadata Documents (CIMD): client_id_url -> (OAuthClient, timestamp)
+        self._cimd_cache: dict[str, tuple[OAuthClient, float]] = {}
+
+    def fetch_cimd_document(
+        self, client_id_url: str, max_redirects: int = 2
+    ) -> tuple[bool, dict[str, Any] | dict[str, str]]:
+        """Securely fetch and validate a Client ID Metadata Document (CIMD) over HTTPS.
+
+        Enforces strict SSRF defense:
+        - HTTPS scheme only (rejects http, ftp, file, etc.).
+        - Strict DNS resolution check: rejects private, loopback, link-local, multicast,
+          reserved, unspecified, and cloud metadata (IMDS) IP ranges.
+        - DNS Rebinding Defense: Pins the validated IP address directly on the connection
+          socket while preserving TLS SNI and Host header.
+        - Strict JSON parsing, max 64 KB response size, and redirect target validation.
+        """
+        if not isinstance(client_id_url, str) or not client_id_url.startswith("https://"):
+            return False, {
+                "error": "invalid_client",
+                "error_description": "CIMD client_id must be a valid HTTPS URL",
+            }
+
+        parsed = urllib.parse.urlparse(client_id_url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False, {
+                "error": "invalid_client",
+                "error_description": "CIMD URL missing valid hostname",
+            }
+
+        port = parsed.port or 443
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        # 1. Resolve hostname and validate every returned IP address (SSRF Defense)
+        try:
+            addr_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except Exception as exc:
+            logger.warning("DNS resolution failed for CIMD host '%s': %s", hostname, exc)
+            return False, {
+                "error": "invalid_client",
+                "error_description": f"DNS resolution failed for '{hostname}': {exc}",
+            }
+
+        if not addr_info:
+            return False, {
+                "error": "invalid_client",
+                "error_description": f"No IP addresses resolved for '{hostname}'",
+            }
+
+        validated_ips: list[str] = []
+        for entry in addr_info:
+            sockaddr = entry[4]
+            ip_str = sockaddr[0]
+            if is_ip_restricted(ip_str):
+                logger.warning(
+                    "CIMD SSRF attempt blocked: host '%s' resolves to restricted IP [%s]",
+                    hostname,
+                    ip_str,
+                )
+                return False, {
+                    "error": "invalid_client",
+                    "error_description": f"SSRF blocked: host '{hostname}' resolves to restricted IP: {ip_str}",
+                }
+            validated_ips.append(ip_str)
+
+        # 2. Pin connection to first validated IP to prevent DNS rebinding
+        pinned_ip = validated_ips[0]
+        try:
+            ssl_ctx = ssl.create_default_context()
+            conn = PinnedIPHTTPSConnection(
+                pinned_ip=pinned_ip,
+                sni_hostname=hostname,
+                port=port,
+                context=ssl_ctx,
+                timeout=5.0,
+            )
+            req_headers = {
+                "Host": f"{hostname}:{port}" if parsed.port and parsed.port != 443 else hostname,
+                "Accept": "application/json",
+                "User-Agent": "SNOW-CIMD/1.0",
+            }
+            conn.request("GET", path, headers=req_headers)
+            resp = conn.getresponse()
+
+            # Handle Redirects safely
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                conn.close()
+                if not location:
+                    return False, {
+                        "error": "invalid_client",
+                        "error_description": "Redirect missing Location header",
+                    }
+                if max_redirects <= 0:
+                    return False, {
+                        "error": "invalid_client",
+                        "error_description": "Exceeded maximum allowed redirects for CIMD",
+                    }
+                redirect_url = urllib.parse.urljoin(client_id_url, location)
+                if not redirect_url.startswith("https://"):
+                    return False, {
+                        "error": "invalid_client",
+                        "error_description": f"Insecure redirect to non-HTTPS URL: {redirect_url}",
+                    }
+                logger.info("Following CIMD redirect to: %s", redirect_url)
+                return self.fetch_cimd_document(redirect_url, max_redirects=max_redirects - 1)
+
+            if resp.status != 200:
+                conn.close()
+                return False, {
+                    "error": "invalid_client",
+                    "error_description": f"CIMD endpoint returned HTTP {resp.status}",
+                }
+
+            content_type = resp.getheader("Content-Type", "")
+            if "json" not in content_type.lower():
+                conn.close()
+                return False, {
+                    "error": "invalid_client",
+                    "error_description": f"Invalid Content-Type for CIMD: expected JSON, got '{content_type}'",
+                }
+
+            body_bytes = resp.read(MAX_CIMD_BODY_SIZE_BYTES + 1)
+            conn.close()
+
+            if len(body_bytes) > MAX_CIMD_BODY_SIZE_BYTES:
+                return False, {
+                    "error": "invalid_client",
+                    "error_description": f"CIMD response exceeds maximum permitted size of {MAX_CIMD_BODY_SIZE_BYTES} bytes",
+                }
+
+            doc = json.loads(body_bytes.decode("utf-8"))
+            if not isinstance(doc, dict):
+                return False, {
+                    "error": "invalid_client",
+                    "error_description": "CIMD document must be a JSON object",
+                }
+
+            # Exact Client Identity Matching: client_id in document MUST match requested URL
+            doc_client_id = doc.get("client_id")
+            if doc_client_id != client_id_url:
+                return False, {
+                    "error": "invalid_client",
+                    "error_description": f"CIMD client_id '{doc_client_id}' does not match requested URL '{client_id_url}'",
+                }
+
+            # Redirect URIs validation
+            redirect_uris = doc.get("redirect_uris")
+            if not isinstance(redirect_uris, list) or not redirect_uris:
+                return False, {
+                    "error": "invalid_client",
+                    "error_description": "CIMD document must specify non-empty redirect_uris array",
+                }
+
+            for uri in redirect_uris:
+                if not isinstance(uri, str) or not uri.strip():
+                    return False, {
+                        "error": "invalid_client",
+                        "error_description": "CIMD document contains empty or invalid redirect_uri",
+                    }
+
+            return True, doc
+
+        except Exception as exc:
+            logger.warning("Failed fetching CIMD from '%s': %s", client_id_url, exc)
+            return False, {
+                "error": "invalid_client",
+                "error_description": f"Failed fetching CIMD: {exc}",
+            }
 
     def register_client(
         self,
@@ -98,7 +328,7 @@ class OAuthServer:
             client_id=client_id,
             client_secret=client_secret,
             client_name=client_name or "AI Assistant Client",
-            redirect_uris=redirect_uris or ["http://localhost", "http://127.0.0.1"],
+            redirect_uris=redirect_uris or ["http://localhost", "http://127.0.0.1", "urn:ietf:wg:oauth:2.0:oob"],
             scope=scope,
             created_at=time.time(),
         )
@@ -117,8 +347,46 @@ class OAuthServer:
         return res
 
     def get_client(self, client_id: str) -> Optional[OAuthClient]:
-        """Retrieve registered client metadata."""
-        return self._clients.get(client_id)
+        """Retrieve registered client metadata from DCR registry or CIMD cache/URL."""
+        if not client_id:
+            return None
+
+        # 1. Check local DCR registered clients
+        if client_id in self._clients:
+            return self._clients[client_id]
+
+        # 2. Check CIMD cache
+        now = time.time()
+        if client_id in self._cimd_cache:
+            client, cached_at = self._cimd_cache[client_id]
+            if now - cached_at < DEFAULT_CIMD_CACHE_TTL_SECONDS:
+                return client
+            self._cimd_cache.pop(client_id, None)
+
+        # 3. If client_id is an HTTPS URL, fetch Client ID Metadata Document (CIMD)
+        if client_id.startswith("https://"):
+            ok, doc_or_err = self.fetch_cimd_document(client_id)
+            if ok and isinstance(doc_or_err, dict):
+                parsed = urllib.parse.urlparse(client_id)
+                client_name = str(doc_or_err.get("client_name") or parsed.hostname or "CIMD Client")
+                redirect_uris = [str(u) for u in doc_or_err.get("redirect_uris", [])]
+                scope = str(doc_or_err.get("scope") or "snow:mcp")
+                client = OAuthClient(
+                    client_id=client_id,
+                    client_secret=None,
+                    client_name=client_name,
+                    redirect_uris=redirect_uris,
+                    scope=scope,
+                    created_at=now,
+                )
+                if len(self._cimd_cache) >= DEFAULT_CIMD_MAX_CACHE_SIZE:
+                    oldest_key = min(self._cimd_cache.keys(), key=lambda k: self._cimd_cache[k][1])
+                    self._cimd_cache.pop(oldest_key, None)
+                self._cimd_cache[client_id] = (client, now)
+                logger.info("Validated and cached CIMD client: %s (%s)", client.client_name, client_id)
+                return client
+
+        return None
 
     def create_authorization_code(
         self,
@@ -132,6 +400,13 @@ class OAuthServer:
         client = self.get_client(client_id)
         if not client:
             return False, {"error": "unauthorized_client", "error_description": "Unknown client_id"}
+
+        # Strict exact redirect URI matching against registered metadata
+        if redirect_uri not in client.redirect_uris:
+            return False, {
+                "error": "invalid_request",
+                "error_description": f"Redirect URI '{redirect_uri}' is not registered for client '{client_id}'",
+            }
 
         if code_challenge_method != "S256":
             return False, {
@@ -325,5 +600,6 @@ class OAuthServer:
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
+            "client_id_metadata_document_supported": True,
             "scopes_supported": ["snow:mcp", "read", "write"],
         }

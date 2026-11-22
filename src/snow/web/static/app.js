@@ -1963,14 +1963,41 @@
             }
             if (epEl && d.endpoint) epEl.textContent = d.endpoint;
 
+            const publicEpRow = document.getElementById("row-public-mcp-endpoint");
+            const publicEpEl = document.getElementById("mcp-public-endpoint-val");
+            const btnCopyPublicMcp = document.getElementById("btn-copy-public-mcp-url");
+            const capCountEl = document.getElementById("mcp-capabilities-count");
+
+            if (capCountEl && d.capabilities_count) {
+                capCountEl.textContent = String(d.capabilities_count);
+            }
+
+            if (d.public_endpoint && typeof d.public_endpoint === "string" && d.public_endpoint.startsWith("http")) {
+                if (publicEpEl) publicEpEl.textContent = d.public_endpoint;
+                if (publicEpRow) publicEpRow.style.display = "flex";
+                if (btnCopyPublicMcp) btnCopyPublicMcp.style.display = "inline-block";
+            } else {
+                if (publicEpEl) publicEpEl.textContent = "Not Configured";
+                if (publicEpRow) publicEpRow.style.display = "none";
+                if (btnCopyPublicMcp) btnCopyPublicMcp.style.display = "none";
+            }
+
             if (hostsEl && Array.isArray(d.ai_hosts)) {
+                hostsEl.textContent = "";
                 if (d.ai_hosts.length === 0) {
-                    hostsEl.innerHTML = `<span class="text-muted">None</span>`;
+                    const emptySpan = document.createElement("span");
+                    emptySpan.className = "text-muted";
+                    emptySpan.textContent = "None";
+                    hostsEl.appendChild(emptySpan);
                 } else {
-                    hostsEl.innerHTML = d.ai_hosts.map(h => {
+                    d.ai_hosts.forEach(h => {
+                        const badge = document.createElement("span");
                         const cls = h.is_configured ? "badge-success" : "badge-muted";
-                        return `<span class="badge ${cls}" style="margin-right: 4px;">${h.display_name || h.host}</span>`;
-                    }).join("");
+                        badge.className = `badge ${cls}`;
+                        badge.style.marginRight = "4px";
+                        badge.textContent = h.display_name || h.host || "Host";
+                        hostsEl.appendChild(badge);
+                    });
                 }
             }
 
@@ -2511,14 +2538,32 @@
         const btnRefreshActivity = document.getElementById("btn-refresh-activity");
         if (btnRefreshActivity) btnRefreshActivity.addEventListener("click", loadActivityHistory);
 
-        // Phase 23 Remote MCP Gateway Card Bindings
+        // Phase 23 & 28B Remote MCP Gateway Card Bindings
         const btnCopyMcp = document.getElementById("btn-copy-mcp-url");
         if (btnCopyMcp) {
             btnCopyMcp.addEventListener("click", () => {
-                navigator.clipboard.writeText("http://127.0.0.1:8771/mcp").then(() => {
-                    btnCopyMcp.textContent = "Copied!";
-                    setTimeout(() => { btnCopyMcp.textContent = "Copy Endpoint URL"; }, 2000);
-                });
+                const epVal = document.getElementById("mcp-endpoint-val");
+                const url = (epVal && epVal.textContent) ? epVal.textContent.trim() : "http://127.0.0.1:8771/mcp";
+                if (url && url.startsWith("http")) {
+                    navigator.clipboard.writeText(url).then(() => {
+                        btnCopyMcp.textContent = "Copied!";
+                        setTimeout(() => { btnCopyMcp.textContent = "Copy Local Endpoint"; }, 2000);
+                    });
+                }
+            });
+        }
+
+        const btnCopyPublicMcp = document.getElementById("btn-copy-public-mcp-url");
+        if (btnCopyPublicMcp) {
+            btnCopyPublicMcp.addEventListener("click", () => {
+                const epVal = document.getElementById("mcp-public-endpoint-val");
+                const url = (epVal && epVal.textContent && epVal.textContent !== "Not Configured") ? epVal.textContent.trim() : "";
+                if (url && url.startsWith("https://")) {
+                    navigator.clipboard.writeText(url).then(() => {
+                        btnCopyPublicMcp.textContent = "Copied!";
+                        setTimeout(() => { btnCopyPublicMcp.textContent = "Copy Public Endpoint"; }, 2000);
+                    });
+                }
             });
         }
 

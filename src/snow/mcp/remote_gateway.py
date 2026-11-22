@@ -12,8 +12,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import secrets
+import time
 from typing import Any, Dict, List, Optional
 import urllib.parse
 import uuid
@@ -30,12 +32,87 @@ logger = logging.getLogger(__name__)
 DEFAULT_GATEWAY_HOST: str = "127.0.0.1"
 DEFAULT_GATEWAY_PORT: int = 8771
 SUPPORTED_MCP_PROTOCOL_VERSIONS: list[str] = [
+    "2026-07-28",
     "2025-11-25",
     "2025-06-18",
     "2025-03-26",
     "2024-11-05",
 ]
 MCP_PROTOCOL_VERSION: str = SUPPORTED_MCP_PROTOCOL_VERSIONS[0]
+
+
+class BoundedRateLimiter:
+    """Thread-safe bounded in-memory sliding-window rate limiter."""
+
+    def __init__(self, limit: int = 30, window_seconds: float = 60.0, max_keys: int = 1000) -> None:
+        self.limit = limit
+        self.window = window_seconds
+        self.max_keys = max_keys
+        self._records: dict[str, list[float]] = {}
+        self._lock = asyncio.Lock()
+
+    async def is_allowed(self, key: str) -> tuple[bool, int]:
+        now = time.time()
+        async with self._lock:
+            if key not in self._records:
+                if len(self._records) >= self.max_keys:
+                    expired = [k for k, v in self._records.items() if not v or (now - v[-1]) > self.window]
+                    for k in expired:
+                        self._records.pop(k, None)
+                    if len(self._records) >= self.max_keys:
+                        oldest = min(self._records.keys(), key=lambda k: self._records[k][0] if self._records[k] else 0)
+                        self._records.pop(oldest, None)
+                self._records[key] = []
+
+            timestamps = [ts for ts in self._records[key] if now - ts < self.window]
+            self._records[key] = timestamps
+
+            if len(timestamps) >= self.limit:
+                oldest_in_window = timestamps[0]
+                retry_after = max(1, int(self.window - (now - oldest_in_window)))
+                return False, retry_after
+
+            self._records[key].append(now)
+            return True, 0
+
+
+def parse_trusted_proxies(proxies_arg: Optional[str] = None) -> set[str]:
+    """Parse comma-separated trusted proxy list from CLI, environment, or default."""
+    raw = proxies_arg or os.environ.get("SNOW_MCP_TRUSTED_PROXIES") or "127.0.0.1,::1"
+    proxies = set()
+    for item in raw.split(","):
+        cleaned = item.strip().lower()
+        if cleaned:
+            proxies.add(cleaned)
+    return proxies
+
+
+def get_client_ip(request: web.Request, trusted_proxies: Optional[set[str]] = None) -> str:
+    """Safely obtain client IP, ignoring untrusted X-Forwarded-For headers."""
+    peername = request.transport.get_extra_info("peername") if request.transport else None
+    direct_ip = peername[0] if peername and isinstance(peername, tuple) else (request.remote or "127.0.0.1")
+    if trusted_proxies and direct_ip in trusted_proxies:
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[0]
+    return direct_ip
+
+
+def redact_sensitive_topology(data: Any) -> Any:
+    """Recursively scrub credentials, tickets, and keys from topology payload."""
+    if isinstance(data, dict):
+        clean = {}
+        for k, v in data.items():
+            k_lower = str(k).lower()
+            if any(s in k_lower for s in ("ticket", "secret", "private_key", "token_hash", "auth_token", "pin", "password", "credential", "pairing_token")):
+                continue
+            clean[k] = redact_sensitive_topology(v)
+        return clean
+    elif isinstance(data, list):
+        return [redact_sensitive_topology(item) for item in data]
+    return data
 
 
 class RemoteMcpGateway:
@@ -47,13 +124,27 @@ class RemoteMcpGateway:
         port: int = DEFAULT_GATEWAY_PORT,
         bridge: Optional[SnowMcpBridge] = None,
         issuer: Optional[str] = None,
+        public_url: Optional[str] = None,
+        trusted_proxies: Optional[set[str]] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.bridge = bridge or SnowMcpBridge(is_owner_channel=False)
-        self.issuer = issuer or f"http://{host}:{port}"
+        env_pub = os.environ.get("SNOW_MCP_PUBLIC_URL")
+        self.public_url = (public_url or env_pub or "").strip().rstrip("/") or None
+        self.trusted_proxies = parse_trusted_proxies() if trusted_proxies is None else set(trusted_proxies)
+
+        if self.public_url:
+            self.issuer = self.public_url
+        else:
+            self.issuer = (issuer or f"http://{host}:{port}").rstrip("/")
+
         self.oauth_server = OAuthServer(issuer=self.issuer)
         self.fastmcp_server = create_snow_mcp_server(bridge=self.bridge)
+
+        # Rate limiters for OAuth endpoints: token (30/min), register (10/min)
+        self.token_rate_limiter = BoundedRateLimiter(limit=30, window_seconds=60.0)
+        self.register_rate_limiter = BoundedRateLimiter(limit=10, window_seconds=60.0)
 
         self._active_sessions: dict[str, dict[str, Any]] = {}
         self.app = web.Application(middlewares=[self._security_middleware])
@@ -62,21 +153,34 @@ class RemoteMcpGateway:
     @web.middleware
     async def _security_middleware(self, request: web.Request, handler: Any) -> web.Response:
         """Enforce DNS-rebinding protection and Origin validation."""
-        host_header = request.headers.get("Host", "")
-        # Allow loopback variants and explicitly configured host
         allowed_base_hosts = {
             self.host.split(":")[0].strip().lower(),
             "127.0.0.1",
             "localhost",
         }
-        if host_header:
-            req_host = host_header.split(":")[0].strip().lower()
-            if req_host not in allowed_base_hosts:
-                logger.warning("Rejected request with invalid Host header: '%s'", host_header)
-                return web.Response(
-                    status=421,
-                    text="Misdirected Request: Invalid Host header for loopback service.",
-                )
+        if self.public_url:
+            pub_parsed = urllib.parse.urlparse(self.public_url)
+            if pub_parsed.hostname:
+                allowed_base_hosts.add(pub_parsed.hostname.lower())
+
+        # Check peer IP if behind trusted reverse proxy
+        direct_ip = get_client_ip(request, trusted_proxies=None)
+        is_trusted_proxy = direct_ip in self.trusted_proxies
+
+        host_header = request.headers.get("Host", "")
+        forwarded_host = request.headers.get("X-Forwarded-Host", "") if is_trusted_proxy else ""
+        effective_host = (forwarded_host or host_header).split(":")[0].strip().lower()
+
+        if effective_host and effective_host not in allowed_base_hosts:
+            logger.warning(
+                "Rejected request with invalid Host header: '%s' (effective: '%s')",
+                host_header,
+                effective_host,
+            )
+            return web.Response(
+                status=421,
+                text="Misdirected Request: Invalid Host header for configured service.",
+            )
 
         # Origin header check if present
         origin_header = request.headers.get("Origin")
@@ -131,13 +235,26 @@ class RemoteMcpGateway:
         return web.json_response(self.oauth_server.get_authorization_server_metadata())
 
     async def handle_oauth_register(self, request: web.Request) -> web.Response:
-        """RFC 7591 Dynamic Client Registration."""
+        """RFC 7591 Dynamic Client Registration with bounded rate limiting."""
+        client_ip = get_client_ip(request, self.trusted_proxies)
+        allowed, retry_after = await self.register_rate_limiter.is_allowed(client_ip)
+        if not allowed:
+            return web.Response(
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+                text=json.dumps({
+                    "error": "rate_limit_exceeded",
+                    "error_description": "Registration rate limit exceeded. Please retry later.",
+                }),
+                content_type="application/json",
+            )
+
         try:
             body = await request.json()
         except Exception:
             body = {}
         client_name = body.get("client_name", "AI Assistant Client")
-        redirect_uris = body.get("redirect_uris", ["http://127.0.0.1", "http://localhost"])
+        redirect_uris = body.get("redirect_uris", ["http://127.0.0.1", "http://localhost", "urn:ietf:wg:oauth:2.0:oob"])
         scope = body.get("scope", "snow:mcp")
         is_confidential = body.get("token_endpoint_auth_method") == "client_secret_post"
 
@@ -201,7 +318,20 @@ class RemoteMcpGateway:
         return web.json_response({"code": code, "state": state})
 
     async def handle_oauth_token(self, request: web.Request) -> web.Response:
-        """RFC 6749 Token Exchange & Rotation Endpoint."""
+        """RFC 6749 Token Exchange & Rotation Endpoint with bounded rate limiting."""
+        client_ip = get_client_ip(request, self.trusted_proxies)
+        allowed, retry_after = await self.token_rate_limiter.is_allowed(client_ip)
+        if not allowed:
+            return web.Response(
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+                text=json.dumps({
+                    "error": "rate_limit_exceeded",
+                    "error_description": "Token endpoint rate limit exceeded. Please retry later.",
+                }),
+                content_type="application/json",
+            )
+
         try:
             body = await request.json()
         except Exception:
@@ -398,6 +528,7 @@ class RemoteMcpGateway:
                     "protocolVersion": negotiated_proto,
                     "capabilities": {
                         "tools": {"listChanged": False},
+                        "resources": {"subscribe": False, "listChanged": False},
                     },
                     "serverInfo": {
                         "name": "SNOW Remote MCP Gateway",
@@ -502,6 +633,52 @@ class RemoteMcpGateway:
                     },
                 }, headers=resp_headers)
 
+        # 6. resources/list
+        if method == "resources/list":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "snow://mesh/topology",
+                            "name": "SNOW Mesh Topology",
+                            "description": "Topology of participating devices, reachability, and capability authorization",
+                            "mimeType": "application/json",
+                        }
+                    ]
+                },
+            }
+            return web.json_response(resp, headers=resp_headers)
+
+        # 7. resources/read
+        if method == "resources/read":
+            uri = params.get("uri")
+            if uri == "snow://mesh/topology":
+                from snow.security.context import ExecutionContext, ExecutionPrincipal
+                ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="remote_gateway_resource")
+                topo_data = await self.bridge.snow_mesh_topology(ctx=ctx)
+                clean_topo = redact_sensitive_topology(topo_data)
+                resp = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": "snow://mesh/topology",
+                                "mimeType": "application/json",
+                                "text": json.dumps(clean_topo, indent=2),
+                            }
+                        ]
+                    },
+                }
+                return web.json_response(resp, headers=resp_headers)
+            return web.json_response({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": f"Resource not found: '{uri}'"},
+            }, headers=resp_headers)
+
         return web.json_response({
             "jsonrpc": "2.0",
             "id": req_id,
@@ -591,9 +768,17 @@ def create_gateway_app(
     host: str = DEFAULT_GATEWAY_HOST,
     port: int = DEFAULT_GATEWAY_PORT,
     bridge: Optional[SnowMcpBridge] = None,
+    public_url: Optional[str] = None,
+    trusted_proxies: Optional[set[str]] = None,
 ) -> web.Application:
     """Create and configure the Remote MCP Gateway application."""
-    gateway = RemoteMcpGateway(host=host, port=port, bridge=bridge)
+    gateway = RemoteMcpGateway(
+        host=host,
+        port=port,
+        bridge=bridge,
+        public_url=public_url,
+        trusted_proxies=trusted_proxies,
+    )
     return gateway.app
 
 
@@ -601,14 +786,23 @@ async def start_gateway_async(
     host: str = DEFAULT_GATEWAY_HOST,
     port: int = DEFAULT_GATEWAY_PORT,
     bridge: Optional[SnowMcpBridge] = None,
+    public_url: Optional[str] = None,
+    trusted_proxies: Optional[set[str]] = None,
 ) -> tuple[web.AppRunner, web.TCPSite, RemoteMcpGateway]:
     """Start the Remote MCP Gateway on an aiohttp AppRunner."""
-    gateway = RemoteMcpGateway(host=host, port=port, bridge=bridge)
+    gateway = RemoteMcpGateway(
+        host=host,
+        port=port,
+        bridge=bridge,
+        public_url=public_url,
+        trusted_proxies=trusted_proxies,
+    )
     runner = web.AppRunner(gateway.app)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
-    logger.info("Remote MCP Gateway running at http://%s:%d/mcp", host, port)
+    endpoint_url = gateway.public_url or f"http://{host}:{port}"
+    logger.info("Remote MCP Gateway running at %s/mcp", endpoint_url)
     return runner, site, gateway
 
 
@@ -617,10 +811,22 @@ def run_gateway() -> None:
     parser = argparse.ArgumentParser(description="SNOW Remote MCP Streamable HTTP Gateway")
     parser.add_argument("--host", default=DEFAULT_GATEWAY_HOST, help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=DEFAULT_GATEWAY_PORT, help="Port (default: 8771)")
+    parser.add_argument("--public-url", default=None, help="Configured public HTTPS URL origin for reverse proxy")
+    parser.add_argument(
+        "--trusted-proxies",
+        default=None,
+        help="Comma-separated trusted proxy IPs or hostnames (default: SNOW_MCP_TRUSTED_PROXIES or 127.0.0.1,::1)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
-    app = create_gateway_app(host=args.host, port=args.port)
+    trusted = parse_trusted_proxies(args.trusted_proxies)
+    app = create_gateway_app(
+        host=args.host,
+        port=args.port,
+        public_url=args.public_url,
+        trusted_proxies=trusted,
+    )
     web.run_app(app, host=args.host, port=args.port)
 
 

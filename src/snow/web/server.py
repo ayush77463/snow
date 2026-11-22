@@ -854,14 +854,22 @@ class SnowWebServer:
                 "scopes_supported": metadata.get("scopes_supported", []),
             }
 
+        public_url = os.environ.get("SNOW_MCP_PUBLIC_URL")
+        public_endpoint = f"{public_url.rstrip('/')}/mcp" if public_url else (metadata.get("resource") if metadata and metadata.get("resource") and not metadata.get("resource").startswith("http://127.0.0.1") else None)
+
+        from snow.mcp.registry import list_capabilities
+        caps_count = len(list_capabilities())
+
         return web.json_response({
             "success": True,
             "status": "SUCCESS",
             "data": {
                 "gateway_status": gw_status,
                 "endpoint": f"http://{gw_host}:{gw_port}/mcp",
+                "public_endpoint": public_endpoint,
                 "metadata": safe_metadata,
                 "ai_hosts": safe_hosts,
+                "capabilities_count": caps_count,
             }
         })
 

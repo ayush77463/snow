@@ -1070,6 +1070,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mcp_gw_parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     mcp_gw_parser.add_argument("--port", type=int, default=8771, help="Gateway port (default: 8771)")
+    mcp_gw_parser.add_argument("--public-url", default=None, help="Configured public HTTPS URL origin for reverse proxy")
+    mcp_gw_parser.add_argument("--trusted-proxies", default=None, help="Comma-separated trusted proxy IPs or hostnames")
+
+    # 12. expose (Phase 28B Zero-Port-Forwarding Public Exposure)
+    expose_parser = subparsers.add_parser(
+        "expose", help="Expose local Remote MCP Gateway over secure public tunnel (Phase 28B)"
+    )
+    expose_parser.add_argument(
+        "--provider",
+        choices=["cloudflared", "tailscale"],
+        default="cloudflared",
+        help="Tunnel provider (default: cloudflared)",
+    )
+    expose_parser.add_argument(
+        "--port",
+        type=int,
+        default=8771,
+        help="Target local Remote MCP Gateway port (default: 8771)",
+    )
+    expose_parser.add_argument(
+        "--public-url",
+        default=None,
+        help="Explicit public HTTPS URL if pre-allocated or custom domain",
+    )
+    expose_parser.add_argument(
+        "--trusted-proxies",
+        default=None,
+        help="Comma-separated trusted proxy IPs or hostnames for managed gateway",
+    )
+    expose_parser.add_argument(
+        "--external-gateway",
+        action="store_true",
+        default=False,
+        help="Connect to an already running external Remote MCP Gateway instead of managing one",
+    )
 
     # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")
@@ -1183,11 +1218,26 @@ def main(args: Optional[list[str]] = None) -> int:
         action = getattr(parsed, "relay_action", "status") or "status"
         return run_relay(action=action)
     elif parsed.command == "mcp-gateway":
-        from snow.mcp.remote_gateway import create_gateway_app
+        from snow.mcp.remote_gateway import create_gateway_app, parse_trusted_proxies
         from aiohttp import web
-        app = create_gateway_app(host=parsed.host, port=parsed.port)
+        trusted = parse_trusted_proxies(getattr(parsed, "trusted_proxies", None))
+        app = create_gateway_app(
+            host=parsed.host,
+            port=parsed.port,
+            public_url=getattr(parsed, "public_url", None),
+            trusted_proxies=trusted,
+        )
         web.run_app(app, host=parsed.host, port=parsed.port)
         return 0
+    elif parsed.command == "expose":
+        from snow.mcp.expose import run_expose
+        return run_expose(
+            provider=parsed.provider,
+            port=parsed.port,
+            public_url=getattr(parsed, "public_url", None),
+            external_gateway=getattr(parsed, "external_gateway", False),
+            trusted_proxies=getattr(parsed, "trusted_proxies", None),
+        )
     elif parsed.command == "start":
         return run_daemon_start()
     elif parsed.command == "stop":
