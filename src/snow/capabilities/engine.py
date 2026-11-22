@@ -147,6 +147,19 @@ class CapabilityResponse:
         }
 
 
+# High-frequency read-only querying actions excluded from activity audit log to prevent log noise
+AUDIT_EXCLUDED_ACTIONS = {
+    "windows_system_info",
+    "windows_battery",
+    "activity_history",
+    "clipboard_buffer_list",
+    "desktop_status",
+    "get_device_status",
+    "list_devices",
+    "system_info",
+}
+
+
 class CapabilityEngine:
     """Layer 2 central capability execution engine for SNOW V2."""
 
@@ -291,9 +304,10 @@ class CapabilityEngine:
                 error="Principal AI_MCP is not authorized to delete or clear items from clipboard buffer.",
             )
 
-        # 5. Shared Approval Policy Check (Phase 21)
+        # 5. Shared Approval Policy Check (Phase 21 & V4.1 Gate 1B Single-Approval Hardening)
         # Terminal command authorization is governed by WindowsTerminalExecutor's 4-tier
         # security policy and confirmation tickets to preserve exact read-only & workspace scoping.
+        approval_consumed = False
         if self.approval_engine and action not in ("windows_terminal_exec", "desktop_exec"):
             requires_approval, reason, risk_level = self.approval_engine.evaluate_policy(
                 action=action,
@@ -321,6 +335,7 @@ class CapabilityEngine:
                             status="UNAUTHORIZED",
                             error=f"Approval validation failed: {msg}",
                         )
+                    approval_consumed = True
                 else:
                     # Issue pending approval request
                     app_req = self.approval_engine.create_request(
@@ -342,9 +357,11 @@ class CapabilityEngine:
                         error="Action requires human owner approval.",
                     )
 
-        # 5. Route to capability implementations
+        # 6. Route to capability implementations
         try:
-            resp = await self._dispatch_action(action, params, effective_ctx)
+            resp = await self._dispatch_action(
+                action, params, effective_ctx, approval_consumed=approval_consumed
+            )
         except Exception as exc:
             logger.error("Unexpected error executing capability action '%s': %s", action, exc, exc_info=True)
             resp = CapabilityResponse(
@@ -353,8 +370,8 @@ class CapabilityEngine:
                 error=f"Internal error executing '{action}': {exc}",
             )
 
-        # 6. Audit Activity Log (Phase 21)
-        if self.db_manager and hasattr(self.db_manager, "log_activity"):
+        # 6. Audit Activity Log (Phase 21 & Phase 31 Audit Noise Hardening)
+        if action not in AUDIT_EXCLUDED_ACTIONS and self.db_manager and hasattr(self.db_manager, "log_activity"):
             try:
                 p_str = effective_ctx.principal.value if hasattr(effective_ctx.principal, "value") else str(effective_ctx.principal)
                 self.db_manager.log_activity(
@@ -371,7 +388,11 @@ class CapabilityEngine:
         return resp
 
     async def _dispatch_action(
-        self, action: str, params: dict[str, Any], ctx: ExecutionContext
+        self,
+        action: str,
+        params: dict[str, Any],
+        ctx: ExecutionContext,
+        approval_consumed: bool = False,
     ) -> CapabilityResponse:
         """Internal dispatch router executing Windows capabilities."""
 
@@ -968,13 +989,18 @@ class CapabilityEngine:
                 error=res.get("error"),
             )
 
-        # --- Workflows (Phase 24 Repair A1) ---
+        # --- Workflows (Phase 24 Repair A1 & Single-Approval Hardening) ---
         if action in ("workflow_run", "snow_workflow_run"):
             workflow_id = str(params.get("workflow_id", "")).strip()
             wf_params = params.get("arguments") or params.get("params") or {}
             from snow.capabilities.workflows import WorkflowOrchestrator
             orchestrator = WorkflowOrchestrator(capability_engine=self)
-            rep = await orchestrator.run_workflow(workflow_id, params=wf_params, ctx=ctx)
+            rep = await orchestrator.run_workflow(
+                workflow_id,
+                params=wf_params,
+                ctx=ctx,
+                workflow_approved=approval_consumed,
+            )
             rep_dict = rep.to_dict()
             is_ok = rep.status in ("COMPLETED", "PARTIAL")
             return CapabilityResponse(

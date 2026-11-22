@@ -61,6 +61,10 @@ class SnowWebServer:
         self.bridge = bridge or SnowMcpBridge(auto_start_core=False, is_owner_channel=True)
         self.transfer_server = transfer_server
 
+        # Shared DatabaseManager instance to prevent connection churn
+        from snow.security.db import DatabaseManager
+        self.db_manager = DatabaseManager()
+
         # Security state
         self.bootstrap_token: str = secrets.token_urlsafe(32)
         self.bootstrap_expires_at: float = time.time() + BOOTSTRAP_EXPIRY_SECONDS
@@ -76,6 +80,18 @@ class SnowWebServer:
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._is_running: bool = False
+
+        # Remote MCP Gateway managed runner & state
+        self._mcp_gateway_runner: Optional[web.AppRunner] = None
+        self._mcp_gateway_site: Optional[web.TCPSite] = None
+        self._mcp_gateway_instance: Optional[Any] = None
+        self._mcp_gateway_lock = asyncio.Lock()
+        self.gateway_port = 8771
+
+        # USB status caching (10-second TTL)
+        self._usb_status_cache: Optional[dict[str, Any]] = None
+        self._usb_status_cache_time: float = 0.0
+        self._usb_status_lock = asyncio.Lock()
 
     # =========================================================================
     # Security Middleware
@@ -236,6 +252,29 @@ class SnowWebServer:
         )
         return resp
 
+    async def _get_cached_usb_status(self) -> dict[str, Any]:
+        """Retrieve USB ADB status using a 10-second TTL cache with async lock protection."""
+        now = time.monotonic()
+        if self._usb_status_cache is not None and (now - self._usb_status_cache_time) < 10.0:
+            return self._usb_status_cache
+
+        async with self._usb_status_lock:
+            now = time.monotonic()
+            if self._usb_status_cache is not None and (now - self._usb_status_cache_time) < 10.0:
+                return self._usb_status_cache
+
+            from snow.core.usb import get_usb_status
+            try:
+                stat = await asyncio.to_thread(get_usb_status)
+                self._usb_status_cache = stat
+                self._usb_status_cache_time = time.monotonic()
+                return stat
+            except Exception as exc:
+                logger.debug("Failed refreshing USB status cache: %s", exc)
+                if self._usb_status_cache is not None:
+                    return self._usb_status_cache
+                return {"connected": False, "authorized_count": 0, "reverse_active": False}
+
     async def handle_api_status(self, request: web.Request) -> web.Response:
         """Query Core daemon status and host telemetry."""
         session_token = request.cookies.get("snow_session")
@@ -248,6 +287,12 @@ class SnowWebServer:
         
         from snow.core.network import get_active_ip_addresses
         lan_ips = get_active_ip_addresses()
+        lan_available = bool(lan_ips)
+        try:
+            usb_stat = await self._get_cached_usb_status()
+            usb_connected = bool(usb_stat.get("connected") or usb_stat.get("authorized_count", 0) > 0)
+        except Exception:
+            usb_connected = False
 
         data = {
             "success": True,
@@ -255,6 +300,8 @@ class SnowWebServer:
             "ipc_endpoint": f"127.0.0.1:{self.bridge.port}",
             "wss_port": 8765,
             "lan_ips": lan_ips,
+            "lan_available": lan_available,
+            "usb_connected": usb_connected,
             "telemetry": telemetry_res.get("data") if telemetry_res.get("success") else {},
         }
         if csrf_token:
@@ -1033,6 +1080,20 @@ class SnowWebServer:
         latest_file = candidates[0]
 
         try:
+            import hashlib
+            st = latest_file.stat()
+            etag = f'"{hashlib.sha256(f"{latest_file.name}-{st.st_mtime}-{st.st_size}".encode("utf-8")).hexdigest()[:16]}"'
+
+            if_none_match = request.headers.get("If-None-Match", "").strip()
+            if if_none_match and if_none_match == etag:
+                return web.Response(
+                    status=304,
+                    headers={
+                        "ETag": etag,
+                        "Cache-Control": "no-cache, must-revalidate",
+                    },
+                )
+
             with open(latest_file, "rb") as f:
                 data = f.read()
             mime = "image/png" if latest_file.suffix.lower() == ".png" else "image/jpeg"
@@ -1040,7 +1101,8 @@ class SnowWebServer:
                 body=data,
                 content_type=mime,
                 headers={
-                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "ETag": etag,
+                    "Cache-Control": "no-cache, must-revalidate",
                     "X-Content-Type-Options": "nosniff",
                     "X-Snow-Filename": latest_file.name,
                 },
@@ -1280,10 +1342,7 @@ class SnowWebServer:
         try:
             from snow.network.network_model import SnowNetworkManager
             cap_engine = getattr(self.bridge, "capability_engine", None)
-            db_mgr = getattr(cap_engine, "db_manager", None) if cap_engine else None
-            if db_mgr is None:
-                from snow.security.db import DatabaseManager
-                db_mgr = DatabaseManager()
+            db_mgr = getattr(cap_engine, "db_manager", None) or self.db_manager
             net_mgr = SnowNetworkManager(db_manager=db_mgr)
             ident = net_mgr.get_network_identity()
             completed = str(db_mgr.get_setting("onboarding_completed", "false")).lower() in ("true", "1", "yes")
@@ -1311,10 +1370,7 @@ class SnowWebServer:
         try:
             from snow.network.network_model import SnowNetworkManager
             cap_engine = getattr(self.bridge, "capability_engine", None)
-            db_mgr = getattr(cap_engine, "db_manager", None) if cap_engine else None
-            if db_mgr is None:
-                from snow.security.db import DatabaseManager
-                db_mgr = DatabaseManager()
+            db_mgr = getattr(cap_engine, "db_manager", None) or self.db_manager
             net_mgr = SnowNetworkManager(db_manager=db_mgr)
 
             network_name = (body.get("network_name") or "").strip()
@@ -1389,10 +1445,7 @@ class SnowWebServer:
         from pathlib import Path
 
         cap_engine = getattr(self.bridge, "capability_engine", None)
-        db_mgr = getattr(cap_engine, "db_manager", None) if cap_engine else None
-        if db_mgr is None:
-            from snow.security.db import DatabaseManager
-            db_mgr = DatabaseManager()
+        db_mgr = getattr(cap_engine, "db_manager", None) or self.db_manager
         net_mgr = SnowNetworkManager(db_manager=db_mgr)
         ident = net_mgr.get_network_identity()
 
@@ -1556,6 +1609,142 @@ class SnowWebServer:
             return web.json_response({"success": False, "error": str(exc)}, status=500)
 
     # =========================================================================
+    # USB Tethering and AI MCP Host Management (Batch 4)
+    # =========================================================================
+
+    async def handle_api_usb_status(self, request: web.Request) -> web.Response:
+        """Query USB ADB status, connected devices, and reverse socket mappings."""
+        from snow.core.usb import get_usb_status
+        try:
+            stat = await asyncio.to_thread(get_usb_status)
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                **stat,
+            })
+        except Exception as exc:
+            logger.error("Failed querying USB status: %s", exc)
+            return web.json_response({
+                "success": False,
+                "status": "ERROR",
+                "error": f"Failed querying USB status: {exc}",
+            }, status=500)
+
+    async def handle_api_usb_connect(self, request: web.Request) -> web.Response:
+        """Establish ADB reverse mappings for zero-data USB tethering."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        serial = body.get("serial")
+        from snow.core.usb import setup_usb_reverse
+        try:
+            ok, msg = await asyncio.to_thread(setup_usb_reverse, serial=serial)
+            return web.json_response({
+                "success": ok,
+                "status": "SUCCESS" if ok else "ERROR",
+                "message": msg,
+            }, status=200 if ok else 400)
+        except Exception as exc:
+            logger.error("Failed establishing USB reverse mappings: %s", exc)
+            return web.json_response({
+                "success": False,
+                "status": "ERROR",
+                "error": f"Failed establishing USB reverse mappings: {exc}",
+            }, status=500)
+
+    async def handle_api_usb_disconnect(self, request: web.Request) -> web.Response:
+        """Remove ADB reverse mappings."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        serial = body.get("serial")
+        from snow.core.usb import remove_usb_reverse
+        try:
+            ok, msg = await asyncio.to_thread(remove_usb_reverse, serial=serial)
+            return web.json_response({
+                "success": ok,
+                "status": "SUCCESS" if ok else "ERROR",
+                "message": msg,
+            }, status=200 if ok else 400)
+        except Exception as exc:
+            logger.error("Failed removing USB reverse mappings: %s", exc)
+            return web.json_response({
+                "success": False,
+                "status": "ERROR",
+                "error": f"Failed removing USB reverse mappings: {exc}",
+            }, status=500)
+
+    async def handle_api_mcp_setup(self, request: web.Request) -> web.Response:
+        """Configure SNOW MCP server across AI assistant hosts."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        host = body.get("host", "all")
+        dry_run = bool(body.get("dry_run", False))
+        from snow.onboarding import HostOnboardingManager
+        mgr = HostOnboardingManager()
+        res = mgr.setup_host(host, dry_run=dry_run)
+        return web.json_response(res)
+
+    async def handle_api_mcp_gateway_toggle(self, request: web.Request) -> web.Response:
+        """Toggle or configure the remote MCP gateway with real lifecycle control."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        enable = body.get("enable")
+
+        gw_port = getattr(self, "gateway_port", 8771)
+        async with self._mcp_gateway_lock:
+            is_currently_running = self._mcp_gateway_runner is not None
+
+            # If enable is None, treat as status check
+            target_enable = is_currently_running if enable is None else bool(enable)
+
+            if target_enable and not is_currently_running:
+                try:
+                    from snow.mcp.remote_gateway import start_gateway_async
+                    runner, site, gateway = await start_gateway_async(
+                        host="127.0.0.1",
+                        port=gw_port,
+                        bridge=self.bridge,
+                    )
+                    self._mcp_gateway_runner = runner
+                    self._mcp_gateway_site = site
+                    self._mcp_gateway_instance = gateway
+                    is_currently_running = True
+                except Exception as exc:
+                    logger.error("Failed starting MCP gateway on port %d: %s", gw_port, exc)
+                    return web.json_response({
+                        "success": False,
+                        "status": "ERROR",
+                        "error": f"Failed starting MCP gateway: {exc}",
+                        "running": False,
+                    }, status=500)
+            elif not target_enable and is_currently_running:
+                try:
+                    if self._mcp_gateway_runner:
+                        await self._mcp_gateway_runner.cleanup()
+                except Exception as exc:
+                    logger.warning("Error during MCP gateway cleanup: %s", exc)
+                finally:
+                    self._mcp_gateway_runner = None
+                    self._mcp_gateway_site = None
+                    self._mcp_gateway_instance = None
+                    is_currently_running = False
+
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "running": is_currently_running,
+                "port": gw_port,
+                "public_url": getattr(self._mcp_gateway_instance, "public_url", None) if is_currently_running else None,
+            })
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
 
@@ -1637,6 +1826,13 @@ class SnowWebServer:
         app.router.add_post("/api/federation/revoke", self.handle_api_federation_revoke)
         app.router.add_post("/api/federation/kill-switch", self.handle_api_federation_kill_switch)
 
+        # USB Tethering and AI MCP Host Management (Batch 4)
+        app.router.add_get("/api/usb/status", self.handle_api_usb_status)
+        app.router.add_post("/api/usb/connect", self.handle_api_usb_connect)
+        app.router.add_post("/api/usb/disconnect", self.handle_api_usb_disconnect)
+        app.router.add_post("/api/mcp/setup", self.handle_api_mcp_setup)
+        app.router.add_post("/api/mcp/gateway/toggle", self.handle_api_mcp_gateway_toggle)
+
         return app
 
     async def start(self) -> None:
@@ -1678,6 +1874,17 @@ class SnowWebServer:
 
     async def stop(self) -> None:
         """Gracefully release server listener and invalidate sessions."""
+        # Stop active MCP gateway if one exists
+        if self._mcp_gateway_runner:
+            try:
+                await self._mcp_gateway_runner.cleanup()
+            except Exception as exc:
+                logger.warning("Error cleaning up MCP gateway on server stop: %s", exc)
+            finally:
+                self._mcp_gateway_runner = None
+                self._mcp_gateway_site = None
+                self._mcp_gateway_instance = None
+
         if not self._is_running:
             return
 

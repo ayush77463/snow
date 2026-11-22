@@ -377,6 +377,7 @@ def create_qr_pairing_payload(
     pin: str,
     version: int = 1,
     trust_tier: str = "owner",
+    allow_usb_loopback: bool = False,
 ) -> dict[str, Any]:
     """Construct a validated QR pairing payload for SNOW zero-friction onboarding.
 
@@ -412,13 +413,17 @@ def create_qr_pairing_payload(
             f"Certificate fingerprint must be a 64-character SHA-256 hex string, got {len(raw_fp)} chars."
         )
 
-    # Filter candidate IPs: exclude loopback, link-local, unspecified, and non-IPv4
+    # Filter candidate IPs: exclude loopback, link-local, unspecified, and non-IPv4.
+    # When allow_usb_loopback is True, 127.0.0.1 is permitted exclusively for USB tethering.
     filtered_ips: list[str] = []
     seen = set()
     for ip_str in candidate_ips:
         try:
             ip = ipaddress.IPv4Address(ip_str.strip())
-            if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+            if ip.is_loopback:
+                if not (allow_usb_loopback and str(ip) == "127.0.0.1"):
+                    continue
+            elif ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
                 continue
             norm = str(ip)
             if norm not in seen:
@@ -428,6 +433,8 @@ def create_qr_pairing_payload(
             continue
 
     if not filtered_ips:
+        if allow_usb_loopback:
+            raise ValueError("At least one reachable candidate IPv4 address (or 127.0.0.1 for USB) is required for QR pairing.")
         raise ValueError("At least one reachable, non-loopback candidate IPv4 address is required for QR pairing.")
 
     clean_tier = "peer" if str(trust_tier).lower() == "peer" else "owner"
@@ -442,7 +449,10 @@ def create_qr_pairing_payload(
     }
 
 
-def validate_qr_pairing_payload(payload: dict[str, Any] | str) -> dict[str, Any]:
+def validate_qr_pairing_payload(
+    payload: dict[str, Any] | str,
+    allow_usb_loopback: bool = False,
+) -> dict[str, Any]:
     """Validate and normalize an incoming QR pairing payload.
 
     Raises ValueError if payload violates format, schema version, or security rules.
@@ -486,12 +496,17 @@ def validate_qr_pairing_payload(payload: dict[str, Any] | str) -> dict[str, Any]
             continue
         try:
             ip = ipaddress.IPv4Address(item.strip())
-            if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved):
+            if ip.is_loopback:
+                if allow_usb_loopback and str(ip) == "127.0.0.1":
+                    filtered_ips.append(str(ip))
+            elif not (ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved):
                 filtered_ips.append(str(ip))
         except Exception:
             continue
 
     if not filtered_ips:
+        if allow_usb_loopback:
+            raise ValueError("No reachable candidate IPv4 addresses found in QR payload.")
         raise ValueError("No reachable, non-loopback candidate IPv4 addresses found in QR payload.")
 
     tier = str(payload.get("tier", "owner")).strip().lower()

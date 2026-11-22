@@ -88,6 +88,7 @@ class LiveScreenStreamHandler(
     private var projectionCallback: MediaProjection.Callback? = null
     private var frameLoopJob: Job? = null
     private val handlerScope = CoroutineScope(Dispatchers.IO)
+    private val reusableBaos = ByteArrayOutputStream(64 * 1024)
 
     @Volatile
     private var currentSessionId: String? = null
@@ -303,10 +304,12 @@ class LiveScreenStreamHandler(
                 bitmap
             }
 
-            val baos = ByteArrayOutputStream()
-            cleanBitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, baos)
-            cleanBitmap.recycle()
-            return baos.toByteArray()
+            synchronized(reusableBaos) {
+                reusableBaos.reset()
+                cleanBitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, reusableBaos)
+                cleanBitmap.recycle()
+                return reusableBaos.toByteArray()
+            }
         } catch (e: Exception) {
             SafeLog.w(TAG, "Bitmap processing error: ${e.message}")
             return null

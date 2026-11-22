@@ -437,11 +437,21 @@ class RemoteMcpAdapter(BaseHostAdapter):
         return get_remote_mcp_entry()
 
 
+class AntigravityAdapter(BaseHostAdapter):
+    """Adapter for Google Antigravity IDE MCP configuration."""
+
+    name = "antigravity"
+    display_name = "Google Antigravity"
+
+    def get_default_config_path(self) -> Path:
+        return Path.home() / ".gemini" / "antigravity" / "mcp_config.json"
+
+
 # =========================================================================
 # Host Onboarding Manager
 # =========================================================================
 
-SUPPORTED_HOSTS = ["claude", "gemini", "cursor", "chatgpt"]
+SUPPORTED_HOSTS = ["claude", "gemini", "cursor", "chatgpt", "antigravity"]
 
 
 class HostOnboardingManager:
@@ -457,6 +467,7 @@ class HostOnboardingManager:
             "gemini": GeminiAdapter(),
             "cursor": CursorAdapter(),
             "chatgpt": ChatGPTAdapter(),
+            "antigravity": AntigravityAdapter(),
             "remote": RemoteMcpAdapter(),
         }
         self.custom_paths: dict[str, Path] = {

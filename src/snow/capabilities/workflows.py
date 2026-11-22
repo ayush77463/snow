@@ -319,6 +319,7 @@ class WorkflowOrchestrator:
         workflow_id: str,
         params: Optional[dict[str, Any]] = None,
         ctx: Optional[ExecutionContext] = None,
+        workflow_approved: bool = False,
     ) -> WorkflowExecutionReport:
         """Execute a declared workflow in sequential steps through CapabilityEngine.
 
@@ -326,6 +327,8 @@ class WorkflowOrchestrator:
             workflow_id: Registered preset identifier.
             params: Optional caller arguments mapped to steps.
             ctx: ExecutionContext (derives caller principal, e.g. OWNER_MANUAL or AI_MCP).
+            workflow_approved: Trusted flag from CapabilityEngine indicating that human owner
+                               approval for this workflow was verified and consumed.
 
         Returns:
             Structured WorkflowExecutionReport.
@@ -363,7 +366,23 @@ class WorkflowOrchestrator:
         input_params.pop("trust_tier", None)
         input_params.pop("execution_principal", None)
 
-        approval_id = input_params.get("approval_id")
+        # Security Policy: A caller-supplied approval_id in input_params NEVER independently grants
+        # OWNER_MANUAL privileges. Privileges are ONLY promoted to OWNER_MANUAL if the caller is
+        # already OWNER_MANUAL or if CapabilityEngine verified and consumed an authentic owner approval
+        # token (workflow_approved=True).
+        is_owner_authorized = (
+            effective_ctx.principal == ExecutionPrincipal.OWNER_MANUAL
+            or workflow_approved is True
+        )
+        step_execution_ctx = (
+            ExecutionContext(
+                principal=ExecutionPrincipal.OWNER_MANUAL,
+                origin=f"workflow:{workflow_id}",
+                device_id=effective_ctx.device_id,
+            )
+            if is_owner_authorized
+            else effective_ctx
+        )
 
         for idx, step in enumerate(wf.steps):
             step_order = idx + 1
@@ -383,9 +402,6 @@ class WorkflowOrchestrator:
                     step_params["sha256"] = cap_data["sha256"]
                 if "transfer_id" in cap_data:
                     step_params["transfer_id"] = cap_data["transfer_id"]
-
-            if approval_id:
-                step_params["approval_id"] = approval_id
 
             target_dev = step.target_device or input_params.get("target_device")
 
@@ -480,7 +496,7 @@ class WorkflowOrchestrator:
             )
 
             try:
-                resp: CapabilityResponse = await self.capability_engine.execute(req, ctx=effective_ctx)
+                resp: CapabilityResponse = await self.capability_engine.execute(req, ctx=step_execution_ctx)
             except Exception as step_exc:
                 resp = CapabilityResponse(
                     success=False,

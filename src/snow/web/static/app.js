@@ -3290,9 +3290,10 @@
         refreshActiveTab();
         updateSessionIndicator();
 
-        // Background Periodic Poller (every 4 seconds)
+        // Background Periodic Poller (every 4 seconds, pauses when tab is hidden)
         if (pollInterval) clearInterval(pollInterval);
         pollInterval = setInterval(() => {
+            if (document.hidden) return;
             loadSystemStatus();
             loadApprovalsCount();
             updateSessionIndicator();
@@ -3312,6 +3313,16 @@
                 loadNetworkIdentity();
             }
         }, 4000);
+
+        // Resume / immediately refresh when page visibility changes to visible
+        document.addEventListener("visibilitychange", () => {
+            if (!document.hidden) {
+                loadSystemStatus();
+                loadApprovalsCount();
+                updateSessionIndicator();
+                refreshActiveTab();
+            }
+        });
     }
 
     // Boot entry point

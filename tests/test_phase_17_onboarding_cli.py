@@ -35,6 +35,7 @@ from snow.onboarding import (
     CursorAdapter,
     GeminiAdapter,
     HostOnboardingManager,
+    SUPPORTED_HOSTS,
     atomic_write_json,
     safe_read_json,
 )
@@ -50,12 +51,14 @@ class TestHostOnboarding(unittest.TestCase):
         self.gemini_path = Path(self.temp_dir) / "gemini.json"
         self.cursor_path = Path(self.temp_dir) / "cursor.json"
         self.chatgpt_path = Path(self.temp_dir) / "chatgpt.json"
+        self.antigravity_path = Path(self.temp_dir) / "antigravity.json"
 
         self.custom_paths = {
             "claude": self.claude_path,
             "gemini": self.gemini_path,
             "cursor": self.cursor_path,
             "chatgpt": self.chatgpt_path,
+            "antigravity": self.antigravity_path,
         }
         self.fake_python = "C:\\Program Files\\Python313\\python.exe"
         self.manager = HostOnboardingManager(
@@ -136,11 +139,12 @@ class TestHostOnboarding(unittest.TestCase):
         """--host all configures all supported hosts in a single call."""
         res = self.manager.setup_host("all")
         self.assertTrue(res["success"])
-        self.assertEqual(len(res["results"]), 4)
+        self.assertEqual(len(res["results"]), len(SUPPORTED_HOSTS))
         self.assertTrue(self.claude_path.exists())
         self.assertTrue(self.gemini_path.exists())
         self.assertTrue(self.cursor_path.exists())
         self.assertTrue(self.chatgpt_path.exists())
+        self.assertTrue(self.antigravity_path.exists())
 
     def test_dry_run_makes_zero_filesystem_changes(self) -> None:
         """--dry-run simulates changes and creates zero files on disk."""

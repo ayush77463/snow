@@ -8,6 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -29,6 +33,7 @@ import org.snow.network.SnowWebSocketClient
 import org.snow.protocol.Constants
 import org.snow.security.DeviceIdentity
 import org.snow.security.EncryptedCertPinStorage
+import org.snow.security.SafeLog
 import org.snow.security.SharedPreferencesTokenStorage
 import org.snow.transfer.FileTransferClient
 import org.snow.ui.MainActivity
@@ -97,20 +102,38 @@ class SnowForegroundService : Service() {
     }
 
     var relayClient: org.snow.network.RelayClient? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile internal var userDisconnected = false
 
     fun startRelay(endpoint: String) {
         if (endpoint.isBlank()) return
         stopRelay()
         val deviceId = org.snow.security.DeviceIdentity.getOrCreate(applicationContext).deviceId
+        val certPinStorage = EncryptedCertPinStorage(applicationContext)
+        val relayTokenStorage = SharedPreferencesTokenStorage(
+            applicationContext,
+            prefName = "snow_relay_security"
+        )
+        val ticket = relayTokenStorage.getToken()
+        if (ticket.isNullOrBlank()) {
+            SafeLog.e("SnowForegroundService", "Relay connection aborted: missing or unauthenticatable relay ticket in snow_relay_security")
+            return
+        }
+        val prefs = getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val groupId = prefs.getString("remote_relay_group_id", null) ?: "default_group"
+        val targetPeerId = prefs.getString("remote_relay_target_peer", null) ?: "desktop-core"
+        val expectedFingerprint = certPinStorage.getPinnedFingerprint()
+        val isClientMode = (deviceId < targetPeerId)
+
         relayClient = org.snow.network.RelayClient(
             relayUrl = endpoint,
             deviceId = deviceId,
-            groupId = "default_group",
-            ticket = "temp_ticket",
-            targetPeerId = "desktop-core",
-            certPinStorage = null,
-            expectedPeerFingerprint = null,
-            isClientMode = true
+            groupId = groupId,
+            ticket = ticket,
+            targetPeerId = targetPeerId,
+            certPinStorage = certPinStorage,
+            expectedPeerFingerprint = expectedFingerprint,
+            isClientMode = isClientMode
         )
         relayClient?.connect()
     }
@@ -118,6 +141,47 @@ class SnowForegroundService : Service() {
     fun stopRelay() {
         relayClient?.disconnect()
         relayClient = null
+    }
+
+    fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (userDisconnected) {
+                    SafeLog.i("SnowForegroundService", "Network restored but userDisconnected == true; suppressing reconnection.")
+                    return
+                }
+                if (client.connectionState.value == ConnectionState.DISCONNECTED ||
+                    client.connectionState.value == ConnectionState.RECONNECTING) {
+                    val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+                    val savedHost = prefs.getString(PREF_SAVED_HOST, null)
+                    val savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
+                    if (!savedHost.isNullOrBlank()) {
+                        SafeLog.i("SnowForegroundService", "Network restored: triggering reconnect to $savedHost:$savedPort")
+                        client.connect(savedHost, savedPort)
+                    }
+                }
+            }
+        }
+        try {
+            connectivityManager.registerNetworkCallback(request, callback)
+            networkCallback = callback
+        } catch (e: Exception) {
+            SafeLog.w("SnowForegroundService", "Failed to register network callback: ${e.message}")
+        }
+    }
+
+    fun unregisterNetworkCallback() {
+        val callback = networkCallback ?: return
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        try {
+            connectivityManager?.unregisterNetworkCallback(callback)
+        } catch (_: Exception) {}
+        networkCallback = null
     }
 
     fun startPeerHost() {
@@ -159,6 +223,7 @@ class SnowForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        registerNetworkCallback()
         org.snow.ui.SnowUiRepository.getInstance(applicationContext).bindService(this)
         client.requestDispatcher = { action, data ->
             capabilityDispatcher.dispatch(
@@ -185,6 +250,7 @@ class SnowForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CONNECT -> {
+                userDisconnected = false
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, Constants.DEFAULT_PORT)
 
@@ -280,6 +346,9 @@ class SnowForegroundService : Service() {
             client.connectionState.collectLatest { state ->
                 when (state) {
                     ConnectionState.DISCONNECTED -> {
+                        if (!userDisconnected) {
+                            discoveryManager.startListening()
+                        }
                         // When disconnected, remove the ongoing foreground notification completely.
                         ServiceCompat.stopForeground(this@SnowForegroundService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -289,9 +358,11 @@ class SnowForegroundService : Service() {
                         updateNotification("Connecting...")
                     }
                     ConnectionState.CONNECTED -> {
+                        discoveryManager.stopListening()
                         updateNotification("Connected to desktop")
                     }
                     ConnectionState.RECONNECTING -> {
+                        discoveryManager.startListening()
                         updateNotification("Reconnecting...")
                     }
                 }
@@ -334,7 +405,8 @@ class SnowForegroundService : Service() {
         }
     }
 
-    private fun handleDisconnect() {
+    internal fun handleDisconnect() {
+        userDisconnected = true
         // 0. Stop live screen sharing if active
         liveScreenHandler.stopStreaming(client.currentTargetHost, 8766)
 
@@ -460,6 +532,7 @@ class SnowForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        unregisterNetworkCallback()
         liveScreenHandler.stopStreaming()
         org.snow.ui.SnowUiRepository.getInstance(applicationContext).unbindService()
         peerHostManager.disableHostMode()

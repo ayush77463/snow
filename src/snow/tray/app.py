@@ -263,11 +263,14 @@ class SnowTrayApp:
             from snow.daemon import CoreDaemonManager
             daemon_manager = CoreDaemonManager(port=self.core_port)
         self.daemon_manager = daemon_manager
+        from snow.mcp.bridge import SnowMcpBridge
+        self.bridge = SnowMcpBridge(host="127.0.0.1", port=self.core_port, auto_start_core=False, is_owner_channel=True)
         self._hwnd: Optional[int] = None
         self._nid: Optional[Any] = None
         self._is_running: bool = False
         self._core_online: bool = False
         self._device_count: int = 0
+        self._connected_count: int = 0
         self._status_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._dashboard_spawn_lock = threading.Lock()
@@ -340,11 +343,41 @@ class SnowTrayApp:
             except Exception as exc:
                 logger.error("Failed opening browser to %s: %s", target_url, exc)
 
+    @staticmethod
+    def extract_connected_count(payload: Any) -> int:
+        """Safely extract active connected device count from an IPC status payload.
+
+        Priority order:
+        1. Count of devices in 'devices' list where is_connected is True.
+        2. Fallback to 'active_sessions_count' if devices list is missing/unusable.
+        3. Compatibility fallback to 'connected_count' if present.
+        """
+        if not isinstance(payload, dict):
+            return 0
+        devices = payload.get("devices")
+        if isinstance(devices, list):
+            return sum(1 for d in devices if isinstance(d, dict) and bool(d.get("is_connected")))
+        if "active_sessions_count" in payload:
+            try:
+                return max(0, int(payload.get("active_sessions_count", 0)))
+            except (ValueError, TypeError):
+                pass
+        if "connected_count" in payload:
+            try:
+                return max(0, int(payload.get("connected_count", 0)))
+            except (ValueError, TypeError):
+                pass
+        return 0
+
     def compute_tooltip(self) -> str:
         """Generate formatted tooltip string (<= 127 chars for NOTIFYICONDATAW)."""
         core_status = f"Running ({self.core_port})" if self._core_online else "Stopped"
         dev_text = f"{self._device_count} paired" if self._device_count != 1 else "1 paired"
-        tip = f"SNOW Core: {core_status}\nDevices: {dev_text}"
+        if self._core_online:
+            conn_text = f", {self._connected_count} connected" if self._connected_count != 1 else ", 1 connected"
+            tip = f"SNOW Core: {core_status}\nDevices: {dev_text}{conn_text}"
+        else:
+            tip = f"SNOW Core: {core_status}\nDevices: {dev_text}"
         return tip[:127]
 
     def refresh_status(self) -> dict[str, Any]:
@@ -373,9 +406,28 @@ class SnowTrayApp:
             logger.debug("Failed querying devices: %s", exc)
             self._device_count = 0
 
+        # 3. Active connected devices count via loopback IPC
+        self._connected_count = 0
+        if self._core_online:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                try:
+                    res = loop.run_until_complete(
+                        asyncio.wait_for(self.bridge.call("get_device_status"), timeout=1.0)
+                    )
+                    if isinstance(res, dict) and res.get("success"):
+                        payload = res.get("payload") or res.get("data") or {}
+                        self._connected_count = self.extract_connected_count(payload)
+                finally:
+                    loop.close()
+            except Exception as exc:
+                logger.debug("Failed querying connected device count over IPC: %s", exc)
+
         return {
             "core_online": self._core_online,
             "device_count": self._device_count,
+            "connected_count": self._connected_count,
             "tooltip": self.compute_tooltip(),
         }
 

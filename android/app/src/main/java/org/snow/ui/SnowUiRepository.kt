@@ -692,7 +692,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         if (idx >= 0) {
             current[idx] = current[idx].copy(connectionMode = mode)
             _savedDevices.value = current
-            val prefsV2 = appContext.getSharedPreferences("snow_devices_v2", Context.MODE_PRIVATE)
+            val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
             prefsV2.edit().putString("devices_json", serializeSavedDevices(current)).apply()
 
             when (mode) {
@@ -1266,6 +1266,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             serviceRef?.startRelay(endpoint)
         } else {
             serviceRef?.stopRelay()
+        }
+    }
+
+    fun getRelayTokenStorage(keyStoreManager: org.snow.security.KeyStoreManager? = null): org.snow.security.TokenStorage {
+        return if (keyStoreManager != null) {
+            org.snow.security.SharedPreferencesTokenStorage(
+                appContext.getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE),
+                keyStoreManager
+            )
+        } else {
+            org.snow.security.SharedPreferencesTokenStorage(appContext, prefName = "snow_relay_security")
         }
     }
 

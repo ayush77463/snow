@@ -40,6 +40,14 @@ APPDATA = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
 CLAUDE_CONFIG_PATH = Path(APPDATA) / "Claude" / "claude_desktop_config.json"
 ANTIGRAVITY_CONFIG_PATH = Path.home() / ".gemini" / "antigravity" / "mcp_config.json"
 
+from snow.core.usb import (
+    find_adb_binary,
+    get_connected_adb_devices,
+    get_usb_status,
+    setup_usb_reverse,
+    remove_usb_reverse,
+)
+
 
 def get_snow_mcp_config_entry() -> dict[str, Any]:
     """Generate the canonical MCP server configuration entry for SNOW."""
@@ -541,7 +549,6 @@ def run_usb(
     status: bool = False,
 ) -> int:
     """Execute 'snow usb [--serial <ID>] [--remove] [--status]' for zero-data USB reverse mode."""
-    import subprocess
     adb_bin = find_adb_binary()
     if not adb_bin:
         print("[-] ADB (Android Debug Bridge) executable not found.")
@@ -581,14 +588,9 @@ def run_usb(
     dev_name = f"{target_device['model']} ({dev_serial})"
 
     if status:
-        res = subprocess.run(
-            [str(adb_bin), "-s", dev_serial, "reverse", "--list"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        stat = get_usb_status(adb_bin=adb_bin, serial=dev_serial)
         print(f"ADB reverse status for device {dev_name}:")
-        mappings = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+        mappings = stat.get("mappings", [])
         if mappings:
             for m in mappings:
                 print(f"  {m}")
@@ -597,56 +599,28 @@ def run_usb(
         return 0
 
     if remove:
-        r1 = subprocess.run([str(adb_bin), "-s", dev_serial, "reverse", "--remove", "tcp:8765"], capture_output=True, text=True, check=False)
-        r2 = subprocess.run([str(adb_bin), "-s", dev_serial, "reverse", "--remove", "tcp:8766"], capture_output=True, text=True, check=False)
-        print(f"[+] Removed SNOW reverse port mappings from device {dev_name}.")
-        return 0
-
-    # Establish reverse mappings: tcp:8765 (WSS) and tcp:8766 (HTTPS Transfers)
-    res1 = subprocess.run(
-        [str(adb_bin), "-s", dev_serial, "reverse", "tcp:8765", "tcp:8765"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    res2 = subprocess.run(
-        [str(adb_bin), "-s", dev_serial, "reverse", "tcp:8766", "tcp:8766"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    if res1.returncode != 0 or res2.returncode != 0:
-        err = (res1.stderr + " " + res2.stderr).strip()
-        print(f"[-] Failed to establish ADB reverse mappings on {dev_name}: {err}")
+        ok, msg = remove_usb_reverse(serial=dev_serial, adb_bin=adb_bin)
+        if ok:
+            print(f"[+] Removed SNOW reverse port mappings from device {dev_name}.")
+            return 0
+        print(f"[-] {msg}")
         return 1
 
-    # Verify both mappings in reverse --list
-    check = subprocess.run(
-        [str(adb_bin), "-s", dev_serial, "reverse", "--list"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    output = check.stdout
-    has_8765 = "tcp:8765" in output
-    has_8766 = "tcp:8766" in output
-
-    if has_8765 and has_8766:
-        print("============================================================")
-        print(f"[+] SNOW Zero-Data USB Mode Configured for {dev_name}")
-        print("============================================================")
-        print(" Active ADB Reverse Mappings:")
-        print("  - Phone 127.0.0.1:8765 -> Desktop 127.0.0.1:8765 (WSS WebSocket Core)")
-        print("  - Phone 127.0.0.1:8766 -> Desktop 127.0.0.1:8766 (HTTPS File Transfers)")
-        print("\nNext step on your phone:")
-        print("  Open Devices tab -> Tap 'Connect via USB (Localhost)'.")
-        print("============================================================")
-        return 0
-    else:
-        print(f"[-] Reverse mapping verification failed on {dev_name}.")
-        print(f"    Current mappings: {output.strip()}")
+    ok, msg = setup_usb_reverse(serial=dev_serial, adb_bin=adb_bin)
+    if not ok:
+        print(f"[-] Failed to establish ADB reverse mappings on {dev_name}: {msg}")
         return 1
+
+    print("============================================================")
+    print(f"[+] SNOW Zero-Data USB Mode Configured for {dev_name}")
+    print("============================================================")
+    print(" Active ADB Reverse Mappings:")
+    print("  - Phone 127.0.0.1:8765 -> Desktop 127.0.0.1:8765 (WSS WebSocket Core)")
+    print("  - Phone 127.0.0.1:8766 -> Desktop 127.0.0.1:8766 (HTTPS File Transfers)")
+    print("\nNext step on your phone:")
+    print("  Open Devices tab -> Tap 'Connect via USB (Localhost)'.")
+    print("============================================================")
+    return 0
 
 
 # =========================================================================
@@ -837,18 +811,32 @@ def run_doctor(
 
     # 8. MCP Dynamic Capability Registry and Metadata Consistency
     try:
-        from snow.mcp.registry import validate_registry, list_capabilities
+        from snow.mcp.registry import validate_registry, list_capabilities, CAPABILITY_REGISTRY
         from snow.mcp.tools import ALL_TOOL_NAMES
+        from snow.mcp.server import create_snow_mcp_server
         is_valid, validation_errors = validate_registry()
         capabilities = list_capabilities()
         tool_count = len(ALL_TOOL_NAMES)
-        if is_valid and tool_count >= 24:
+        server = create_snow_mcp_server()
+        server_tools = {t.name for t in server._tool_manager.list_tools()}
+        registry_tools = set(CAPABILITY_REGISTRY.keys())
+        missing_tools = registry_tools - server_tools
+        unexpected_tools = server_tools - registry_tools
+        parity_ok = (server_tools == registry_tools and tool_count == 38 and not missing_tools and not unexpected_tools)
+        if is_valid and parity_ok:
             status = "OK"
-            msg = f"{tool_count} capabilities dynamically registered with verified metadata ({len(capabilities)} catalog entries)"
+            msg = f"{tool_count} capabilities dynamically registered with verified metadata ({len(capabilities)} catalog entries, 38 MCP tools verified)"
             remed = None
         else:
             status = "FAILED"
-            msg = f"Registry consistency issues: {'; '.join(validation_errors)}" if not is_valid else f"Unexpected tool count: {tool_count}"
+            issues = list(validation_errors)
+            if missing_tools:
+                issues.append(f"Missing tools in server: {', '.join(sorted(missing_tools))}")
+            if unexpected_tools:
+                issues.append(f"Unexpected tools in server: {', '.join(sorted(unexpected_tools))}")
+            if tool_count != 38:
+                issues.append(f"Expected 38 tools, got {tool_count}")
+            msg = f"Registry consistency issues: {'; '.join(issues)}"
             remed = "Audit snow.mcp.registry capability definitions and metadata."
     except Exception as exc:
         status = "FAILED"
@@ -996,9 +984,9 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser = subparsers.add_parser("setup", help="Configure SNOW as an MCP server in AI assistant clients")
     setup_parser.add_argument(
         "--host",
-        choices=["all", "claude", "gemini", "cursor", "chatgpt"],
-        default="claude",
-        help="Target AI assistant host (default: claude; use 'all' for all hosts)",
+        choices=["all", "claude", "gemini", "cursor", "chatgpt", "antigravity"],
+        default="all",
+        help="Target AI assistant host (default: all; use 'all' for all hosts)",
     )
     setup_parser.add_argument(
         "--dry-run",
