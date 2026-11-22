@@ -27,8 +27,11 @@ class E2eRelayTunnel(
         private const val INITIAL_BUFFER_CAPACITY = 32 * 1024
     }
 
-    private val engine: SSLEngine = sslContext.createSSLEngine().apply {
+    val engine: SSLEngine = sslContext.createSSLEngine().apply {
         useClientMode = !isServer
+        if (isServer && expectedPeerFingerprint != null) {
+            needClientAuth = true
+        }
         // Support TLS 1.3 with TLS 1.2 compatibility
         val supported = supportedProtocols.toSet()
         val requested = listOf("TLSv1.3", "TLSv1.2").filter { supported.contains(it) }
@@ -47,9 +50,8 @@ class E2eRelayTunnel(
     private var inNetBuffer: ByteBuffer = ByteBuffer.allocate(INITIAL_BUFFER_CAPACITY)
 
     init {
-        if (!isServer) {
-            engine.beginHandshake()
-        }
+        // Begin handshake for both client and server roles
+        engine.beginHandshake()
     }
 
     /**
@@ -86,10 +88,17 @@ class E2eRelayTunnel(
         val appOut = ByteBuffer.allocate(maxOf(engine.session.applicationBufferSize, 16384) * 2)
 
         var loop = true
-        while (loop) {
-            var status = engine.handshakeStatus
-            if (handshakeDone || status == HandshakeStatus.NOT_HANDSHAKING || status == HandshakeStatus.FINISHED) {
-                if (!handshakeDone) {
+        while (loop && !handshakeDone) {
+            val status = engine.handshakeStatus
+            if (status == HandshakeStatus.FINISHED) {
+                verifyPeerCertificate()
+                handshakeDone = true
+                break
+            } else if (status == HandshakeStatus.NOT_HANDSHAKING) {
+                // In SSLEngine, NOT_HANDSHAKING can occur after completion or before initial data.
+                // Complete ONLY if session negotiated a valid cipher suite!
+                val cipher = engine.session.cipherSuite
+                if (cipher != null && cipher != "SSL_NULL_WITH_NULL_NULL") {
                     verifyPeerCertificate()
                     handshakeDone = true
                 }
@@ -214,23 +223,54 @@ class E2eRelayTunnel(
         return outStream.toByteArray()
     }
 
-    private fun verifyPeerCertificate() {
-        try {
-            val certs = engine.session.peerCertificates
-            if (certs.isNotEmpty() && certs[0] is X509Certificate) {
-                val presented = TlsConfig.computeSha256Fingerprint(certs[0] as X509Certificate)
-                peerFingerprint = presented
-                if (expectedPeerFingerprint != null) {
-                    if (!TlsConfig.fingerprintsMatch(expectedPeerFingerprint, presented)) {
-                        SafeLog.e(TAG, "Relay peer fingerprint mismatch! Expected: $expectedPeerFingerprint, Got: $presented")
-                        throw SecurityException("Certificate fingerprint mismatch! Expected: $expectedPeerFingerprint, Presented: $presented")
-                    }
-                }
+    /**
+     * Initiate clean TLS shutdown and return closure alert bytes.
+     */
+    @Synchronized
+    fun closeOutbound(): ByteArray {
+        engine.closeOutbound()
+        val emptyApp = ByteBuffer.allocate(0)
+        val packetSize = maxOf(engine.session.packetBufferSize, 16384)
+        val netOut = ByteBuffer.allocate(packetSize * 2)
+        val outStream = ByteArrayOutputStream()
+        while (!engine.isOutboundDone) {
+            netOut.clear()
+            val res = engine.wrap(emptyApp, netOut)
+            netOut.flip()
+            if (netOut.hasRemaining()) {
+                val chunk = ByteArray(netOut.remaining())
+                netOut.get(chunk)
+                outStream.write(chunk)
             }
+            if (res.status == SSLEngineResult.Status.CLOSED) {
+                break
+            }
+        }
+        return outStream.toByteArray()
+    }
+
+    private fun verifyPeerCertificate() {
+        val certs = try {
+            engine.session.peerCertificates
         } catch (e: Exception) {
             if (expectedPeerFingerprint != null) {
-                throw e
+                SafeLog.e(TAG, "Peer certificate required for mutual authentication, but none presented: ${e.message}")
+                throw SecurityException("Peer certificate required for mutual authentication, but none presented: ${e.message}")
             }
+            null
+        }
+
+        if (certs != null && certs.isNotEmpty() && certs[0] is X509Certificate) {
+            val presented = TlsConfig.computeSha256Fingerprint(certs[0] as X509Certificate)
+            peerFingerprint = presented
+            if (expectedPeerFingerprint != null) {
+                if (!TlsConfig.fingerprintsMatch(expectedPeerFingerprint, presented)) {
+                    SafeLog.e(TAG, "Relay peer fingerprint mismatch! Expected: $expectedPeerFingerprint, Got: $presented")
+                    throw SecurityException("Certificate fingerprint mismatch! Expected: $expectedPeerFingerprint, Presented: $presented")
+                }
+            }
+        } else if (expectedPeerFingerprint != null) {
+            throw SecurityException("Peer certificate missing during mutual authentication!")
         }
     }
 }

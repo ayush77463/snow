@@ -260,6 +260,7 @@ class DeviceNode:
     is_authenticated: bool = False
     is_paired: bool = False
     transport: str = "unknown"
+    connection_mode: str = "auto"
 
     def __post_init__(self) -> None:
         if self.capabilities and not self.supported_capabilities:
@@ -295,6 +296,7 @@ class DeviceNode:
             "is_paired": self.is_paired,
             "is_authenticated": self.is_authenticated,
             "transport": self.transport,
+            "connection_mode": self.connection_mode,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,
@@ -321,6 +323,7 @@ class DeviceNode:
             "is_connected": self.is_connected,
             "is_paired": self.is_paired,
             "transport": self.transport,
+            "connection_mode": self.connection_mode,
             "supported_capabilities": list(self.supported_capabilities),
             "permission_states": dict(self.permission_states),
             "last_seen_timestamp": self.last_seen_timestamp,
@@ -372,4 +375,6 @@ class DeviceNode:
             capabilities=caps,
             is_authenticated=bool(data.get("is_authenticated", False)),
             is_paired=bool(data.get("is_paired", False)),
+            transport=str(data.get("transport", "unknown")),
+            connection_mode=str(data.get("connection_mode", "auto")),
         )

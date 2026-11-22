@@ -368,6 +368,7 @@ class NodeRegistry:
                 is_authenticated=is_authed,
                 is_paired=is_paired,
                 transport=active_session.get("transport", "unknown") if active_session else "offline",
+                connection_mode=getattr(paired_record, "connection_mode", "auto") if paired_record else "auto",
             )
 
     def list_nodes(

@@ -15,9 +15,22 @@ from snow.network.e2e_tunnel import (
     TlsMemoryBioTunnel,
     create_e2e_tunnel_ssl_context,
 )
-from snow.protocol.models import SnowMessage
+from snow.protocol.models import MessageType, SnowMessage
 
 logger = logging.getLogger(__name__)
+
+TUNNEL_INIT_SIGNAL = b"SNOW_TUNNEL_INIT"
+
+
+def is_tls_server_role(local_id: str, remote_id: str) -> bool:
+    """Determine deterministic TLS role for end-to-end encrypted relay tunnels.
+
+    The node with the lexicographically greater device_id acts as the TLS server.
+    The node with the smaller device_id acts as the TLS client.
+    Ensures symmetric pairings (Windows <-> Windows, Android <-> Android)
+    never deadlock or contend for the same role.
+    """
+    return str(local_id) > str(remote_id)
 
 
 class RelayTunnelClient:
@@ -54,6 +67,9 @@ class RelayTunnelClient:
         self._incoming_queues: Dict[str, asyncio.Queue[SnowMessage]] = {}
         # peer_id -> handshake completion event
         self._handshake_events: Dict[str, asyncio.Event] = {}
+
+        # Optional request dispatcher callback: async (source_id: str, msg: SnowMessage) -> Optional[SnowMessage]
+        self.request_dispatcher: Optional[Callable[[str, SnowMessage], Any]] = None
 
     def set_peer_pinned_fingerprint(
         self,
@@ -125,18 +141,28 @@ class RelayTunnelClient:
         self._handshake_events.clear()
 
     async def initiate_e2e_tunnel(self, target_id: str, timeout: float = 10.0) -> bool:
-        """Initiate client-side E2E TLS 1.3 handshake with target peer through relay."""
+        """Initiate E2E TLS 1.3 handshake with target peer through relay.
+
+        Uses deterministic role negotiation:
+        - If local_id < target_id: node is TLS client; generates ClientHello and sends frame.
+        - If local_id > target_id: node is TLS server; prepares server tunnel and prompts client.
+        """
         if not self._is_connected or not self._ws:
             return False
 
+        existing = self._tunnels.get(target_id)
+        if existing and existing.handshake_done:
+            return True
+
+        is_server = is_tls_server_role(self.device_id, target_id)
         pinned_fp = self._pinned_fingerprints.get(target_id)
         peer_cert = self._peer_cert_paths.get(target_id)
         ctx = create_e2e_tunnel_ssl_context(
-            self.cert_path, self.key_path, is_server=False, peer_cert_path=peer_cert
+            self.cert_path, self.key_path, is_server=is_server, peer_cert_path=peer_cert
         )
         tunnel = TlsMemoryBioTunnel(
             ssl_context=ctx,
-            is_server=False,
+            is_server=is_server,
             expected_peer_fingerprint=pinned_fp,
         )
         self._tunnels[target_id] = tunnel
@@ -144,10 +170,15 @@ class RelayTunnelClient:
         self._handshake_events[target_id] = event
         self._incoming_queues.setdefault(target_id, asyncio.Queue())
 
-        # Drive initial client_hello
-        done, out_bytes = tunnel.drive_handshake()
-        if out_bytes:
-            await self._send_relay_frame(target_id, out_bytes)
+        if not is_server:
+            # Client role: drive initial client_hello
+            done, out_bytes = tunnel.drive_handshake()
+            if out_bytes:
+                await self._send_relay_frame(target_id, out_bytes)
+        else:
+            # Server role: prepare server tunnel and send init signal to prompt client ClientHello
+            logger.debug("Prepared TLS server tunnel for peer [%s], sending init prompt...", target_id)
+            await self._send_relay_frame(target_id, TUNNEL_INIT_SIGNAL)
 
         # Wait for handshake completion
         try:
@@ -166,7 +197,9 @@ class RelayTunnelClient:
             ok = await self.initiate_e2e_tunnel(target_id)
             if not ok:
                 return False
-            tunnel = self._tunnels[target_id]
+            tunnel = self._tunnels.get(target_id)
+            if not tunnel:
+                return False
 
         plaintext = message.to_json().encode("utf-8")
         encrypted = tunnel.encrypt_application_data(plaintext)
@@ -224,17 +257,26 @@ class RelayTunnelClient:
 
     async def _handle_incoming_relay_bytes(self, source_id: str, raw_bytes: bytes) -> None:
         """Process incoming raw inner TLS bytes from a peer."""
+        # Check for out-of-band tunnel init signal
+        if raw_bytes == TUNNEL_INIT_SIGNAL:
+            if not is_tls_server_role(self.device_id, source_id):
+                # We are client: initiate handshake by sending ClientHello
+                logger.debug("Received tunnel init prompt from [%s]. Initiating client handshake...", source_id)
+                asyncio.create_task(self.initiate_e2e_tunnel(source_id))
+            return
+
         tunnel = self._tunnels.get(source_id)
         if not tunnel:
-            # Incoming handshake from peer: initialize server-side tunnel
+            # Incoming handshake from peer: initialize tunnel with deterministic role
+            is_server = is_tls_server_role(self.device_id, source_id)
             pinned_fp = self._pinned_fingerprints.get(source_id)
             peer_cert = self._peer_cert_paths.get(source_id)
             ctx = create_e2e_tunnel_ssl_context(
-                self.cert_path, self.key_path, is_server=True, peer_cert_path=peer_cert
+                self.cert_path, self.key_path, is_server=is_server, peer_cert_path=peer_cert
             )
             tunnel = TlsMemoryBioTunnel(
                 ssl_context=ctx,
-                is_server=True,
+                is_server=is_server,
                 expected_peer_fingerprint=pinned_fp,
             )
             self._tunnels[source_id] = tunnel
@@ -269,5 +311,19 @@ class RelayTunnelClient:
                     msg_obj = SnowMessage.from_json(decrypted.decode("utf-8"))
                     queue = self._incoming_queues.setdefault(source_id, asyncio.Queue())
                     await queue.put(msg_obj)
+
+                    if self.request_dispatcher and msg_obj.type == MessageType.REQUEST:
+                        asyncio.create_task(self._dispatch_incoming_request(source_id, msg_obj))
                 except Exception as de:
                     logger.warning("Failed parsing decrypted message from [%s]: %s", source_id, de)
+
+    async def _dispatch_incoming_request(self, source_id: str, req: SnowMessage) -> None:
+        """Asynchronously dispatch an incoming request and return the response."""
+        if not self.request_dispatcher:
+            return
+        try:
+            resp = await self.request_dispatcher(source_id, req)
+            if isinstance(resp, SnowMessage):
+                await self.send_message(source_id, resp)
+        except Exception as exc:
+            logger.warning("Error dispatching incoming relay request from [%s]: %s", source_id, exc)

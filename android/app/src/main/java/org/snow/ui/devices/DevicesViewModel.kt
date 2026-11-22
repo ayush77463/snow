@@ -79,4 +79,8 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
     fun handleQrScanPayload(qrJson: String, onComplete: (Boolean, String?) -> Unit) {
         repository.handleQrScanPayload(qrJson, onComplete)
     }
+
+    fun updateConnectionMode(deviceId: String, mode: String) {
+        repository.updateDeviceConnectionMode(deviceId, mode)
+    }
 }

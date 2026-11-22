@@ -291,7 +291,7 @@
         if (tr === "usb_adb" || tr === "USB ADB") return "🔌 USB ADB";
         if (tr === "loopback" || tr === "Loopback") return "🔁 Loopback";
         if (tr === "peer_link" || tr === "mesh_peer" || tr === "Peer Link") return "🔗 Peer Link";
-        if (tr === "remote_relay" || tr === "Remote Relay") return "☁️ Remote Relay";
+        if (tr === "remote_relay" || tr === "Remote Relay" || tr === "relay") return "🌐 Remote Relay";
         return tr;
     }
 
@@ -301,7 +301,7 @@
         if (tr === "usb_adb" || tr === "USB ADB") return "chip-usb";
         if (tr === "loopback" || tr === "Loopback") return "chip-loopback";
         if (tr === "peer_link" || tr === "mesh_peer" || tr === "Peer Link") return "chip-peer";
-        if (tr === "remote_relay" || tr === "Remote Relay") return "chip-relay";
+        if (tr === "remote_relay" || tr === "Remote Relay" || tr === "relay") return "chip-relay";
         return "chip-neutral";
     }
 
@@ -966,7 +966,11 @@
             const trChip = document.createElement("span");
 
             const tr = dev.transport || "unknown";
-            if (!dev.is_connected) {
+            const isRelayedOnline = dev.reachability_state === "ONLINE_RELAYED" || (dev.is_connected && (tr === "remote_relay" || tr === "relay"));
+            if (isRelayedOnline) {
+                trChip.className = "chip chip-relay";
+                trChip.textContent = "🌐 Remote Relay";
+            } else if (!dev.is_connected) {
                 trChip.className = "chip chip-neutral";
                 trChip.textContent = "Disconnected";
             } else if (tr === "wifi_lan") {
@@ -985,6 +989,35 @@
             trRow.appendChild(trLabel);
             trRow.appendChild(trChip);
             body.appendChild(trRow);
+
+            // Connection Mode Selector (Phase 28A)
+            const modeRow = document.createElement("div");
+            modeRow.className = "device-detail-row mt-2";
+            const modeLabel = document.createElement("span");
+            modeLabel.className = "label";
+            modeLabel.textContent = "Mode:";
+            const modeSelect = document.createElement("select");
+            modeSelect.className = "device-connection-mode-select";
+            modeSelect.innerHTML = `
+                <option value="auto">Auto (Local First)</option>
+                <option value="local_only">Local Only</option>
+                <option value="remote_only">Remote Relay</option>
+            `;
+            modeSelect.value = dev.connection_mode || "auto";
+            modeSelect.addEventListener("change", async () => {
+                const newMode = modeSelect.value;
+                const res = await apiRequest("/api/devices/connection-mode", "POST", {
+                    device_id: dev.device_id,
+                    connection_mode: newMode,
+                });
+                if (!res || !res.success) {
+                    alert("Failed to update connection mode: " + (res?.error || "Unknown error"));
+                    modeSelect.value = dev.connection_mode || "auto";
+                }
+            });
+            modeRow.appendChild(modeLabel);
+            modeRow.appendChild(modeSelect);
+            body.appendChild(modeRow);
 
             // Actions row
             const actionsRow = document.createElement("div");
@@ -1860,24 +1893,48 @@
 
     async function loadRelayStatus() {
         const valEl = document.getElementById("relay-status-val");
+        const clientValEl = document.getElementById("relay-client-status-val");
         const epEl = document.getElementById("relay-endpoint-val");
         const frameEl = document.getElementById("relay-max-frame-val");
         const resBox = document.getElementById("relay-test-result");
+        const toggleEl = document.getElementById("relay-enable-toggle");
+        const urlInput = document.getElementById("relay-url-input");
+        const groupInput = document.getElementById("relay-group-input");
 
         const res = await apiRequest("/api/relay/status");
         if (res && res.success && res.data) {
             const d = res.data;
             if (valEl) {
                 valEl.innerHTML = d.enabled
-                    ? `<span class="badge badge-success">Active Tunnel</span>`
-                    : `<span class="badge badge-muted">Disabled (Default)</span>`;
+                    ? `<span class="badge badge-success">Service Active</span>`
+                    : `<span class="badge badge-muted">Service Standby</span>`;
             }
             if (epEl) epEl.textContent = d.endpoint || "Not Configured";
             if (frameEl) frameEl.textContent = `${d.max_frame_size_mib || 25} MiB (${d.quota_mib_hr || 100} MiB/hr quota)`;
-            if (resBox) resBox.textContent = d.enabled ? "Relay tunnel configured." : "Operating in local-first zero-trust mode.";
         } else {
             if (valEl) valEl.innerHTML = `<span class="badge badge-danger">Unavailable</span>`;
-            if (resBox) resBox.textContent = (res && res.error) ? res.error : "Failed fetching relay status.";
+        }
+
+        const cfgRes = await apiRequest("/api/relay/config");
+        if (cfgRes && cfgRes.success && cfgRes.data) {
+            const cd = cfgRes.data;
+            if (toggleEl && !toggleEl.dataset.userEdited) toggleEl.checked = !!cd.enabled;
+            if (urlInput && !urlInput.dataset.userEdited) urlInput.value = cd.relay_url || "";
+            if (groupInput && !groupInput.dataset.userEdited) groupInput.value = cd.group_id || "";
+            if (clientValEl) {
+                if (cd.connected) {
+                    clientValEl.innerHTML = `<span class="badge badge-success">Connected</span>`;
+                } else if (cd.enabled) {
+                    clientValEl.innerHTML = `<span class="badge badge-warning">Connecting...</span>`;
+                } else {
+                    clientValEl.innerHTML = `<span class="badge badge-muted">Disabled</span>`;
+                }
+            }
+            if (resBox) {
+                resBox.textContent = cd.connected
+                    ? `Connected to ${cd.relay_url} (group: ${cd.group_id}). Active tunnels: ${(cd.active_tunnels || []).length}.`
+                    : (cd.enabled ? "Relay client enabled, connecting..." : "Relay client disabled (operating in local-first zero-trust mode).");
+            }
         }
     }
 
@@ -2473,6 +2530,38 @@
         const btnRefreshRelay = document.getElementById("btn-refresh-relay-status");
         if (btnRefreshRelay) {
             btnRefreshRelay.addEventListener("click", () => loadRelayStatus());
+        }
+
+        const btnSaveRelay = document.getElementById("btn-save-relay-config");
+        if (btnSaveRelay) {
+            btnSaveRelay.addEventListener("click", async () => {
+                const toggleEl = document.getElementById("relay-enable-toggle");
+                const urlInput = document.getElementById("relay-url-input");
+                const groupInput = document.getElementById("relay-group-input");
+                const ticketInput = document.getElementById("relay-ticket-input");
+
+                btnSaveRelay.disabled = true;
+                btnSaveRelay.textContent = "Saving...";
+
+                const payload = {
+                    enabled: toggleEl ? toggleEl.checked : false,
+                    relay_url: urlInput ? urlInput.value.trim() : "",
+                    group_id: groupInput ? groupInput.value.trim() : "",
+                    ticket: ticketInput ? ticketInput.value.trim() : "",
+                };
+
+                const res = await apiRequest("/api/relay/config", "POST", payload);
+                btnSaveRelay.disabled = false;
+                btnSaveRelay.textContent = "Save & Apply";
+
+                if (res && res.success) {
+                    alert("Relay configuration updated successfully.");
+                    if (ticketInput) ticketInput.value = "";
+                    loadRelayStatus();
+                } else {
+                    alert("Failed to update relay config: " + (res?.error || "Unknown error"));
+                }
+            });
         }
 
         const btnJumpApprovals = document.getElementById("btn-jump-approvals");

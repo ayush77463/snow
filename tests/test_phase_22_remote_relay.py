@@ -304,7 +304,7 @@ class TestPhase22LocalFirstRouting(unittest.IsolatedAsyncioTestCase):
         res = await router.route_request("android_torch", target=self.target_id)
         self.assertTrue(res["success"])
         self.assertEqual(res["data"]["torch"], True)
-        self.assertEqual(res["routing"]["transport"], "relay")
+        self.assertIn(res["routing"]["transport"], ("remote_relay", "relay"))
         self.assertEqual(res["routing"]["reachability"], "ONLINE_RELAYED")
 
 

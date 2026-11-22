@@ -56,6 +56,10 @@ class CoreConfig:
     beacon_interval: float = 3.0
     device_connect_grace_period: float = 6.0
     primary_owner_device_id: str | None = None
+    relay_enabled: bool = False
+    relay_url: str = ""
+    relay_group_id: str = ""
+    relay_ticket: str = ""
 
     def __post_init__(self) -> None:
         """Validate configuration invariants upon instantiation."""
@@ -449,6 +453,12 @@ class CoreConfig:
         raw_owner_dev = os.getenv("SNOW_PRIMARY_OWNER_DEVICE")
         primary_owner_device_id = raw_owner_dev.strip() if raw_owner_dev and raw_owner_dev.strip() else None
 
+        # Parse Relay client configuration
+        relay_enabled = os.getenv("SNOW_RELAY_CLIENT_ENABLED", "0").lower() in ("1", "true", "yes")
+        relay_url = os.getenv("SNOW_RELAY_URL", "").strip()
+        relay_group_id = os.getenv("SNOW_RELAY_GROUP_ID", "").strip()
+        relay_ticket = os.getenv("SNOW_RELAY_TICKET", "").strip()
+
         return cls(
             app_name=app_name,
             version="0.1.0",
@@ -474,4 +484,8 @@ class CoreConfig:
             beacon_interval=beacon_interval,
             device_connect_grace_period=device_connect_grace_period,
             primary_owner_device_id=primary_owner_device_id,
+            relay_enabled=relay_enabled,
+            relay_url=relay_url,
+            relay_group_id=relay_group_id,
+            relay_ticket=relay_ticket,
         )

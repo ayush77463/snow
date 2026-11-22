@@ -1433,3 +1433,66 @@ class SnowMcpBridge:
         from snow.network.network_model import SnowNetworkManager
         network_mgr = SnowNetworkManager(db_manager=self.capability_engine.db_manager)
         return network_mgr.build_topology(principal=principal)
+
+    # =========================================================================
+    # Phase 28A: Connection Mode & Relay Management Methods
+    # =========================================================================
+
+    async def set_device_connection_mode(self, device_id: str, connection_mode: str) -> dict[str, Any]:
+        """Update connection mode ('auto', 'local_only', 'remote_only') for a paired device."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call(
+                "device_set_connection_mode",
+                payload={"device_id": device_id, "connection_mode": connection_mode},
+                timeout=5.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
+        # In-process fallback
+        db = self.capability_engine.db_manager
+        if db:
+            ok = db.update_device_connection_mode(device_id, connection_mode)
+            if ok:
+                node_reg = getattr(self.capability_engine, "node_registry", None)
+                if node_reg:
+                    node = node_reg.get_node(device_id)
+                    if node:
+                        node.connection_mode = connection_mode
+                return {"success": True, "status": "SUCCESS", "data": {"device_id": device_id, "connection_mode": connection_mode}}
+            return {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"Device '{device_id}' not found."}
+        return {"success": False, "status": "DATABASE_UNAVAILABLE", "error": "Database unavailable."}
+
+    async def get_relay_config(self) -> dict[str, Any]:
+        """Query live relay client configuration and status."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call("relay_status", payload={}, timeout=5.0)
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
+        return {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {
+                "enabled": False,
+                "connected": False,
+                "relay_url": "",
+                "group_id": "",
+                "active_tunnels": [],
+            },
+        }
+
+    async def set_relay_config(
+        self, enabled: bool, relay_url: str = "", group_id: str = "", ticket: str = ""
+    ) -> dict[str, Any]:
+        """Configure or toggle outbound relay tunnel connectivity."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call(
+                "relay_config",
+                payload={"enabled": enabled, "relay_url": relay_url, "group_id": group_id, "ticket": ticket},
+                timeout=10.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
+        return {"success": False, "status": "CORE_OFFLINE", "error": "Desktop Core daemon is offline."}

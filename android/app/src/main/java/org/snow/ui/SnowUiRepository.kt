@@ -272,6 +272,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             return
         }
 
+        val matchingDevice = _savedDevices.value.find { it.host == cleanHost && it.port == port }
+        if (matchingDevice?.connectionMode == "remote_only") {
+            appendLog("WARNING", TAG, "Cannot connect locally: Policy for '${matchingDevice.deviceName}' is set to remote_only.")
+            _connectionState.value = ConnectionState.DISCONNECTED
+            return
+        }
+
         val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         prefs.edit().putString("last_connected_host", cleanHost).putInt("last_connected_port", port).apply()
 
@@ -610,6 +617,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             obj.put("lastSeen", d.lastSeen ?: "")
             obj.put("trustTier", d.trustTier)
             obj.put("certFingerprint", d.certFingerprint ?: "")
+            obj.put("connectionMode", d.connectionMode)
             val epArr = org.json.JSONArray()
             for (ep in d.recentEndpoints) {
                 val epObj = org.json.JSONObject()
@@ -654,12 +662,47 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         lastSeen = obj.optString("lastSeen", "").takeIf { it.isNotBlank() },
                         trustTier = obj.optString("trustTier", "PEER"),
                         certFingerprint = obj.optString("certFingerprint", "").takeIf { it.isNotBlank() },
-                        recentEndpoints = eps.take(5)
+                        recentEndpoints = eps.take(5),
+                        connectionMode = obj.optString("connectionMode", "auto")
                     )
                 )
             }
         } catch (_: Exception) {}
         return list
+    }
+
+    fun updateDeviceConnectionMode(deviceId: String, mode: String) {
+        val current = _savedDevices.value.toMutableList()
+        val idx = current.indexOfFirst { it.deviceId == deviceId }
+        if (idx >= 0) {
+            current[idx] = current[idx].copy(connectionMode = mode)
+            _savedDevices.value = current
+            val prefsV2 = appContext.getSharedPreferences("snow_devices_v2", Context.MODE_PRIVATE)
+            prefsV2.edit().putString("devices_json", serializeSavedDevices(current)).apply()
+
+            when (mode) {
+                "local_only" -> {
+                    serviceRef?.stopRelay()
+                }
+                "remote_only" -> {
+                    serviceRef?.client?.disconnect()
+                    val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                    val endpoint = prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "") ?: ""
+                    if (endpoint.isNotBlank()) {
+                        serviceRef?.startRelay(endpoint)
+                    }
+                }
+                "auto" -> {
+                    if (_connectionState.value == ConnectionState.DISCONNECTED) {
+                        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                        val endpoint = prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "") ?: ""
+                        if (endpoint.isNotBlank()) {
+                            serviceRef?.startRelay(endpoint)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // --- Telemetry & Status ---
@@ -2027,7 +2070,8 @@ data class SavedDevice(
     val lastSeen: String? = null,
     val trustTier: String = "PEER",
     val certFingerprint: String? = null,
-    val recentEndpoints: List<DeviceEndpoint> = emptyList()
+    val recentEndpoints: List<DeviceEndpoint> = emptyList(),
+    val connectionMode: String = "auto"
 )
 
 data class ActiveTransferInfo(

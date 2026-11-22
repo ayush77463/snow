@@ -24,6 +24,7 @@ from snow.network.connection_manager import ConnectionManager
 from snow.network.discovery import SnowDiscoveryService
 from snow.network.registry import NodeRegistry
 from snow.network.ws_server import SnowWebSocketServer
+from snow.protocol.models import SnowMessage
 from snow.security.db import DatabaseManager
 from snow.security.identity import DeviceIdentity
 from snow.security.policy import PeerCapabilityPolicy
@@ -145,6 +146,12 @@ class SnowCoreServer:
             node_registry=self.node_registry,
         )
         self.peer_clients: dict[str, Any] = {}
+        self.relay_client: Optional[Any] = None
+        self.relay_enabled: bool = getattr(self.config, "relay_enabled", False)
+        self.relay_url: str = getattr(self.config, "relay_url", "")
+        self.relay_group_id: str = getattr(self.config, "relay_group_id", "")
+        self.relay_ticket: str = getattr(self.config, "relay_ticket", "")
+        self.session_router.relay_enabled = self.relay_enabled
 
     async def connect_peer(
         self,
@@ -242,6 +249,198 @@ class SnowCoreServer:
             self.node_registry.on_session_disconnected(device_id)
             return {"success": True, "status": "DISCONNECTED", "device_id": device_id}
         return {"success": False, "status": "NOT_CONNECTED", "error": f"Peer '{device_id}' is not connected."}
+
+    def get_relay_status(self) -> dict[str, Any]:
+        """Query live relay client connection state and active tunnels."""
+        connected = bool(self.relay_client and getattr(self.relay_client, "_is_connected", False))
+        tunnels = list(self.relay_client._tunnels.keys()) if self.relay_client else []
+        return {
+            "success": True,
+            "status": "SUCCESS",
+            "enabled": self.relay_enabled,
+            "connected": connected,
+            "relay_url": self.relay_url,
+            "group_id": self.relay_group_id,
+            "active_tunnels": tunnels,
+            "tunnel_count": len(tunnels),
+        }
+
+    async def configure_relay(
+        self,
+        enabled: bool,
+        relay_url: Optional[str] = None,
+        group_id: Optional[str] = None,
+        ticket: Optional[str] = None,
+        clear_ticket: bool = False,
+    ) -> dict[str, Any]:
+        """Configure, enable, or disable the outbound relay tunnel client."""
+        self.relay_enabled = bool(enabled)
+        if relay_url is not None and relay_url.strip():
+            self.relay_url = relay_url.strip()
+        if group_id is not None and group_id.strip():
+            self.relay_group_id = group_id.strip()
+        if clear_ticket:
+            self.relay_ticket = ""
+        elif ticket is not None:
+            clean_ticket = ticket.strip()
+            # Submitting an empty dashboard ticket must not overwrite an already configured valid relay ticket.
+            if clean_ticket:
+                self.relay_ticket = clean_ticket
+
+        # Update SessionRouter relay state
+        self.session_router.relay_enabled = self.relay_enabled
+
+        if not self.relay_enabled:
+            # Drain and disconnect active relay client
+            if self.relay_client:
+                try:
+                    await self.relay_client.disconnect()
+                except Exception as exc:
+                    logger.debug("Error disconnecting relay client: %s", exc)
+                self.relay_client = None
+                self.session_router.relay_client = None
+            return self.get_relay_status()
+
+        # Disconnect existing relay client if already running
+        if self.relay_client:
+            try:
+                await self.relay_client.disconnect()
+            except Exception:
+                pass
+            self.relay_client = None
+
+        if not self.relay_url or not self.relay_ticket:
+            logger.warning("Relay enabled but missing relay_url or ticket.")
+            return self.get_relay_status()
+
+        # Resolve cert & key paths safely using config attributes
+        from snow.security.tls import DEFAULT_CERT_FILE, DEFAULT_KEY_FILE, DEFAULT_TLS_DIR
+        data_dir = os.environ.get("SNOW_DATA_DIR")
+        tls_dir = (Path(data_dir) / "tls") if data_dir else DEFAULT_TLS_DIR
+        cert_candidate = (
+            getattr(self.config, "tls_cert_path", None)
+            or getattr(self.config, "tls_cert_file", None)
+            or str(tls_dir / DEFAULT_CERT_FILE)
+        )
+        key_candidate = (
+            getattr(self.config, "tls_key_path", None)
+            or getattr(self.config, "tls_key_file", None)
+            or str(tls_dir / DEFAULT_KEY_FILE)
+        )
+        cert_path = str(cert_candidate)
+        key_path = str(key_candidate)
+
+        if not os.path.exists(cert_path) or not os.path.exists(key_path):
+            logger.warning(
+                "Relay enabled but TLS certificate or key file not found: cert=%s, key=%s",
+                cert_path,
+                key_path,
+            )
+            return self.get_relay_status()
+
+        from snow.network.relay_client import RelayTunnelClient
+        local_dev_id = getattr(self.device_identity, "device_id", "desktop-core") if hasattr(self, "device_identity") and self.device_identity else "desktop-core"
+
+        client = RelayTunnelClient(
+            relay_url=self.relay_url,
+            device_id=local_dev_id,
+            group_id=self.relay_group_id or "default_group",
+            ticket=self.relay_ticket,
+            cert_path=cert_path,
+            key_path=key_path,
+        )
+
+        # Pin fingerprints for all paired devices
+        if self.db_manager:
+            for p in self.db_manager.list_paired_devices():
+                if p.cert_fingerprint:
+                    client.set_peer_pinned_fingerprint(p.device_id, p.cert_fingerprint)
+
+        # Wire incoming request dispatcher
+        async def _relay_request_dispatcher(source_id: str, req: SnowMessage) -> Optional[SnowMessage]:
+            return await self._handle_incoming_relay_request(source_id, req)
+
+        client.request_dispatcher = _relay_request_dispatcher
+
+        connected = await client.connect()
+        if connected:
+            self.relay_client = client
+            self.session_router.relay_client = client
+            logger.info("Outbound relay tunnel client connected and registered with router.")
+        else:
+            logger.warning("Failed connecting to relay at %s", self.relay_url)
+
+        return self.get_relay_status()
+
+    async def _handle_incoming_relay_request(self, source_id: str, req: SnowMessage) -> Optional[SnowMessage]:
+        """Dispatch incoming capability request received over inner E2E relay tunnel."""
+        # Verify sender is paired
+        paired = self.db_manager.get_paired_device(source_id) if self.db_manager else None
+        if not paired:
+            logger.warning("Incoming relay request from unpaired peer [%s] rejected.", source_id)
+            return SnowMessage.create_error(
+                code="UNAUTHORIZED",
+                message="Unpaired peer not authorized to execute capabilities via relay.",
+                correlation_id=req.id,
+            )
+
+        action = req.action
+        data = req.data
+        if not action:
+            return SnowMessage.create_error(
+                code="INVALID_ARGUMENT",
+                message="Missing capability action.",
+                correlation_id=req.id,
+            )
+
+        # Derive execution principal strictly from authenticated paired-device trust
+        from snow.security.context import ExecutionContext, ExecutionPrincipal
+        from snow.capabilities.engine import CapabilityRequest, CapabilityResponse
+
+        trust_tier = getattr(paired, "trust_tier", "peer")
+        principal = (
+            ExecutionPrincipal.OWNER_MANUAL
+            if str(trust_tier).lower() == "owner"
+            else ExecutionPrincipal.AI_MCP
+        )
+
+        ctx = ExecutionContext(
+            principal=principal,
+            device_id=source_id,
+            origin=f"relay:{source_id}",
+        )
+
+        try:
+            # Clean data: reject caller-supplied authority overrides
+            clean_params = dict(data) if isinstance(data, dict) else {}
+            clean_params.pop("principal", None)
+            clean_params.pop("trust_tier", None)
+            clean_params.pop("execution_principal", None)
+
+            req_obj = CapabilityRequest(action=action, params=clean_params)
+            res: CapabilityResponse = await self.capability_engine.execute(req_obj, ctx=ctx)
+
+            if res.success:
+                return SnowMessage.create_response(
+                    correlation_id=req.id,
+                    payload={
+                        "status": "success",
+                        "action": action,
+                        "data": res.data if res.data is not None else {},
+                    },
+                )
+            else:
+                return SnowMessage.create_error(
+                    code=res.status or "ERROR",
+                    message=res.error or "Capability execution failed.",
+                    correlation_id=req.id,
+                )
+        except Exception as exc:
+            return SnowMessage.create_error(
+                code="INTERNAL_ERROR",
+                message=str(exc),
+                correlation_id=req.id,
+            )
 
     @property
     def is_running(self) -> bool:
@@ -421,6 +620,14 @@ class SnowCoreServer:
                 except Exception:
                     pass
             self.peer_clients.clear()
+
+        # Disconnect relay client
+        if getattr(self, "relay_client", None):
+            try:
+                await self.relay_client.disconnect()
+            except Exception:
+                pass
+            self.relay_client = None
 
         # Stop WebSocket server and close client connections
         await self.ws_server.stop()

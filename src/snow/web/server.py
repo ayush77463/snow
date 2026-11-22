@@ -342,6 +342,32 @@ class SnowWebServer:
 
         return web.json_response(res)
 
+    async def handle_api_devices_connection_mode(self, request: web.Request) -> web.Response:
+        """Update per-device connection mode (auto, local_only, remote_only)."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        device_id = (body.get("device_id") or "").strip()
+        conn_mode = (body.get("connection_mode") or "").strip().lower()
+
+        if not device_id:
+            return web.json_response({"success": False, "error": "Missing required field 'device_id'."}, status=400)
+
+        from snow.security.db import VALID_CONNECTION_MODES
+        if conn_mode not in VALID_CONNECTION_MODES:
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": f"Invalid connection_mode '{conn_mode}'. Must be one of: {', '.join(sorted(VALID_CONNECTION_MODES))}",
+                },
+                status=400,
+            )
+
+        res = await self.bridge.set_device_connection_mode(device_id, conn_mode)
+        return web.json_response(res)
+
     async def handle_api_network_identity(self, request: web.Request) -> web.Response:
         """Query local SNOW Network identity."""
         try:
@@ -744,6 +770,31 @@ class SnowWebServer:
                 "quota_mib_hr": config.max_transfer_quota_bytes // (1024 * 1024),
             },
         })
+
+    async def handle_api_relay_config_get(self, request: web.Request) -> web.Response:
+        """Get live relay client configuration and status (secret ticket redacted)."""
+        res = await self.bridge.get_relay_config()
+        return web.json_response(res)
+
+    async def handle_api_relay_config_post(self, request: web.Request) -> web.Response:
+        """Configure and toggle outbound relay tunnel connectivity."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        enabled = bool(body.get("enabled", False))
+        relay_url = (body.get("relay_url") or "").strip()
+        group_id = (body.get("group_id") or "").strip()
+        ticket = (body.get("ticket") or "").strip()
+
+        res = await self.bridge.set_relay_config(
+            enabled=enabled,
+            relay_url=relay_url,
+            group_id=group_id,
+            ticket=ticket,
+        )
+        return web.json_response(res)
 
     async def handle_api_mcp_gateway_status(self, request: web.Request) -> web.Response:
         """Query Remote MCP Streamable HTTP Gateway status and local host integrations."""
@@ -1177,6 +1228,7 @@ class SnowWebServer:
         app.router.add_get("/api/devices", self.handle_api_devices)
         app.router.add_post("/api/devices/revoke", self.handle_api_devices_revoke)
         app.router.add_post("/api/devices/connect-peer", self.handle_api_devices_connect_peer)
+        app.router.add_post("/api/devices/connection-mode", self.handle_api_devices_connection_mode)
         app.router.add_get("/api/network/identity", self.handle_api_network_identity)
         app.router.add_post("/api/network/identity", self.handle_api_network_identity_update)
         app.router.add_get("/api/network/topology", self.handle_api_network_topology)
@@ -1198,6 +1250,8 @@ class SnowWebServer:
         app.router.add_post("/api/workflows/run", self.handle_api_workflow_run)
         app.router.add_get("/api/activity", self.handle_api_activity)
         app.router.add_get("/api/relay/status", self.handle_api_relay_status)
+        app.router.add_get("/api/relay/config", self.handle_api_relay_config_get)
+        app.router.add_post("/api/relay/config", self.handle_api_relay_config_post)
         app.router.add_get("/api/mcp-gateway/status", self.handle_api_mcp_gateway_status)
 
         # Screen streaming & Camera delivery routes (Phase 26A)

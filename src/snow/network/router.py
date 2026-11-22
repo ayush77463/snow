@@ -236,6 +236,39 @@ class SessionRouter:
         if action in ("file_list", "file_receive_request") and effective_ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
             clean_data["principal"] = effective_ctx.principal.value
 
+        # Query persisted connection mode policy for target device
+        paired_rec = self.db_manager.get_paired_device(device_id) if self.db_manager else None
+        conn_mode = getattr(paired_rec, "connection_mode", "auto") if paired_rec else "auto"
+        if not conn_mode:
+            conn_mode = "auto"
+
+        # Policy Rule: remote_only forces relay tunnel directly, bypassing local LAN/USB tiers
+        if conn_mode == "remote_only":
+            attempted_transports.append("remote_relay_tunnel")
+            logger.info("Router Policy: 'remote_only' configured for [%s]. Skipping local tiers.", device_id)
+            if self.relay_enabled and self.relay_client is not None:
+                relay_tunnel_res = await self._attempt_remote_relay_tunnel(
+                    node=node,
+                    action=action,
+                    clean_data=clean_data,
+                    timeout=timeout,
+                    attempted_transports=attempted_transports,
+                )
+                if relay_tunnel_res is not None:
+                    return relay_tunnel_res
+
+            status_val = "RELAY_UNAVAILABLE" if not (self.relay_enabled and self.relay_client and getattr(self.relay_client, "_is_connected", False)) else "DEVICE_UNREACHABLE"
+            return {
+                "success": False,
+                "status": status_val,
+                "error": f"Remote relay routing failed or is unavailable for device '{device_id}' (mode: remote_only).",
+                "target_device_id": device_id,
+                "attempted_transports": attempted_transports,
+                "last_reachability_state": last_state,
+                "last_known_endpoint": last_endpoint,
+                "connection_mode": "remote_only",
+            }
+
         # =====================================================================
         # Tier 1: Active Session Routing
         # =====================================================================
@@ -344,6 +377,20 @@ class SessionRouter:
                 return await self._dispatch_over_inbound_wss(
                     reconnected_session.connection_id, action, clean_data, timeout, node, attempted_transports
                 )
+
+        # Policy Rule: local_only strictly forbids relay hops or remote tunnels
+        if conn_mode == "local_only":
+            logger.info("Router Policy: 'local_only' configured for [%s]. Rejecting remote relay fallback.", device_id)
+            return {
+                "success": False,
+                "status": "REMOTE_DISABLED_BY_POLICY",
+                "error": f"Remote relay routing is disabled by policy for device '{device_id}'.",
+                "target_device_id": device_id,
+                "attempted_transports": attempted_transports,
+                "last_reachability_state": last_state,
+                "last_known_endpoint": last_endpoint,
+                "connection_mode": "local_only",
+            }
 
         # =====================================================================
         # Tier 3.5: Authenticated Peer Relay
@@ -721,17 +768,26 @@ class SessionRouter:
             resp = await self.relay_client.receive_message(device_id, timeout=timeout)
             if resp:
                 node.reachability_state = ReachabilityState.ONLINE_RELAYED
+                node.transport = "remote_relay"
                 err_text = None
                 if resp.error:
-                    err_text = resp.error.message if hasattr(resp.error, "message") else str(resp.error)
+                    err_text = resp.error.get("message") if isinstance(resp.error, dict) else (resp.error.message if hasattr(resp.error, "message") else str(resp.error))
+                data_val = (resp.payload.get("data") if (isinstance(resp.payload, dict) and "data" in resp.payload) else (resp.payload or {})) if resp.payload else resp.data
+                payload_status = resp.payload.get("status") if (isinstance(resp.payload, dict) and "status" in resp.payload) else None
+                is_ok = resp.type != MessageType.ERROR and (resp.payload is None or (payload_status != "error" and resp.payload.get("success") is not False))
+                if not is_ok and not err_text and isinstance(resp.payload, dict):
+                    err_text = resp.payload.get("message") or resp.payload.get("error")
+                status_val = payload_status if (payload_status and payload_status != "error") else ("SUCCESS" if is_ok else "REMOTE_ERROR")
                 return {
-                    "success": resp.type != MessageType.ERROR,
-                    "status": "SUCCESS" if resp.type != MessageType.ERROR else "REMOTE_ERROR",
-                    "data": resp.data,
+                    "success": is_ok,
+                    "status": status_val,
+                    "data": data_val,
                     "error": err_text,
+                    "target_device_id": device_id,
+                    "attempted_transports": attempted_transports,
                     "routing": {
                         "tier": "Tier 3.75 (Remote E2E Relay Tunnel)",
-                        "transport": "relay",
+                        "transport": "remote_relay",
                         "reachability": "ONLINE_RELAYED",
                         "target_device_id": device_id,
                     },

@@ -417,13 +417,41 @@ class DevicesFragment : Fragment() {
                 val activeBadge = if (isCurrentActive) {
                     if (currentEp.startsWith("127.0.0.1")) " • ACTIVE [USB]" else " • ACTIVE [WI-FI]"
                 } else ""
-                text = "$hostDisplay • Tier: ${device.trustTier}$activeBadge • ID: ${device.deviceId.take(8)}"
+                val modeBadge = when (device.connectionMode) {
+                    "local_only" -> " • [Local Only]"
+                    "remote_only" -> " • [Remote Relay]"
+                    else -> " • [Auto]"
+                }
+                text = "$hostDisplay • Tier: ${device.trustTier}$activeBadge$modeBadge • ID: ${device.deviceId.take(8)}"
                 textSize = 12f
                 setTextColor(if (isCurrentActive) ContextCompat.getColor(requireContext(), R.color.status_connected) else ContextCompat.getColor(requireContext(), R.color.secondary_text))
             }
 
             info.addView(title)
             info.addView(sub)
+
+            val modeBtn = MaterialButton(requireContext(), null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
+                val modeLabel = when (device.connectionMode) {
+                    "local_only" -> "Local"
+                    "remote_only" -> "Relay"
+                    else -> "Auto"
+                }
+                text = modeLabel
+                textSize = 11f
+                setOnClickListener {
+                    val modes = arrayOf("Auto (Local First)", "Local Only", "Remote Relay")
+                    val modeKeys = arrayOf("auto", "local_only", "remote_only")
+                    val curIdx = modeKeys.indexOf(device.connectionMode).coerceAtLeast(0)
+                    androidx.appcompat.app.AlertDialog.Builder(requireContext())
+                        .setTitle("Connection Mode: ${device.deviceName}")
+                        .setSingleChoiceItems(modes, curIdx) { dialog, which ->
+                            viewModel.updateConnectionMode(device.deviceId, modeKeys[which])
+                            dialog.dismiss()
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
+            }
 
             val reconnectBtn = MaterialButton(requireContext(), null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
                 text = "Reconnect"
@@ -436,6 +464,7 @@ class DevicesFragment : Fragment() {
             }
 
             row.addView(info)
+            row.addView(modeBtn)
             row.addView(reconnectBtn)
             card.addView(row)
             binding.containerSavedDevices.addView(card)

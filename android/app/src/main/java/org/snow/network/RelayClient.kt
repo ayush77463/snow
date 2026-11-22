@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -27,6 +28,12 @@ import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 
 /**
+ * Determine deterministic TLS role for end-to-end encrypted relay tunnels.
+ * The node with lexicographically greater device_id acts as server.
+ */
+fun isTlsServerRole(localId: String, remoteId: String): Boolean = localId > remoteId
+
+/**
  * Android client managing connection to an untrusted SNOW Remote Relay
  * and maintaining an End-to-End TLS 1.3 tunnel to the Desktop Core.
  */
@@ -38,11 +45,12 @@ class RelayClient(
     val targetPeerId: String,
     var certPinStorage: CertPinStorage? = null,
     val expectedPeerFingerprint: String? = null,
-    val isClientMode: Boolean = true,
+    val isClientMode: Boolean = (deviceId < targetPeerId),
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 ) {
     companion object {
         private const val TAG = "RelayClient"
+        private val TUNNEL_INIT_SIGNAL = "SNOW_TUNNEL_INIT".toByteArray(Charsets.UTF_8)
     }
 
     private var webSocket: WebSocket? = null
@@ -52,6 +60,13 @@ class RelayClient(
     val reachabilityState: StateFlow<ReachabilityState> = _reachabilityState.asStateFlow()
 
     var requestDispatcher: (suspend (action: String, data: Map<String, Any?>?) -> Pair<Map<String, Any?>?, SnowError?>)? = null
+
+    @Volatile
+    private var shouldReconnect = false
+    private var reconnectAttempts = 0
+    private var reconnectJob: Job? = null
+
+    val isServer: Boolean = !isClientMode
 
     private val okHttpClient: OkHttpClient by lazy {
         val builder = OkHttpClient.Builder()
@@ -71,14 +86,19 @@ class RelayClient(
         builder.build()
     }
 
-    private fun createTunnelSslContext(): SSLContext {
+    var keyManagers: Array<javax.net.ssl.KeyManager>? = null
+
+    fun createTunnelSslContext(isServerRole: Boolean = isServer): SSLContext {
         val storage = certPinStorage
         val trustManager = if (storage != null) SnowTrustManager(storage) else object : javax.net.ssl.X509TrustManager {
             override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
             override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
             override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
         }
-        return TlsConfig.createSslContext(trustManager)
+        val sslContext = SSLContext.getInstance("TLS")
+        val km = if (isServerRole) keyManagers else null
+        sslContext.init(km, arrayOf(trustManager), java.security.SecureRandom())
+        return sslContext
     }
 
     fun connect() {
@@ -86,15 +106,23 @@ class RelayClient(
             return
         }
 
-        disconnect()
+        shouldReconnect = true
+        reconnectJob?.cancel()
+
+        try {
+            webSocket?.close(1000, "Reconnecting")
+        } catch (_: Exception) {}
+        webSocket = null
+        tunnel = null
+
         _reachabilityState.value = ReachabilityState.CONNECTED_SESSION
 
         try {
-            val innerSslContext = createTunnelSslContext()
+            val innerSslContext = createTunnelSslContext(isServer)
             val expectedFp = expectedPeerFingerprint ?: certPinStorage?.getPinnedFingerprint()
             tunnel = E2eRelayTunnel(
                 sslContext = innerSslContext,
-                isServer = !isClientMode,
+                isServer = isServer,
                 expectedPeerFingerprint = expectedFp
             )
 
@@ -106,16 +134,33 @@ class RelayClient(
         } catch (e: Exception) {
             SafeLog.e(TAG, "Failed to initiate relay connection: ${e.message}", e)
             _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
+            scheduleReconnect()
         }
     }
 
     fun disconnect() {
+        shouldReconnect = false
+        reconnectJob?.cancel()
         _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
         try {
             webSocket?.close(1000, "Normal disconnect")
         } catch (_: Exception) {}
         webSocket = null
         tunnel = null
+    }
+
+    private fun scheduleReconnect() {
+        if (!shouldReconnect) return
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            val backoffMs = minOf(60000L, (1000L * (1 shl minOf(reconnectAttempts, 6)))) + (Math.random() * 500).toLong()
+            reconnectAttempts++
+            SafeLog.i(TAG, "Scheduling relay reconnect in ${backoffMs}ms (attempt $reconnectAttempts)...")
+            delay(backoffMs)
+            if (shouldReconnect) {
+                connect()
+            }
+        }
     }
 
     fun sendRelayMessage(message: SnowMessage): Boolean {
@@ -143,6 +188,7 @@ class RelayClient(
     private inner class RelayWebSocketListener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             SafeLog.i(TAG, "Relay WebSocket open. Sending hello ticket...")
+            reconnectAttempts = 0
             val hello = JSONObject().apply {
                 put("type", "hello")
                 put("ticket", ticket)
@@ -163,10 +209,15 @@ class RelayClient(
                             _reachabilityState.value = ReachabilityState.ONLINE_RELAYED
 
                             val tun = tunnel
-                            if (tun != null && isClientMode) {
-                                val (_, outBytes) = tun.driveHandshake()
-                                if (outBytes.isNotEmpty()) {
-                                    sendRelayFrame(webSocket, targetPeerId, outBytes)
+                            if (tun != null) {
+                                if (isClientMode) {
+                                    val (_, outBytes) = tun.driveHandshake()
+                                    if (outBytes.isNotEmpty()) {
+                                        sendRelayFrame(webSocket, targetPeerId, outBytes)
+                                    }
+                                } else {
+                                    // Server mode: proactively prompt client with init signal
+                                    sendRelayFrame(webSocket, targetPeerId, TUNNEL_INIT_SIGNAL)
                                 }
                             }
                         } else {
@@ -195,15 +246,35 @@ class RelayClient(
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             SafeLog.w(TAG, "Relay WebSocket failure: ${t.message}")
             _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
+            scheduleReconnect()
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             SafeLog.i(TAG, "Relay WebSocket closed: code=$code, reason=$reason")
             _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
+            if (code != 1000) {
+                scheduleReconnect()
+            }
         }
     }
 
     private fun handleIncomingRelayBytes(ws: WebSocket, source: String, rawBytes: ByteArray) {
+        // Check for out-of-band tunnel init signal
+        if (rawBytes.contentEquals(TUNNEL_INIT_SIGNAL)) {
+            if (isClientMode) {
+                val tun = tunnel ?: E2eRelayTunnel(
+                    createTunnelSslContext(isServerRole = false),
+                    isServer = false,
+                    expectedPeerFingerprint = expectedPeerFingerprint ?: certPinStorage?.getPinnedFingerprint()
+                ).also { tunnel = it }
+                val (_, outBytes) = tun.driveHandshake()
+                if (outBytes.isNotEmpty()) {
+                    sendRelayFrame(ws, source, outBytes)
+                }
+            }
+            return
+        }
+
         val tun = tunnel ?: return
         try {
             tun.feedNetworkData(rawBytes)

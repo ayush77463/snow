@@ -562,6 +562,110 @@ class SnowIpcServer:
                     "error": "Peer client manager unavailable on this Core instance.",
                 }, now_authed
 
+        if op == "device_set_connection_mode":
+            device_id = payload.get("device_id")
+            mode = payload.get("connection_mode")
+            if not device_id or not mode:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing required 'device_id' or 'connection_mode' in payload.",
+                }, now_authed
+
+            from snow.security.db import VALID_CONNECTION_MODES
+            if mode not in VALID_CONNECTION_MODES:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": f"Invalid connection_mode '{mode}'. Must be one of: {', '.join(sorted(VALID_CONNECTION_MODES))}",
+                }, now_authed
+
+            db = getattr(self.core_server, "db_manager", None)
+            if db:
+                ok = db.update_device_connection_mode(device_id, mode)
+                if not ok:
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": False,
+                        "status": "DEVICE_NOT_FOUND",
+                        "error": f"Device '{device_id}' is not in paired devices database.",
+                    }, now_authed
+
+                # Invalidate or update node registry cached node
+                if hasattr(self, "node_registry") and self.node_registry:
+                    node = self.node_registry.get_node(device_id)
+                    if node:
+                        node.connection_mode = mode
+
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"device_id": device_id, "connection_mode": mode},
+                }, now_authed
+            else:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "DATABASE_UNAVAILABLE",
+                    "error": "Database manager unavailable on Core server.",
+                }, now_authed
+
+        if op == "relay_status":
+            if hasattr(self.core_server, "get_relay_status"):
+                status_dict = self.core_server.get_relay_status()
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": status_dict,
+                }, now_authed
+            else:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "UNSUPPORTED_OPERATION",
+                    "error": "Relay control unavailable on this Core instance.",
+                }, now_authed
+
+        if op == "relay_config":
+            enabled = payload.get("enabled", False)
+            relay_url = payload.get("relay_url")
+            group_id = payload.get("group_id")
+            ticket = payload.get("ticket")
+
+            if hasattr(self.core_server, "configure_relay"):
+                res = await self.core_server.configure_relay(
+                    enabled=bool(enabled),
+                    relay_url=relay_url,
+                    group_id=group_id,
+                    ticket=ticket,
+                )
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": res.get("success", True),
+                    "status": res.get("status", "SUCCESS"),
+                    "data": res,
+                }, now_authed
+            else:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "UNSUPPORTED_OPERATION",
+                    "error": "Relay control unavailable on this Core instance.",
+                }, now_authed
+
         if op == "device_request":
             dev_resp = await self._handle_device_request(payload, ctx=ctx)
             return {

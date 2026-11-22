@@ -312,6 +312,9 @@ class DatabaseManager:
         last_known_port: Optional[int] = 8765,
         capabilities_json: str = "{}",
         connection_mode: str = "auto",
+        role: str = "member",
+        cert_fingerprint: Optional[str] = None,
+        endpoints_json: str = "[]",
     ) -> PairedDeviceRecord:
         """Insert a newly paired device record.
 
@@ -353,8 +356,8 @@ class DatabaseManager:
             INSERT INTO paired_devices (
                 device_id, device_name, pairing_timestamp, last_seen_timestamp, auth_token_hash,
                 trust_tier, platform, reachability_profile, last_known_host, last_known_port, capabilities_json,
-                connection_mode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                connection_mode, role, cert_fingerprint, endpoints_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         with self._get_connection() as conn:
             conn.execute(
@@ -372,6 +375,9 @@ class DatabaseManager:
                     last_known_port,
                     capabilities_json,
                     connection_mode,
+                    role,
+                    cert_fingerprint,
+                    endpoints_json,
                 ),
             )
 
@@ -388,7 +394,18 @@ class DatabaseManager:
             last_known_port=last_known_port,
             capabilities_json=capabilities_json,
             connection_mode=connection_mode,
+            role=role,
+            cert_fingerprint=cert_fingerprint,
+            endpoints_json=endpoints_json,
         )
+
+    def update_device_cert_fingerprint(self, device_id: str, cert_fingerprint: str) -> bool:
+        """Update certificate fingerprint for a paired device."""
+        now = current_utc_timestamp()
+        query = "UPDATE paired_devices SET cert_fingerprint = ?, last_seen_timestamp = ? WHERE device_id = ?;"
+        with self._get_connection() as conn:
+            cursor = conn.execute(query, (cert_fingerprint, now, device_id))
+            return cursor.rowcount > 0
 
     def update_device_connection_mode(self, device_id: str, connection_mode: str) -> bool:
         """Update connection mode ('auto', 'local_only', 'remote_only') for a paired device."""
