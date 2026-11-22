@@ -934,10 +934,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
 
         repoScope.launch(Dispatchers.IO) {
+            var toCleanup: File? = null
             try {
-                val cacheDir = File(appContext.cacheDir, "screenshots").apply { mkdirs() }
-                val safeName = if (displayName.isNotBlank()) displayName else "screenshot_${System.currentTimeMillis()}.png"
-                val stagedFile = File(cacheDir, safeName)
+                val cacheDir = File(appContext.cacheDir, "screenshots")
+                val stagedFile = SafeStagingManager.createStagedFile(cacheDir, displayName)
+                toCleanup = stagedFile
+
                 appContext.contentResolver.openInputStream(uri)?.use { input ->
                     stagedFile.outputStream().use { output ->
                         input.copyTo(output)
@@ -945,18 +947,24 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 }
                 val actualSize = stagedFile.length()
                 if (actualSize <= 0L) {
-                    stagedFile.delete()
+                    SafeStagingManager.cleanupStagedFile(stagedFile)
+                    toCleanup = null
                     repoScope.launch(Dispatchers.Main) {
                         onComplete?.invoke(false, "Screenshot data unreadable or empty.")
                     }
                     return@launch
                 }
+                val safeName = stagedFile.name
                 appendLog("INFO", TAG, "Uploading screenshot '$safeName' ($actualSize bytes) to PC...")
                 val upRes = transferClient.uploadFile(
                     serverHost = targetHost,
                     transferPort = 8766,
                     file = stagedFile
                 )
+                // Remove staged file immediately once transferClient finishes uploading
+                SafeStagingManager.cleanupStagedFile(stagedFile)
+                toCleanup = null
+
                 when (upRes) {
                     is FileTransferClient.TransferResult.Success -> {
                         recordIncomingClipboardText(upRes.sha256)
@@ -1017,6 +1025,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     appendLog("ERROR", TAG, "Screenshot upload exception: ${e.message}")
                     onComplete?.invoke(false, e.message)
                 }
+            } finally {
+                SafeStagingManager.cleanupStagedFile(toCleanup)
             }
         }
     }
@@ -1302,10 +1312,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         if (isImage && uri != null && transferClient != null && targetHost.isNotBlank()) {
             appendLog("INFO", TAG, "Uploading clipboard image to PC...")
             repoScope.launch(Dispatchers.IO) {
+                var toCleanup: java.io.File? = null
                 try {
-                    val cacheDir = File(appContext.cacheDir, "clipboard").apply { mkdirs() }
-                    val fileName = "clip_${System.currentTimeMillis()}.png"
-                    val stagedFile = File(cacheDir, fileName)
+                    val stagingDir = java.io.File(appContext.cacheDir, "safe_staging")
+                    SafeStagingManager.cleanupStaleFiles(stagingDir)
+                    val rawName = "clip_${System.currentTimeMillis()}.png"
+                    val stagedFile = SafeStagingManager.createStagedFile(stagingDir, rawName)
+                    toCleanup = stagedFile
                     appContext.contentResolver.openInputStream(uri)?.use { input ->
                         stagedFile.outputStream().use { output ->
                             input.copyTo(output)
@@ -1313,14 +1326,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     }
                     val fileSize = stagedFile.length()
                     if (fileSize <= 0L) {
-                        stagedFile.delete()
                         repoScope.launch(Dispatchers.Main) {
                             onComplete(false, "Clipboard image is empty or inaccessible.")
                         }
                         return@launch
                     }
                     if (fileSize > 20 * 1024 * 1024) {
-                        stagedFile.delete()
                         repoScope.launch(Dispatchers.Main) {
                             onComplete(false, "Image exceeds 20 MB limit.")
                         }
@@ -1340,7 +1351,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                     "type" to "image",
                                     "transfer_id" to upRes.transferId,
                                     "sha256" to upRes.sha256,
-                                    "file_name" to fileName
+                                    "file_name" to stagedFile.name
                                 )
                             ) { resp ->
                                 repoScope.launch(Dispatchers.Main) {
@@ -1361,7 +1372,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                 mapOf(
                                     "type" to "image",
                                     "sha256" to upRes.sha256,
-                                    "file_name" to fileName
+                                    "file_name" to stagedFile.name
                                 )
                             ) { resp ->
                                 repoScope.launch(Dispatchers.Main) {
@@ -1385,6 +1396,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     repoScope.launch(Dispatchers.Main) {
                         onComplete(false, "Failed pushing image: ${e.message}")
                     }
+                } finally {
+                    SafeStagingManager.cleanupStagedFile(toCleanup)
                 }
             }
             return

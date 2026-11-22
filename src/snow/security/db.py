@@ -21,6 +21,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import time
 from typing import Any, Generator, List, Optional
 import uuid
 
@@ -387,6 +388,57 @@ class DatabaseManager:
                     revoked_timestamp TEXT,
                     revocation_reason TEXT
                 );
+            """)
+
+            # OAuth 2.1 persistent storage tables (F22)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS oauth_clients (
+                    client_id TEXT PRIMARY KEY,
+                    client_name TEXT NOT NULL,
+                    client_secret_hash TEXT,
+                    redirect_uris_json TEXT NOT NULL DEFAULT '[]',
+                    scope TEXT NOT NULL DEFAULT 'snow:mcp',
+                    is_confidential INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+                    code_hash TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    code_challenge TEXT NOT NULL,
+                    code_challenge_method TEXT NOT NULL DEFAULT 'S256',
+                    scope TEXT NOT NULL DEFAULT 'snow:mcp',
+                    expires_at REAL NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_oauth_auth_codes_client
+                ON oauth_auth_codes(client_id);
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    access_token_hash TEXT PRIMARY KEY,
+                    refresh_token_hash TEXT UNIQUE,
+                    client_id TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'snow:mcp',
+                    family_id TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    refresh_expires_at REAL NOT NULL,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_oauth_tokens_refresh
+                ON oauth_tokens(refresh_token_hash);
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_oauth_tokens_family
+                ON oauth_tokens(family_id);
             """)
 
     @staticmethod
@@ -1138,6 +1190,234 @@ class DatabaseManager:
                 "revoked_grants": revoked_grants,
                 "revoked_invites": revoked_invites,
             }
+
+    # =========================================================================
+    # OAuth 2.1 Persistence Operations (F22)
+    # =========================================================================
+
+    def save_oauth_client(
+        self,
+        client_id: str,
+        client_name: str,
+        redirect_uris: list[str],
+        scope: str = "snow:mcp",
+        client_secret_hash: Optional[str] = None,
+        is_confidential: bool = False,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """Persist or update an OAuth 2.1 client registration record."""
+        now = created_at if created_at is not None else time.time()
+        redirect_json = json.dumps(redirect_uris)
+        conf_int = 1 if is_confidential else 0
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO oauth_clients (
+                    client_id, client_name, client_secret_hash,
+                    redirect_uris_json, scope, is_confidential, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (client_id, client_name, client_secret_hash, redirect_json, scope, conf_int, now),
+            )
+
+    def get_oauth_client(self, client_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve a registered OAuth client by client_id."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM oauth_clients WHERE client_id = ?;",
+                (client_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            try:
+                redirect_uris = json.loads(row["redirect_uris_json"])
+            except Exception:
+                redirect_uris = []
+            return {
+                "client_id": row["client_id"],
+                "client_name": row["client_name"],
+                "client_secret_hash": row["client_secret_hash"],
+                "redirect_uris": redirect_uris,
+                "scope": row["scope"],
+                "is_confidential": bool(row["is_confidential"]),
+                "created_at": float(row["created_at"]),
+            }
+
+    def save_oauth_auth_code(
+        self,
+        code_hash: str,
+        client_id: str,
+        redirect_uri: str,
+        code_challenge: str,
+        code_challenge_method: str = "S256",
+        scope: str = "snow:mcp",
+        expires_at: float = 0.0,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """Persist a single-use authorization code with PKCE binding."""
+        now = created_at if created_at is not None else time.time()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO oauth_auth_codes (
+                    code_hash, client_id, redirect_uri,
+                    code_challenge, code_challenge_method, scope,
+                    expires_at, used, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?);
+                """,
+                (
+                    code_hash,
+                    client_id,
+                    redirect_uri,
+                    code_challenge,
+                    code_challenge_method,
+                    scope,
+                    expires_at,
+                    now,
+                ),
+            )
+
+    def consume_oauth_auth_code(self, code_hash: str) -> Optional[dict[str, Any]]:
+        """Atomically validate and consume an authorization code. Single-use only."""
+        now = time.time()
+        with self._get_connection() as conn:
+            # Atomic single-use test-and-set: only the request that changes 0 -> 1 succeeds
+            cursor = conn.execute(
+                "UPDATE oauth_auth_codes SET used = 1 WHERE code_hash = ? AND used = 0 AND expires_at > ?;",
+                (code_hash, now),
+            )
+            if cursor.rowcount != 1:
+                return None
+
+            # Fetch the consumed record
+            cur2 = conn.execute(
+                "SELECT * FROM oauth_auth_codes WHERE code_hash = ?;",
+                (code_hash,),
+            )
+            row = cur2.fetchone()
+            return dict(row) if row else None
+
+    def save_oauth_token_record(
+        self,
+        access_token_hash: str,
+        refresh_token_hash: str,
+        client_id: str,
+        scope: str,
+        family_id: str,
+        expires_at: float,
+        refresh_expires_at: float,
+        created_at: Optional[float] = None,
+    ) -> None:
+        """Persist an issued access and refresh token pair."""
+        now = created_at if created_at is not None else time.time()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO oauth_tokens (
+                    access_token_hash, refresh_token_hash, client_id,
+                    scope, family_id, expires_at, refresh_expires_at,
+                    revoked, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?);
+                """,
+                (
+                    access_token_hash,
+                    refresh_token_hash,
+                    client_id,
+                    scope,
+                    family_id,
+                    expires_at,
+                    refresh_expires_at,
+                    now,
+                ),
+            )
+
+    def get_oauth_access_token(self, access_token_hash: str) -> Optional[dict[str, Any]]:
+        """Validate access token hash and return token record if active and unexpired."""
+        now = time.time()
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM oauth_tokens WHERE access_token_hash = ? AND revoked = 0;",
+                (access_token_hash,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            if now > float(row["expires_at"]):
+                return None
+            return dict(row)
+
+    def get_oauth_refresh_token(self, refresh_token_hash: str) -> Optional[dict[str, Any]]:
+        """Retrieve token record by refresh token hash (even if revoked, for replay detection)."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM oauth_tokens WHERE refresh_token_hash = ?;",
+                (refresh_token_hash,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def rotate_oauth_refresh_token(
+        self,
+        old_refresh_token_hash: str,
+        new_access_token_hash: str,
+        new_refresh_token_hash: str,
+        client_id: str,
+        scope: str,
+        family_id: str,
+        expires_at: float,
+        refresh_expires_at: float,
+    ) -> bool:
+        """Atomically invalidate old refresh token and issue new token pair."""
+        now = time.time()
+        with self._get_connection() as conn:
+            # Mark old token as revoked
+            conn.execute(
+                "UPDATE oauth_tokens SET revoked = 1 WHERE refresh_token_hash = ?;",
+                (old_refresh_token_hash,),
+            )
+            # Insert new token pair
+            conn.execute(
+                """
+                INSERT INTO oauth_tokens (
+                    access_token_hash, refresh_token_hash, client_id,
+                    scope, family_id, expires_at, refresh_expires_at,
+                    revoked, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?);
+                """,
+                (
+                    new_access_token_hash,
+                    new_refresh_token_hash,
+                    client_id,
+                    scope,
+                    family_id,
+                    expires_at,
+                    refresh_expires_at,
+                    now,
+                ),
+            )
+            return True
+
+    def revoke_oauth_family(self, family_id: str) -> int:
+        """Revoke all tokens associated with a compromised token family."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE oauth_tokens SET revoked = 1 WHERE family_id = ?;",
+                (family_id,),
+            )
+            return cursor.rowcount
+
+    def revoke_oauth_token(self, token_hash: str) -> bool:
+        """Revoke an access token or refresh token by its hash."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE oauth_tokens SET revoked = 1
+                WHERE access_token_hash = ? OR refresh_token_hash = ?;
+                """,
+                (token_hash, token_hash),
+            )
+            return cursor.rowcount > 0
 
 
 SENSITIVE_KEY_PATTERNS = {

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import html
 import json
 import logging
 import os
@@ -115,6 +117,24 @@ def redact_sensitive_topology(data: Any) -> Any:
     return data
 
 
+def build_oauth_redirect_url(redirect_uri: str, params: dict[str, str]) -> str:
+    """Safely construct an OAuth redirect URL using urllib.parse, preserving existing query params."""
+    parsed = urllib.parse.urlparse(redirect_uri)
+    existing_qs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    for k, v in params.items():
+        if v is not None:
+            existing_qs.append((k, str(v)))
+    new_query = urllib.parse.urlencode(existing_qs)
+    return urllib.parse.urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment,
+    ))
+
+
 class RemoteMcpGateway:
     """Streamable HTTP and SSE Gateway for SNOW MCP."""
 
@@ -139,12 +159,16 @@ class RemoteMcpGateway:
         else:
             self.issuer = (issuer or f"http://{host}:{port}").rstrip("/")
 
-        self.oauth_server = OAuthServer(issuer=self.issuer)
+        cap_eng = getattr(self.bridge, "capability_engine", None)
+        db_mgr = getattr(cap_eng, "db_manager", None) if cap_eng else None
+        self.oauth_server = OAuthServer(issuer=self.issuer, db_manager=db_mgr)
         self.fastmcp_server = create_snow_mcp_server(bridge=self.bridge)
 
-        # Rate limiters for OAuth endpoints: token (30/min), register (10/min)
+        # Rate limiters for OAuth endpoints: token (30/min), register (10/min), authorize (10/min)
         self.token_rate_limiter = BoundedRateLimiter(limit=30, window_seconds=60.0)
         self.register_rate_limiter = BoundedRateLimiter(limit=10, window_seconds=60.0)
+        self.authorize_rate_limiter = BoundedRateLimiter(limit=10, window_seconds=60.0)
+        self._consent_tokens: dict[str, dict[str, Any]] = {}
 
         self._active_sessions: dict[str, dict[str, Any]] = {}
         self.app = web.Application(middlewares=[self._security_middleware])
@@ -266,15 +290,45 @@ class RemoteMcpGateway:
         )
         return web.json_response(res, status=201)
 
+    def _is_owner_authenticated(self, request: web.Request, params: dict[str, Any]) -> bool:
+        """Verify whether the incoming request carries authenticated SNOW owner authority."""
+        # 1. Check IPC secret from header or request params
+        provided_secret = (
+            request.headers.get("X-Snow-Ipc-Secret")
+            or params.get("ipc_secret")
+            or params.get("owner_secret")
+        )
+        if provided_secret:
+            expected_secret = self.bridge._get_secret()
+            if expected_secret and secrets.compare_digest(str(provided_secret).strip(), expected_secret.strip()):
+                return True
+
+        # 2. Check Bearer token against paired devices with trust_tier == 'owner'
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            raw_token = auth_header[7:].strip()
+            db_mgr = getattr(self.bridge.capability_engine, "db_manager", None)
+            if db_mgr:
+                token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+                dev = db_mgr.get_paired_device_by_token_hash(token_hash)
+                if dev and dev.trust_tier == "owner":
+                    return True
+
+        return False
+
     async def handle_oauth_authorize(self, request: web.Request) -> web.Response:
-        """OAuth 2.1 Authorization Endpoint (with PKCE)."""
+        """OAuth 2.1 Authorization Endpoint (with PKCE, owner authentication, and explicit consent)."""
         if request.method == "GET":
-            params = request.query
+            params = dict(request.query)
         else:
             try:
                 params = await request.json()
             except Exception:
-                params = await request.post()
+                try:
+                    post_data = await request.post()
+                    params = dict(post_data)
+                except Exception:
+                    params = {}
 
         client_id = params.get("client_id")
         redirect_uri = params.get("redirect_uri", "http://localhost")
@@ -283,7 +337,9 @@ class RemoteMcpGateway:
         code_challenge_method = params.get("code_challenge_method", "S256")
         scope = params.get("scope", "snow:mcp")
         state = params.get("state", "")
+        decision = params.get("decision", "").strip().lower()
 
+        # Validate mandatory OAuth 2.1 parameters
         if response_type != "code":
             return web.json_response(
                 {"error": "unsupported_response_type", "error_description": "Only 'code' response_type supported"},
@@ -296,6 +352,180 @@ class RemoteMcpGateway:
                 status=400,
             )
 
+        client = self.oauth_server.get_client(client_id)
+        if not client:
+            return web.json_response(
+                {"error": "unauthorized_client", "error_description": f"Unknown or unregistered client_id '{client_id}'"},
+                status=400,
+            )
+
+        # Exact matching of redirect URI
+        if redirect_uri not in client.redirect_uris:
+            return web.json_response(
+                {
+                    "error": "invalid_request",
+                    "error_description": f"Redirect URI '{redirect_uri}' is not registered for client '{client_id}'",
+                },
+                status=400,
+            )
+
+        if code_challenge_method != "S256":
+            return web.json_response(
+                {"error": "invalid_request", "error_description": "Only 'S256' code_challenge_method is supported"},
+                status=400,
+            )
+
+        # Validate scopes
+        supported_scopes = {"snow:mcp", "read", "write"}
+        requested_scopes = set(scope.split()) if scope else {"snow:mcp"}
+        if not requested_scopes.issubset(supported_scopes):
+            return web.json_response(
+                {"error": "invalid_scope", "error_description": f"Requested unauthorized or unsupported scope '{scope}'"},
+                status=400,
+            )
+
+        # If GET request from browser: render interactive owner consent challenge screen
+        if request.method == "GET":
+            # Generate anti-CSRF token for the consent transaction
+            csrf_token = secrets.token_urlsafe(32)
+            now = time.time()
+            self._consent_tokens[csrf_token] = {
+                "expires_at": now + 600.0,
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+            }
+
+            # Prune expired consent tokens
+            expired_csrf = [k for k, v in self._consent_tokens.items() if now > v.get("expires_at", 0)]
+            for k in expired_csrf:
+                self._consent_tokens.pop(k, None)
+
+            safe_client_name = html.escape(client.client_name)
+            safe_client_id = html.escape(client_id)
+            safe_redirect = html.escape(redirect_uri)
+            safe_scope = html.escape(scope)
+            safe_state = html.escape(state)
+            safe_challenge = html.escape(code_challenge)
+            safe_method = html.escape(code_challenge_method)
+
+            consent_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SNOW MCP — Authorize Application</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
+    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 2rem; max-width: 500px; width: 100%; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+    h1 {{ font-size: 1.3rem; margin-top: 0; color: #38bdf8; display: flex; align-items: center; gap: 0.5rem; }}
+    .meta-box {{ background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 1rem; margin: 1rem 0; font-size: 0.9rem; line-height: 1.6; }}
+    .badge {{ background: #0284c7; color: #fff; padding: 0.15rem 0.45rem; border-radius: 4px; font-weight: bold; font-size: 0.8rem; }}
+    .secret-input {{ width: 100%; box-sizing: border-box; padding: 0.65rem; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; margin: 0.5rem 0 1rem; font-size: 0.95rem; }}
+    .actions {{ display: flex; gap: 1rem; margin-top: 1.5rem; }}
+    button {{ flex: 1; padding: 0.75rem; border-radius: 6px; border: none; font-weight: bold; cursor: pointer; font-size: 0.95rem; }}
+    .btn-approve {{ background: #10b981; color: #fff; }}
+    .btn-approve:hover {{ background: #059669; }}
+    .btn-deny {{ background: #ef4444; color: #fff; }}
+    .btn-deny:hover {{ background: #dc2626; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>❄️ SNOW MCP Authorization</h1>
+    <p style="font-size: 0.9rem; color: #cbd5e1;">An AI client is requesting authorization to connect to your local SNOW capability bridge:</p>
+    <div class="meta-box">
+      <strong>Application:</strong> {safe_client_name}<br>
+      <strong>Client ID:</strong> <code>{safe_client_id}</code><br>
+      <strong>Requested Scopes:</strong> <span class="badge">{safe_scope}</span><br>
+      <strong>Redirect URI:</strong> <code>{safe_redirect}</code>
+    </div>
+    <form method="POST" action="/oauth/authorize">
+      <input type="hidden" name="client_id" value="{safe_client_id}">
+      <input type="hidden" name="redirect_uri" value="{safe_redirect}">
+      <input type="hidden" name="response_type" value="code">
+      <input type="hidden" name="code_challenge" value="{safe_challenge}">
+      <input type="hidden" name="code_challenge_method" value="{safe_method}">
+      <input type="hidden" name="scope" value="{safe_scope}">
+      <input type="hidden" name="state" value="{safe_state}">
+      <input type="hidden" name="csrf_token" value="{csrf_token}">
+      <label for="ipc_secret" style="font-size:0.85rem;color:#94a3b8;font-weight:600;">Owner Authentication (IPC Secret from ~/.snow/ipc.secret):</label>
+      <input type="password" id="ipc_secret" name="ipc_secret" class="secret-input" placeholder="Paste owner IPC secret..." required>
+      <div class="actions">
+        <button type="submit" name="decision" value="deny" class="btn-deny">✕ Deny</button>
+        <button type="submit" name="decision" value="approve" class="btn-approve">✓ Authorize</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>"""
+            return web.Response(text=consent_html, content_type="text/html")
+
+        # POST Request Handling — Rate limit consent submissions
+        client_ip = get_client_ip(request, self.trusted_proxies)
+        allowed, retry_after = await self.authorize_rate_limiter.is_allowed(client_ip)
+        if not allowed:
+            return web.Response(
+                status=429,
+                text=json.dumps({"error": "slow_down", "error_description": "Rate limit exceeded for authorization attempts"}),
+                content_type="application/json",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        if decision == "deny":
+            if redirect_uri and not redirect_uri.startswith("urn:"):
+                deny_params = {"error": "access_denied", "error_description": "Owner denied authorization"}
+                if state:
+                    deny_params["state"] = state
+                target_url = build_oauth_redirect_url(redirect_uri, deny_params)
+                raise web.HTTPFound(target_url)
+            return web.json_response({"error": "access_denied", "error_description": "Owner denied consent."}, status=403)
+
+        if decision != "approve":
+            return web.json_response(
+                {"error": "invalid_request", "error_description": "Explicit owner decision required ('decision=approve')."},
+                status=400,
+            )
+
+        # CSRF validation: Required for browser form submissions (application/x-www-form-urlencoded)
+        is_form_submission = (request.content_type == "application/x-www-form-urlencoded")
+        csrf_in = params.get("csrf_token")
+        if is_form_submission:
+            if not csrf_in:
+                return web.json_response(
+                    {"error": "invalid_request", "error_description": "Missing CSRF token in browser form submission."},
+                    status=400,
+                )
+            token_meta = self._consent_tokens.pop(csrf_in, None)
+            now = time.time()
+            if not token_meta or now > token_meta.get("expires_at", 0):
+                return web.json_response(
+                    {"error": "invalid_request", "error_description": "Invalid or expired consent CSRF token."},
+                    status=400,
+                )
+            if token_meta.get("client_id") != client_id or token_meta.get("redirect_uri") != redirect_uri:
+                return web.json_response(
+                    {"error": "invalid_request", "error_description": "CSRF token does not match client_id or redirect_uri."},
+                    status=400,
+                )
+        elif csrf_in:
+            token_meta = self._consent_tokens.pop(csrf_in, None)
+            now = time.time()
+            if not token_meta or now > token_meta.get("expires_at", 0) or token_meta.get("client_id") != client_id:
+                return web.json_response(
+                    {"error": "invalid_request", "error_description": "Invalid or expired consent CSRF token."},
+                    status=400,
+                )
+
+        # Strictly enforce owner authentication: unauthenticated callers NEVER receive authorization codes
+        if not self._is_owner_authenticated(request, params):
+            return web.json_response(
+                {
+                    "error": "unauthorized",
+                    "error_description": "Owner authentication required. Unauthenticated callers cannot receive authorization codes.",
+                },
+                status=401,
+            )
+
+        # Issue single-use authorization code with PKCE binding and SQLite persistence
         ok, code_or_err = self.oauth_server.create_authorization_code(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -308,11 +538,8 @@ class RemoteMcpGateway:
             return web.json_response(err_dict, status=400)
 
         code = code_or_err
-        # If client expects redirect
         if redirect_uri and not redirect_uri.startswith("urn:"):
-            target_url = f"{redirect_uri}?code={code}"
-            if state:
-                target_url += f"&state={state}"
+            target_url = build_oauth_redirect_url(redirect_uri, {"code": code, **({"state": state} if state else {})})
             raise web.HTTPFound(target_url)
 
         return web.json_response({"code": code, "state": state})

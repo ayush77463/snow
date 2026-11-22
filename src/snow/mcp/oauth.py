@@ -22,6 +22,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
 
+from snow.security.db import DatabaseManager, hash_token
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_AUTH_CODE_TTL_SECONDS: float = 600.0  # 10 minutes
@@ -129,19 +131,16 @@ class TokenRecord:
 
 
 class OAuthServer:
-    """In-memory OAuth 2.1 Authorization and Token Management Server."""
+    """OAuth 2.1 Authorization and Token Management Server with SQLite persistence."""
 
-    def __init__(self, issuer: str = "http://127.0.0.1:8771") -> None:
+    def __init__(
+        self,
+        issuer: str = "http://127.0.0.1:8771",
+        db_manager: Optional[DatabaseManager] = None,
+    ) -> None:
         self.issuer = issuer.rstrip("/")
-        self._clients: dict[str, OAuthClient] = {}
-        self._auth_codes: dict[str, AuthorizationCode] = {}
-        # access_token -> TokenRecord
-        self._access_tokens: dict[str, TokenRecord] = {}
-        # refresh_token -> TokenRecord
-        self._refresh_tokens: dict[str, TokenRecord] = {}
-        # family_id -> set of refresh_tokens
-        self._token_families: dict[str, set[str]] = {}
-        # Cache for fetched Client ID Metadata Documents (CIMD): client_id_url -> (OAuthClient, timestamp)
+        self.db_manager = db_manager or DatabaseManager()
+        # In-memory transient cache for fetched Client ID Metadata Documents (CIMD): client_id_url -> (OAuthClient, timestamp)
         self._cimd_cache: dict[str, tuple[OAuthClient, float]] = {}
 
     def fetch_cimd_document(
@@ -320,26 +319,29 @@ class OAuthServer:
         scope: str = "snow:mcp",
         is_confidential: bool = False,
     ) -> dict[str, Any]:
-        """Perform Dynamic Client Registration (RFC 7591)."""
+        """Perform Dynamic Client Registration (RFC 7591) with SQLite persistence."""
         client_id = f"snow_client_{secrets.token_hex(12)}"
         client_secret = secrets.token_urlsafe(32) if is_confidential else None
+        client_secret_hash = hash_token(client_secret) if client_secret else None
+        now = time.time()
+        uris = redirect_uris or ["http://localhost", "http://127.0.0.1", "urn:ietf:wg:oauth:2.0:oob"]
 
-        client = OAuthClient(
+        self.db_manager.save_oauth_client(
             client_id=client_id,
-            client_secret=client_secret,
             client_name=client_name or "AI Assistant Client",
-            redirect_uris=redirect_uris or ["http://localhost", "http://127.0.0.1", "urn:ietf:wg:oauth:2.0:oob"],
+            redirect_uris=uris,
             scope=scope,
-            created_at=time.time(),
+            client_secret_hash=client_secret_hash,
+            is_confidential=is_confidential,
+            created_at=now,
         )
-        self._clients[client_id] = client
-        logger.info("Registered dynamic OAuth client: %s (%s)", client.client_name, client_id)
+        logger.info("Registered dynamic OAuth client: %s (%s)", client_name, client_id)
 
         res = {
             "client_id": client_id,
-            "client_name": client.client_name,
-            "redirect_uris": client.redirect_uris,
-            "scope": client.scope,
+            "client_name": client_name or "AI Assistant Client",
+            "redirect_uris": uris,
+            "scope": scope,
             "token_endpoint_auth_method": "client_secret_post" if is_confidential else "none",
         }
         if client_secret:
@@ -347,13 +349,21 @@ class OAuthServer:
         return res
 
     def get_client(self, client_id: str) -> Optional[OAuthClient]:
-        """Retrieve registered client metadata from DCR registry or CIMD cache/URL."""
+        """Retrieve registered client metadata from SQLite DCR registry or CIMD cache/URL."""
         if not client_id:
             return None
 
-        # 1. Check local DCR registered clients
-        if client_id in self._clients:
-            return self._clients[client_id]
+        # 1. Check SQLite database
+        row = self.db_manager.get_oauth_client(client_id)
+        if row:
+            return OAuthClient(
+                client_id=row["client_id"],
+                client_secret=row["client_secret_hash"],
+                client_name=row["client_name"],
+                redirect_uris=row["redirect_uris"],
+                scope=row["scope"],
+                created_at=row["created_at"],
+            )
 
         # 2. Check CIMD cache
         now = time.time()
@@ -421,18 +431,20 @@ class OAuthServer:
             }
 
         code = f"snow_code_{secrets.token_urlsafe(32)}"
+        code_h = hash_token(code)
         now = time.time()
-        auth_code = AuthorizationCode(
-            code=code,
+        expires_at = now + DEFAULT_AUTH_CODE_TTL_SECONDS
+
+        self.db_manager.save_oauth_auth_code(
+            code_hash=code_h,
             client_id=client_id,
             redirect_uri=redirect_uri,
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
             scope=scope,
-            expires_at=now + DEFAULT_AUTH_CODE_TTL_SECONDS,
-            used=False,
+            expires_at=expires_at,
+            created_at=now,
         )
-        self._auth_codes[code] = auth_code
         logger.info("Issued authorization code for client [%s]", client_id)
         return True, code
 
@@ -445,23 +457,21 @@ class OAuthServer:
         client_secret: Optional[str] = None,
     ) -> tuple[bool, dict[str, Any]]:
         """Validate authorization code, verify PKCE S256 challenge, and issue tokens."""
-        auth_code = self._auth_codes.get(code)
-        if not auth_code:
-            return False, {"error": "invalid_grant", "error_description": "Invalid or expired authorization code"}
+        code_h = hash_token(code)
+        auth_code_row = self.db_manager.consume_oauth_auth_code(code_h)
+        if not auth_code_row:
+            return False, {"error": "invalid_grant", "error_description": "Invalid, expired, or already used authorization code"}
 
-        # Immediate single-use consumption: revoke code regardless of outcome
-        self._auth_codes.pop(code, None)
-
-        if auth_code.used or time.time() > auth_code.expires_at:
-            return False, {"error": "invalid_grant", "error_description": "Authorization code expired or already used"}
-
-        if auth_code.client_id != client_id:
+        if auth_code_row["client_id"] != client_id:
             return False, {"error": "invalid_grant", "error_description": "Client ID mismatch"}
+
+        if redirect_uri != auth_code_row["redirect_uri"]:
+            return False, {"error": "invalid_grant", "error_description": "Redirect URI mismatch"}
 
         # Validate client credentials if client is confidential
         client = self.get_client(client_id)
         if client and client.client_secret:
-            if not client_secret or not secrets.compare_digest(client.client_secret, client_secret):
+            if not client_secret or not secrets.compare_digest(client.client_secret, hash_token(client_secret)):
                 return False, {"error": "invalid_client", "error_description": "Client secret authentication failed"}
 
         # PKCE S256 Verification: BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))
@@ -471,15 +481,14 @@ class OAuthServer:
         try:
             digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
             computed_challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-            expected_challenge = auth_code.code_challenge.rstrip("=")
+            expected_challenge = auth_code_row["code_challenge"].rstrip("=")
             if not secrets.compare_digest(computed_challenge, expected_challenge):
                 return False, {"error": "invalid_grant", "error_description": "PKCE code_verifier verification failed"}
         except Exception as exc:
             return False, {"error": "invalid_grant", "error_description": f"PKCE validation error: {exc}"}
 
-        # Issue tokens
-        auth_code.used = True
-        return True, self._issue_token_pair(client_id, auth_code.scope)
+        # Issue tokens and persist in SQLite
+        return True, self._issue_token_pair(client_id, auth_code_row["scope"])
 
     def refresh_access_token(
         self,
@@ -488,55 +497,84 @@ class OAuthServer:
         client_secret: Optional[str] = None,
     ) -> tuple[bool, dict[str, Any]]:
         """Rotate refresh token, enforce single-use replay protection, and issue new token pair."""
-        token_record = self._refresh_tokens.get(refresh_token)
-        if not token_record:
+        rt_hash = hash_token(refresh_token)
+        row = self.db_manager.get_oauth_refresh_token(rt_hash)
+        if not row:
             return False, {"error": "invalid_grant", "error_description": "Invalid refresh token"}
+
+        # Client Binding: Enforce that refresh token was issued to this client
+        if row["client_id"] != client_id:
+            logger.warning("Refresh token client mismatch: issued to '%s', requested by '%s'", row["client_id"], client_id)
+            return False, {"error": "invalid_grant", "error_description": "Refresh token was not issued to this client"}
 
         client = self.get_client(client_id)
         if client and client.client_secret:
-            if not client_secret or not secrets.compare_digest(client.client_secret, client_secret):
+            if not client_secret or not secrets.compare_digest(client.client_secret, hash_token(client_secret)):
                 return False, {"error": "invalid_client", "error_description": "Client secret authentication failed"}
 
         # Token Replay Detection: If token is revoked or already used, revoke whole family
-        if token_record.revoked or time.time() > token_record.refresh_expires_at:
-            self._revoke_family(token_record.family_id)
+        now = time.time()
+        if bool(row["revoked"]) or now > float(row["refresh_expires_at"]):
+            self.db_manager.revoke_oauth_family(row["family_id"])
+            logger.warning("Compromised OAuth token family [%s] invalidated.", row["family_id"])
             return False, {
                 "error": "invalid_grant",
                 "error_description": "Refresh token replay detected. Token family invalidated for security.",
             }
 
-        # Invalidate old refresh token immediately (rotation)
-        token_record.revoked = True
-        self._access_tokens.pop(token_record.access_token, None)
-
         # Issue new token pair preserving family_id
-        new_pair = self._issue_token_pair(client_id, token_record.scope, family_id=token_record.family_id)
-        return True, new_pair
+        new_access_tok = f"snow_at_{secrets.token_urlsafe(32)}"
+        new_refresh_tok = f"snow_rt_{secrets.token_urlsafe(32)}"
+        new_at_hash = hash_token(new_access_tok)
+        new_rt_hash = hash_token(new_refresh_tok)
+        fam_id = row["family_id"]
+        exp = now + DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        ref_exp = now + DEFAULT_REFRESH_TOKEN_TTL_SECONDS
+
+        self.db_manager.rotate_oauth_refresh_token(
+            old_refresh_token_hash=rt_hash,
+            new_access_token_hash=new_at_hash,
+            new_refresh_token_hash=new_rt_hash,
+            client_id=client_id,
+            scope=row["scope"],
+            family_id=fam_id,
+            expires_at=exp,
+            refresh_expires_at=ref_exp,
+        )
+
+        return True, {
+            "access_token": new_access_tok,
+            "token_type": "Bearer",
+            "expires_in": int(DEFAULT_ACCESS_TOKEN_TTL_SECONDS),
+            "refresh_token": new_refresh_tok,
+            "scope": row["scope"],
+        }
 
     def revoke_token(self, token: str) -> bool:
         """Revoke an access token or refresh token (RFC 7009)."""
-        found = False
-        if token in self._access_tokens:
-            rec = self._access_tokens.pop(token)
-            rec.revoked = True
-            found = True
-        if token in self._refresh_tokens:
-            rec = self._refresh_tokens.pop(token)
-            rec.revoked = True
-            found = True
-        return found
+        if not token:
+            return False
+        tok_hash = hash_token(token)
+        return self.db_manager.revoke_oauth_token(tok_hash)
 
     def validate_access_token(self, access_token: str) -> Optional[TokenRecord]:
         """Validate bearer access token, checking revocation and expiration."""
         if not access_token:
             return None
-        rec = self._access_tokens.get(access_token)
-        if not rec or rec.revoked:
+        at_hash = hash_token(access_token)
+        row = self.db_manager.get_oauth_access_token(at_hash)
+        if not row:
             return None
-        if time.time() > rec.expires_at:
-            self._access_tokens.pop(access_token, None)
-            return None
-        return rec
+        return TokenRecord(
+            access_token=access_token,
+            refresh_token="",
+            client_id=row["client_id"],
+            scope=row["scope"],
+            expires_at=float(row["expires_at"]),
+            refresh_expires_at=float(row["refresh_expires_at"]),
+            family_id=row["family_id"],
+            revoked=bool(row["revoked"]),
+        )
 
     def _issue_token_pair(
         self, client_id: str, scope: str, family_id: Optional[str] = None
@@ -546,20 +584,21 @@ class OAuthServer:
         refresh_tok = f"snow_rt_{secrets.token_urlsafe(32)}"
         fam_id = family_id or f"fam_{secrets.token_hex(8)}"
 
-        record = TokenRecord(
-            access_token=access_tok,
-            refresh_token=refresh_tok,
+        at_hash = hash_token(access_tok)
+        rt_hash = hash_token(refresh_tok)
+        exp = now + DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        ref_exp = now + DEFAULT_REFRESH_TOKEN_TTL_SECONDS
+
+        self.db_manager.save_oauth_token_record(
+            access_token_hash=at_hash,
+            refresh_token_hash=rt_hash,
             client_id=client_id,
             scope=scope,
-            expires_at=now + DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
-            refresh_expires_at=now + DEFAULT_REFRESH_TOKEN_TTL_SECONDS,
             family_id=fam_id,
-            revoked=False,
+            expires_at=exp,
+            refresh_expires_at=ref_exp,
+            created_at=now,
         )
-
-        self._access_tokens[access_tok] = record
-        self._refresh_tokens[refresh_tok] = record
-        self._token_families.setdefault(fam_id, set()).add(refresh_tok)
 
         return {
             "access_token": access_tok,
@@ -571,12 +610,7 @@ class OAuthServer:
 
     def _revoke_family(self, family_id: str) -> None:
         """Invalidate all tokens associated with a compromised token family."""
-        tokens = self._token_families.pop(family_id, set())
-        for tok in tokens:
-            rec = self._refresh_tokens.pop(tok, None)
-            if rec:
-                rec.revoked = True
-                self._access_tokens.pop(rec.access_token, None)
+        self.db_manager.revoke_oauth_family(family_id)
         logger.warning("Compromised OAuth token family [%s] invalidated.", family_id)
 
     def get_protected_resource_metadata(self) -> dict[str, Any]:

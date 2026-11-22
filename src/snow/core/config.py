@@ -262,12 +262,12 @@ class CoreConfig:
         raw_hb_timeout = os.getenv("SNOW_HEARTBEAT_TIMEOUT")
         if raw_hb_timeout is not None:
             try:
-                hb_timeout = float(raw_hb_timeout)
+                heartbeat_timeout = float(raw_hb_timeout)
             except (ValueError, TypeError):
                 raise ValueError(
                     f"Invalid SNOW_HEARTBEAT_TIMEOUT '{raw_hb_timeout}': must be a finite positive number."
                 ) from None
-            if not math.isfinite(hb_timeout) or hb_timeout <= 0:
+            if not math.isfinite(heartbeat_timeout) or heartbeat_timeout <= 0:
                 raise ValueError(
                     f"Invalid SNOW_HEARTBEAT_TIMEOUT '{raw_hb_timeout}': must be a finite positive number (> 0)."
                 )
@@ -278,12 +278,12 @@ class CoreConfig:
         raw_hb_interval = os.getenv("SNOW_HEARTBEAT_INTERVAL")
         if raw_hb_interval is not None:
             try:
-                hb_interval = float(raw_hb_interval)
+                heartbeat_interval = float(raw_hb_interval)
             except (ValueError, TypeError):
                 raise ValueError(
                     f"Invalid SNOW_HEARTBEAT_INTERVAL '{raw_hb_interval}': must be a finite positive number."
                 ) from None
-            if not math.isfinite(hb_interval) or hb_interval <= 0:
+            if not math.isfinite(heartbeat_interval) or heartbeat_interval <= 0:
                 raise ValueError(
                     f"Invalid SNOW_HEARTBEAT_INTERVAL '{raw_hb_interval}': must be a finite positive number (> 0)."
                 )

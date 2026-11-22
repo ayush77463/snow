@@ -1682,9 +1682,16 @@
             const btnApprove = document.createElement("button");
             btnApprove.className = "btn-success";
             btnApprove.textContent = "✓ Approve Operation";
-            if (remSecs <= 0) btnApprove.disabled = true;
+            if (initialRemaining <= 0) btnApprove.disabled = true;
 
             btnApprove.addEventListener("click", async () => {
+                const nowMs = Date.now();
+                const deadline = Number(ttlSpan.getAttribute("data-deadline") || 0);
+                if (deadline > 0 && (deadline - nowMs) <= 0) {
+                    btnApprove.disabled = true;
+                    alert("This approval request has expired and cannot be approved.");
+                    return;
+                }
                 btnApprove.disabled = true;
                 btnApprove.textContent = "Approving...";
                 const r = await apiRequest(`/api/approvals/${encodeURIComponent(req.request_id)}/resolve`, "POST", {
@@ -1853,16 +1860,6 @@
     // =========================================================================
     // 6. Utility Functions
     // =========================================================================
-
-    function escapeHtml(str) {
-        if (str === null || str === undefined) return "";
-        return String(str)
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#39;");
-    }
 
     function getRiskBadgeClass(riskLevel) {
         const lvl = (riskLevel || "").toUpperCase();

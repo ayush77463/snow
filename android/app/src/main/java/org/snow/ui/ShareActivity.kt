@@ -76,7 +76,8 @@ class ShareActivity : AppCompatActivity() {
                 } catch (_: Exception) {}
 
                 Toast.makeText(this, "Sharing image to PC clipboard ❄️...", Toast.LENGTH_SHORT).show()
-                repository.uploadScreenshot(imageUri, displayName, size)
+                val safeDisplayName = SafeStagingManager.sanitizeFilename(displayName)
+                repository.uploadScreenshot(imageUri, safeDisplayName, size)
                 finish()
             } else {
                 Toast.makeText(this, "No image found to share", Toast.LENGTH_SHORT).show()

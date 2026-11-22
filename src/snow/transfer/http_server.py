@@ -61,9 +61,10 @@ class SnowHttpTransferServer:
         self._bound_port: Optional[int] = None
         self._is_running = False
 
-        # Set client_max_size=0 to allow unlimited streaming upload sizes
+        # Bound client upload size (default 2 GiB or configured max_transfer_size)
+        max_upload_size = getattr(config, "max_transfer_size", 2 * 1024 * 1024 * 1024)
         self.app = web.Application(
-            client_max_size=0,
+            client_max_size=max_upload_size,
             middlewares=[self._auth_middleware],
         )
         self._setup_routes()
@@ -268,26 +269,24 @@ class SnowHttpTransferServer:
         transfer_id = request.match_info["transfer_id"]
         device_id = request["device_id"]
 
-        record = self.transfer_manager.get_transfer_for_device(transfer_id, device_id)
+        record = self.transfer_manager.get_transfer(transfer_id)
         if not record:
-            # Check if self-describing upload headers were supplied
-            hdr_filename = request.headers.get("X-Snow-Filename")
-            hdr_filesize = request.headers.get("X-Snow-Filesize")
-            hdr_sha256 = request.headers.get("X-Snow-SHA256")
-            if hdr_filename and hdr_filesize and hdr_sha256:
-                try:
-                    record = self.transfer_manager.create_transfer(
-                        device_id=device_id,
-                        file_name=hdr_filename,
-                        file_size=int(hdr_filesize),
-                        sha256=hdr_sha256,
-                        direction=TransferDirection.UPLOAD,
-                        transfer_id=transfer_id,
-                    )
-                except Exception as exc:
-                    return web.json_response({"error": str(exc)}, status=400)
-            else:
-                return web.json_response({"error": "Transfer session not found."}, status=404)
+            return web.json_response({"error": "Transfer session not found."}, status=404)
+
+        if record.device_id != device_id:
+            return web.json_response({"error": "Forbidden: transfer not owned by device."}, status=403)
+
+        if record.direction != TransferDirection.UPLOAD:
+            return web.json_response(
+                {"error": f"Invalid transfer direction: cannot upload to a {record.direction.value} transfer."},
+                status=400,
+            )
+
+        if record.status in (TransferState.FAILED, TransferState.CANCELLED):
+            return web.json_response(
+                {"error": f"Transfer cannot proceed: transfer is in '{record.status.value}' state."},
+                status=409,
+            )
 
         if record.status == TransferState.COMPLETED:
             return web.json_response({
@@ -315,6 +314,41 @@ class SnowHttpTransferServer:
                 )
             range_start = int(match.group(1))
             range_end = int(match.group(2))
+            total_str = match.group(3)
+
+            # Validate range bounds
+            if range_start < 0 or range_end < range_start:
+                return web.json_response(
+                    {"error": f"Invalid range bounds: start={range_start}, end={range_end}."},
+                    status=400,
+                )
+            if range_end >= record.file_size:
+                return web.json_response(
+                    {"error": f"Range end {range_end} exceeds declared file size {record.file_size}."},
+                    status=416,
+                )
+            if total_str != "*":
+                range_total = int(total_str)
+                if range_total != record.file_size:
+                    return web.json_response(
+                        {"error": f"Content-Range total {range_total} does not match declared file size {record.file_size}."},
+                        status=400,
+                    )
+
+            # Enforce Content-Range and Content-Length parity when both are present
+            if request.content_length is not None:
+                expected_span = range_end - range_start + 1
+                if request.content_length != expected_span:
+                    logger.warning(
+                        "Transfer [%s] Content-Range length (%d) does not match Content-Length (%d)",
+                        transfer_id, expected_span, request.content_length
+                    )
+                    return web.json_response(
+                        {
+                            "error": f"Content-Length ({request.content_length}) does not match declared Content-Range span ({expected_span})."
+                        },
+                        status=400,
+                    )
 
             if range_start != expected_start:
                 logger.warning(
@@ -335,6 +369,18 @@ class SnowHttpTransferServer:
             write_mode = "wb"
             expected_start = 0
 
+        # Enforce Content-Length before streaming if present
+        if request.content_length is not None:
+            if expected_start + request.content_length > record.file_size:
+                self.storage_manager.delete_part_file(part_path)
+                self.transfer_manager.mark_failed(transfer_id, "Upload size exceeds declared file size.")
+                return web.json_response(
+                    {
+                        "error": f"Upload size {expected_start + request.content_length} exceeds declared file size {record.file_size}."
+                    },
+                    status=413,
+                )
+
         # Stream request body into .part file in bounded 64 KiB chunks
         bytes_written = expected_start
         try:
@@ -343,11 +389,24 @@ class SnowHttpTransferServer:
                     chunk = await request.content.read(CHUNK_SIZE)
                     if not chunk:
                         break
+                    # Enforce hard upload limit against declared file_size
+                    if bytes_written + len(chunk) > record.file_size:
+                        f.close()
+                        self.storage_manager.delete_part_file(part_path)
+                        self.transfer_manager.mark_failed(
+                            transfer_id,
+                            f"Upload byte limit exceeded: wrote {bytes_written} bytes, received chunk of {len(chunk)} bytes exceeding file size {record.file_size}."
+                        )
+                        return web.json_response(
+                            {"error": "Payload Too Large: upload bytes exceeded declared file size."},
+                            status=413,
+                        )
                     f.write(chunk)
                     bytes_written += len(chunk)
                     self.transfer_manager.update_offset(transfer_id, bytes_written)
         except Exception as exc:
             logger.error("Error streaming upload for transfer [%s]: %s", transfer_id, exc)
+            self.storage_manager.delete_part_file(part_path)
             self.transfer_manager.mark_failed(transfer_id, f"I/O error during upload: {exc}")
             return web.json_response({"error": "I/O error during upload.", "details": str(exc)}, status=500)
 
@@ -369,12 +428,14 @@ class SnowHttpTransferServer:
                     "bytes_received": bytes_written,
                 }, status=200)
             except ValueError as ve:
+                self.storage_manager.delete_part_file(part_path)
                 self.transfer_manager.mark_failed(transfer_id, str(ve))
                 return web.json_response(
                     {"error": "SHA-256 integrity mismatch.", "details": str(ve)},
                     status=422,
                 )
             except Exception as exc:
+                self.storage_manager.delete_part_file(part_path)
                 self.transfer_manager.mark_failed(transfer_id, str(exc))
                 return web.json_response(
                     {"error": "Failed to commit completed file.", "details": str(exc)},
@@ -394,9 +455,24 @@ class SnowHttpTransferServer:
         transfer_id = request.match_info["transfer_id"]
         device_id = request["device_id"]
 
-        record = self.transfer_manager.get_transfer_for_device(transfer_id, device_id)
+        record = self.transfer_manager.get_transfer(transfer_id)
         if not record:
-            return web.json_response({"error": "Transfer not found or not owned by device."}, status=404)
+            return web.json_response({"error": "Transfer session not found."}, status=404)
+
+        if record.device_id != device_id:
+            return web.json_response({"error": "Forbidden: transfer not owned by device."}, status=403)
+
+        if record.direction != TransferDirection.DOWNLOAD:
+            return web.json_response(
+                {"error": f"Invalid transfer direction: cannot download from a {record.direction.value} transfer."},
+                status=400,
+            )
+
+        if record.status in (TransferState.FAILED, TransferState.CANCELLED):
+            return web.json_response(
+                {"error": f"Transfer cannot proceed: transfer is in '{record.status.value}' state."},
+                status=409,
+            )
 
         if record.file_path and Path(record.file_path).exists() and Path(record.file_path).is_file():
             file_path = Path(record.file_path)

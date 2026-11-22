@@ -20,9 +20,11 @@ import asyncio
 import base64
 import hashlib
 import json
+from pathlib import Path
 import secrets
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase
@@ -32,13 +34,30 @@ from snow.mcp.oauth import OAuthServer
 from snow.mcp.registry import list_capabilities
 from snow.mcp.remote_gateway import RemoteMcpGateway
 from snow.mcp.server import create_snow_mcp_server
+from snow.security.db import DatabaseManager
 
 
 class TestPhase23RemoteMcpGateway(AioHTTPTestCase):
     """Integration test suite for the Remote MCP Gateway and OAuth 2.1."""
 
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_phase23.db"
+        self.db_manager = DatabaseManager(db_path=self.db_path)
+        super().setUp()
+
+    def tearDown(self) -> None:
+        super().tearDown()
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
     async def get_application(self) -> web.Application:
+        self.test_secret = "test_owner_secret_12345"
         self.mock_bridge = AsyncMock(spec=SnowMcpBridge)
+        self.mock_bridge.capability_engine = MagicMock(db_manager=self.db_manager)
+        self.mock_bridge._get_secret = MagicMock(return_value=self.test_secret)
         self.mock_bridge.windows_system_info = AsyncMock(return_value={
             "success": True,
             "status": "SUCCESS",
@@ -112,6 +131,8 @@ class TestPhase23RemoteMcpGateway(AioHTTPTestCase):
             "code_challenge_method": "S256",
             "scope": "snow:mcp",
             "state": "state_12345",
+            "decision": "approve",
+            "ipc_secret": self.test_secret,
         }, allow_redirects=False)
         self.assertEqual(auth_resp.status, 302)
         location = auth_resp.headers.get("Location")
@@ -202,6 +223,8 @@ class TestPhase23RemoteMcpGateway(AioHTTPTestCase):
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "decision": "approve",
+            "ipc_secret": self.test_secret,
         })
         code = (await auth_resp.json())["code"]
 
@@ -231,6 +254,8 @@ class TestPhase23RemoteMcpGateway(AioHTTPTestCase):
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "decision": "approve",
+            "ipc_secret": self.test_secret,
         })
         code = (await auth_resp.json())["code"]
 
@@ -328,6 +353,8 @@ class TestPhase23RemoteMcpGateway(AioHTTPTestCase):
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "decision": "approve",
+            "ipc_secret": self.test_secret,
         })
         code = (await auth_resp.json())["code"]
 

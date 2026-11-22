@@ -55,6 +55,7 @@ class SnowCoreServer:
         self.connection_manager = ConnectionManager()
         self.transfer_manager = TransferManager()
         self.storage_manager = TransferStorageManager(root_dir=self.config.transfer_root)
+        self._maintenance_task: Optional[asyncio.Task] = None
         self.ws_server = SnowWebSocketServer(
             config=self.config,
             connection_manager=self.connection_manager,
@@ -549,6 +550,15 @@ class SnowCoreServer:
             self.node_registry.discovery_service = self.discovery_service
             self.session_router.discovery_service = self.discovery_service
 
+        # F31: Perform startup cleanup of abandoned partial transfer files
+        try:
+            self._run_maintenance_once()
+        except Exception as exc:
+            logger.warning("Startup cleanup of stale parts encountered error: %s", exc)
+
+        # F31: Start periodic background maintenance loop
+        self._maintenance_task = asyncio.create_task(self._periodic_maintenance_loop())
+
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port
         actual_http_port = self.http_transfer_server.bound_port or self.config.transfer_port
@@ -572,6 +582,29 @@ class SnowCoreServer:
             raise
         finally:
             await self.stop()
+
+    def _run_maintenance_once(self) -> int:
+        """Execute one maintenance cycle: clean up abandoned .part files protecting active transfers."""
+        try:
+            active_ids = self.transfer_manager.get_active_transfer_ids()
+            cleaned = self.storage_manager.cleanup_stale_parts(active_transfer_ids=active_ids)
+            if cleaned > 0:
+                logger.info("Maintenance cycle removed %d stale partial transfer file(s).", cleaned)
+            return cleaned
+        except Exception as exc:
+            logger.warning("Error during transfer storage maintenance: %s", exc)
+            return 0
+
+    async def _periodic_maintenance_loop(self) -> None:
+        """Periodically clean up abandoned .part files and maintain transfer storage."""
+        try:
+            while not self._shutdown_event.is_set():
+                await asyncio.sleep(3600)  # Hourly maintenance
+                if self._shutdown_event.is_set():
+                    break
+                self._run_maintenance_once()
+        except asyncio.CancelledError:
+            pass
 
     def request_shutdown(self) -> None:
         """Signal the running server loop to terminate gracefully.
@@ -597,6 +630,15 @@ class SnowCoreServer:
         logger.info("Stopping %s...", self.config.app_name)
         self._is_running = False
         self._shutdown_event.set()
+
+        # F31: Cancel and await background maintenance task
+        if self._maintenance_task:
+            self._maintenance_task.cancel()
+            try:
+                await self._maintenance_task
+            except asyncio.CancelledError:
+                pass
+            self._maintenance_task = None
 
         # Stop IPC server first so external tool requests terminate cleanly before core shuts down
         if self.ipc_server:
