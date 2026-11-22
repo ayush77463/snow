@@ -140,6 +140,47 @@ class RelayTunnelClient:
         self._incoming_queues.clear()
         self._handshake_events.clear()
 
+    async def close_tunnel(self, peer_id: str) -> bool:
+        """Safely close and clean up an active E2E relay tunnel for a specific peer.
+
+        Safely:
+        1. Locates tunnel belonging to peer_id.
+        2. Terminates active inner TLS 1.3 tunnel.
+        3. Removes entries from _tunnels, _handshake_events, _incoming_queues,
+           _pinned_fingerprints, and _peer_cert_paths.
+        4. Releases associated BIO resources.
+        5. Is idempotent and safe if tunnel does not exist or is called repeatedly.
+        6. Returns True if a tunnel was located and closed, False otherwise.
+        """
+        tunnel = self._tunnels.pop(peer_id, None)
+        self._pinned_fingerprints.pop(peer_id, None)
+        self._peer_cert_paths.pop(peer_id, None)
+        queue = self._incoming_queues.pop(peer_id, None)
+        event = self._handshake_events.pop(peer_id, None)
+
+        if event:
+            event.set()
+
+        if queue:
+            # Drain any pending messages in incoming queue
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except Exception:
+                    break
+
+        if tunnel:
+            try:
+                ssl_obj = getattr(tunnel, "ssl_obj", tunnel)
+                if hasattr(ssl_obj, "unwrap"):
+                    ssl_obj.unwrap()
+            except Exception:
+                pass
+            logger.info("Closed active E2E relay tunnel for peer [%s]", peer_id)
+            return True
+
+        return False
+
     async def initiate_e2e_tunnel(self, target_id: str, timeout: float = 10.0) -> bool:
         """Initiate E2E TLS 1.3 handshake with target peer through relay.
 

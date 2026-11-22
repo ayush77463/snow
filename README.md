@@ -1,11 +1,11 @@
-# SNOW V3 — AI-Native Cross-Device Capability Platform
+# SNOW V4 — AI-Native Multi-Device Capability & Federation Platform
 
-[![Version](https://img.shields.io/badge/version-3.0.0-blue.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)](pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.13-brightgreen.svg)](https://python.org)
 [![Android](https://img.shields.io/badge/android-14--17-green.svg)](android/)
-[![Architecture](https://img.shields.io/badge/architecture-Local--First%204--Layer-orange.svg)](docs/ARCHITECTURE_V3.md)
+[![Architecture](https://img.shields.io/badge/architecture-Local--First%204--Layer-orange.svg)](docs/ARCHITECTURE_V4.md)
 
-**SNOW** (Synthesized Node Orchestration Wireless) is a lightweight, headless cross-device AI capability bridge. It allows compatible AI assistants (Claude Desktop, Google Antigravity, Cursor, ChatGPT Desktop) to perform explicitly authorized operations across a Windows laptop and an Android mobile device through the standardized [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
+**SNOW** (Synthesized Node Orchestration Wireless) is an AI-native cross-device capability bridge and local federation platform. It allows compatible AI assistants (Claude Desktop, Google Antigravity, Cursor, ChatGPT Desktop) to perform explicitly authorized operations across Windows desktop workstations, Android mobile devices, and trusted peer networks through the standardized [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
 ---
 
@@ -17,18 +17,36 @@ SNOW preserves a strict 4-layer architecture with non-negotiable security bounda
 +-------------------------------------------------------------------------+
 | Layer 1: AI Integration                                                 |
 | - MCP stdio Server (JSON-RPC 2.0 over standard I/O)                    |
-| - Remote MCP Streamable HTTP Gateway (Port 8771, OAuth 2.1 + PKCE)      |
+| - Remote MCP Gateway (Port 8771, OAuth 2.1 + PKCE S256, CIMD)          |
+| - Zero-Port-Forwarding Public Exposure via `snow expose`                |
 | - Web Dashboard (Port 8769, Loopback only, Zero CDN dependencies)       |
+| - Win32 System Tray Companion (`snow-tray.exe`, pure ctypes, RSS < 35MB)|
 | - Unified CLI (`snow setup`, `snow devices`, `snow doctor`, etc.)       |
 +-------------------------------------------------------------------------+
                                     |
 +-------------------------------------------------------------------------+
 | Layer 2: Capability Engine & Policy Authority                           |
-| - Dynamic 34-Tool Capability Catalog                                    |
+| - Dynamic 38-Tool Capability Catalog                                    |
 | - ApprovalPolicyEngine (Security Principals: AI_MCP vs OWNER_MANUAL)    |
+| - Cross-Network Federation Engine (9-Digit PINs, ACLs, Kill Switch)     |
 | - Cryptographic one-time approval tokens & timeout enforcement          |
 | - Multi-step workflow orchestration with partial failure handling       |
 +-------------------------------------------------------------------------+
+                                    |
++-------------------------------------------------------------------------+
+| Layer 3: Device Networking & Transport                                  |
+| - Local-First Discovery & Transport Hierarchy (LAN -> USB ADB -> Relay) |
+| - Encrypted WSS Control Plane (Port 8765, 64 KiB strict frame limit)    |
+| - Authenticated HTTPS Out-of-Band Transfer (Port 8766, zero image Base64) |
+| - NodeRegistry, SessionRouter, TLS 1.3 certificate pinning             |
++-------------------------------------------------------------------------+
+                                    |
++-------------------------------------------------------------------------+
+| Layer 4: Device Runtime                                                 |
+| - Windows Python Runtime (Desktop status, clipboard, screen capture)    |
+| - Android Kotlin Runtime (Foreground Service, MediaProjection capture)  |
++-------------------------------------------------------------------------+
+```
                                     |
 +-------------------------------------------------------------------------+
 | Layer 3: Device Networking & Transport                                  |

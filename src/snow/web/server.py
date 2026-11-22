@@ -69,6 +69,9 @@ class SnowWebServer:
         # Active session store: session_token -> dict
         self._sessions: dict[str, dict[str, Any]] = {}
 
+        # Federation failed attempts tracker (shared across FederationManager instances for HTTP 429)
+        self._federation_failed_attempts: dict[str, list[float]] = {}
+
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -1363,6 +1366,189 @@ class SnowWebServer:
         })
 
     # =========================================================================
+    # Federation & Sharing (Phase 30)
+    # =========================================================================
+
+    def _get_federation_manager(self) -> Any:
+        from snow.network.federation import FederationManager
+        from snow.network.network_model import SnowNetworkManager
+        from snow.security.tls import (
+            DEFAULT_CERT_FILE,
+            DEFAULT_KEY_FILE,
+            DEFAULT_TLS_DIR,
+            ensure_tls_certificate,
+        )
+        import os
+        from pathlib import Path
+
+        cap_engine = getattr(self.bridge, "capability_engine", None)
+        db_mgr = getattr(cap_engine, "db_manager", None) if cap_engine else None
+        if db_mgr is None:
+            from snow.security.db import DatabaseManager
+            db_mgr = DatabaseManager()
+        net_mgr = SnowNetworkManager(db_manager=db_mgr)
+        ident = net_mgr.get_network_identity()
+
+        # Genuine TLS Fingerprint calculation (Repair 4)
+        data_dir = os.environ.get("SNOW_DATA_DIR")
+        tls_dir = (Path(data_dir).resolve() / "tls") if data_dir else DEFAULT_TLS_DIR
+        cert_path = tls_dir / DEFAULT_CERT_FILE
+        key_path = tls_dir / DEFAULT_KEY_FILE
+
+        try:
+            cert_info = ensure_tls_certificate(cert_path=cert_path, key_path=key_path)
+            local_fingerprint = cert_info.fingerprint_sha256
+        except Exception as e:
+            logger.error("Failed obtaining genuine TLS certificate fingerprint: %s", e)
+            raise RuntimeError(f"Host TLS certificate inaccessible or invalid for federation: {e}") from e
+
+        return FederationManager(
+            db_manager=db_mgr,
+            local_network_id=ident.network_id,
+            local_network_name=ident.network_name,
+            local_node_id="desktop-core",
+            local_node_name="Windows Desktop Host",
+            local_cert_fingerprint=local_fingerprint,
+            failed_attempts_store=self._federation_failed_attempts,
+        )
+
+    async def handle_api_federation_grants(self, request: web.Request) -> web.Response:
+        """List active and revoked cross-network federation grants."""
+        try:
+            fed_mgr = self._get_federation_manager()
+            grants = fed_mgr.list_grants()
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "local_network_id": fed_mgr.local_network_id,
+                "local_network_name": fed_mgr.local_network_name,
+                "grants": grants,
+            })
+        except Exception as exc:
+            logger.error("Failed querying federation grants: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_federation_invite(self, request: web.Request) -> web.Response:
+        """Generate a 9-digit mutual federation invitation code."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        try:
+            fed_mgr = self._get_federation_manager()
+            caps = body.get("allowed_capabilities")
+            devs = body.get("allowed_device_ids")
+            grant_ttl = int(body.get("grant_ttl_seconds", 86400))
+            ttl = int(body.get("ttl_seconds", 600))
+
+            res = fed_mgr.create_invitation(
+                allowed_capabilities=caps,
+                allowed_device_ids=devs,
+                grant_ttl_seconds=grant_ttl,
+                ttl_seconds=ttl,
+                principal="OWNER_MANUAL",
+            )
+            return web.json_response(res)
+        except ValueError as ve:
+            return web.json_response({"success": False, "error": str(ve)}, status=400)
+        except PermissionError as pe:
+            return web.json_response({"success": False, "error": str(pe)}, status=403)
+        except Exception as exc:
+            logger.error("Failed creating federation invitation: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_federation_accept(self, request: web.Request) -> web.Response:
+        """Accept a 9-digit federation invitation code from a peer network."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        code = str(body.get("code", "")).strip()
+        peer_net_id = str(body.get("peer_network_id", "")).strip() or "remote-network"
+        peer_net_name = str(body.get("peer_network_name", "")).strip() or "Remote SNOW Network"
+        peer_node_id = str(body.get("peer_node_id", "")).strip() or "remote-node"
+        peer_node_name = str(body.get("peer_node_name", "")).strip() or "Remote Coordinator"
+        peer_fp = str(body.get("peer_cert_fingerprint", "")).strip() or "REMOTE_FINGERPRINT"
+
+        # Requester-keyed rate limiting identity
+        session_id = request.get("snow_session_id") or request.cookies.get("snow_session")
+        remote_ip = request.remote or "127.0.0.1"
+        requester_id = f"{remote_ip}:{session_id}" if session_id else remote_ip
+
+        try:
+            fed_mgr = self._get_federation_manager()
+            res = fed_mgr.accept_invitation(
+                code=code,
+                peer_network_id=peer_net_id,
+                peer_network_name=peer_net_name,
+                peer_node_id=peer_node_id,
+                peer_node_name=peer_node_name,
+                peer_cert_fingerprint=peer_fp,
+                principal="OWNER_MANUAL",
+                requester_id=requester_id,
+            )
+            if res.get("status") == "RATE_LIMIT_EXCEEDED":
+                return web.json_response(res, status=429)
+            status_code = 200 if res.get("success") else 400
+            return web.json_response(res, status=status_code)
+        except PermissionError as pe:
+            return web.json_response({"success": False, "error": str(pe)}, status=403)
+        except Exception as exc:
+            logger.error("Failed accepting federation invitation: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_federation_revoke(self, request: web.Request) -> web.Response:
+        """Revoke a single active federation grant via Core IPC or local manager."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        grant_id = str(body.get("grant_id", "")).strip()
+        reason = str(body.get("reason", "Revoked via Web Dashboard")).strip()
+
+        if not grant_id:
+            return web.json_response({"success": False, "error": "Missing grant_id."}, status=400)
+
+        try:
+            if hasattr(self.bridge, "federation_revoke"):
+                res = await self.bridge.federation_revoke(grant_id, reason=reason)
+            else:
+                fed_mgr = self._get_federation_manager()
+                res = fed_mgr.revoke_grant(grant_id, reason=reason, principal="OWNER_MANUAL")
+            status_code = 200 if res.get("success") else 404
+            return web.json_response(res, status=status_code)
+        except PermissionError as pe:
+            return web.json_response({"success": False, "error": str(pe)}, status=403)
+        except Exception as exc:
+            logger.error("Failed revoking federation grant: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_federation_kill_switch(self, request: web.Request) -> web.Response:
+        """Global Emergency Kill Switch: immediately terminate all federation and remote sessions via Core IPC."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        reason = str(body.get("reason", "Emergency Kill Switch from Web Dashboard")).strip()
+
+        try:
+            if hasattr(self.bridge, "federation_kill_switch"):
+                res = await self.bridge.federation_kill_switch(reason=reason)
+            else:
+                fed_mgr = self._get_federation_manager()
+                res = fed_mgr.global_kill_switch(reason=reason, principal="OWNER_MANUAL")
+            return web.json_response(res)
+        except PermissionError as pe:
+            return web.json_response({"success": False, "error": str(pe)}, status=403)
+        except Exception as exc:
+            logger.error("Failed executing federation kill switch: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    # =========================================================================
     # Lifecycle
     # =========================================================================
 
@@ -1436,6 +1622,13 @@ class SnowWebServer:
         app.router.add_post("/api/onboarding/complete", self.handle_api_onboarding_complete)
         app.router.add_get("/api/account-discovery/status", self.handle_api_account_discovery_status)
         app.router.add_post("/api/account-discovery/config", self.handle_api_account_discovery_config)
+
+        # Cross-Network Federation & Session Controls (Phase 30)
+        app.router.add_get("/api/federation/grants", self.handle_api_federation_grants)
+        app.router.add_post("/api/federation/invite", self.handle_api_federation_invite)
+        app.router.add_post("/api/federation/accept", self.handle_api_federation_accept)
+        app.router.add_post("/api/federation/revoke", self.handle_api_federation_revoke)
+        app.router.add_post("/api/federation/kill-switch", self.handle_api_federation_kill_switch)
 
         return app
 

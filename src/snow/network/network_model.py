@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from snow.security.context import ExecutionContext, ExecutionPrincipal
+from snow.network.federation import is_capability_forbidden_for_federation
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +293,7 @@ class SnowNetworkManager:
                             is_connected = False
                             reachability_state = "offline"
                             transport = "none"
+                            federated = False
                             supported_capabilities: list[str] = [
                                 c for c in relevant_capabilities
                                 if (p_plat == "android" and c.startswith("android."))
@@ -300,15 +302,68 @@ class SnowNetworkManager:
                             last_seen_timestamp = getattr(p, "last_seen_timestamp", 0.0) or 0.0
                         nodes.append(PairedNode())
                         seen_ids.add(p.device_id)
+
+                # Phase 30: Incorporate active federated peer nodes (Repair 4: Expiry-aware & Real Connectivity)
+                if hasattr(self.db_manager, "list_federation_grants"):
+                    grants = self.db_manager.list_federation_grants(active_only=True)
+                    now_utc = datetime.now(timezone.utc)
+                    for g in grants:
+                        peer_id = g.get("peer_node_id")
+                        if not peer_id or peer_id in seen_ids:
+                            continue
+
+                        # Filter out expired grants with timezone-aware UTC comparison
+                        exp_str = g.get("expires_timestamp")
+                        if exp_str:
+                            try:
+                                exp_dt = datetime.fromisoformat(exp_str)
+                                if exp_dt.tzinfo is None:
+                                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                                if now_utc > exp_dt:
+                                    continue  # Expired grant, skip from active topology
+                            except Exception:
+                                pass
+
+                        # Genuine connectivity reflection via node_registry
+                        fed_is_conn = False
+                        fed_reachability = "offline"
+                        if getattr(self, "node_registry", None):
+                            reg_node = self.node_registry.get_node(peer_id)
+                            if reg_node:
+                                fed_is_conn = bool(getattr(reg_node, "is_connected", False))
+                                fed_reachability = "active" if fed_is_conn else "offline"
+
+                        raw_g_caps = json.loads(g.get("allowed_capabilities_json", "[]"))
+                        g_caps = [c for c in raw_g_caps if not is_capability_forbidden_for_federation(c)]
+                        class FederatedPeerNode:
+                            device_id = peer_id
+                            device_name = f"{g.get('peer_node_name', 'Remote Peer')} ({g.get('network_name', 'Federated Network')})"
+                            platform = "federated"
+                            trust_tier = "federated"
+                            role = "federated_peer"
+                            is_connected = fed_is_conn
+                            reachability_state = fed_reachability
+                            transport = "remote_relay" if fed_is_conn else "none"
+                            federated = True
+                            network_id = g.get("network_id", "")
+                            network_name = g.get("network_name", "")
+                            supported_capabilities = g_caps
+                            last_seen_timestamp = g.get("last_used_timestamp") or g.get("created_timestamp") or 0.0
+                            expires_timestamp = g.get("expires_timestamp")
+                        nodes.append(FederatedPeerNode())
+                        seen_ids.add(peer_id)
             except Exception as e:
-                logger.debug("Failed listing paired devices for topology: %s", e)
+                logger.debug("Failed listing paired or federated devices for topology: %s", e)
 
         device_views: list[dict[str, Any]] = []
         for n in nodes:
+            is_fed = getattr(n, "federated", False)
             # Map authoritative transport safely
             raw_tr = getattr(n, "transport", "unknown")
             safe_tr = "unknown"
-            if raw_tr == "wifi_lan":
+            if is_fed:
+                safe_tr = "Federated Mesh"
+            elif raw_tr == "wifi_lan":
                 safe_tr = "Wi-Fi LAN"
             elif raw_tr == "usb_adb":
                 safe_tr = "USB ADB"
@@ -324,7 +379,14 @@ class SnowNetworkManager:
                 safe_tr = raw_tr
 
             node_platform = getattr(n, "platform", "unknown")
-            node_perms = _compute_effective_permissions(node_platform)
+            if is_fed:
+                node_perms = {
+                    c: "ALLOW"
+                    for c in getattr(n, "supported_capabilities", [])
+                    if not is_capability_forbidden_for_federation(c)
+                }
+            else:
+                node_perms = _compute_effective_permissions(node_platform)
 
             if principal == ExecutionPrincipal.AI_MCP:
                 device_views.append({
@@ -335,21 +397,28 @@ class SnowNetworkManager:
                     "reachability_state": str(n.reachability_state),
                     "transport": safe_tr,
                     "effective_permissions": node_perms,
+                    "federated": is_fed,
                 })
             else:
-                raw_caps = list(getattr(n, "supported_capabilities", []))
-                if not raw_caps:
-                    if node_platform in ("windows", "desktop"):
-                        raw_caps = [c for c in relevant_capabilities if c.startswith("desktop.")]
-                    elif node_platform == "android":
-                        raw_caps = [c for c in relevant_capabilities if c.startswith("android.")]
+                if is_fed:
+                    raw_caps = [
+                        c for c in getattr(n, "supported_capabilities", [])
+                        if not is_capability_forbidden_for_federation(c)
+                    ]
                 else:
-                    if node_platform in ("windows", "desktop"):
-                        raw_caps = [c for c in raw_caps if not c.startswith("android.")]
-                    elif node_platform == "android":
-                        raw_caps = [c for c in raw_caps if not c.startswith("desktop.")]
+                    raw_caps = list(getattr(n, "supported_capabilities", []))
+                    if not raw_caps:
+                        if node_platform in ("windows", "desktop"):
+                            raw_caps = [c for c in relevant_capabilities if c.startswith("desktop.")]
+                        elif node_platform == "android":
+                            raw_caps = [c for c in relevant_capabilities if c.startswith("android.")]
+                    else:
+                        if node_platform in ("windows", "desktop"):
+                            raw_caps = [c for c in raw_caps if not c.startswith("android.")]
+                        elif node_platform == "android":
+                            raw_caps = [c for c in raw_caps if not c.startswith("desktop.")]
 
-                device_views.append({
+                view_entry = {
                     "device_id": n.device_id,
                     "device_name": n.device_name,
                     "platform": n.platform,
@@ -361,7 +430,13 @@ class SnowNetworkManager:
                     "supported_capabilities": raw_caps,
                     "effective_permissions": node_perms,
                     "last_seen": getattr(n, "last_seen_timestamp", 0.0),
-                })
+                    "federated": is_fed,
+                }
+                if is_fed:
+                    view_entry["network_id"] = getattr(n, "network_id", "")
+                    view_entry["network_name"] = getattr(n, "network_name", "")
+                    view_entry["expires_timestamp"] = getattr(n, "expires_timestamp", None)
+                device_views.append(view_entry)
 
         if principal == ExecutionPrincipal.AI_MCP:
             return {

@@ -19,6 +19,7 @@
     --success-color: #10B981;
     --chip-bg: #E2E8F0;
     --chip-text: #334155;
+    --bg-input: #FFFFFF;
     --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.05), 0 1px 2px rgba(0, 0, 0, 0.03);
     --font-stack: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
 }
@@ -41,6 +42,7 @@ body.theme-dark {
     --success-color: #10B981;
     --chip-bg: #1B2436;
     --chip-text: #E2E8F0;
+    --bg-input: #151D2A;
     --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.4);
 }
 
@@ -1633,4 +1635,48 @@ body.theme-dark .data-table tr:hover td {
     display: flex;
     flex-direction: column;
     gap: 0.3rem;
+}
+
+/* Phase 30: Form Controls Dark Mode Polish & Federation Styles */
+input[type="text"],
+input[type="search"],
+input[type="password"],
+input[type="number"],
+textarea,
+select,
+.form-input,
+.form-textarea,
+.form-select,
+.form-control,
+#android-app-filter,
+#windows-app-filter,
+#activity-search,
+.modal-content input,
+.modal-content select {
+    background-color: var(--bg-input);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+}
+
+input[type="text"]:focus,
+input[type="search"]:focus,
+input[type="password"]:focus,
+input[type="number"]:focus,
+textarea:focus,
+select:focus,
+.form-input:focus,
+.form-control:focus {
+    border-color: var(--accent-primary);
+    outline: none;
+}
+
+@keyframes pulse {
+    0% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.9); }
+    100% { opacity: 1; transform: scale(1); }
+}
+
+.topbar-session-indicator {
+    animation: fadeIn 0.3s ease;
 }

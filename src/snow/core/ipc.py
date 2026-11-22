@@ -562,6 +562,58 @@ class SnowIpcServer:
                     "error": "Peer client manager unavailable on this Core instance.",
                 }, now_authed
 
+        if op == "federation_revoke":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": f"Principal '{getattr(ctx, 'principal', 'UNKNOWN')}' is unauthorized to revoke federation grants. OWNER_MANUAL required.",
+                }, now_authed
+
+            grant_id = payload.get("grant_id")
+            reason = payload.get("reason", "Revoked by network owner")
+            if not grant_id:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing 'grant_id'.",
+                }, now_authed
+
+            res = await self._handle_federation_revoke(grant_id, reason, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "federation_kill_switch":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": f"Principal '{getattr(ctx, 'principal', 'UNKNOWN')}' is unauthorized to execute federation kill switch. OWNER_MANUAL required.",
+                }, now_authed
+
+            reason = payload.get("reason", "Emergency Global Kill Switch Activated")
+            res = await self._handle_federation_kill_switch(reason, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res if res.get("success") else None,
+                "error": res.get("error"),
+            }, now_authed
+
         if op == "device_set_connection_mode":
             device_id = payload.get("device_id")
             mode = payload.get("connection_mode")
@@ -2159,4 +2211,216 @@ class SnowIpcServer:
         return {
             "status": "STOPPED",
             "device_dispatched": dispatched,
+        }
+
+    async def _handle_federation_revoke(
+        self, grant_id: str, reason: str, ctx: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
+        """Revoke a single federation grant and terminate active transport sessions for its peer."""
+        # Enforce OWNER_MANUAL authorization (Finding 2)
+        if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+            return {
+                "success": False,
+                "status": "POLICY_DENIED",
+                "error": f"Principal '{getattr(ctx, 'principal', 'UNKNOWN')}' is unauthorized to revoke federation grants. OWNER_MANUAL required.",
+            }
+
+        db_mgr = getattr(self.core_server, "db_manager", None)
+        if not db_mgr:
+            return {"success": False, "status": "DATABASE_UNAVAILABLE", "error": "Database manager unavailable."}
+
+        grant = db_mgr.get_federation_grant(grant_id)
+        if not grant:
+            return {"success": False, "status": "GRANT_NOT_FOUND", "error": f"Grant '{grant_id}' does not exist."}
+
+        peer_node_id = grant.get("peer_node_id")
+
+        # 1. Revoke in database
+        db_mgr.revoke_federation_grant(grant_id, reason=reason)
+
+        # 2. Genuine peer client disconnection
+        peer_disconnected = False
+        if hasattr(self.core_server, "peer_clients") and peer_node_id:
+            if peer_node_id in self.core_server.peer_clients:
+                try:
+                    res = await self.core_server.disconnect_peer(peer_node_id)
+                    if isinstance(res, dict) and res.get("success"):
+                        peer_disconnected = True
+                except Exception as e:
+                    logger.debug("disconnect_peer exception for %s: %s", peer_node_id, e)
+
+        # 3. Genuine WebSocket client closure and session revocation
+        ws_closed = False
+        sess_mgr = getattr(self.core_server, "session_manager", None)
+        ws_server = getattr(self.core_server, "ws_server", None)
+        if sess_mgr and peer_node_id:
+            session = sess_mgr.get_session_by_device(peer_node_id)
+            if session:
+                conn_id = session.connection_id
+                if conn_id and ws_server and hasattr(ws_server, "connection_manager"):
+                    ws_conn = ws_server.connection_manager.get(conn_id)
+                    if ws_conn and getattr(ws_conn, "websocket", None):
+                        try:
+                            await ws_conn.websocket.close(code=1000, reason=reason)
+                            ws_closed = True
+                        except Exception as e:
+                            logger.debug("Error closing websocket for %s: %s", peer_node_id, e)
+                    ws_server.connection_manager.unregister(conn_id)
+                sess_mgr.revoke_session(session.session_id)
+
+        # 4. Remove from node registry
+        if getattr(self, "node_registry", None) and peer_node_id:
+            try:
+                self.node_registry.remove_node(peer_node_id)
+            except Exception:
+                pass
+
+        # 5. Genuine relay tunnel closure
+        relay_closed = False
+        relay_client = getattr(self.core_server, "relay_client", None)
+        if relay_client and hasattr(relay_client, "close_tunnel") and peer_node_id:
+            try:
+                if await relay_client.close_tunnel(peer_node_id):
+                    relay_closed = True
+            except Exception as e:
+                logger.debug("Error closing relay tunnel for %s: %s", peer_node_id, e)
+
+        # 6. Secret-safe audit logging with genuine authenticated principal
+        db_mgr.log_activity(
+            event_type="FEDERATION_GRANT_REVOKED",
+            principal=str(ctx.principal),
+            target_device=peer_node_id or "UNKNOWN",
+            capability="network.federation.revoke",
+            outcome="SUCCESS",
+            details={
+                "grant_id": grant_id,
+                "reason": reason,
+                "ipc": True,
+                "disconnected_peers": 1 if peer_disconnected else 0,
+                "closed_ws_clients": 1 if ws_closed else 0,
+                "relay_disconnected": 1 if relay_closed else 0,
+            },
+        )
+
+        return {
+            "success": True,
+            "status": "GRANT_REVOKED",
+            "grant_id": grant_id,
+            "peer_node_id": peer_node_id,
+            "reason": reason,
+            "disconnected_peers": 1 if peer_disconnected else 0,
+            "closed_ws_clients": 1 if ws_closed else 0,
+            "relay_disconnected": 1 if relay_closed else 0,
+        }
+
+    async def _handle_federation_kill_switch(
+        self, reason: str, ctx: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
+        """Execute global kill switch: revoke all grants/invites and disconnect all federated sessions."""
+        # Enforce OWNER_MANUAL authorization (Finding 2)
+        if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+            return {
+                "success": False,
+                "status": "POLICY_DENIED",
+                "error": f"Principal '{getattr(ctx, 'principal', 'UNKNOWN')}' is unauthorized to execute federation kill switch. OWNER_MANUAL required.",
+            }
+
+        db_mgr = getattr(self.core_server, "db_manager", None)
+        if not db_mgr:
+            return {"success": False, "status": "DATABASE_UNAVAILABLE", "error": "Database manager unavailable."}
+
+        # Identify all federated peer IDs before database revocation
+        federated_peer_ids: set[str] = set()
+        try:
+            for g in db_mgr.list_federation_grants():
+                p_id = g.get("peer_node_id")
+                if p_id:
+                    federated_peer_ids.add(p_id)
+        except Exception as e:
+            logger.debug("Error querying federated peer IDs: %s", e)
+
+        counts = db_mgr.kill_all_federation(reason=reason)
+
+        # 1. Disconnect active peer clients ONLY for federated peers (protecting unrelated peers)
+        disconnected_peers = 0
+        if hasattr(self.core_server, "peer_clients"):
+            for p_id in list(self.core_server.peer_clients.keys()):
+                if p_id in federated_peer_ids:
+                    try:
+                        res = await self.core_server.disconnect_peer(p_id)
+                        if isinstance(res, dict) and res.get("success"):
+                            disconnected_peers += 1
+                    except Exception:
+                        pass
+
+        # 2. Genuine WebSocket closure and session revocation ONLY for federated peers
+        closed_ws_clients = 0
+        sess_mgr = getattr(self.core_server, "session_manager", None)
+        ws_server = getattr(self.core_server, "ws_server", None)
+        if sess_mgr:
+            for p_id in federated_peer_ids:
+                session = sess_mgr.get_session_by_device(p_id)
+                if session:
+                    conn_id = session.connection_id
+                    if conn_id and ws_server and hasattr(ws_server, "connection_manager"):
+                        ws_conn = ws_server.connection_manager.get(conn_id)
+                        if ws_conn and getattr(ws_conn, "websocket", None):
+                            try:
+                                await ws_conn.websocket.close(code=1000, reason=reason)
+                                closed_ws_clients += 1
+                            except Exception:
+                                pass
+                        ws_server.connection_manager.unregister(conn_id)
+                    sess_mgr.revoke_session(session.session_id)
+
+        # 3. Genuine relay tunnel closure ONLY for federated peers (protecting unrelated remote sessions)
+        closed_tunnels = 0
+        relay_client = getattr(self.core_server, "relay_client", None)
+        if relay_client and hasattr(relay_client, "close_tunnel"):
+            for p_id in federated_peer_ids:
+                try:
+                    if await relay_client.close_tunnel(p_id):
+                        closed_tunnels += 1
+                except Exception:
+                    pass
+
+        # 4. Remove federated nodes from registry (DeviceNode object handling fix)
+        if getattr(self, "node_registry", None):
+            try:
+                for node in list(self.node_registry.list_nodes()):
+                    # Extract string device_id from DeviceNode instance or string
+                    node_dev_id = getattr(node, "device_id", None) if not isinstance(node, str) else node
+                    if node_dev_id and (
+                        node_dev_id in federated_peer_ids or getattr(node, "trust_tier", "") == "federated"
+                    ):
+                        self.node_registry.remove_node(node_dev_id)
+            except Exception as reg_err:
+                logger.debug("Failed cleaning federated nodes from registry: %s", reg_err)
+
+        # 5. Secret-safe audit logging with genuine authenticated principal
+        db_mgr.log_activity(
+            event_type="FEDERATION_GLOBAL_KILL_SWITCH",
+            principal=str(ctx.principal),
+            target_device="ALL_FEDERATED_PEERS",
+            capability="network.federation.kill_switch",
+            outcome="SUCCESS",
+            details={
+                "reason": reason,
+                "ipc": True,
+                **counts,
+                "disconnected_peers": disconnected_peers,
+                "closed_ws_clients": closed_ws_clients,
+                "relay_disconnected": closed_tunnels,
+            },
+        )
+
+        return {
+            "success": True,
+            "status": "KILL_SWITCH_EXECUTED",
+            "reason": reason,
+            "revoked_grants_count": counts["revoked_grants"],
+            "revoked_invites_count": counts["revoked_invites"],
+            "disconnected_peers": disconnected_peers,
+            "closed_ws_clients": closed_ws_clients,
+            "relay_disconnected": closed_tunnels,
         }

@@ -8,6 +8,16 @@
 (function () {
     "use strict";
 
+    function escapeHtml(str) {
+        if (str === null || str === undefined) return "";
+        return String(str)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
     // Application State
     let csrfToken = "";
     let currentTab = "overview";
@@ -152,6 +162,7 @@
             share: "Share Link / Note",
             approvals: "Security Approvals",
             activity: "Activity Audit",
+            federation: "Federation & Sharing",
             settings: "Settings & Diagnostics",
         };
         activeTabTitle.textContent = titleMap[tabName] || "Dashboard";
@@ -215,6 +226,8 @@
             loadClipboardBuffer();
         } else if (currentTab === "apps") {
             loadAndroidApps();
+        } else if (currentTab === "federation") {
+            loadFederationData();
         } else if (currentTab === "settings") {
             loadRelayStatus();
             loadMcpGatewayStatus();
@@ -913,7 +926,7 @@
             const empty = document.createElement("div");
             empty.className = "empty-state";
             const errMsg = (data && data.error) ? data.error : "SNOW Desktop Core is offline or unreachable.";
-            empty.innerHTML = `⚠️ <strong>Desktop Core Offline</strong><br><small class="text-muted">${errMsg}<br>Please launch the core daemon in terminal with <code>python -m snow daemon start</code> or <code>snow</code>, then refresh.</small>`;
+            empty.innerHTML = `⚠️ <strong>Desktop Core Offline</strong><br><small class="text-muted">${escapeHtml(errMsg)}<br>Please launch the core daemon in terminal with <code>python -m snow daemon start</code> or <code>snow</code>, then refresh.</small>`;
             container.appendChild(empty);
             return;
         }
@@ -1112,7 +1125,7 @@
                 }
             } else {
                 const errMsg = (res && res.error) ? res.error : "Failed to generate pairing QR. Ensure SNOW Desktop Core is running.";
-                svgBox.innerHTML = `<div class="empty-state text-danger">${errMsg}</div>`;
+                svgBox.innerHTML = `<div class="empty-state text-danger">${escapeHtml(errMsg)}</div>`;
             }
         }
 
@@ -1209,7 +1222,7 @@
             } else if (res && res.status === "ALL_FILES_ACCESS_REQUIRED") {
                 errorText = "Full Phone Storage Access is not granted. Please open SNOW Settings > Full Phone Storage Access on your phone to enable.";
             }
-            tbody.innerHTML = `<tr><td colspan="5" class="empty-state text-danger">${errorText}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="5" class="empty-state text-danger">${escapeHtml(errorText)}</td></tr>`;
             return;
         }
 
@@ -2012,7 +2025,7 @@
             }
         } else {
             if (statusEl) statusEl.innerHTML = `<span class="badge badge-danger">Error</span>`;
-            if (resBox) resBox.innerHTML = `<span class="text-danger">${(res && res.error) ? res.error : "Failed querying MCP gateway status"}</span>`;
+            if (resBox) resBox.innerHTML = `<span class="text-danger">${escapeHtml((res && res.error) ? res.error : "Failed querying MCP gateway status")}</span>`;
         }
     }
 
@@ -2371,6 +2384,284 @@
                     `;
                 }
             }
+        }
+    }
+
+    // =========================================================================
+    // Federation & Sharing (Phase 30)
+    // =========================================================================
+
+    let fedCountdownInterval = null;
+
+    async function updateSessionIndicator() {
+        const indicator = document.getElementById("topbar-session-indicator");
+        const statusText = document.getElementById("topbar-session-text");
+        if (!indicator) return;
+
+        try {
+            const data = await apiRequest("/api/federation/grants");
+            if (data && data.success && Array.isArray(data.grants)) {
+                const activeGrants = data.grants.filter(g => g.status === "ACTIVE");
+                if (activeGrants.length > 0) {
+                    indicator.style.display = "flex";
+                    if (statusText) {
+                        statusText.textContent = `${activeGrants.length} Active Federated Grant${activeGrants.length > 1 ? "s" : ""}`;
+                    }
+                    return;
+                }
+            }
+            indicator.style.display = "none";
+        } catch (e) {
+            indicator.style.display = "none";
+        }
+    }
+
+    async function loadFederationData() {
+        const netIdEl = document.getElementById("fed-local-net-id");
+        const netNameEl = document.getElementById("fed-local-net-name");
+        const tbody = document.getElementById("fed-grants-tbody");
+        if (!tbody) return;
+
+        try {
+            const res = await apiRequest("/api/federation/grants");
+            if (res && res.success) {
+                if (netIdEl) netIdEl.textContent = res.local_network_id || "Unknown";
+                if (netNameEl) netNameEl.textContent = res.local_network_name || "My SNOW Network";
+
+                const grants = Array.isArray(res.grants) ? res.grants : [];
+                if (grants.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="empty-state text-muted">No cross-network federation grants active.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = "";
+                grants.forEach(g => {
+                    const tr = document.createElement("tr");
+
+                    // 1. Network / Node
+                    const tdNode = document.createElement("td");
+                    const nameDiv = document.createElement("div");
+                    nameDiv.style.fontWeight = "600";
+                    nameDiv.textContent = g.network_name || "Remote Network";
+                    const idDiv = document.createElement("div");
+                    idDiv.className = "text-muted text-xs";
+                    idDiv.textContent = `${g.peer_node_name || 'Coordinator'} (${(g.peer_node_id || '').substring(0, 8)}...)`;
+                    tdNode.appendChild(nameDiv);
+                    tdNode.appendChild(idDiv);
+                    tr.appendChild(tdNode);
+
+                    // 2. Direction
+                    const tdDir = document.createElement("td");
+                    const dirChip = document.createElement("span");
+                    dirChip.className = "chip chip-xs " + (g.direction === "INBOUND" ? "chip-primary" : "chip-neutral");
+                    dirChip.textContent = g.direction;
+                    tdDir.appendChild(dirChip);
+                    tr.appendChild(tdDir);
+
+                    // 3. Status
+                    const tdStat = document.createElement("td");
+                    const statChip = document.createElement("span");
+                    statChip.className = "chip chip-xs " + (g.status === "ACTIVE" ? "chip-success" : (g.status === "REVOKED" ? "chip-danger" : "chip-neutral"));
+                    statChip.textContent = g.status;
+                    tdStat.appendChild(statChip);
+                    tr.appendChild(tdStat);
+
+                    // 4. Capabilities
+                    const tdCaps = document.createElement("td");
+                    const caps = Array.isArray(g.allowed_capabilities) ? g.allowed_capabilities : [];
+                    if (caps.length === 0) {
+                        tdCaps.textContent = "None";
+                    } else {
+                        const capsDiv = document.createElement("div");
+                        capsDiv.style.display = "flex";
+                        capsDiv.style.flexWrap = "wrap";
+                        capsDiv.style.gap = "0.2rem";
+                        caps.forEach(c => {
+                            const badge = document.createElement("span");
+                            badge.className = "chip chip-xs";
+                            badge.textContent = c;
+                            capsDiv.appendChild(badge);
+                        });
+                        tdCaps.appendChild(capsDiv);
+                    }
+                    tr.appendChild(tdCaps);
+
+                    // 5. Expiry
+                    const tdExp = document.createElement("td");
+                    tdExp.className = "text-xs text-muted";
+                    tdExp.textContent = g.expires_timestamp ? new Date(g.expires_timestamp).toLocaleDateString() : "Never";
+                    tr.appendChild(tdExp);
+
+                    // 6. Action
+                    const tdAct = document.createElement("td");
+                    if (g.status === "ACTIVE") {
+                        const btnRevoke = document.createElement("button");
+                        btnRevoke.className = "btn btn-danger btn-xs";
+                        btnRevoke.textContent = "Revoke";
+                        btnRevoke.addEventListener("click", async () => {
+                            if (confirm(`Revoke federation grant for network '${g.network_name}'?`)) {
+                                const revRes = await apiRequest("/api/federation/revoke", "POST", { grant_id: g.grant_id });
+                                if (revRes && revRes.success) {
+                                    loadFederationData();
+                                } else {
+                                    alert("Failed to revoke grant: " + ((revRes && revRes.error) ? revRes.error : "Unknown error"));
+                                }
+                            }
+                        });
+                        tdAct.appendChild(btnRevoke);
+                    } else {
+                        tdAct.textContent = "—";
+                    }
+                    tr.appendChild(tdAct);
+
+                    tbody.appendChild(tr);
+                });
+            }
+        } catch (err) {
+            tbody.innerHTML = `<tr><td colspan="6" class="empty-state text-danger">${escapeHtml(err.message)}</td></tr>`;
+        }
+        updateSessionIndicator();
+    }
+
+    function setupFederation() {
+        const btnCreateInvite = document.getElementById("btn-fed-create-invite");
+        if (btnCreateInvite) {
+            btnCreateInvite.addEventListener("click", async () => {
+                const ttlSelect = document.getElementById("fed-grant-ttl");
+                const grantTtl = ttlSelect ? parseInt(ttlSelect.value, 10) : 86400;
+
+                const capCheckboxes = document.querySelectorAll(".fed-cap-checkbox:checked");
+                const caps = Array.from(capCheckboxes).map(cb => cb.value);
+
+                btnCreateInvite.disabled = true;
+                btnCreateInvite.textContent = "Generating...";
+
+                const res = await apiRequest("/api/federation/invite", "POST", {
+                    allowed_capabilities: caps,
+                    grant_ttl_seconds: grantTtl,
+                });
+
+                btnCreateInvite.disabled = false;
+                btnCreateInvite.textContent = "Generate 9-Digit Code";
+
+                if (res && res.success && res.code) {
+                    const resultBox = document.getElementById("fed-invite-result-box");
+                    const codeDisplay = document.getElementById("fed-display-code");
+                    const timerDisplay = document.getElementById("fed-invite-timer");
+
+                    if (resultBox) resultBox.style.display = "block";
+                    if (codeDisplay) codeDisplay.textContent = res.code;
+
+                    // Start 10-minute countdown
+                    if (fedCountdownInterval) clearInterval(fedCountdownInterval);
+                    let remaining = res.ttl_seconds || 600;
+                    fedCountdownInterval = setInterval(() => {
+                        remaining--;
+                        if (remaining <= 0) {
+                            clearInterval(fedCountdownInterval);
+                            if (timerDisplay) timerDisplay.textContent = "Code expired.";
+                            if (codeDisplay) codeDisplay.style.color = "var(--text-muted)";
+                        } else {
+                            const mins = Math.floor(remaining / 60);
+                            const secs = remaining % 60;
+                            if (timerDisplay) {
+                                timerDisplay.textContent = `Expires in: ${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                            }
+                        }
+                    }, 1000);
+                } else {
+                    alert("Failed generating invitation: " + ((res && res.error) ? res.error : "Unknown error"));
+                }
+            });
+        }
+
+        const btnCopyCode = document.getElementById("btn-fed-copy-code");
+        if (btnCopyCode) {
+            btnCopyCode.addEventListener("click", () => {
+                const codeEl = document.getElementById("fed-display-code");
+                if (codeEl) {
+                    navigator.clipboard.writeText(codeEl.textContent.trim()).then(() => {
+                        btnCopyCode.textContent = "Copied!";
+                        setTimeout(() => { btnCopyCode.textContent = "📋 Copy Code"; }, 2000);
+                    });
+                }
+            });
+        }
+
+        const btnAcceptCode = document.getElementById("btn-fed-accept-code");
+        if (btnAcceptCode) {
+            btnAcceptCode.addEventListener("click", async () => {
+                const codeInput = document.getElementById("fed-input-code");
+                const nameInput = document.getElementById("fed-peer-net-name");
+                const statusDiv = document.getElementById("fed-accept-status");
+
+                const code = (codeInput ? codeInput.value : "").trim();
+                const netName = (nameInput ? nameInput.value : "").trim() || "Peer SNOW Network";
+
+                if (!code) {
+                    if (statusDiv) {
+                        statusDiv.className = "mt-2 text-xs text-danger";
+                        statusDiv.textContent = "Please enter a 9-digit code.";
+                    }
+                    return;
+                }
+
+                btnAcceptCode.disabled = true;
+                btnAcceptCode.textContent = "Verifying...";
+                if (statusDiv) statusDiv.textContent = "";
+
+                const res = await apiRequest("/api/federation/accept", "POST", {
+                    code: code,
+                    peer_network_name: netName,
+                });
+
+                btnAcceptCode.disabled = false;
+                btnAcceptCode.textContent = "Verify & Establish Federation";
+
+                if (res && res.success) {
+                    if (statusDiv) {
+                        statusDiv.className = "mt-2 text-xs text-success";
+                        statusDiv.textContent = `✓ Federation established with '${netName}'!`;
+                    }
+                    if (codeInput) codeInput.value = "";
+                    loadFederationData();
+                } else {
+                    if (statusDiv) {
+                        statusDiv.className = "mt-2 text-xs text-danger";
+                        statusDiv.textContent = "Verification failed: " + ((res && res.error) ? res.error : "Invalid code");
+                    }
+                }
+            });
+        }
+
+        const btnRefreshGrants = document.getElementById("btn-fed-refresh-grants");
+        if (btnRefreshGrants) {
+            btnRefreshGrants.addEventListener("click", loadFederationData);
+        }
+
+        const handleKillSwitch = async () => {
+            if (confirm("🚨 EMERGENCY GLOBAL KILL SWITCH\n\nAre you sure you want to revoke ALL federation grants and terminate all remote access immediately?")) {
+                const res = await apiRequest("/api/federation/kill-switch", "POST", {
+                    reason: "Owner manual kill switch from Dashboard",
+                });
+                if (res && res.success) {
+                    alert(`Global Kill Switch Activated!\n\nRevoked ${res.revoked_grants_count} grants and ${res.revoked_invites_count} pending invites.`);
+                    loadFederationData();
+                    refreshActiveTab();
+                } else {
+                    alert("Kill switch failed: " + ((res && res.error) ? res.error : "Unknown error"));
+                }
+            }
+        };
+
+        const btnNuclearKillSwitch = document.getElementById("btn-fed-nuclear-kill-switch");
+        if (btnNuclearKillSwitch) {
+            btnNuclearKillSwitch.addEventListener("click", handleKillSwitch);
+        }
+
+        const btnTopbarKillSwitch = document.getElementById("btn-topbar-kill-switch");
+        if (btnTopbarKillSwitch) {
+            btnTopbarKillSwitch.addEventListener("click", handleKillSwitch);
         }
     }
 
@@ -2913,15 +3204,18 @@
         setupWorkflows();
         setupOnboardingWizard();
         checkOnboardingStatus();
+        setupFederation();
 
         // Initial Data Load
         refreshActiveTab();
+        updateSessionIndicator();
 
         // Background Periodic Poller (every 4 seconds)
         if (pollInterval) clearInterval(pollInterval);
         pollInterval = setInterval(() => {
             loadSystemStatus();
             loadApprovalsCount();
+            updateSessionIndicator();
             if (currentTab === "overview") {
                 loadOverview();
             } else if (currentTab === "devices") {
@@ -2930,6 +3224,8 @@
                 loadNotifications();
             } else if (currentTab === "clipboard") {
                 loadClipboardBuffer();
+            } else if (currentTab === "federation") {
+                loadFederationData();
             } else if (currentTab === "settings") {
                 loadRelayStatus();
                 loadMcpGatewayStatus();

@@ -1496,3 +1496,47 @@ class SnowMcpBridge:
                 return res
 
         return {"success": False, "status": "CORE_OFFLINE", "error": "Desktop Core daemon is offline."}
+
+    # =========================================================================
+    # Phase 30: Cross-Network Federation Operations
+    # =========================================================================
+
+    async def federation_revoke(self, grant_id: str, reason: str = "Revoked by network owner") -> dict[str, Any]:
+        """Revoke a cross-network federation grant and terminate active sessions via Core IPC."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call(
+                "federation_revoke",
+                payload={"grant_id": grant_id, "reason": reason},
+                timeout=5.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
+        # Fallback to local DB and peer clients if Core daemon IPC is offline
+        cap_engine = getattr(self, "capability_engine", None)
+        db_mgr = getattr(cap_engine, "db_manager", None)
+        if db_mgr:
+            from snow.network.federation import FederationManager
+            fed_mgr = FederationManager(db_manager=db_mgr)
+            return fed_mgr.revoke_grant(grant_id, reason=reason, principal="OWNER_MANUAL")
+        return {"success": False, "status": "CORE_OFFLINE", "error": "Core daemon IPC offline and database unavailable."}
+
+    async def federation_kill_switch(self, reason: str = "Emergency Global Kill Switch Activated") -> dict[str, Any]:
+        """Immediately terminate all active federation grants, pending invitations, and federated sessions via Core IPC."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call(
+                "federation_kill_switch",
+                payload={"reason": reason},
+                timeout=5.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
+        # Fallback to local DB if Core daemon IPC is offline
+        cap_engine = getattr(self, "capability_engine", None)
+        db_mgr = getattr(cap_engine, "db_manager", None)
+        if db_mgr:
+            from snow.network.federation import FederationManager
+            fed_mgr = FederationManager(db_manager=db_mgr)
+            return fed_mgr.global_kill_switch(reason=reason, principal="OWNER_MANUAL")
+        return {"success": False, "status": "CORE_OFFLINE", "error": "Core daemon IPC offline and database unavailable."}

@@ -142,6 +142,9 @@
                 <button class="nav-item" data-tab="activity">
                     <span class="nav-icon">📜</span> Activity Audit
                 </button>
+                <button class="nav-item" data-tab="federation">
+                    <span class="nav-icon">🌐</span> Federation & Sharing
+                </button>
                 <button class="nav-item" id="nav-btn-wizard">
                     <span class="nav-icon">🧙‍♂️</span> Setup Wizard
                 </button>
@@ -171,6 +174,11 @@
                     <button id="btn-jump-approvals" class="btn-xs btn-primary">Review & Resolve →</button>
                 </div>
                 <div class="topbar-actions">
+                    <div id="topbar-session-indicator" class="topbar-session-indicator" style="display: none; align-items: center; gap: 0.5rem; background: rgba(239, 68, 68, 0.12); border: 1px solid var(--danger-color); padding: 0.25rem 0.6rem; border-radius: 6px;">
+                        <span class="status-dot dot-active" style="background-color: var(--danger-color); animation: pulse 1.5s infinite;"></span>
+                        <span id="topbar-session-text" style="font-size: 0.8rem; font-weight: 600; color: var(--danger-color);">Remote Session Active</span>
+                        <button id="btn-topbar-kill-switch" class="btn btn-danger btn-xs" style="padding: 0.2rem 0.5rem; font-size: 0.75rem; font-weight: bold;" title="Emergency Global Kill Switch — Terminate all federation and remote access immediately">🛑 KILL SWITCH</button>
+                    </div>
                     <div class="topbar-target-selector" id="topbar-target-selector-container">
                         <select id="global-target-select" class="form-select form-select-sm" title="Active Target Peer Device">
                             <option value="">No Active Peer</option>
@@ -967,6 +975,142 @@
                                 </div>
                                 <span id="network-name-status" class="text-xs text-muted mt-1 d-block"></span>
                             </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 10. Federation & Sharing Section (Phase 30) -->
+                <section id="section-federation" class="tab-pane">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>🌐 Cross-Network Federation & Session Controls</h3>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-muted">
+                                Authorize scoped capability sharing between independent SNOW networks.
+                                Enforces mutual 9-digit owner PIN verification, zero privilege inheritance,
+                                strict anti-transitivity, and instant revocation.
+                            </p>
+
+                            <div style="display: flex; gap: 1rem; align-items: center; margin-top: 1rem; padding: 0.75rem 1rem; background: var(--chip-bg); border-radius: 6px; font-size: 0.85rem;">
+                                <div><strong>Local Network ID:</strong> <code id="fed-local-net-id">Loading...</code></div>
+                                <div><strong>Network Name:</strong> <span id="fed-local-net-name" class="chip chip-primary">Loading...</span></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="grid-overview mt-4" style="grid-template-columns: 1fr 1fr;">
+                        <!-- Create Invitation Box -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h4>🤝 Create Federation Invitation</h4>
+                            </div>
+                            <div class="card-body">
+                                <p class="text-muted text-xs">Generate a temporary 9-digit PIN to authorize an incoming peer network (10-minute expiry).</p>
+
+                                <div class="form-group mt-2">
+                                    <label for="fed-grant-ttl" class="text-xs">Grant Duration (TTL):</label>
+                                    <select id="fed-grant-ttl" class="form-select form-select-sm">
+                                        <option value="3600">1 Hour</option>
+                                        <option value="86400" selected>24 Hours (Default)</option>
+                                        <option value="604800">7 Days</option>
+                                    </select>
+                                </div>
+
+                                <div class="form-group mt-2">
+                                    <label class="text-xs">Allowed Capabilities:</label>
+                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.25rem; font-size: 0.8rem; margin-top: 0.25rem;">
+                                        <label><input type="checkbox" class="fed-cap-checkbox" value="android.status" checked> Android Status</label>
+                                        <label><input type="checkbox" class="fed-cap-checkbox" value="desktop.system.info" checked> Desktop Info</label>
+                                        <label><input type="checkbox" class="fed-cap-checkbox" value="android.notifications.read"> Notifications</label>
+                                        <label><input type="checkbox" class="fed-cap-checkbox" value="desktop.clipboard.read"> Clipboard Read</label>
+                                    </div>
+                                </div>
+
+                                <div class="mt-3">
+                                    <button id="btn-fed-create-invite" class="btn btn-primary btn-sm">Generate 9-Digit Code</button>
+                                </div>
+
+                                <div id="fed-invite-result-box" class="mt-3" style="display: none; background: var(--bg-surface); border: 2px dashed var(--accent-primary); border-radius: 8px; padding: 1rem; text-align: center;">
+                                    <div class="text-xs text-muted">Temporary Mutual Pairing Code:</div>
+                                    <div id="fed-display-code" style="font-size: 1.8rem; font-family: monospace; font-weight: bold; letter-spacing: 3px; color: var(--accent-primary); margin: 0.5rem 0;">--- --- ---</div>
+                                    <div class="text-xs text-muted" id="fed-invite-timer">Expires in: 10:00</div>
+                                    <button id="btn-fed-copy-code" class="btn btn-secondary btn-xs mt-2">📋 Copy Code</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Accept Invitation Box -->
+                        <div class="card">
+                            <div class="card-header">
+                                <h4>🔗 Connect to Peer Network</h4>
+                            </div>
+                            <div class="card-body">
+                                <p class="text-muted text-xs">Enter a 9-digit federation code provided by another SNOW network owner.</p>
+
+                                <div class="form-group mt-2">
+                                    <label for="fed-input-code" class="text-xs">9-Digit PIN (XXX-XXX-XXX):</label>
+                                    <input type="text" id="fed-input-code" class="form-input form-input-sm" placeholder="123-456-789" maxlength="11" />
+                                </div>
+
+                                <div class="form-group mt-2">
+                                    <label for="fed-peer-net-name" class="text-xs">Peer Network Name (Optional):</label>
+                                    <input type="text" id="fed-peer-net-name" class="form-input form-input-sm" placeholder="e.g. Office Mesh" />
+                                </div>
+
+                                <div class="mt-3">
+                                    <button id="btn-fed-accept-code" class="btn btn-secondary btn-sm">Verify & Establish Federation</button>
+                                </div>
+                                <div id="fed-accept-status" class="mt-2 text-xs"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Active Grants Table -->
+                    <div class="card mt-4">
+                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                            <h4>🤝 Active Federation Grants</h4>
+                            <button id="btn-fed-refresh-grants" class="btn btn-secondary btn-xs">🔄 Refresh Grants</button>
+                        </div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table" style="width: 100%; font-size: 0.85rem;">
+                                    <thead>
+                                        <tr>
+                                            <th>Network / Node</th>
+                                            <th>Direction</th>
+                                            <th>Status</th>
+                                            <th>Capabilities</th>
+                                            <th>Expires</th>
+                                            <th>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="fed-grants-tbody">
+                                        <tr>
+                                            <td colspan="6" class="empty-state text-muted">No cross-network federation grants active.</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Global Kill Switch Card -->
+                    <div class="card mt-4" style="border: 1px solid var(--danger-color); background: rgba(239, 68, 68, 0.04);">
+                        <div class="card-header" style="border-bottom: 1px solid rgba(239, 68, 68, 0.2);">
+                            <h4 style="color: var(--danger-color);">🛑 Global Kill Switch (Nuclear Revocation)</h4>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-muted text-xs">
+                                Immediately revokes all inbound and outbound federation grants, terminates all active remote and peer sessions,
+                                and invalidates pending invitations across all networks.
+                            </p>
+                            <div class="mt-3">
+                                <button id="btn-fed-nuclear-kill-switch" class="btn btn-danger btn-sm" style="font-weight: bold;">
+                                    🚨 Trigger Global Kill Switch (Revoke All Federation)
+                                </button>
+                            </div>
+                            <div id="fed-kill-switch-status" class="mt-2 text-xs"></div>
                         </div>
                     </div>
                 </section>

@@ -27,7 +27,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_FILENAME = "snow_devices.db"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 VALID_TRUST_TIERS = ("owner", "peer")
 VALID_CONNECTION_MODES = ("auto", "local_only", "remote_only")
@@ -275,20 +275,117 @@ class DatabaseManager:
                     );
                 """)
 
+                # Phase 30: Cross-Network Federation (Schema v6)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS federation_invitations (
+                        invite_id TEXT PRIMARY KEY,
+                        network_id TEXT NOT NULL,
+                        network_name TEXT NOT NULL,
+                        code_hash TEXT UNIQUE NOT NULL,
+                        cert_fingerprint TEXT NOT NULL,
+                        created_timestamp TEXT NOT NULL,
+                        expires_timestamp TEXT NOT NULL,
+                        ttl_seconds INTEGER NOT NULL DEFAULT 600,
+                        status TEXT NOT NULL DEFAULT 'PENDING',
+                        allowed_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                        allowed_device_ids_json TEXT NOT NULL DEFAULT '[]',
+                        grant_ttl_seconds INTEGER NOT NULL DEFAULT 86400,
+                        attempts INTEGER NOT NULL DEFAULT 0
+                    );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_federation_invites_hash
+                    ON federation_invitations(code_hash);
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_federation_invites_status
+                    ON federation_invitations(status);
+                """)
+
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS federation_grants (
+                        grant_id TEXT PRIMARY KEY,
+                        network_id TEXT NOT NULL,
+                        network_name TEXT NOT NULL,
+                        peer_node_id TEXT NOT NULL,
+                        peer_node_name TEXT NOT NULL,
+                        peer_cert_fingerprint TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'ACTIVE',
+                        created_timestamp TEXT NOT NULL,
+                        expires_timestamp TEXT NOT NULL,
+                        allowed_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                        allowed_device_ids_json TEXT NOT NULL DEFAULT '[]',
+                        auth_token_hash TEXT UNIQUE NOT NULL,
+                        last_used_timestamp TEXT,
+                        revoked_timestamp TEXT,
+                        revocation_reason TEXT
+                    );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_federation_grants_network
+                    ON federation_grants(network_id);
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_federation_grants_token
+                    ON federation_grants(auth_token_hash);
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_federation_grants_status
+                    ON federation_grants(status);
+                """)
+
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
-            # Guarantee connection_mode exists even on already-versioned Schema v5 databases
+            # Guarantee connection_mode exists even on already-versioned databases
             col_cursor = conn.execute("PRAGMA table_info(paired_devices);")
             existing_cols = [row["name"] for row in col_cursor.fetchall()]
             if existing_cols and "connection_mode" not in existing_cols:
                 logger.info("Ensuring connection_mode column in paired_devices")
                 conn.execute("ALTER TABLE paired_devices ADD COLUMN connection_mode TEXT NOT NULL DEFAULT 'auto';")
 
-            # Guarantee app_settings table exists on existing databases
+            # Guarantee app_settings and federation tables exist on existing databases
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS federation_invitations (
+                    invite_id TEXT PRIMARY KEY,
+                    network_id TEXT NOT NULL,
+                    network_name TEXT NOT NULL,
+                    code_hash TEXT UNIQUE NOT NULL,
+                    cert_fingerprint TEXT NOT NULL,
+                    created_timestamp TEXT NOT NULL,
+                    expires_timestamp TEXT NOT NULL,
+                    ttl_seconds INTEGER NOT NULL DEFAULT 600,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    allowed_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_device_ids_json TEXT NOT NULL DEFAULT '[]',
+                    grant_ttl_seconds INTEGER NOT NULL DEFAULT 86400,
+                    attempts INTEGER NOT NULL DEFAULT 0
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS federation_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    network_id TEXT NOT NULL,
+                    network_name TEXT NOT NULL,
+                    peer_node_id TEXT NOT NULL,
+                    peer_node_name TEXT NOT NULL,
+                    peer_cert_fingerprint TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    created_timestamp TEXT NOT NULL,
+                    expires_timestamp TEXT NOT NULL,
+                    allowed_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    allowed_device_ids_json TEXT NOT NULL DEFAULT '[]',
+                    auth_token_hash TEXT UNIQUE NOT NULL,
+                    last_used_timestamp TEXT,
+                    revoked_timestamp TEXT,
+                    revocation_reason TEXT
                 );
             """)
 
@@ -822,6 +919,225 @@ class DatabaseManager:
         with self._get_connection() as conn:
             cur = conn.execute("DELETE FROM app_settings WHERE key = ?;", (key,))
             return cur.rowcount > 0
+
+    # Phase 30: Cross-Network Federation Operations
+
+    def create_federation_invitation(
+        self,
+        invite_id: str,
+        network_id: str,
+        network_name: str,
+        code_hash: str,
+        cert_fingerprint: str,
+        created_timestamp: str,
+        expires_timestamp: str,
+        ttl_seconds: int = 600,
+        allowed_capabilities_json: str = "[]",
+        allowed_device_ids_json: str = "[]",
+        grant_ttl_seconds: int = 86400,
+    ) -> None:
+        """Store a new mutual federation invitation."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO federation_invitations (
+                    invite_id, network_id, network_name, code_hash,
+                    cert_fingerprint, created_timestamp, expires_timestamp,
+                    ttl_seconds, status, allowed_capabilities_json,
+                    allowed_device_ids_json, grant_ttl_seconds, attempts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, 0);
+                """,
+                (
+                    invite_id,
+                    network_id,
+                    network_name,
+                    code_hash,
+                    cert_fingerprint,
+                    created_timestamp,
+                    expires_timestamp,
+                    ttl_seconds,
+                    allowed_capabilities_json,
+                    allowed_device_ids_json,
+                    grant_ttl_seconds,
+                ),
+            )
+
+    def get_federation_invitation_by_hash(self, code_hash: str) -> Optional[dict[str, Any]]:
+        """Retrieve an invitation by its SHA-256 code hash."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM federation_invitations WHERE code_hash = ?;",
+                (code_hash,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def update_federation_invitation_status(self, invite_id: str, status: str) -> bool:
+        """Update invitation status (e.g. ACCEPTED, EXPIRED, REVOKED)."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE federation_invitations SET status = ? WHERE invite_id = ?;",
+                (status, invite_id),
+            )
+            return cur.rowcount > 0
+
+    def increment_federation_invitation_attempts(self, invite_id: str) -> int:
+        """Atomically increment the verification attempts counter for a specific invitation.
+
+        If attempts reach 3 or more, automatically marks status as 'EXPIRED'.
+        Returns the updated attempts count.
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE federation_invitations SET attempts = attempts + 1 WHERE invite_id = ?;",
+                (invite_id,),
+            )
+            cur = conn.execute(
+                "SELECT attempts, status FROM federation_invitations WHERE invite_id = ?;",
+                (invite_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return 0
+            attempts = int(row["attempts"])
+            if attempts >= 3 and row["status"] == "PENDING":
+                conn.execute(
+                    "UPDATE federation_invitations SET status = 'EXPIRED' WHERE invite_id = ?;",
+                    (invite_id,),
+                )
+            return attempts
+
+    def create_federation_grant(
+        self,
+        grant_id: str,
+        network_id: str,
+        network_name: str,
+        peer_node_id: str,
+        peer_node_name: str,
+        peer_cert_fingerprint: str,
+        direction: str,
+        created_timestamp: str,
+        expires_timestamp: str,
+        allowed_capabilities_json: str,
+        allowed_device_ids_json: str,
+        auth_token_hash: str,
+    ) -> None:
+        """Persist an authorized federation grant."""
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO federation_grants (
+                    grant_id, network_id, network_name, peer_node_id,
+                    peer_node_name, peer_cert_fingerprint, direction,
+                    status, created_timestamp, expires_timestamp,
+                    allowed_capabilities_json, allowed_device_ids_json,
+                    auth_token_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?);
+                """,
+                (
+                    grant_id,
+                    network_id,
+                    network_name,
+                    peer_node_id,
+                    peer_node_name,
+                    peer_cert_fingerprint,
+                    direction,
+                    created_timestamp,
+                    expires_timestamp,
+                    allowed_capabilities_json,
+                    allowed_device_ids_json,
+                    auth_token_hash,
+                ),
+            )
+
+    def get_federation_grant(self, grant_id: str) -> Optional[dict[str, Any]]:
+        """Fetch a federation grant by grant ID."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM federation_grants WHERE grant_id = ?;",
+                (grant_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_federation_grant_by_token_hash(self, token_hash: str) -> Optional[dict[str, Any]]:
+        """Lookup an active federation grant by credential token hash."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM federation_grants WHERE auth_token_hash = ?;",
+                (token_hash,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def list_federation_grants(self, active_only: bool = False) -> list[dict[str, Any]]:
+        """List federation grants."""
+        query = "SELECT * FROM federation_grants"
+        params: tuple[Any, ...] = ()
+        if active_only:
+            query += " WHERE status = 'ACTIVE'"
+        query += " ORDER BY created_timestamp DESC;"
+
+        with self._get_connection() as conn:
+            cur = conn.execute(query, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    def revoke_federation_grant(self, grant_id: str, reason: str = "Revoked by owner") -> bool:
+        """Revoke a single active federation grant."""
+        now_str = current_utc_timestamp()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE federation_grants
+                SET status = 'REVOKED',
+                    revoked_timestamp = ?,
+                    revocation_reason = ?
+                WHERE grant_id = ? AND status = 'ACTIVE';
+                """,
+                (now_str, reason, grant_id),
+            )
+            return cur.rowcount > 0
+
+    def update_federation_grant_last_used(self, grant_id: str, timestamp_str: str) -> bool:
+        """Update last used timestamp on a federation grant."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE federation_grants SET last_used_timestamp = ? WHERE grant_id = ?;",
+                (timestamp_str, grant_id),
+            )
+            return cur.rowcount > 0
+
+    def kill_all_federation(self, reason: str = "Global Kill Switch Activated") -> dict[str, int]:
+        """Nuclear revocation: Revoke all active federation grants and expire pending invitations."""
+        now_str = current_utc_timestamp()
+        with self._get_connection() as conn:
+            cur_grants = conn.execute(
+                """
+                UPDATE federation_grants
+                SET status = 'REVOKED',
+                    revoked_timestamp = ?,
+                    revocation_reason = ?
+                WHERE status = 'ACTIVE';
+                """,
+                (now_str, reason),
+            )
+            revoked_grants = cur_grants.rowcount
+
+            cur_invites = conn.execute(
+                """
+                UPDATE federation_invitations
+                SET status = 'REVOKED'
+                WHERE status = 'PENDING';
+                """,
+            )
+            revoked_invites = cur_invites.rowcount
+
+            return {
+                "revoked_grants": revoked_grants,
+                "revoked_invites": revoked_invites,
+            }
 
 
 SENSITIVE_KEY_PATTERNS = {

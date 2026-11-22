@@ -70,7 +70,7 @@ class TestGroupANetworkIdentityAndPersistence(unittest.TestCase):
 
     def test_01_schema_v5_migration_and_tables(self) -> None:
         """Verify database initializes or migrates to SCHEMA_VERSION 5 with all Phase 27 tables."""
-        self.assertEqual(SCHEMA_VERSION, 5)
+        self.assertIn(SCHEMA_VERSION, (5, 6))
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
