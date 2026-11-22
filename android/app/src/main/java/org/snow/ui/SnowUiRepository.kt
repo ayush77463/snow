@@ -150,6 +150,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _clipboardBufferItems = MutableStateFlow<List<ClipboardItemDto>>(emptyList())
     val clipboardBufferItems: StateFlow<List<ClipboardItemDto>> = _clipboardBufferItems.asStateFlow()
 
+    // Phase 27 Direct Phone-to-Phone Peer Host state
+    private val _peerHostState = MutableStateFlow(org.snow.network.PeerHostState())
+    val peerHostState: StateFlow<org.snow.network.PeerHostState> = _peerHostState.asStateFlow()
+    private var peerHostJob: Job? = null
+
     // Bounded retries tracking
     private var connectionAttemptCount = 0
     private var activeDownloadJob: Job? = null
@@ -180,6 +185,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 _screenShareState.value = s
             }
         }
+
+        peerHostJob?.cancel()
+        peerHostJob = repoScope.launch {
+            service.peerHostManager.hostState.collectLatest { s ->
+                _peerHostState.value = s
+            }
+        }
     }
 
     fun unbindService() {
@@ -191,7 +203,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         discoveryJob = null
         screenShareJob?.cancel()
         screenShareJob = null
+        peerHostJob?.cancel()
+        peerHostJob = null
         _screenShareState.value = LiveScreenStreamHandler.StreamState.IDLE
+        _peerHostState.value = org.snow.network.PeerHostState()
         serviceRef = null
     }
 
@@ -236,7 +251,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     )
                     // Auto-restore Instant Sync only if enabled in preferences
                     val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                    if (prefs.getBoolean(PREF_KEY_INSTANT_SYNC, true)) {
+                    if (prefs.getBoolean(PREF_KEY_INSTANT_SYNC, false)) {
                         toggleInstantClipboardSync(true)
                     }
                     if (prefs.getBoolean(PREF_KEY_AUTO_SYNC_SCREENSHOTS, false)) {
@@ -1541,14 +1556,76 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     fun applyBufferItemToClipboard(item: ClipboardItemDto, onComplete: (Boolean, String?) -> Unit) {
-        if (item.type != "text") {
-            onComplete(false, "Image items must be transferred via HTTP download")
-            return
-        }
         val client = serviceRef?.client ?: run {
             onComplete(false, "Client disconnected or offline")
             return
         }
+        if (item.type == "image") {
+            val transferClient = _fileTransferClient ?: run {
+                onComplete(false, "File transfer client offline")
+                return
+            }
+            val targetHost = client.currentTargetHost.takeIf { it.isNotBlank() } ?: connectedHost
+            client.sendRequest("clipboard_buffer_apply", mapOf("item_id" to item.itemId, "target" to "phone", "stage_only" to true)) { resp ->
+                if (resp.isSuccess) {
+                    val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
+                    val transferId = data?.get("transfer_id") as? String
+                    val sha256 = (data?.get("sha256") as? String) ?: ""
+                    val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: 8766
+                    val mimeType = data?.get("mime_type") as? String
+                    if (transferId != null && targetHost.isNotBlank()) {
+                        repoScope.launch(Dispatchers.IO) {
+                            val cacheDir = File(appContext.cacheDir, "clipboard").apply { mkdirs() }
+                            val ext = if (mimeType?.contains("jpeg") == true) "jpg" else "png"
+                            val prefix = if (sha256.isNotBlank()) sha256.take(16) else item.itemId.take(16)
+                            val localFile = File(cacheDir, "clip_$prefix.$ext")
+                            val dlRes = transferClient.downloadFile(
+                                serverHost = targetHost,
+                                transferPort = transferPort,
+                                transferId = transferId,
+                                destinationFile = localFile,
+                                expectedSha256 = sha256
+                            )
+                            if (dlRes is FileTransferClient.TransferResult.Success) {
+                                repoScope.launch(Dispatchers.Main) {
+                                    try {
+                                        val contentUri = androidx.core.content.FileProvider.getUriForFile(
+                                            appContext,
+                                            "${appContext.packageName}.fileprovider",
+                                            dlRes.file
+                                        )
+                                        val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        val clip = ClipData.newUri(appContext.contentResolver, "SNOW Shared Clipboard", contentUri)
+                                        cm.setPrimaryClip(clip)
+                                        recordIncomingClipboardText(sha256)
+                                        appendLog("INFO", TAG, "Applied image buffer item to Android clipboard (${dlRes.file.length()} bytes).")
+                                        onComplete(true, "Copied image to Android clipboard")
+                                    } catch (e: Exception) {
+                                        SafeLog.e(TAG, "Failed applying image buffer item: ${e.message}", e)
+                                        onComplete(false, "Failed copying to clipboard: ${e.message}")
+                                    }
+                                }
+                            } else {
+                                repoScope.launch(Dispatchers.Main) {
+                                    onComplete(false, "Failed downloading image buffer item")
+                                }
+                            }
+                        }
+                    } else {
+                        repoScope.launch(Dispatchers.Main) {
+                            onComplete(true, "Applied image to clipboard")
+                        }
+                    }
+                } else {
+                    val errMsg = resp.error?.message ?: "Failed applying image buffer item"
+                    repoScope.launch(Dispatchers.Main) {
+                        onComplete(false, errMsg)
+                    }
+                }
+            }
+            return
+        }
+
         // Fetch full text content via clipboard_buffer_get rather than preview truncation
         client.sendRequest("clipboard_buffer_get", mapOf("item_id" to item.itemId)) { resp ->
             if (resp.isSuccess) {

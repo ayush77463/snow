@@ -43,6 +43,7 @@ class AndroidPeerHostServer(
     private val localDeviceId: String,
     private val manifestProvider: () -> Map<String, Any?> = { emptyMap() },
     private val peerTokenValidator: ((String) -> Boolean)? = null,
+    private val pinVerifier: ((String) -> Boolean)? = null,
     private val parentScope: CoroutineScope? = null,
     private val sslContext: SSLContext? = null
 ) {
@@ -72,6 +73,11 @@ class AndroidPeerHostServer(
         if (isRunning.get()) {
             SafeLog.i(TAG, "AndroidPeerHostServer is already running on port $boundPort")
             return true
+        }
+
+        if (sslContext == null) {
+            SafeLog.e(TAG, "Cannot start AndroidPeerHostServer without SSLContext: mandatory TLS is enforced.")
+            return false
         }
 
         return try {
@@ -187,7 +193,43 @@ class AndroidPeerHostServer(
         @Suppress("UNCHECKED_CAST")
         val data = message.payload?.get("data") as? Map<String, Any?> ?: emptyMap()
 
-        if (action == "auth_request") {
+        if (action == "pair_request") {
+            val pin = (data["pin"] as? String) ?: (data["pairing_pin"] as? String)
+            val peerId = (data["device_id"] as? String) ?: "unknown_peer"
+            val isPinValid = pin != null && pinVerifier != null && pinVerifier.invoke(pin)
+
+            if (isPinValid) {
+                val newToken = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")
+                tokenStorage.saveToken(newToken)
+                val newSessionId = UUID.randomUUID().toString()
+                session.isAuthenticated = true
+                session.peerDeviceId = peerId
+                session.sessionId = newSessionId
+
+                val resp = SnowMessage.createResponse(
+                    correlationId = message.id,
+                    payload = mapOf(
+                        "status" to "success",
+                        "action" to "pair_response",
+                        "session_id" to newSessionId,
+                        "device_id" to localDeviceId,
+                        "auth_token" to newToken,
+                        "manifest" to manifestProvider()
+                    )
+                )
+                conn.send(JsonSerialization.toJson(resp))
+                SafeLog.i(TAG, "Peer successfully paired via PIN: device_id=$peerId session=$newSessionId")
+            } else {
+                val err = SnowMessage.createError(
+                    code = ErrorCode.UNAUTHORIZED,
+                    message = "Invalid or expired pairing PIN.",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                conn.close(1008, "Pairing unauthorized")
+                SafeLog.w(TAG, "Peer pairing rejected for device_id=$peerId: invalid/expired PIN")
+            }
+        } else if (action == "auth_request") {
             val presentedToken = data["auth_token"] as? String
             val peerId = data["device_id"] as? String
 

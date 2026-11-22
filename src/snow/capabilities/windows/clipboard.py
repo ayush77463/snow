@@ -382,9 +382,19 @@ class WindowsClipboardManager:
             return {"success": False, "status": "CLIPBOARD_BUSY", "error": "Failed opening clipboard"}
 
         try:
-            h_data = self._user32.GetClipboardData(CF_DIB)
+            # Try CF_DIBV5 first, then fallback to standard CF_DIB
+            formats_to_try = [CF_DIBV5, CF_DIB]
+            h_data = None
+            fmt_chosen = None
+            for fmt in formats_to_try:
+                h = self._user32.GetClipboardData(fmt)
+                if h:
+                    h_data = h
+                    fmt_chosen = fmt
+                    break
+
             if not h_data:
-                return {"success": False, "status": "NO_IMAGE", "error": "No DIB image on clipboard"}
+                return {"success": False, "status": "NO_IMAGE", "error": "No DIB or DIBV5 image on clipboard"}
 
             p_data = self._kernel32.GlobalLock(h_data)
             if not p_data:
@@ -393,15 +403,31 @@ class WindowsClipboardManager:
             try:
                 bih = BITMAPINFOHEADER.from_address(p_data)
                 header_size = bih.biSize
+                if header_size < 40:
+                    return {
+                        "success": False,
+                        "status": "INVALID_IMAGE_HEADER",
+                        "error": f"Invalid DIB header size: {header_size}",
+                    }
+
                 clr_used = bih.biClrUsed
                 bit_count = bih.biBitCount
                 compression = bih.biCompression
                 clr_size = 0
-                if compression == 3 and header_size == 40:
+                if header_size == 40 and compression == 3:
+                    # BI_BITFIELDS with BITMAPINFOHEADER appends 3 DWORD color masks (12 bytes)
                     clr_size = 12
+                elif header_size >= 124:
+                    # BITMAPV5HEADER has color masks embedded directly within its 124-byte structure
+                    if clr_used > 0:
+                        clr_size = clr_used * 4
+                    elif bit_count <= 8 and bit_count > 0:
+                        clr_size = (1 << bit_count) * 4
+                    else:
+                        clr_size = 0
                 elif clr_used > 0:
                     clr_size = clr_used * 4
-                elif bit_count <= 8:
+                elif bit_count <= 8 and bit_count > 0:
                     clr_size = (1 << bit_count) * 4
                 p_bits = p_data + header_size + clr_size
 
@@ -413,7 +439,7 @@ class WindowsClipboardManager:
                     return {
                         "success": False,
                         "status": "DECODE_FAILED",
-                        "error": f"GDI+ decode failed (status {st})",
+                        "error": f"GDI+ decode failed (status {st}) for format {fmt_chosen}",
                     }
 
                 try:
@@ -460,6 +486,84 @@ class WindowsClipboardManager:
                 self._kernel32.GlobalUnlock(h_data)
         finally:
             self._user32.CloseClipboard()
+
+    def decode_dib_bytes_to_png(self, dib_bytes: bytes, output_dir: Optional[Path] = None) -> dict[str, Any]:
+        """Decode raw DIB/DIBV5 bytes into a PNG file. Used for testing and headless processing."""
+        if not self._is_windows or not self._kernel32:
+            return {"success": False, "status": "UNSUPPORTED_PLATFORM", "error": "Windows only"}
+        if len(dib_bytes) < 40:
+            return {"success": False, "status": "INVALID_IMAGE_HEADER", "error": "DIB bytes too short for header"}
+
+        self._init_gdiplus()
+        if not self._gdiplus or self._gdiplus_token is None:
+            return {"success": False, "status": "GDIPLUS_UNAVAILABLE", "error": "GDI+ not available"}
+
+        buf = ctypes.create_string_buffer(dib_bytes)
+        p_data = ctypes.addressof(buf)
+        bih = BITMAPINFOHEADER.from_address(p_data)
+        header_size = bih.biSize
+        if header_size < 40:
+            return {"success": False, "status": "INVALID_IMAGE_HEADER", "error": f"Invalid DIB header size: {header_size}"}
+
+        clr_used = bih.biClrUsed
+        bit_count = bih.biBitCount
+        compression = bih.biCompression
+        clr_size = 0
+        if header_size == 40 and compression == 3:
+            clr_size = 12
+        elif header_size >= 124:
+            if clr_used > 0:
+                clr_size = clr_used * 4
+            elif bit_count <= 8 and bit_count > 0:
+                clr_size = (1 << bit_count) * 4
+        elif clr_used > 0:
+            clr_size = clr_used * 4
+        elif bit_count <= 8 and bit_count > 0:
+            clr_size = (1 << bit_count) * 4
+        p_bits = p_data + header_size + clr_size
+
+        p_bmp = ctypes.c_void_p()
+        st = self._gdiplus.GdipCreateBitmapFromGdiDib(
+            ctypes.c_void_p(p_data), ctypes.c_void_p(p_bits), ctypes.byref(p_bmp)
+        )
+        if st != 0:
+            return {"success": False, "status": "DECODE_FAILED", "error": f"GDI+ decode failed (status {st})"}
+
+        try:
+            target_dir = output_dir or (Path.home() / ".snow" / "transfers")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            temp_name = f"clip_{int(time.time() * 1000)}.png"
+            out_path = target_dir / temp_name
+
+            save_st = self._gdiplus.GdipSaveImageToFile(
+                p_bmp, str(out_path), ctypes.byref(PNG_CLSID), None
+            )
+            if save_st != 0 or not out_path.exists():
+                return {"success": False, "status": "SAVE_FAILED", "error": f"Failed saving PNG (status {save_st})"}
+
+            size = out_path.stat().st_size
+            sha256 = hashlib.sha256(out_path.read_bytes()).hexdigest()
+            final_path = target_dir / f"clip_{sha256[:16]}.png"
+            if final_path.exists():
+                try:
+                    out_path.unlink()
+                except Exception:
+                    pass
+            else:
+                out_path.rename(final_path)
+
+            return {
+                "success": True,
+                "status": "SUCCESS",
+                "type": "image",
+                "mime_type": "image/png",
+                "file_path": str(final_path),
+                "file_name": final_path.name,
+                "sha256": sha256,
+                "size": size,
+            }
+        finally:
+            self._gdiplus.GdipDisposeImage(p_bmp)
 
     def set_image_sync(self, image_path: Path | str) -> dict[str, Any]:
         """Load an image file (PNG, JPEG, BMP) and place it on Windows clipboard as CF_DIB."""

@@ -20,14 +20,14 @@ class ClipSyncActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        ClipboardHandler.isAppInForeground = true
+        ClipboardHandler.onActivityResumed("ClipSyncActivity")
         ClipboardHandler.isUserIntentGranted = true
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus && hasTriggered.compareAndSet(false, true)) {
-            ClipboardHandler.isAppInForeground = true
+            ClipboardHandler.onActivityResumed("ClipSyncActivity")
             ClipboardHandler.isUserIntentGranted = true
             handler.postDelayed({
                 val repo = SnowUiRepository.getInstance(applicationContext)
@@ -48,6 +48,6 @@ class ClipSyncActivity : AppCompatActivity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
-        ClipboardHandler.isAppInForeground = false
+        ClipboardHandler.onActivityPaused("ClipSyncActivity")
     }
 }

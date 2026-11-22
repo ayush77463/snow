@@ -37,8 +37,12 @@ import org.snow.security.TlsConfig
 import org.snow.security.TokenStorage
 import org.snow.security.UnconfirmedCertificateException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Authentication and authorization states for the SNOW connection lifecycle.
@@ -72,6 +76,13 @@ class SnowWebSocketClient(
     companion object {
         private const val TAG = "SnowWebSocketClient"
         const val MAX_CONNECT_RETRIES = 3
+        const val MAX_PENDING_REQUESTS = 100
+        const val DEFAULT_REQUEST_TIMEOUT_SECONDS = 30L
+    }
+
+    private var okHttpClient: OkHttpClient? = null
+    private val timeoutScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "SnowWsClientTimeout").apply { isDaemon = true }
     }
 
     private var webSocket: WebSocket? = null
@@ -250,7 +261,7 @@ class SnowWebSocketClient(
             .url(wsUrl)
             .build()
 
-        val client = buildOkHttpClient()
+        val client = okHttpClient ?: buildOkHttpClient().also { okHttpClient = it }
         webSocket = client.newWebSocket(request, SnowListener())
     }
 
@@ -301,6 +312,19 @@ class SnowWebSocketClient(
     }
 
     /**
+     * Terminate the client completely, shut down HTTP connection pool and background timeout scheduler.
+     */
+    fun teardown() {
+        disconnect()
+        okHttpClient?.dispatcher?.executorService?.shutdown()
+        okHttpClient?.connectionPool?.evictAll()
+        okHttpClient = null
+        try {
+            timeoutScheduler.shutdownNow()
+        } catch (_: Exception) {}
+    }
+
+    /**
      * Send a request action to the server.
      */
     fun sendRequest(
@@ -322,7 +346,43 @@ class SnowWebSocketClient(
 
         val requestMessage = SnowMessage.createRequest(action = action, data = data)
         if (onResponse != null) {
-            pendingRequests[requestMessage.id] = onResponse
+            if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
+                log("Cannot send request: Pending request capacity ($MAX_PENDING_REQUESTS) exceeded.")
+                onResponse.invoke(
+                    SnowMessage.createError(
+                        code = ErrorCode.INTERNAL_ERROR,
+                        message = "Request rejected: pending request queue capacity ($MAX_PENDING_REQUESTS) exceeded."
+                    )
+                )
+                return
+            }
+
+            val invoked = AtomicBoolean(false)
+            val timeoutFutureRef = AtomicReference<ScheduledFuture<*>?>()
+
+            val safeCallback: (SnowMessage) -> Unit = { response ->
+                if (invoked.compareAndSet(false, true)) {
+                    timeoutFutureRef.get()?.cancel(false)
+                    pendingRequests.remove(requestMessage.id)
+                    onResponse.invoke(response)
+                }
+            }
+
+            val timeoutFuture = timeoutScheduler.schedule({
+                if (invoked.compareAndSet(false, true)) {
+                    pendingRequests.remove(requestMessage.id)
+                    onResponse.invoke(
+                        SnowMessage.createError(
+                            code = ErrorCode.INTERNAL_ERROR,
+                            message = "Request timed out after $DEFAULT_REQUEST_TIMEOUT_SECONDS seconds [action='$action']",
+                            correlationId = requestMessage.id
+                        )
+                    )
+                }
+            }, DEFAULT_REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+
+            timeoutFutureRef.set(timeoutFuture)
+            pendingRequests[requestMessage.id] = safeCallback
         }
 
         val json = JsonSerialization.toJson(requestMessage)

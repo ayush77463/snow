@@ -100,7 +100,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        org.snow.capabilities.ClipboardHandler.isAppInForeground = true
+        org.snow.capabilities.ClipboardHandler.onActivityResumed("MainActivity")
         org.snow.capabilities.ClipboardHandler.isUserIntentGranted = true
         lifecycleScope.launch {
             kotlinx.coroutines.delay(150)
@@ -111,7 +111,7 @@ class MainActivity : AppCompatActivity() {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
-            org.snow.capabilities.ClipboardHandler.isAppInForeground = true
+            org.snow.capabilities.ClipboardHandler.onActivityResumed("MainActivity")
             org.snow.capabilities.ClipboardHandler.isUserIntentGranted = true
             lifecycleScope.launch {
                 // 150ms delay required on Android 10+ / Android 17 (ColorOS) for window focus
@@ -124,7 +124,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        org.snow.capabilities.ClipboardHandler.isAppInForeground = false
+        org.snow.capabilities.ClipboardHandler.onActivityPaused("MainActivity")
     }
 
     override fun onStart() {
@@ -274,20 +274,5 @@ class MainActivity : AppCompatActivity() {
                 binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected))
             }
         }
-    }
-
-    // --- Backward Compatible Quarantined Peer-Host Methods ---
-
-    fun enablePeerHostMode(port: Int = 8767): Boolean {
-        SafeLog.w(TAG, "enablePeerHostMode() called on MainActivity: Quarantined in Phase 19A.")
-        return false
-    }
-
-    fun disablePeerHostMode() {
-        // Quarantined
-    }
-
-    fun isPeerHostModeActive(): Boolean {
-        return false
     }
 }

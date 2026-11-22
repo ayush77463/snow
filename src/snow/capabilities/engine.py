@@ -178,7 +178,7 @@ class CapabilityEngine:
         self.terminal = terminal or WindowsTerminalExecutor()
         self.terminal.set_ticket_validator(self.validate_confirmation_ticket)
         self.clipboard = clipboard or WindowsClipboardManager()
-        self.clipboard_buffer = clipboard_buffer or ClipboardRingBuffer()
+        self.clipboard_buffer = clipboard_buffer or ClipboardRingBuffer(db_manager=db_manager)
         self.policy = policy or PeerCapabilityPolicy()
         self.node_registry = node_registry
         self.db_manager = db_manager
@@ -742,6 +742,7 @@ class CapabilityEngine:
                         else:
                             return CapabilityResponse(success=False, status="DEVICE_NOT_FOUND", error="No active connected device found.")
 
+                stage_only = bool(params.get("stage_only", False))
                 if c_type == "text":
                     route_res = await router.route_request(
                         action="clipboard_push",
@@ -804,17 +805,29 @@ class CapabilityEngine:
                         "size": file_size,
                     }
 
-                    route_res = await router.route_request(
-                        action="clipboard_push",
-                        target=resolved_target,
-                        data=push_data,
-                        ctx=ctx,
-                    )
+                    if stage_only:
+                        route_res = {"success": True, "status": "SUCCESS"}
+                    else:
+                        route_res = await router.route_request(
+                            action="clipboard_push",
+                            target=resolved_target,
+                            data=push_data,
+                            ctx=ctx,
+                        )
                 is_ok = route_res.get("success", False)
+                res_data = {"applied": is_ok, "item_id": target_id, "type": c_type, "target": target}
+                if c_type == "image":
+                    res_data.update({
+                        "transfer_id": transfer_id,
+                        "transfer_port": transfer_port,
+                        "sha256": file_sha256,
+                        "file_name": img_path.name,
+                        "mime_type": item.get("mime_type") or "image/png",
+                    })
                 return CapabilityResponse(
                     success=is_ok,
                     status=route_res.get("status", "SUCCESS" if is_ok else "ERROR"),
-                    data={"applied": is_ok, "item_id": target_id, "type": c_type, "target": target},
+                    data=res_data,
                     error=route_res.get("error"),
                 )
 

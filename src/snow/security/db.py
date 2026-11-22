@@ -28,7 +28,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_FILENAME = "snow_devices.db"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 VALID_TRUST_TIERS = ("owner", "peer")
 VALID_CONNECTION_MODES = ("auto", "local_only", "remote_only")
@@ -439,6 +439,32 @@ class DatabaseManager:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_oauth_tokens_family
                 ON oauth_tokens(family_id);
+            """)
+
+            # Clipboard Ring Buffer persistence (Batch 3)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS clipboard_buffer_items (
+                    item_id TEXT PRIMARY KEY,
+                    content_type TEXT NOT NULL,
+                    preview TEXT NOT NULL,
+                    source_device_id TEXT NOT NULL,
+                    source_device_name TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    text_content TEXT,
+                    image_rel_path TEXT,
+                    mime_type TEXT
+                );
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_clipboard_timestamp
+                ON clipboard_buffer_items(timestamp DESC);
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_clipboard_sha256
+                ON clipboard_buffer_items(sha256);
             """)
 
     @staticmethod
@@ -1411,6 +1437,88 @@ class DatabaseManager:
                 (token_hash, token_hash),
             )
             return cursor.rowcount > 0
+
+    # -------------------------------------------------------------------------
+    # Clipboard Ring Buffer Persistence Methods (Batch 3)
+    # -------------------------------------------------------------------------
+
+    def save_clipboard_item(
+        self,
+        item_id: str,
+        content_type: str,
+        preview: str,
+        source_device_id: str,
+        source_device_name: str,
+        timestamp: float,
+        sha256: str,
+        size_bytes: int,
+        pinned: bool = False,
+        text_content: Optional[str] = None,
+        image_rel_path: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> bool:
+        """Insert or replace a clipboard ring buffer item in persistent storage."""
+        query = """
+            INSERT INTO clipboard_buffer_items (
+                item_id, content_type, preview, source_device_id, source_device_name,
+                timestamp, sha256, size_bytes, pinned, text_content, image_rel_path, mime_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id) DO UPDATE SET
+                pinned = excluded.pinned,
+                preview = excluded.preview,
+                text_content = excluded.text_content,
+                image_rel_path = excluded.image_rel_path;
+        """
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                query,
+                (
+                    item_id,
+                    content_type,
+                    preview,
+                    source_device_id,
+                    source_device_name,
+                    timestamp,
+                    sha256,
+                    size_bytes,
+                    1 if pinned else 0,
+                    text_content,
+                    image_rel_path,
+                    mime_type,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def delete_clipboard_item(self, item_id: str) -> bool:
+        """Delete a clipboard item from persistent storage."""
+        with self._get_connection() as conn:
+            cursor = conn.execute("DELETE FROM clipboard_buffer_items WHERE item_id = ?;", (item_id,))
+            return cursor.rowcount > 0
+
+    def update_clipboard_pinned(self, item_id: str, pinned: bool) -> bool:
+        """Update pinned state of a clipboard buffer item."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE clipboard_buffer_items SET pinned = ? WHERE item_id = ?;",
+                (1 if pinned else 0, item_id),
+            )
+            return cursor.rowcount > 0
+
+    def load_all_clipboard_items(self) -> List[dict[str, Any]]:
+        """Load all persistent clipboard buffer items ordered by timestamp descending."""
+        query = "SELECT * FROM clipboard_buffer_items ORDER BY timestamp DESC;"
+        with self._get_connection() as conn:
+            cursor = conn.execute(query)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def clear_clipboard_items(self, unpinned_only: bool = False) -> int:
+        """Clear clipboard buffer items from persistent storage."""
+        with self._get_connection() as conn:
+            if unpinned_only:
+                cursor = conn.execute("DELETE FROM clipboard_buffer_items WHERE pinned = 0;")
+            else:
+                cursor = conn.execute("DELETE FROM clipboard_buffer_items;")
+            return cursor.rowcount
 
 
 SENSITIVE_KEY_PATTERNS = {

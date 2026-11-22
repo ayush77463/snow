@@ -47,6 +47,23 @@ class AndroidPeerHostTest {
     private class TestWsClient(uri: URI) : WebSocketClient(uri) {
         val messages = LinkedBlockingQueue<String>()
 
+        init {
+            if (uri.scheme.equals("wss", ignoreCase = true)) {
+                val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : javax.net.ssl.X509TrustManager {
+                    override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                    override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                    override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
+                })
+                val sc = javax.net.ssl.SSLContext.getInstance("TLS")
+                sc.init(null, trustAll, java.security.SecureRandom())
+                setSocketFactory(sc.socketFactory)
+            }
+        }
+
+        override fun onSetSSLParameters(sslParameters: javax.net.ssl.SSLParameters) {
+            sslParameters.endpointIdentificationAlgorithm = null
+        }
+
         override fun onOpen(handshakedata: ServerHandshake?) {}
         override fun onMessage(message: String) {
             messages.offer(message)
@@ -89,13 +106,15 @@ class AndroidPeerHostTest {
         port: Int,
         manifestProvider: () -> Map<String, Any?> = { emptyMap() }
     ): AndroidPeerHostServer {
+        val certResult = org.snow.security.AndroidSelfSignedCertGenerator.generate()
         val s = AndroidPeerHostServer(
             requestedPort = port,
             tokenStorage = mockTokenStorage,
             dispatcher = dispatcher,
             localDeviceId = "android-node-test-1",
             manifestProvider = manifestProvider,
-            parentScope = testScope
+            parentScope = testScope,
+            sslContext = certResult.sslContext
         )
         assertTrue("Direct AndroidPeerHostServer should bind", s.start())
         peerHostServer = s
@@ -104,11 +123,11 @@ class AndroidPeerHostTest {
     }
 
     @Test
-    fun testHostModeLifecycleAndQuarantine() {
+    fun testHostModeLifecycleAndDisabledRefusal() {
         assertFalse(hostManager.isHostModeActive())
         assertEquals(ReachabilityProfile.ACTIVE_SESSION_PEER, hostManager.getReachabilityProfile())
 
-        // Under Phase 19A/20 quarantine release gate, enableHostMode must fail closed until release gate passes
+        // Under disabled host mode setting, enableHostMode must fail closed
         val enabled = hostManager.enableHostMode(
             port = testPort,
             tokenStorage = mockTokenStorage,
@@ -118,7 +137,7 @@ class AndroidPeerHostTest {
             parentScope = testScope
         )
 
-        assertFalse("Quarantined host manager must return false", enabled)
+        assertFalse("Disabled host manager must return false", enabled)
         assertFalse(hostManager.isHostModeActive())
         assertEquals(ReachabilityProfile.ACTIVE_SESSION_PEER, hostManager.getReachabilityProfile())
 
@@ -131,7 +150,21 @@ class AndroidPeerHostTest {
         } catch (_: Exception) {
             failedToConnect = true
         }
-        assertTrue("Quarantined host manager must not open socket", failedToConnect)
+        assertTrue("Disabled host manager must not open socket", failedToConnect)
+
+        // When setting is enabled, start succeeds
+        hostManager.setHostModeSettingEnabled(true)
+        val started = hostManager.enableHostMode(
+            port = testPort,
+            tokenStorage = mockTokenStorage,
+            dispatcher = dispatcher,
+            localDeviceId = "android-node-test-1",
+            manifestProvider = { mapOf("supported_capabilities" to listOf("android.telemetry.get")) },
+            parentScope = testScope
+        )
+        assertTrue("Host manager should start when setting enabled", started)
+        assertTrue(hostManager.isHostModeActive())
+        assertEquals(ReachabilityProfile.FOREGROUND_HOST, hostManager.getReachabilityProfile())
 
         hostManager.disableHostMode()
         assertFalse(hostManager.isHostModeActive())
@@ -141,7 +174,7 @@ class AndroidPeerHostTest {
     @Test
     fun testPingPongOverPeerHostWebSocket() {
         val s = startDirectServer(testPort)
-        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        val client = TestWsClient(URI("wss://127.0.0.1:${s.boundPort}"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         try {
@@ -162,7 +195,7 @@ class AndroidPeerHostTest {
     @Test
     fun testUnauthenticatedCapabilityRequestRejected() {
         val s = startDirectServer(testPort)
-        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        val client = TestWsClient(URI("wss://127.0.0.1:${s.boundPort}"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         try {
@@ -182,7 +215,7 @@ class AndroidPeerHostTest {
     @Test
     fun testPairRequestCannotBypassAuthentication() {
         val s = startDirectServer(testPort)
-        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        val client = TestWsClient(URI("wss://127.0.0.1:${s.boundPort}"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         try {
@@ -208,7 +241,7 @@ class AndroidPeerHostTest {
             port = testPort,
             manifestProvider = { mapOf("manifest_version" to "2.0") }
         )
-        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        val client = TestWsClient(URI("wss://127.0.0.1:${s.boundPort}"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         try {
@@ -236,7 +269,7 @@ class AndroidPeerHostTest {
     @Test
     fun testAuthenticationWithInvalidTokenRejected() {
         val s = startDirectServer(testPort)
-        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        val client = TestWsClient(URI("wss://127.0.0.1:${s.boundPort}"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         try {
@@ -262,7 +295,7 @@ class AndroidPeerHostTest {
     @Test
     fun testAuthenticatedCapabilityExecutionThroughDispatcher() {
         val s = startDirectServer(testPort)
-        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        val client = TestWsClient(URI("wss://127.0.0.1:${s.boundPort}"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         try {
@@ -294,7 +327,7 @@ class AndroidPeerHostTest {
         ClipboardHandler.isUserIntentGranted = false
 
         val s = startDirectServer(testPort)
-        val client = TestWsClient(URI("ws://127.0.0.1:${s.boundPort}"))
+        val client = TestWsClient(URI("wss://127.0.0.1:${s.boundPort}"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         try {

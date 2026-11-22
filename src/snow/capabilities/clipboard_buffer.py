@@ -101,6 +101,7 @@ class ClipboardRingBuffer:
         storage_dir: Optional[Path | str] = None,
         capacity: int = MAX_BUFFER_ITEMS,
         max_pinned: int = MAX_PINNED_ITEMS,
+        db_manager: Optional[Any] = None,
     ) -> None:
         if storage_dir:
             self.storage_dir = Path(storage_dir).resolve()
@@ -110,9 +111,100 @@ class ClipboardRingBuffer:
 
         self.capacity: int = capacity
         self.max_pinned: int = max_pinned
+        self.db_manager = db_manager
         self._items: List[ClipboardItem] = []
         # Echo-loop tracking: sha256 -> set of device_ids that have synchronized this content
         self._synced_devices: Dict[str, Set[str]] = {}
+
+        if self.db_manager is not None:
+            self._reconcile_and_load_persisted()
+
+    def _reconcile_and_load_persisted(self) -> None:
+        """Reconcile SQLite persistence with disk storage on startup."""
+        if not self.db_manager or not hasattr(self.db_manager, "load_all_clipboard_items"):
+            return
+
+        try:
+            persisted = self.db_manager.load_all_clipboard_items()
+        except Exception as e:
+            logger.error("Failed loading persisted clipboard items from SQLite: %s", e)
+            return
+
+        referenced_disk_files: Set[str] = set()
+        loaded_items: List[ClipboardItem] = []
+
+        for row in persisted:
+            item_id = row.get("item_id")
+            if not item_id:
+                continue
+            c_type = row.get("content_type", "text")
+            sha256 = row.get("sha256", "")
+            pinned = bool(row.get("pinned", 0))
+
+            if c_type == "image":
+                rel_path = row.get("image_rel_path")
+                disk_file = (self.storage_dir / rel_path).resolve() if rel_path else None
+                # Check if referenced file exists on disk and is safely within storage_dir
+                if disk_file and disk_file.is_file() and disk_file.is_relative_to(self.storage_dir):
+                    referenced_disk_files.add(disk_file.name)
+                    item = ClipboardItem(
+                        item_id=item_id,
+                        content_type="image",
+                        preview=row.get("preview") or "Image",
+                        source_device_id=row.get("source_device_id") or "desktop_windows",
+                        source_device_name=row.get("source_device_name") or "Windows PC",
+                        timestamp=float(row.get("timestamp", 0.0)),
+                        sha256=sha256,
+                        size_bytes=int(row.get("size_bytes", 0)),
+                        pinned=pinned,
+                        image_path=disk_file,
+                        mime_type=row.get("mime_type") or "image/png",
+                    )
+                    loaded_items.append(item)
+                else:
+                    # Missing referenced image file on disk! Prune database record to maintain integrity
+                    logger.warning(
+                        "Pruning clipboard record %s: referenced image file %s missing from disk.",
+                        item_id,
+                        rel_path,
+                    )
+                    try:
+                        self.db_manager.delete_clipboard_item(item_id)
+                    except Exception as e:
+                        logger.error("Failed pruning missing image clipboard record %s: %s", item_id, e)
+            else:
+                item = ClipboardItem(
+                    item_id=item_id,
+                    content_type="text",
+                    preview=row.get("preview") or "[Empty text]",
+                    source_device_id=row.get("source_device_id") or "desktop_windows",
+                    source_device_name=row.get("source_device_name") or "Windows PC",
+                    timestamp=float(row.get("timestamp", 0.0)),
+                    sha256=sha256,
+                    size_bytes=int(row.get("size_bytes", 0)),
+                    pinned=pinned,
+                    text_content=row.get("text_content"),
+                    mime_type=row.get("mime_type") or "text/plain; charset=utf-8",
+                )
+                loaded_items.append(item)
+
+        # Orphan disk cleanup: any cache file in storage_dir not referenced by a valid record is pruned
+        try:
+            if self.storage_dir.is_dir():
+                for disk_entry in self.storage_dir.iterdir():
+                    if disk_entry.is_file() and disk_entry.name not in referenced_disk_files:
+                        if disk_entry.name.startswith("clip_"):
+                            logger.info("Pruning orphaned clipboard media file: %s", disk_entry.name)
+                            try:
+                                disk_entry.unlink(missing_ok=True)
+                            except Exception as u_err:
+                                logger.warning("Could not delete orphaned file %s: %s", disk_entry.name, u_err)
+        except Exception as o_err:
+            logger.warning("Error during clipboard storage orphan reconciliation: %s", o_err)
+
+        # Sort newest at index 0 and respect capacity
+        loaded_items.sort(key=lambda x: x.timestamp, reverse=True)
+        self._items = loaded_items[: self.capacity]
 
     def list_items(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Return ordered list of safe item metadata (newest at index 0)."""
@@ -163,6 +255,11 @@ class ClipboardRingBuffer:
         evicted = self._items.pop(evict_idx)
         logger.info("Evicted oldest unpinned clipboard item: %s (%s)", evicted.item_id, evicted.preview)
         self._cleanup_item_files(evicted)
+        if self.db_manager and hasattr(self.db_manager, "delete_clipboard_item"):
+            try:
+                self.db_manager.delete_clipboard_item(evicted.item_id)
+            except Exception as e:
+                logger.warning("Error deleting evicted item %s from DB: %s", evicted.item_id, e)
         return True
 
     def _cleanup_item_files(self, item: ClipboardItem) -> None:
@@ -223,6 +320,23 @@ class ClipboardRingBuffer:
             self._items.insert(0, existing)
             # Track synced origin
             self._synced_devices.setdefault(digest, set()).add(source_device_id)
+            if self.db_manager and hasattr(self.db_manager, "save_clipboard_item"):
+                try:
+                    self.db_manager.save_clipboard_item(
+                        item_id=existing.item_id,
+                        content_type="text",
+                        preview=existing.preview,
+                        source_device_id=existing.source_device_id,
+                        source_device_name=existing.source_device_name,
+                        timestamp=existing.timestamp,
+                        sha256=existing.sha256,
+                        size_bytes=existing.size_bytes,
+                        pinned=existing.pinned,
+                        text_content=existing.text_content,
+                        mime_type=existing.mime_type,
+                    )
+                except Exception as e:
+                    logger.warning("Error updating deduplicated item in DB: %s", e)
             return {
                 "success": True,
                 "status": "DEDUPLICATED",
@@ -270,6 +384,24 @@ class ClipboardRingBuffer:
 
         self._items.insert(0, item)
         self._synced_devices.setdefault(digest, set()).add(source_device_id)
+
+        if self.db_manager and hasattr(self.db_manager, "save_clipboard_item"):
+            try:
+                self.db_manager.save_clipboard_item(
+                    item_id=item.item_id,
+                    content_type="text",
+                    preview=item.preview,
+                    source_device_id=item.source_device_id,
+                    source_device_name=item.source_device_name,
+                    timestamp=item.timestamp,
+                    sha256=item.sha256,
+                    size_bytes=item.size_bytes,
+                    pinned=item.pinned,
+                    text_content=item.text_content,
+                    mime_type=item.mime_type,
+                )
+            except Exception as e:
+                logger.warning("Error saving new text item to DB: %s", e)
 
         return {
             "success": True,
@@ -340,6 +472,25 @@ class ClipboardRingBuffer:
                     existing.pinned = True
             self._items.insert(0, existing)
             self._synced_devices.setdefault(digest, set()).add(source_device_id)
+            if self.db_manager and hasattr(self.db_manager, "save_clipboard_item"):
+                try:
+                    rel_p = existing.image_path.name if existing.image_path else None
+                    self.db_manager.save_clipboard_item(
+                        item_id=existing.item_id,
+                        content_type="image",
+                        preview=existing.preview,
+                        source_device_id=existing.source_device_id,
+                        source_device_name=existing.source_device_name,
+                        timestamp=existing.timestamp,
+                        sha256=existing.sha256,
+                        size_bytes=existing.size_bytes,
+                        pinned=existing.pinned,
+                        text_content=None,
+                        image_rel_path=rel_p,
+                        mime_type=existing.mime_type,
+                    )
+                except Exception as e:
+                    logger.warning("Error updating deduplicated image item in DB: %s", e)
             return {
                 "success": True,
                 "status": "DEDUPLICATED",
@@ -395,6 +546,25 @@ class ClipboardRingBuffer:
         self._items.insert(0, item)
         self._synced_devices.setdefault(digest, set()).add(source_device_id)
 
+        if self.db_manager and hasattr(self.db_manager, "save_clipboard_item"):
+            try:
+                self.db_manager.save_clipboard_item(
+                    item_id=item.item_id,
+                    content_type="image",
+                    preview=item.preview,
+                    source_device_id=item.source_device_id,
+                    source_device_name=item.source_device_name,
+                    timestamp=item.timestamp,
+                    sha256=item.sha256,
+                    size_bytes=item.size_bytes,
+                    pinned=item.pinned,
+                    text_content=None,
+                    image_rel_path=target_path.name,
+                    mime_type=item.mime_type,
+                )
+            except Exception as e:
+                logger.warning("Error saving new image item to DB: %s", e)
+
         return {
             "success": True,
             "status": "ADDED",
@@ -416,6 +586,11 @@ class ClipboardRingBuffer:
                         "error": f"Maximum pinned items limit ({self.max_pinned}) reached. Unpin an item first.",
                     }
                 item.pinned = True
+                if self.db_manager and hasattr(self.db_manager, "update_clipboard_pinned"):
+                    try:
+                        self.db_manager.update_clipboard_pinned(item_id, True)
+                    except Exception as e:
+                        logger.warning("Error updating pinned state in DB: %s", e)
                 return {"success": True, "status": "PINNED", "item": item.to_metadata()}
 
         return {"success": False, "status": "ITEM_NOT_FOUND", "error": f"Item '{item_id}' not found."}
@@ -425,6 +600,11 @@ class ClipboardRingBuffer:
         for item in self._items:
             if item.item_id == item_id:
                 item.pinned = False
+                if self.db_manager and hasattr(self.db_manager, "update_clipboard_pinned"):
+                    try:
+                        self.db_manager.update_clipboard_pinned(item_id, False)
+                    except Exception as e:
+                        logger.warning("Error updating pinned state in DB: %s", e)
                 return {"success": True, "status": "UNPINNED", "item": item.to_metadata()}
 
         return {"success": False, "status": "ITEM_NOT_FOUND", "error": f"Item '{item_id}' not found."}
@@ -435,6 +615,11 @@ class ClipboardRingBuffer:
             if item.item_id == item_id:
                 removed = self._items.pop(idx)
                 self._cleanup_item_files(removed)
+                if self.db_manager and hasattr(self.db_manager, "delete_clipboard_item"):
+                    try:
+                        self.db_manager.delete_clipboard_item(item_id)
+                    except Exception as e:
+                        logger.warning("Error deleting item %s from DB: %s", item_id, e)
                 return {"success": True, "status": "DELETED", "item_id": item_id}
 
         return {"success": False, "status": "ITEM_NOT_FOUND", "error": f"Item '{item_id}' not found."}
@@ -461,6 +646,12 @@ class ClipboardRingBuffer:
                 cleared_count += 1
             self._items.clear()
             self._synced_devices.clear()
+
+        if self.db_manager and hasattr(self.db_manager, "clear_clipboard_items"):
+            try:
+                self.db_manager.clear_clipboard_items(unpinned_only=unpinned_only)
+            except Exception as e:
+                logger.warning("Error clearing items from DB: %s", e)
 
         return {
             "success": True,

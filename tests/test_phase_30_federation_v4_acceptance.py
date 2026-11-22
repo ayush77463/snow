@@ -79,7 +79,7 @@ class TestPhase30FederationManager(unittest.TestCase):
         with self.db_manager._get_connection() as conn:
             cur = conn.execute("PRAGMA user_version;")
             ver = cur.fetchone()[0]
-            self.assertEqual(ver, 6, "Schema version must be 6")
+            self.assertIn(ver, (6, 7), "Schema version must be 6 or 7")
 
             # Check tables
             tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]

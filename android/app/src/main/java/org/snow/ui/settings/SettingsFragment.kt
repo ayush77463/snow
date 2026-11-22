@@ -17,6 +17,8 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import org.snow.R
@@ -282,12 +284,17 @@ class SettingsFragment : Fragment() {
         }
     }
 
+    private var isProgrammaticSwitchUpdate = false
+
     private fun setupPeerHostControls() {
         val enabled = viewModel.isPeerHostEnabled()
+        isProgrammaticSwitchUpdate = true
         binding.swPeerHostMode.isChecked = enabled
+        isProgrammaticSwitchUpdate = false
         updatePeerHostUi()
 
         binding.swPeerHostMode.setOnCheckedChangeListener { _, isChecked ->
+            if (isProgrammaticSwitchUpdate) return@setOnCheckedChangeListener
             if (isChecked) {
                 viewModel.startPeerHost()
             } else {
@@ -312,30 +319,42 @@ class SettingsFragment : Fragment() {
         }
 
         binding.btnStopPeerHost.setOnClickListener {
+            isProgrammaticSwitchUpdate = true
             binding.swPeerHostMode.isChecked = false
+            isProgrammaticSwitchUpdate = false
             viewModel.stopPeerHost()
             updatePeerHostUi()
         }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.peerHostState.collect { state ->
+                    updatePeerHostStateUi(state)
+                }
+            }
+        }
     }
 
-    private fun updatePeerHostUi() {
+    private fun updatePeerHostStateUi(state: org.snow.network.PeerHostState) {
         if (_binding == null) return
         val enabled = viewModel.isPeerHostEnabled()
-        val isActive = viewModel.isPeerHostActive()
-        val port = viewModel.getPeerHostPort()
-        val connCount = viewModel.getPeerHostConnectionCount()
-
-        if (isActive) {
-            binding.tvPeerHostStatus.text = "Status: ACTIVE"
+        val desiredChecked = state.isActive || enabled
+        if (binding.swPeerHostMode.isChecked != desiredChecked) {
+            isProgrammaticSwitchUpdate = true
+            binding.swPeerHostMode.isChecked = desiredChecked
+            isProgrammaticSwitchUpdate = false
+        }
+        if (state.isActive) {
+            binding.tvPeerHostStatus.text = "Status: ACTIVE (TLS/WSS)"
             binding.tvPeerHostStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
-            binding.tvPeerHostEndpoint.text = "Endpoint: Port $port (TLS/WSS)"
-            binding.tvPeerHostConnections.text = "Connected Peers: $connCount"
+            binding.tvPeerHostEndpoint.text = "Endpoint: ${state.ipAddress}:${state.port}"
+            binding.tvPeerHostConnections.text = "Connected Peers: ${state.peerCount}"
             binding.btnStopPeerHost.visibility = View.VISIBLE
             binding.btnGeneratePeerPin.isEnabled = true
         } else if (enabled) {
             binding.tvPeerHostStatus.text = "Status: STARTING"
             binding.tvPeerHostStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
-            binding.tvPeerHostEndpoint.text = "Endpoint: Starting on port $port..."
+            binding.tvPeerHostEndpoint.text = "Endpoint: Starting on port ${state.port}..."
             binding.tvPeerHostConnections.text = "Connected Peers: 0"
             binding.btnStopPeerHost.visibility = View.VISIBLE
             binding.btnGeneratePeerPin.isEnabled = false
@@ -349,6 +368,17 @@ class SettingsFragment : Fragment() {
             binding.tvPeerHostPin.visibility = View.GONE
             binding.tvPeerHostPinExpiry.visibility = View.GONE
         }
+        if (state.pairingPin != null) {
+            binding.tvPeerHostPin.text = "PIN: ${state.pairingPin}"
+            binding.tvPeerHostPinExpiry.text = "Validity: 5 minutes"
+            binding.tvPeerHostPin.visibility = View.VISIBLE
+            binding.tvPeerHostPinExpiry.visibility = View.VISIBLE
+        }
+    }
+
+    private fun updatePeerHostUi() {
+        if (_binding == null) return
+        updatePeerHostStateUi(viewModel.peerHostState.value)
     }
 
     private fun updateRemoteRelayStatusText(enabled: Boolean, endpoint: String) {

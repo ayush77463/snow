@@ -167,6 +167,8 @@ class SnowWebSocketServer:
         self._last_local_write_seq: int = 0
         self._clipboard_listener: Optional[WindowsClipboardListener] = None
         self._clipboard_watchdog_task: Optional[asyncio.Task] = None
+        self._clipboard_debounce_task: Optional[asyncio.Task] = None
+        self._last_processed_clipboard_hash: str = ""
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Phase 21: Live in-memory notification cache (strictly never persisted to disk)
         self.live_notifications: dict[str, list[dict[str, Any]]] = {}
@@ -288,6 +290,10 @@ class SnowWebSocketServer:
             # Start background reaper task for stale client connections
             self._reaper_task = asyncio.create_task(self._stale_connection_reaper())
 
+            # Start Windows clipboard format listener and sequence watchdog on startup
+            if sys.platform == "win32":
+                self.start_clipboard_listener()
+
             # Generate initial pairing PIN and display to sys.stderr
             self.pairing_manager.generate_pin(display_to_stderr=True)
         except Exception as exc:
@@ -317,15 +323,7 @@ class SnowWebSocketServer:
                 cb_task.cancel()
         self._clipboard_sync_tasks.clear()
         self._last_synced_clipboard_hash.clear()
-        if self._clipboard_listener:
-            try:
-                self._clipboard_listener.stop()
-            except Exception:
-                pass
-            self._clipboard_listener = None
-        if self._clipboard_watchdog_task and not self._clipboard_watchdog_task.done():
-            self._clipboard_watchdog_task.cancel()
-            self._clipboard_watchdog_task = None
+        self.stop_clipboard_listener()
         self._active_sync_connections.clear()
 
         # Cancel background stale connection reaper
@@ -2366,6 +2364,61 @@ class SnowWebSocketServer:
         )
         await client.websocket.send(response.to_json())
 
+    def start_clipboard_listener(self) -> bool:
+        """Start the Windows clipboard listener and watchdog."""
+        if sys.platform != "win32":
+            return False
+        if self._clipboard_listener and getattr(self._clipboard_listener, "_is_running", False):
+            return True
+        try:
+            self._clipboard_listener = WindowsClipboardListener(
+                self._on_windows_clipboard_update_from_thread
+            )
+            success = self._clipboard_listener.start()
+            if success:
+                logger.info("WindowsClipboardListener successfully attached.")
+            else:
+                if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
+                    self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
+            return success
+        except Exception as exc:
+            logger.warning("Failed starting WindowsClipboardListener: %s", exc)
+            return False
+
+    def stop_clipboard_listener(self) -> None:
+        """Stop the Windows clipboard listener and watchdog."""
+        if self._clipboard_debounce_task and not self._clipboard_debounce_task.done():
+            self._clipboard_debounce_task.cancel()
+            self._clipboard_debounce_task = None
+        if self._clipboard_watchdog_task:
+            self._clipboard_watchdog_task.cancel()
+            self._clipboard_watchdog_task = None
+        if self._clipboard_listener:
+            try:
+                self._clipboard_listener.stop()
+            except Exception:
+                pass
+            self._clipboard_listener = None
+
+    async def broadcast_clipboard_buffer_event(self, item_metadata: dict[str, Any]) -> None:
+        """Broadcast clipboard_buffer_updated event to all authenticated clients."""
+        msg = SnowMessage.create_request(
+            action="clipboard_buffer_updated",
+            data={"item": item_metadata},
+        )
+        payload_str = msg.to_json()
+        for conn_id in self.connection_manager.all_connections():
+            client = self.connection_manager.get(conn_id)
+            if not client or not client.websocket or getattr(client.websocket, "state", 1) != 1:
+                continue
+            session = self.session_manager.get_session_by_connection(conn_id)
+            if session is None:
+                continue
+            try:
+                await client.websocket.send(payload_str)
+            except Exception as exc:
+                logger.debug("Failed sending clipboard_buffer_updated to client [%s]: %s", conn_id, exc)
+
     async def _handle_desktop_clipboard_sync_toggle(
         self,
         client,
@@ -2378,29 +2431,10 @@ class SnowWebSocketServer:
         enabled = bool(data.get("enabled", False))
         if enabled:
             self._active_sync_connections.add(client.connection_id)
-            if sys.platform == "win32":
-                if not self._clipboard_listener:
-                    try:
-                        self._clipboard_listener = WindowsClipboardListener(
-                            self._on_windows_clipboard_update_from_thread
-                        )
-                        self._clipboard_listener.start()
-                    except Exception as err:
-                        logger.warning("Could not start WindowsClipboardListener: %s", err)
-                if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
-                    self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
+            if sys.platform == "win32" and not self._clipboard_listener:
+                self.start_clipboard_listener()
         else:
             self._active_sync_connections.discard(client.connection_id)
-            if not self._active_sync_connections:
-                if self._clipboard_listener:
-                    try:
-                        self._clipboard_listener.stop()
-                    except Exception:
-                        pass
-                    self._clipboard_listener = None
-                if self._clipboard_watchdog_task and not self._clipboard_watchdog_task.done():
-                    self._clipboard_watchdog_task.cancel()
-                    self._clipboard_watchdog_task = None
 
         response = SnowMessage.create_response(
             correlation_id=message.id,
@@ -2452,13 +2486,23 @@ class SnowWebSocketServer:
     def _on_windows_clipboard_update_from_thread(self) -> None:
         """Invoked from Win32 clipboard listener thread on WM_CLIPBOARDUPDATE."""
         if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._broadcast_clipboard_update(), self._loop)
+            asyncio.run_coroutine_threadsafe(self._schedule_debounced_clipboard_update(), self._loop)
+
+    async def _schedule_debounced_clipboard_update(self) -> None:
+        """Debounce rapid clipboard updates by ~200ms."""
+        if self._clipboard_debounce_task and not self._clipboard_debounce_task.done():
+            self._clipboard_debounce_task.cancel()
+        self._clipboard_debounce_task = asyncio.create_task(self._debounced_clipboard_handler())
+
+    async def _debounced_clipboard_handler(self) -> None:
+        try:
+            await asyncio.sleep(0.2)
+            await self._broadcast_clipboard_update()
+        except asyncio.CancelledError:
+            pass
 
     async def _broadcast_clipboard_update(self) -> None:
-        """Broadcast desktop clipboard updates to authenticated clients with Instant Sync enabled."""
-        if not self._active_sync_connections:
-            return
-
+        """Process desktop clipboard update, update shared ring buffer, and broadcast to clients."""
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -2474,75 +2518,134 @@ class SnowWebSocketServer:
 
         c_type = content.get("type")
         c_hash = content.get("sha256")
-        if not c_hash:
+        if not c_hash or c_type == "empty":
             return
 
-        for conn_id in list(self._active_sync_connections):
-            client = self.connection_manager.get(conn_id)
-            if not client or not client.websocket or getattr(client.websocket, "state", 1) != 1:
-                self._active_sync_connections.discard(conn_id)
-                continue
-            session = self.session_manager.get_session_by_connection(conn_id)
-            if session is None:
-                continue
+        # Echo suppression check: if hash is identical to last processed hash, skip
+        if c_hash == getattr(self, "_last_processed_clipboard_hash", ""):
+            return
+        self._last_processed_clipboard_hash = c_hash
 
-            if self._last_synced_clipboard_hash.get(conn_id) == c_hash:
-                continue
+        temp_capture_file = content.get("file_path") if c_type == "image" else None
+        try:
+            # Add to shared clipboard buffer
+            buffer_item = None
+            cb_buf = getattr(self, "clipboard_buffer", None) or getattr(self.capability_engine, "clipboard_buffer", None)
+            if cb_buf:
+                if c_type == "text":
+                    res = cb_buf.add_text(
+                        text=content.get("text", ""),
+                        source_device_id="desktop_windows",
+                        source_device_name="Windows PC",
+                    )
+                    if res.get("success") and res.get("item"):
+                        buffer_item = res["item"]
+                elif c_type == "image":
+                    file_path = content.get("file_path")
+                    if file_path and Path(file_path).is_file():
+                        img_bytes = Path(file_path).read_bytes()
+                        res = cb_buf.add_image(
+                            image_bytes=img_bytes,
+                            mime_type=content.get("mime_type") or "image/png",
+                            source_device_id="desktop_windows",
+                            source_device_name="Windows PC",
+                        )
+                        if res.get("success") and res.get("item"):
+                            buffer_item = res["item"]
 
-            self._last_synced_clipboard_hash[conn_id] = c_hash
+            # Broadcast clipboard_buffer_updated event with lightweight metadata to all connected clients
+            if buffer_item:
+                await self.broadcast_clipboard_buffer_event(buffer_item)
 
-            if c_type == "text":
-                text = content.get("text", "")
-                if len(text.encode("utf-8")) > 65536:
+            # Broadcast full push to clients with Instant Sync enabled
+            if not self._active_sync_connections:
+                return
+
+            for conn_id in list(self._active_sync_connections):
+                client = self.connection_manager.get(conn_id)
+                if not client or not client.websocket or getattr(client.websocket, "state", 1) != 1:
+                    self._active_sync_connections.discard(conn_id)
                     continue
-                push_msg = SnowMessage.create_request(
-                    action="clipboard_push",
-                    data={"type": "text", "text": text, "sha256": c_hash},
-                )
-                try:
-                    await client.websocket.send(push_msg.to_json())
-                    logger.info("Event-pushed desktop clipboard text to [%s] (%d chars)", conn_id, len(text))
-                except Exception as err:
-                    logger.warning("Failed sending clipboard text push to [%s]: %s", conn_id, err, exc_info=True)
+                session = self.session_manager.get_session_by_connection(conn_id)
+                if session is None:
+                    continue
 
-            elif c_type == "image":
-                file_path = content.get("file_path")
-                file_name = content.get("file_name", "clipboard.png")
-                file_size = content.get("size", 0)
-                bound_port = (
-                    self.http_transfer_server.bound_port
-                    if self.http_transfer_server
-                    else self.config.transfer_port
-                )
-                device_id = getattr(session, "device_id", None) or "device"
-                record = self.transfer_manager.create_transfer(
-                    device_id=device_id,
-                    file_name=file_name,
-                    file_size=file_size,
-                    sha256=c_hash,
-                    direction=TransferDirection.DOWNLOAD,
-                )
-                record.file_path = file_path
-                record.status = TransferState.IN_PROGRESS
+                if self._last_synced_clipboard_hash.get(conn_id) == c_hash:
+                    continue
 
-                push_msg = SnowMessage.create_request(
-                    action="clipboard_push",
-                    data={
-                        "type": "image",
-                        "mime_type": "image/png",
-                        "transfer_id": record.transfer_id,
-                        "file_name": file_name,
-                        "sha256": c_hash,
-                        "size": file_size,
-                        "transfer_port": bound_port,
-                        "transfer_url": f"/api/v1/transfers/download/{record.transfer_id}",
-                    },
-                )
+                self._last_synced_clipboard_hash[conn_id] = c_hash
+
+                if c_type == "text":
+                    text = content.get("text", "")
+                    if len(text.encode("utf-8")) > 65536:
+                        continue
+                    push_msg = SnowMessage.create_request(
+                        action="clipboard_push",
+                        data={"type": "text", "text": text, "sha256": c_hash},
+                    )
+                    try:
+                        await client.websocket.send(push_msg.to_json())
+                        logger.info("Event-pushed desktop clipboard text to [%s] (%d chars)", conn_id, len(text))
+                    except Exception as err:
+                        logger.warning("Failed sending clipboard text push to [%s]: %s", conn_id, err, exc_info=True)
+
+                elif c_type == "image":
+                    file_path = content.get("file_path")
+                    file_name = content.get("file_name", "clipboard.png")
+                    file_size = content.get("size", 0)
+                    bound_port = (
+                        self.http_transfer_server.bound_port
+                        if self.http_transfer_server
+                        else self.config.transfer_port
+                    )
+                    device_id = getattr(session, "device_id", None) or "device"
+                    record = self.transfer_manager.create_transfer(
+                        device_id=device_id,
+                        file_name=file_name,
+                        file_size=file_size,
+                        sha256=c_hash,
+                        direction=TransferDirection.DOWNLOAD,
+                    )
+                    # Point transfer record to persistent clipboard buffer storage if available
+                    if buffer_item and cb_buf:
+                        persistent_path = cb_buf.get_image_path(buffer_item["item_id"])
+                        if persistent_path and persistent_path.exists():
+                            record.file_path = str(persistent_path)
+                        else:
+                            record.file_path = file_path
+                    else:
+                        record.file_path = file_path
+                    record.status = TransferState.IN_PROGRESS
+
+                    push_msg = SnowMessage.create_request(
+                        action="clipboard_push",
+                        data={
+                            "type": "image",
+                            "mime_type": "image/png",
+                            "transfer_id": record.transfer_id,
+                            "file_name": file_name,
+                            "sha256": c_hash,
+                            "size": file_size,
+                            "transfer_port": bound_port,
+                            "transfer_url": f"/api/v1/transfers/download/{record.transfer_id}",
+                        },
+                    )
+                    try:
+                        await client.websocket.send(push_msg.to_json())
+                        logger.info("Event-pushed desktop clipboard image to [%s] (%d bytes)", conn_id, file_size)
+                    except Exception as err:
+                        logger.warning("Failed sending clipboard image push to [%s]: %s", conn_id, err, exc_info=True)
+        finally:
+            if temp_capture_file and Path(temp_capture_file).is_file():
                 try:
-                    await client.websocket.send(push_msg.to_json())
-                    logger.info("Event-pushed desktop clipboard image to [%s] (%d bytes)", conn_id, file_size)
-                except Exception as err:
-                    logger.warning("Failed sending clipboard image push to [%s]: %s", conn_id, err, exc_info=True)
+                    import tempfile
+                    temp_p = Path(temp_capture_file).resolve()
+                    temp_dir = Path(tempfile.gettempdir()).resolve()
+                    # Only remove if strictly inside the system temp directory, never touch buffer directory
+                    if temp_dir in temp_p.parents or temp_p.parent == temp_dir:
+                        temp_p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     async def _clipboard_sequence_watchdog(self) -> None:
         """Periodic watchdog polling GetClipboardSequenceNumber as a backup to WindowsClipboardListener."""
@@ -2552,16 +2655,16 @@ class SnowWebSocketServer:
         user32 = ctypes.windll.user32
         user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
         last_seq = user32.GetClipboardSequenceNumber()
-        while self._active_sync_connections:
+        while self._is_running:
             try:
                 await asyncio.sleep(0.4)
-                if not self._active_sync_connections:
+                if not self._is_running:
                     break
                 curr_seq = user32.GetClipboardSequenceNumber()
                 if curr_seq != last_seq:
                     last_seq = curr_seq
                     if curr_seq != getattr(self, "_last_local_write_seq", 0):
-                        await self._broadcast_clipboard_update()
+                        await self._schedule_debounced_clipboard_update()
             except asyncio.CancelledError:
                 break
             except Exception as err:

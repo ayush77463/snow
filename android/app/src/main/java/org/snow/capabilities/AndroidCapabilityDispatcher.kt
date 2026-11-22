@@ -81,12 +81,18 @@ class AndroidCapabilityDispatcher(
                         "remediation_hint" to "Bring SNOW to the foreground on the Android device."
                     )
                 }
-                if (!ClipboardHandler.isUserIntentGranted) {
+                val instantSyncEnabled = try {
+                    context.getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, android.content.Context.MODE_PRIVATE)
+                        ?.getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_INSTANT_SYNC, false) ?: false
+                } catch (_: Exception) {
+                    false
+                }
+                if (!ClipboardHandler.isUserIntentGranted && !instantSyncEnabled) {
                     return mapOf(
                         "success" to false,
                         "status" to "USER_CONFIRMATION_REQUIRED",
                         "error" to "Explicit user confirmation is required to read Android clipboard.",
-                        "remediation_hint" to "Confirm clipboard read intent on the Android device."
+                        "remediation_hint" to "Confirm clipboard read intent on the Android device or enable Instant Sync in settings."
                     )
                 }
             }
@@ -165,6 +171,12 @@ class AndroidCapabilityDispatcher(
                 } else {
                     Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = res["error"] as? String ?: "Ring failed"))
                 }
+            }
+            "clipboard_buffer_updated" -> {
+                try {
+                    org.snow.ui.SnowUiRepository.getInstance(context).fetchClipboardBuffer()
+                } catch (_: Exception) {}
+                Pair(mapOf("status" to "success", "action" to "clipboard_buffer_updated"), null)
             }
             "clipboard_push" -> {
                 val type = data?.get("type") as? String

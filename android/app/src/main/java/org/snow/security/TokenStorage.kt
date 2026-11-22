@@ -93,6 +93,7 @@ class SharedPreferencesTokenStorage(
 
     companion object {
         const val PREFS_NAME = "snow_security"
+        const val PEER_HOST_PREFS_NAME = "snow_peer_host_security"
         private const val TAG = "TokenStorage"
 
         // Encrypted storage keys

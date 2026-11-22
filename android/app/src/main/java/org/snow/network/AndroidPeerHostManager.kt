@@ -1,10 +1,30 @@
 package org.snow.network
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.snow.capabilities.AndroidCapabilityDispatcher
+import org.snow.security.AndroidSelfSignedCertGenerator
 import org.snow.security.SafeLog
 import org.snow.security.TokenStorage
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Live reactive state of the Android Direct Peer-Host service.
+ */
+data class PeerHostState(
+    val isActive: Boolean = false,
+    val ipAddress: String = "--",
+    val port: Int = AndroidPeerHostManager.DEFAULT_HOST_PORT,
+    val certFingerprint: String = "--",
+    val peerCount: Int = 0,
+    val pairingPin: String? = null,
+    val pinExpiresInSeconds: Long = 0L,
+    val errorMessage: String? = null
+)
 
 /**
  * Manages the lifecycle, reachability state, and socket bounds for Android Foreground Peer Host Mode.
@@ -14,6 +34,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Does not claim availability or host mode when stopped.
  * - Advertises ReachabilityProfile.FOREGROUND_HOST only when actively listening.
  * - Shuts down server sockets cleanly upon app/service lifecycle transitions.
+ * - Exposes reactive [hostState] Flow for UI observation.
+ * - Enforces mandatory TLS 1.2+ WSS via [AndroidSelfSignedCertGenerator].
  */
 class AndroidPeerHostManager {
 
@@ -21,11 +43,6 @@ class AndroidPeerHostManager {
         private const val TAG = "AndroidPeerHostManager"
         const val DEFAULT_HOST_PORT = 8767
         const val PIN_VALIDITY_MS = 300_000L // 5 minutes
-
-        /**
-         * Deprecated quarantine flag.
-         * In Phase 27, Direct Phone-to-Phone Host Mode is governed by explicit user setting (default OFF).
-         */
         const val IS_QUARANTINED = false
     }
 
@@ -41,11 +58,35 @@ class AndroidPeerHostManager {
     private var currentEphemeralPin: EphemeralPin? = null
     private val secureRandom = java.security.SecureRandom()
 
+    private val _hostState = MutableStateFlow(PeerHostState())
+    val hostState: StateFlow<PeerHostState> = _hostState.asStateFlow()
+
     var activePort: Int = DEFAULT_HOST_PORT
         private set
 
     val activeConnectionCount: Int
         get() = server?.getActiveConnectionCount() ?: 0
+
+    /**
+     * Resolve the active non-loopback IPv4 address for Wi-Fi or Hotspot interfaces.
+     */
+    fun getLocalIpv4Address(): String? {
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (iface in interfaces) {
+                if (iface.isLoopback || !iface.isUp) continue
+                for (addr in iface.inetAddresses) {
+                    if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                        val host = addr.hostAddress
+                        if (!host.isNullOrBlank() && host != "127.0.0.1") {
+                            return host
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return null
+    }
 
     /**
      * User-controlled setting to opt into Direct Phone-to-Phone Host Mode.
@@ -72,6 +113,10 @@ class AndroidPeerHostManager {
             pin = pinVal,
             expiresAtMillis = System.currentTimeMillis() + PIN_VALIDITY_MS,
             isConsumed = false
+        )
+        _hostState.value = _hostState.value.copy(
+            pairingPin = pinVal,
+            pinExpiresInSeconds = 300L
         )
         SafeLog.i(TAG, "Generated ephemeral 6-digit pairing PIN (valid for 5 minutes)")
         return pinVal
@@ -100,10 +145,12 @@ class AndroidPeerHostManager {
         if (System.currentTimeMillis() > pinObj.expiresAtMillis) {
             SafeLog.w(TAG, "Pairing PIN has expired.")
             currentEphemeralPin = null
+            _hostState.value = _hostState.value.copy(pairingPin = null, pinExpiresInSeconds = 0L)
             return false
         }
         if (pinObj.pin == inputPin.trim()) {
             pinObj.isConsumed = true
+            _hostState.value = _hostState.value.copy(pairingPin = null, pinExpiresInSeconds = 0L)
             SafeLog.i(TAG, "Pairing PIN successfully verified and consumed.")
             return true
         }
@@ -112,7 +159,7 @@ class AndroidPeerHostManager {
     }
 
     /**
-     * Enable foreground peer host mode, starting the listening server.
+     * Enable foreground peer host mode, starting the listening server with mandatory TLS.
      * Requires hostModeSettingEnabled == true.
      */
     @Synchronized
@@ -141,6 +188,14 @@ class AndroidPeerHostManager {
 
         disableHostMode()
 
+        val certResult = try {
+            AndroidSelfSignedCertGenerator.generate()
+        } catch (e: Exception) {
+            SafeLog.e(TAG, "Failed generating TLS certificate for peer host: ${e.message}", e)
+            _hostState.value = _hostState.value.copy(isActive = false, errorMessage = "TLS generation failed: ${e.message}")
+            return false
+        }
+
         val newServer = AndroidPeerHostServer(
             requestedPort = port,
             tokenStorage = tokenStorage,
@@ -148,7 +203,9 @@ class AndroidPeerHostManager {
             localDeviceId = localDeviceId,
             manifestProvider = manifestProvider,
             peerTokenValidator = peerTokenValidator,
-            parentScope = parentScope
+            pinVerifier = { verifyAndConsumePairingPin(it) },
+            parentScope = parentScope,
+            sslContext = certResult.sslContext
         )
 
         val success = newServer.start()
@@ -156,11 +213,23 @@ class AndroidPeerHostManager {
             server = newServer
             activePort = newServer.boundPort
             isRunning.set(true)
-            SafeLog.i(TAG, "Foreground host mode enabled on port $activePort")
+            val ip = getLocalIpv4Address() ?: "127.0.0.1"
+            _hostState.value = PeerHostState(
+                isActive = true,
+                ipAddress = ip,
+                port = activePort,
+                certFingerprint = certResult.fingerprint,
+                peerCount = 0,
+                pairingPin = currentEphemeralPin?.pin,
+                pinExpiresInSeconds = if (currentEphemeralPin != null) 300L else 0L,
+                errorMessage = null
+            )
+            SafeLog.i(TAG, "Foreground host mode enabled on $ip:$activePort (TLS WSS)")
         } else {
             newServer.stop()
             server = null
             isRunning.set(false)
+            _hostState.value = _hostState.value.copy(isActive = false, errorMessage = "Failed to bind port $port")
             SafeLog.e(TAG, "Failed to enable foreground host mode on port $port")
         }
         return success
@@ -173,6 +242,7 @@ class AndroidPeerHostManager {
     fun disableHostMode() {
         currentEphemeralPin = null
         if (!isRunning.getAndSet(false) && server == null) {
+            _hostState.value = PeerHostState(isActive = false, ipAddress = "--", port = activePort)
             return
         }
         SafeLog.i(TAG, "Disabling foreground peer host mode...")
@@ -182,6 +252,16 @@ class AndroidPeerHostManager {
             SafeLog.w(TAG, "Error stopping peer host server: ${e.message}")
         }
         server = null
+        _hostState.value = PeerHostState(
+            isActive = false,
+            ipAddress = "--",
+            port = activePort,
+            certFingerprint = "--",
+            peerCount = 0,
+            pairingPin = null,
+            pinExpiresInSeconds = 0L,
+            errorMessage = null
+        )
         SafeLog.i(TAG, "Foreground peer host mode disabled.")
     }
 

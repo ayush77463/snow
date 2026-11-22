@@ -52,6 +52,23 @@ class Phase27PeerHostTest {
     private class TestWsClient(uri: URI) : WebSocketClient(uri) {
         val messages = LinkedBlockingQueue<String>()
 
+        init {
+            if (uri.scheme.equals("wss", ignoreCase = true)) {
+                val trustAll = arrayOf<javax.net.ssl.TrustManager>(object : javax.net.ssl.X509TrustManager {
+                    override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                    override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                    override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
+                })
+                val sc = javax.net.ssl.SSLContext.getInstance("TLS")
+                sc.init(null, trustAll, java.security.SecureRandom())
+                setSocketFactory(sc.socketFactory)
+            }
+        }
+
+        override fun onSetSSLParameters(sslParameters: javax.net.ssl.SSLParameters) {
+            sslParameters.endpointIdentificationAlgorithm = null
+        }
+
         override fun onOpen(handshakedata: ServerHandshake?) {}
         override fun onMessage(message: String) { messages.offer(message) }
         override fun onClose(code: Int, reason: String?, remote: Boolean) {}
@@ -160,7 +177,7 @@ class Phase27PeerHostTest {
             parentScope = testScope
         )
 
-        val client = TestWsClient(URI("ws://127.0.0.1:$testPort"))
+        val client = TestWsClient(URI("wss://127.0.0.1:$testPort"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         // Authenticate with valid token
@@ -194,7 +211,7 @@ class Phase27PeerHostTest {
             parentScope = testScope
         )
 
-        val client = TestWsClient(URI("ws://127.0.0.1:$testPort"))
+        val client = TestWsClient(URI("wss://127.0.0.1:$testPort"))
         assertTrue("WebSocket client should connect", client.connectBlocking(5, TimeUnit.SECONDS))
 
         // Authenticate with invalid token

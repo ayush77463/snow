@@ -55,6 +55,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     }
 
     // --- Direct Phone-to-Phone Host Mode (Phase 27) ---
+    val peerHostState: StateFlow<org.snow.network.PeerHostState> get() = repository.peerHostState
     fun isPeerHostEnabled(): Boolean = repository.isPeerHostEnabled()
     fun isPeerHostActive(): Boolean = repository.isPeerHostActive()
     fun getPeerHostPort(): Int = repository.getPeerHostManager()?.activePort ?: 8767

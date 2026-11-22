@@ -650,6 +650,10 @@ class DashboardFragment : Fragment() {
                 text = "Copy"
                 textSize = 10f
                 setPadding(12, 4, 12, 4)
+                setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_text))
+                strokeColor = android.content.res.ColorStateList.valueOf(
+                    ContextCompat.getColor(requireContext(), R.color.card_border)
+                )
                 setOnClickListener {
                     viewModel.applyBufferItem(item) { success, msg ->
                         activity?.runOnUiThread {

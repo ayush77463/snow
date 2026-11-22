@@ -159,6 +159,7 @@ class CoreDaemonManager:
             if sys.platform == "win32":
                 creation_flags |= CREATE_NO_WINDOW | DETACHED_PROCESS
 
+            log_file = None
             try:
                 # Open dedicated log file for daemon output
                 log_file = open(log_path, "a", encoding="utf-8")
@@ -179,6 +180,12 @@ class CoreDaemonManager:
                     "status": "SPAWN_FAILED",
                     "error": f"Failed to spawn background SNOW Core process: {exc}",
                 }
+            finally:
+                if log_file and not log_file.closed:
+                    try:
+                        log_file.close()
+                    except Exception:
+                        pass
 
             # Bounded asynchronous polling
             deadline = time.monotonic() + self.spawn_timeout

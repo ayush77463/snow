@@ -83,6 +83,7 @@ class SnowCoreServer:
             terminal=self.windows_terminal,
             clipboard=self.windows_clipboard,
             policy=self.capability_policy,
+            db_manager=self.db_manager,
         )
         self.ws_server.core_server = self
         self.ws_server.windows_telemetry = self.windows_telemetry
@@ -494,6 +495,11 @@ class SnowCoreServer:
     def session_manager(self):
         """Return the core server's active session manager."""
         return self.ws_server.session_manager
+
+    @property
+    def clipboard_listener(self):
+        """Return the core server's active Windows clipboard listener."""
+        return getattr(self.ws_server, "_clipboard_listener", None)
 
     async def start(self) -> None:
         """Initialize the server lifecycle, enumerate interfaces, and start WebSocket listener.

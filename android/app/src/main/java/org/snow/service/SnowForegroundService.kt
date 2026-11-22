@@ -51,7 +51,8 @@ class SnowForegroundService : Service() {
             certPinStorage = certPinStorage,
             tokenStorage = tokenStorage,
             identity = identity,
-            useTls = true
+            useTls = true,
+            context = applicationContext
         )
     }
 
@@ -121,7 +122,10 @@ class SnowForegroundService : Service() {
 
     fun startPeerHost() {
         peerHostManager.setHostModeSettingEnabled(true)
-        val tokenStorage = SharedPreferencesTokenStorage(applicationContext)
+        val tokenStorage = SharedPreferencesTokenStorage(
+            applicationContext,
+            prefName = SharedPreferencesTokenStorage.PEER_HOST_PREFS_NAME
+        )
         val success = peerHostManager.enableHostMode(
             port = org.snow.network.AndroidPeerHostManager.DEFAULT_HOST_PORT,
             tokenStorage = tokenStorage,
@@ -467,6 +471,7 @@ class SnowForegroundService : Service() {
         authObserverJob = null
         discoveryManager.stopListening()
         client.disconnect()
+        client.teardown()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.cancel(NOTIFICATION_ID)

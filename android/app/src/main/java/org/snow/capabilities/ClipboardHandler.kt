@@ -21,12 +21,37 @@ class ClipboardHandler(private val context: Context) {
         private const val TAG = "ClipboardHandler"
         const val MAX_TEXT_BYTES = 64 * 1024 // 64 KiB
 
+        private val activeActivities = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+        @JvmStatic
+        fun onActivityResumed(activityName: String) {
+            activeActivities.add(activityName)
+        }
+
+        @JvmStatic
+        fun onActivityPaused(activityName: String) {
+            activeActivities.remove(activityName)
+        }
+
+        @JvmStatic
+        fun resetForegroundTracking() {
+            activeActivities.clear()
+        }
+
         /**
          * Tracks whether the SNOW application is currently in the foreground with window focus.
-         * Maintained by MainActivity lifecycle (onResume / onPause).
+         * Governed by active resumed activity count.
          */
-        @Volatile
-        var isAppInForeground: Boolean = false
+        @JvmStatic
+        var isAppInForeground: Boolean
+            get() = activeActivities.isNotEmpty()
+            set(value) {
+                if (value) {
+                    activeActivities.add("legacy_manual")
+                } else {
+                    activeActivities.clear()
+                }
+            }
 
         /**
          * Tracks whether an explicit user action has authorized a clipboard read.
