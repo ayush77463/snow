@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import sys
 import threading
@@ -378,6 +379,9 @@ def create_qr_pairing_payload(
     version: int = 1,
     trust_tier: str = "owner",
     allow_usb_loopback: bool = False,
+    relay_url: Optional[str] = None,
+    relay_ticket: Optional[str] = None,
+    group_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Construct a validated QR pairing payload for SNOW zero-friction onboarding.
 
@@ -389,7 +393,10 @@ def create_qr_pairing_payload(
       "port": 8765,
       "fp": "<sha256_cert_fingerprint>",
       "pin": "<six_digit_pin>",
-      "tier": "owner"
+      "tier": "owner",
+      "relay_url": "<optional_relay_endpoint>",
+      "relay_ticket": "<optional_short_lived_ticket>",
+      "group_id": "<optional_group_id>"
     }
     """
     if version != 1:
@@ -438,7 +445,7 @@ def create_qr_pairing_payload(
         raise ValueError("At least one reachable, non-loopback candidate IPv4 address is required for QR pairing.")
 
     clean_tier = "peer" if str(trust_tier).lower() == "peer" else "owner"
-    return {
+    payload: dict[str, Any] = {
         "v": 1,
         "id": clean_id,
         "ips": filtered_ips,
@@ -447,6 +454,32 @@ def create_qr_pairing_payload(
         "pin": clean_pin,
         "tier": clean_tier,
     }
+
+    if relay_url is not None:
+        clean_url = str(relay_url).strip()
+        if not (clean_url.startswith("wss://") or clean_url.startswith("ws://") or clean_url.startswith("https://") or clean_url.startswith("http://")):
+            raise ValueError(f"Invalid relay_url scheme: '{clean_url}'. Expected wss:// or ws://.")
+        if any(c in clean_url for c in (" ", "\n", "\r", "\t", "<", ">", '"')):
+            raise ValueError(f"Malformed relay_url: '{clean_url}'.")
+        payload["relay_url"] = clean_url
+
+    if relay_ticket is not None:
+        clean_ticket = str(relay_ticket).strip()
+        if len(clean_ticket) < 8 or len(clean_ticket) > 512:
+            raise ValueError("relay_ticket must be between 8 and 512 characters.")
+        if not re.match(r"^[a-zA-Z0-9_\-\.=/+]+$", clean_ticket):
+            raise ValueError("relay_ticket contains invalid characters.")
+        payload["relay_ticket"] = clean_ticket
+
+    if group_id is not None:
+        clean_group = str(group_id).strip()
+        if not clean_group or len(clean_group) > 128:
+            raise ValueError("group_id must be between 1 and 128 characters.")
+        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_group):
+            raise ValueError("group_id contains invalid characters.")
+        payload["group_id"] = clean_group
+
+    return payload
 
 
 def validate_qr_pairing_payload(
@@ -511,7 +544,7 @@ def validate_qr_pairing_payload(
 
     tier = str(payload.get("tier", "owner")).strip().lower()
     clean_tier = "peer" if tier == "peer" else "owner"
-    return {
+    res: dict[str, Any] = {
         "v": 1,
         "id": node_id.strip(),
         "ips": filtered_ips,
@@ -520,3 +553,32 @@ def validate_qr_pairing_payload(
         "pin": pin,
         "tier": clean_tier,
     }
+
+    raw_relay_url = payload.get("relay_url")
+    if raw_relay_url is not None:
+        clean_url = str(raw_relay_url).strip()
+        if not (clean_url.startswith("wss://") or clean_url.startswith("ws://") or clean_url.startswith("https://") or clean_url.startswith("http://")):
+            raise ValueError(f"Invalid relay_url in QR payload: '{clean_url}'. Expected wss:// or ws://.")
+        if any(c in clean_url for c in (" ", "\n", "\r", "\t", "<", ">", '"')):
+            raise ValueError(f"Malformed relay_url in QR payload: '{clean_url}'.")
+        res["relay_url"] = clean_url
+
+    raw_relay_ticket = payload.get("relay_ticket")
+    if raw_relay_ticket is not None:
+        clean_ticket = str(raw_relay_ticket).strip()
+        if len(clean_ticket) < 8 or len(clean_ticket) > 512:
+            raise ValueError("relay_ticket in QR payload must be between 8 and 512 characters.")
+        if not re.match(r"^[a-zA-Z0-9_\-\.=/+]+$", clean_ticket):
+            raise ValueError("relay_ticket in QR payload contains invalid characters.")
+        res["relay_ticket"] = clean_ticket
+
+    raw_group_id = payload.get("group_id")
+    if raw_group_id is not None:
+        clean_group = str(raw_group_id).strip()
+        if not clean_group or len(clean_group) > 128:
+            raise ValueError("group_id in QR payload must be between 1 and 128 characters.")
+        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_group):
+            raise ValueError("group_id in QR payload contains invalid characters.")
+        res["group_id"] = clean_group
+
+    return res

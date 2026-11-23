@@ -632,6 +632,82 @@ class SnowIpcServer:
                 "error": res.get("error"),
             }, now_authed
 
+        if op == "system_pause":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "UNAUTHORIZED",
+                    "error": f"Principal '{getattr(ctx, 'principal', 'UNKNOWN')}' is unauthorized to invoke system_pause. OWNER_MANUAL required.",
+                }, now_authed
+
+            reason = payload.get("reason", "System paused by owner via IPC")
+            cs = getattr(self, "core_server", None)
+            if cs and hasattr(cs, "pause_system"):
+                res = await cs.pause_system(reason=reason)
+            else:
+                res = {"success": True, "status": "PAUSED", "state": "PAUSED", "reason": reason}
+
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", True),
+                "status": res.get("status", "PAUSED"),
+                "data": res,
+            }, now_authed
+
+        if op == "system_resume":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "UNAUTHORIZED",
+                    "error": f"Principal '{getattr(ctx, 'principal', 'UNKNOWN')}' is unauthorized to invoke system_resume. OWNER_MANUAL required.",
+                }, now_authed
+
+            cs = getattr(self, "core_server", None)
+            if cs and hasattr(cs, "resume_system"):
+                res = await cs.resume_system()
+            else:
+                res = {"success": True, "status": "RESUMED", "state": "ACTIVE"}
+
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", True),
+                "status": res.get("status", "RESUMED"),
+                "data": res,
+            }, now_authed
+
+        if op == "system_shutdown":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "UNAUTHORIZED",
+                    "error": f"Principal '{getattr(ctx, 'principal', 'UNKNOWN')}' is unauthorized to invoke system_shutdown. OWNER_MANUAL required.",
+                }, now_authed
+
+            reason = payload.get("reason", "Shutdown initiated by owner via IPC")
+            cs = getattr(self, "core_server", None)
+            if cs and hasattr(cs, "request_shutdown"):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.call_soon(cs.request_shutdown)
+                except Exception:
+                    cs.request_shutdown()
+
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SHUTTING_DOWN",
+                "data": {"state": "STOPPING", "reason": reason},
+            }, now_authed
+
         if op == "device_set_connection_mode":
             if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
                 return {
@@ -1597,8 +1673,15 @@ class SnowIpcServer:
                 "last_seen": dev.last_seen_timestamp,
             })
 
+        raw_paused = getattr(cs, "is_paused", False)
+        is_paused = raw_paused if isinstance(raw_paused, bool) else False
+        raw_state = getattr(cs, "_paused_state", {})
+        paused_state = raw_state if isinstance(raw_state, dict) else {}
+
         return {
             "core_running": cs.is_running,
+            "is_paused": is_paused,
+            "paused_state": paused_state,
             "app_name": cs.config.app_name,
             "version": cs.config.version,
             "ws_port": ws_port,

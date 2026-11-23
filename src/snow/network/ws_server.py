@@ -9,6 +9,7 @@ import ipaddress
 import json
 import logging
 from pathlib import Path
+import re
 import secrets
 import ssl
 import sys
@@ -174,6 +175,15 @@ class SnowWebSocketServer:
         self.live_notifications: dict[str, list[dict[str, Any]]] = {}
         # Phase 26A: Screen streaming session metadata (control plane only, strictly no image bytes)
         self._screen_stream_sessions: dict[str, dict[str, Any]] = {}
+        # Phase 30 / Stage 4A: Cross-Network Federation Manager
+        from snow.network.federation import FederationManager
+        self.federation_manager = FederationManager(
+            db_manager=self.db_manager,
+            local_network_id=getattr(self.config, "network_id", "local-network"),
+            local_network_name=getattr(self.config, "network_name", "SNOW Network"),
+            local_node_id=getattr(self.config, "device_id", "desktop-core"),
+            local_node_name=getattr(self.config, "device_name", "Desktop Host"),
+        )
 
     def _sync_capability_engine(self) -> None:
         """Synchronize capability engine references with server attributes."""
@@ -620,6 +630,22 @@ class SnowWebSocketServer:
                 data.pop("trust_tier", None)
                 data.pop("execution_principal", None)
 
+                # Pause mode check: reject non-owner actions if Core is paused
+                cs = getattr(self, "core_server", None)
+                if cs and getattr(cs, "is_paused", False) and not is_owner:
+                    logger.warning(
+                        "Rejected action '%s' from client [%s]: Desktop Core is in PAUSE mode.",
+                        action,
+                        client.connection_id,
+                    )
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.SERVICE_UNAVAILABLE,
+                        message="SNOW Desktop Core is currently in PAUSE mode. Only OWNER_MANUAL operations are permitted.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+
                 ctx = ExecutionContext(
                     principal=principal,
                     device_id=session.device_id,
@@ -713,6 +739,16 @@ class SnowWebSocketServer:
                 await self._handle_clipboard_buffer_add(client, message, data, session)
             elif action == "clipboard_buffer_apply":
                 await self._handle_clipboard_buffer_apply(client, message, data, session)
+            elif action == "federation_create_invite":
+                await self._handle_federation_create_invite(client, message, data, session, is_owner)
+            elif action == "federation_accept_invite":
+                await self._handle_federation_accept_invite(client, message, data, session, is_owner)
+            elif action == "federation_list_grants":
+                await self._handle_federation_list_grants(client, message, data, session, is_owner)
+            elif action == "federation_revoke":
+                await self._handle_federation_revoke(client, message, data, session, is_owner)
+            elif action == "federation_kill_switch":
+                await self._handle_federation_kill_switch(client, message, data, session, is_owner)
             else:
                 logger.warning("Rejected unsupported action '%s' from client [%s]",
                                action, client.connection_id)
@@ -2872,3 +2908,225 @@ class SnowWebSocketServer:
                 break
             except Exception as exc:
                 logger.debug("Error in stale connection reaper loop: %s", exc)
+
+    # =========================================================================
+    # Phase 30 / Stage 4A: Cross-Network Federation Operations over WSS
+    # =========================================================================
+
+    async def _handle_federation_create_invite(
+        self, client: Any, message: SnowMessage, data: dict[str, Any], session: Any, is_owner: bool
+    ) -> None:
+        """Generate a 9-digit federation invitation code over authenticated Owner WSS."""
+        if not is_owner:
+            logger.warning("Denied federation_create_invite from non-owner client [%s]", client.connection_id)
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Privileged federation administration requires OWNER_MANUAL authority.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        caps = data.get("allowed_capabilities")
+        devs = data.get("allowed_device_ids")
+        ttl = data.get("ttl_seconds", 600)
+        grant_ttl = data.get("grant_ttl_seconds", 86400)
+
+        try:
+            res = self.federation_manager.create_invitation(
+                allowed_capabilities=caps,
+                allowed_device_ids=devs,
+                grant_ttl_seconds=grant_ttl,
+                ttl_seconds=ttl,
+                principal="OWNER_MANUAL",
+            )
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={"action": "federation_create_invite", **res, "status": "success"},
+            )
+            await client.websocket.send(resp.to_json())
+        except Exception as exc:
+            logger.error("Failed creating federation invitation: %s", exc)
+            err = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+
+    async def _handle_federation_accept_invite(
+        self, client: Any, message: SnowMessage, data: dict[str, Any], session: Any, is_owner: bool
+    ) -> None:
+        """Accept a 9-digit federation invitation code over authenticated Owner WSS."""
+        if not is_owner:
+            logger.warning("Denied federation_accept_invite from non-owner client [%s]", client.connection_id)
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Privileged federation administration requires OWNER_MANUAL authority.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        raw_code = data.get("code") or data.get("invite_code") or ""
+        clean_code = re.sub(r"\D", "", str(raw_code))
+        if len(clean_code) != 9:
+            err = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Federation invite code must contain exactly 9 digits (format: XXX-XXX-XXX).",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        peer_network_id = data.get("peer_network_id") or "remote-network"
+        peer_network_name = data.get("peer_network_name") or "Remote SNOW Network"
+        peer_node_id = data.get("peer_node_id") or session.device_id
+        peer_node_name = data.get("peer_node_name") or "Remote Peer"
+        peer_fp = data.get("peer_cert_fingerprint") or ""
+
+        try:
+            res = self.federation_manager.accept_invitation(
+                code=clean_code,
+                peer_network_id=peer_network_id,
+                peer_network_name=peer_network_name,
+                peer_node_id=peer_node_id,
+                peer_node_name=peer_node_name,
+                peer_cert_fingerprint=peer_fp,
+                principal="OWNER_MANUAL",
+                requester_id=session.device_id,
+            )
+            if not res.get("success"):
+                err = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD if "INVALID" in res.get("status", "") else ErrorCode.UNAUTHORIZED,
+                    message=res.get("error", "Failed to accept invitation code."),
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(err.to_json())
+                return
+
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={"action": "federation_accept_invite", **res, "status": "success"},
+            )
+            await client.websocket.send(resp.to_json())
+        except Exception as exc:
+            logger.error("Failed accepting federation invitation: %s", exc)
+            err = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+
+    async def _handle_federation_list_grants(
+        self, client: Any, message: SnowMessage, data: dict[str, Any], session: Any, is_owner: bool
+    ) -> None:
+        """List active cross-network federation grants over authenticated Owner WSS."""
+        if not is_owner:
+            logger.warning("Denied federation_list_grants from non-owner client [%s]", client.connection_id)
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Privileged federation administration requires OWNER_MANUAL authority.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        active_only = bool(data.get("active_only", False))
+        try:
+            grants = self.federation_manager.list_grants(active_only=active_only)
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={"status": "success", "action": "federation_list_grants", "grants": grants},
+            )
+            await client.websocket.send(resp.to_json())
+        except Exception as exc:
+            logger.error("Failed listing federation grants: %s", exc)
+            err = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+
+    async def _handle_federation_revoke(
+        self, client: Any, message: SnowMessage, data: dict[str, Any], session: Any, is_owner: bool
+    ) -> None:
+        """Revoke a single cross-network federation grant over authenticated Owner WSS."""
+        if not is_owner:
+            logger.warning("Denied federation_revoke from non-owner client [%s]", client.connection_id)
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Privileged federation administration requires OWNER_MANUAL authority.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        grant_id = data.get("grant_id")
+        if not grant_id:
+            err = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Missing required 'grant_id'.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        reason = data.get("reason", "Revoked by network owner via WSS")
+        try:
+            res = self.federation_manager.revoke_grant(grant_id, reason=reason, principal="OWNER_MANUAL")
+            if not res.get("success"):
+                err = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD,
+                    message=res.get("error", "Grant not found."),
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(err.to_json())
+                return
+
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={"action": "federation_revoke", **res, "status": "success"},
+            )
+            await client.websocket.send(resp.to_json())
+        except Exception as exc:
+            logger.error("Failed revoking federation grant: %s", exc)
+            err = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+
+    async def _handle_federation_kill_switch(
+        self, client: Any, message: SnowMessage, data: dict[str, Any], session: Any, is_owner: bool
+    ) -> None:
+        """Activate the emergency global federation kill switch over authenticated Owner WSS."""
+        if not is_owner:
+            logger.warning("Denied federation_kill_switch from non-owner client [%s]", client.connection_id)
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Privileged federation administration requires OWNER_MANUAL authority.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        reason = data.get("reason", "Emergency Global Kill Switch Activated via Owner WSS")
+        try:
+            res = self.federation_manager.global_kill_switch(reason=reason, principal="OWNER_MANUAL")
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={"action": "federation_kill_switch", **res, "status": "success"},
+            )
+            await client.websocket.send(resp.to_json())
+        except Exception as exc:
+            logger.error("Failed activating global federation kill switch: %s", exc)
+            err = SnowMessage.create_error(
+                code=ErrorCode.INTERNAL_ERROR,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())

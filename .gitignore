@@ -48,6 +48,9 @@ keystore.properties
 # Packaging and distribution
 dist/
 packaging/output/
+packaging/bin/
+bin/cloudflared.exe
+cloudflared.exe
 
 # IDE, Editor, and temporary files
 .idea/

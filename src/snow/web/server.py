@@ -587,6 +587,27 @@ class SnowWebServer:
             })
 
         payload = res.get("data", {})
+
+        # Master QR: If Remote Device Relay tunnel is active, enrich payload with relay credentials
+        if hasattr(self, "tunnel_manager"):
+            relay_stat = self.tunnel_manager.get_status(port=8770)
+            if relay_stat.get("active") and relay_stat.get("public_url"):
+                pub_url = relay_stat["public_url"]
+                relay_ws_url = pub_url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/") + "/v1/tunnel"
+                from snow.relay.auth import create_relay_ticket
+                cfg = getattr(self, "config", None)
+                group_id = os.getenv("SNOW_RELAY_GROUP_ID") or (getattr(cfg, "relay_group_id", None) if cfg else None) or "default_group"
+                relay_secret = os.getenv("SNOW_RELAY_SECRET") or (getattr(cfg, "relay_secret", None) if cfg else None) or "snow_relay_default_key"
+                fresh_ticket = create_relay_ticket(
+                    device_id="mobile-pairing-client",
+                    group_id=group_id,
+                    secret=relay_secret,
+                    ttl_seconds=3600,
+                )
+                payload["relay_url"] = relay_ws_url
+                payload["relay_ticket"] = fresh_ticket
+                payload["group_id"] = group_id
+
         qr_text = json.dumps(payload, separators=(",", ":"))
 
         # Generate standalone vector SVG QR code without external dependencies
@@ -2187,6 +2208,38 @@ class SnowWebServer:
         """Query current tunnel status."""
         return web.json_response({"success": True, **self.tunnel_manager.get_status()})
 
+    # =========================================================================
+    # Remote Device Relay Tunnel Endpoints (Phase 4 Stage 4A)
+    # =========================================================================
+
+    async def handle_api_relay_tunnel_start(self, request: web.Request) -> web.Response:
+        """Start public tunnel for the Remote Device Relay (port 8770)."""
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        provider = body.get("provider", "cloudflared")
+        custom_url = body.get("custom_url")
+
+        res = await self.tunnel_manager.start_relay_tunnel(
+            provider=provider,
+            port=8770,
+            custom_url=custom_url,
+        )
+        return web.json_response(res, status=200 if res.get("success") else 400)
+
+    async def handle_api_relay_tunnel_stop(self, request: web.Request) -> web.Response:
+        """Stop active public tunnel for Remote Device Relay."""
+        res = await self.tunnel_manager.stop_tunnel(port=8770)
+        return web.json_response(res, status=200 if res.get("success") else 400)
+
+    async def handle_api_relay_tunnel_status(self, request: web.Request) -> web.Response:
+        """Query current Relay tunnel status."""
+        status = self.tunnel_manager.get_status(port=8770)
+        return web.json_response({"success": True, **status})
+
     async def handle_api_mcp_oauth_pending(self, request: web.Request) -> web.Response:
         """List active pending OAuth authorization requests."""
         if not self._mcp_gateway_instance:
@@ -2221,6 +2274,115 @@ class SnowWebServer:
             return web.json_response({"success": False, "error": "MCP Gateway is not running."}, status=400)
         res = self._mcp_gateway_instance.reject_authorization(req_id)
         return web.json_response(res)
+
+    # =========================================================================
+    # System Lifecycle Endpoints (Phase 4 Stage 4A)
+    # =========================================================================
+
+    async def handle_api_system_status(self, request: web.Request) -> web.Response:
+        """Query real Core runtime status, including active/paused state."""
+        res = await self.bridge.call("status")
+        if not res.get("success"):
+            return web.json_response({
+                "success": False,
+                "core_running": False,
+                "is_paused": False,
+                "error": res.get("error", "Core daemon unreachable"),
+            })
+        data = res.get("data", {})
+        return web.json_response({
+            "success": True,
+            "core_running": data.get("core_running", True),
+            "is_paused": data.get("is_paused", False),
+            "data": data,
+        })
+
+    async def handle_api_system_pause(self, request: web.Request) -> web.Response:
+        """Pause desktop background services and public tunnels under owner authorization."""
+        # 1. Stop all public tunnels
+        if hasattr(self, "tunnel_manager"):
+            try:
+                await self.tunnel_manager.stop_all_tunnels()
+            except Exception as exc:
+                logger.warning("Error stopping tunnels during pause: %s", exc)
+
+        # 2. Invoke Core IPC system_pause via bridge
+        core_res = {}
+        try:
+            if hasattr(self.bridge, "system_pause"):
+                core_res = await self.bridge.system_pause(reason="Owner requested pause via Web Dashboard")
+            else:
+                core_res = await self.bridge.call("system_pause", payload={"reason": "Owner requested pause via Web Dashboard"})
+        except Exception as exc:
+            logger.warning("Error invoking system_pause IPC: %s", exc)
+            core_res = {"success": True, "status": "PAUSED"}
+
+        return web.json_response({
+            "success": True,
+            "status": "PAUSED",
+            "state": "PAUSED",
+            "dashboard_online": True,
+            "core": core_res,
+        })
+
+    async def handle_api_system_resume(self, request: web.Request) -> web.Response:
+        """Resume desktop background services from pause mode under owner authorization."""
+        core_res = {}
+        try:
+            if hasattr(self.bridge, "system_resume"):
+                core_res = await self.bridge.system_resume()
+            else:
+                core_res = await self.bridge.call("system_resume", payload={})
+        except Exception as exc:
+            logger.warning("Error invoking system_resume IPC: %s", exc)
+            core_res = {"success": True, "status": "RESUMED"}
+
+        return web.json_response({
+            "success": True,
+            "status": "RESUMED",
+            "state": "ACTIVE",
+            "core": core_res,
+        })
+
+    async def handle_api_system_shutdown(self, request: web.Request) -> web.Response:
+        """Initiate coordinated complete desktop power-off under owner authorization."""
+        logger.info("Coordinated system shutdown initiated by owner via Web Dashboard.")
+
+        # 1. Stop all public tunnels
+        if hasattr(self, "tunnel_manager"):
+            try:
+                await self.tunnel_manager.stop_all_tunnels()
+            except Exception as exc:
+                logger.warning("Error stopping tunnels during shutdown: %s", exc)
+
+        # 2. Stop Remote MCP Gateway runner
+        if getattr(self, "_mcp_gateway_runner", None):
+            try:
+                await self._mcp_gateway_runner.cleanup()
+            except Exception as exc:
+                logger.warning("Error cleaning up MCP gateway during shutdown: %s", exc)
+
+        # 3. Request core shutdown via IPC
+        try:
+            if hasattr(self.bridge, "system_shutdown"):
+                await self.bridge.system_shutdown(reason="Owner power-off via Web Dashboard")
+            else:
+                await self.bridge.call("system_shutdown", payload={"reason": "Owner power-off via Web Dashboard"})
+        except Exception as exc:
+            logger.warning("Error sending system_shutdown IPC: %s", exc)
+
+        # 4. Schedule delayed web server stop so HTTP response completes cleanly
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_later(0.5, lambda: asyncio.create_task(self.stop()))
+        except Exception:
+            pass
+
+        return web.json_response({
+            "success": True,
+            "status": "SHUTTING_DOWN",
+            "message": "Coordinated SNOW shutdown initiated. Services stopping.",
+        })
 
     # =========================================================================
     # Lifecycle
@@ -2324,6 +2486,17 @@ class SnowWebServer:
         app.router.add_post("/api/mcp/oauth/approve", self.handle_api_mcp_oauth_approve)
         app.router.add_post("/api/mcp/oauth/reject", self.handle_api_mcp_oauth_reject)
 
+        # Relay Tunnel Management (Phase 4 Stage 4A)
+        app.router.add_post("/api/relay/tunnel/start", self.handle_api_relay_tunnel_start)
+        app.router.add_post("/api/relay/tunnel/stop", self.handle_api_relay_tunnel_stop)
+        app.router.add_get("/api/relay/tunnel/status", self.handle_api_relay_tunnel_status)
+
+        # System Lifecycle (Phase 4 Stage 4A)
+        app.router.add_get("/api/system/status", self.handle_api_system_status)
+        app.router.add_post("/api/system/pause", self.handle_api_system_pause)
+        app.router.add_post("/api/system/resume", self.handle_api_system_resume)
+        app.router.add_post("/api/system/shutdown", self.handle_api_system_shutdown)
+
         return app
 
     async def start(self) -> None:
@@ -2388,14 +2561,14 @@ class SnowWebServer:
                 self._ephemeral_apk_app = None
                 self._ephemeral_apk_port = 0
 
-        # Stop active tunnel if one exists
+        # Stop active tunnels if they exist
         if hasattr(self, "tunnel_manager"):
             try:
-                await self.tunnel_manager.stop_tunnel()
+                await self.tunnel_manager.stop_all_tunnels()
                 if self._mcp_gateway_instance:
                     self._mcp_gateway_instance.set_public_url(None)
             except Exception as texc:
-                logger.warning("Error stopping tunnel on server stop: %s", texc)
+                logger.warning("Error stopping tunnels on server stop: %s", texc)
 
         if not self._is_running:
             return

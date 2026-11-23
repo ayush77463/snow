@@ -48,6 +48,8 @@ Name: "autostart"; Description: "Start SNOW System Tray automatically on Windows
 [Files]
 ; Install all files collected by PyInstaller into {app}
 Source: "..\..\dist\snow\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Explicit inclusion of verified bundled Cloudflare tunnel binary
+Source: "..\..\dist\snow\bin\cloudflared.exe"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 ; Start Menu Shortcuts

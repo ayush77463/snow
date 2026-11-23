@@ -460,7 +460,60 @@ class SnowTrayApp:
             set_autostart(not current)
 
         elif cmd_id == CMD_EXIT:
-            self.stop()
+            self._shutdown_all_sync()
+
+    def _shutdown_all_sync(self) -> None:
+        """Execute coordinated shutdown of all SNOW services before closing the tray."""
+        logger.info("Coordinated shutdown initiated from tray companion.")
+        # 1. Stop dashboard process and any child processes (e.g., cloudflared) if managed
+        with self._dashboard_spawn_lock:
+            if self._dashboard_proc:
+                try:
+                    self._terminate_proc_tree(self._dashboard_proc)
+                except Exception as exc:
+                    logger.debug("Error terminating dashboard process tree: %s", exc)
+                self._dashboard_proc = None
+
+        # 2. Stop Core daemon via DaemonManager
+        try:
+            asyncio.run(self.daemon_manager.stop_core())
+        except Exception as exc:
+            logger.warning("Error stopping core daemon from tray quit: %s", exc)
+
+        # 3. Clean up Win32 tray icon and post quit
+        self.stop()
+
+    @staticmethod
+    def _terminate_proc_tree(proc: Any, timeout: float = 3.0) -> None:
+        """Safely terminate a process and its recursive descendants avoiding orphaned daemons."""
+        if not proc:
+            return
+        try:
+            import psutil
+            pid = proc.pid if hasattr(proc, "pid") else proc
+            if not pid:
+                return
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            for ch in children:
+                try:
+                    ch.terminate()
+                except Exception:
+                    pass
+            parent.terminate()
+            gone, alive = psutil.wait_procs(children + [parent], timeout=timeout)
+            for survivor in alive:
+                try:
+                    survivor.kill()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("psutil tree termination fallback: %s", exc)
+            if hasattr(proc, "terminate"):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
 
     def _start_core_sync(self) -> None:
         try:

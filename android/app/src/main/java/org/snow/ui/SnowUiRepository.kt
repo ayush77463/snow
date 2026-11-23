@@ -572,6 +572,29 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             appendLog("INFO", TAG, "Pinned TLS certificate fingerprint from scanned QR code.")
         }
 
+        // Master QR: provision remote relay credentials if included
+        val relayUrl = payload.optString("relay_url", "").trim()
+        val relayTicket = payload.optString("relay_ticket", "").trim()
+        val groupId = payload.optString("group_id", "").trim()
+        if (relayUrl.isNotEmpty() && relayTicket.isNotEmpty()) {
+            if (relayUrl.startsWith("wss://") || relayUrl.startsWith("ws://")) {
+                try {
+                    getRelayTokenStorage().saveToken(relayTicket)
+                    setRemoteRelayEndpoint(relayUrl)
+                    if (groupId.isNotEmpty()) {
+                        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                        prefs.edit().putString("remote_relay_group_id", groupId).apply()
+                    }
+                    setRemoteRelayEnabled(true)
+                    appendLog("INFO", TAG, "Master QR: Securely provisioned remote relay credentials and endpoint.")
+                } catch (e: Exception) {
+                    appendLog("WARN", TAG, "Could not persist remote relay credentials from QR: ${e.message}")
+                }
+            } else {
+                appendLog("WARN", TAG, "Ignoring invalid relay_url scheme from QR: $relayUrl")
+            }
+        }
+
         // Connect to first candidate IP and proceed with pairing
         val targetIp = candidateIps.first()
         appendLog("INFO", TAG, "Initiating QR onboarding connection to $targetIp:$port...")
@@ -2226,6 +2249,137 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     fun generatePeerHostPin(): String? {
         return serviceRef?.peerHostManager?.generatePairingPin()
+    }
+
+    // --- Phase 30 / Stage 4A: Cross-Network Federation Parity ---
+
+    fun createFederationInvite(
+        allowedCapabilities: List<String>? = null,
+        allowedDeviceIds: List<String>? = null,
+        ttlSeconds: Int = 600,
+        grantTtlSeconds: Int = 86400,
+        onComplete: (Boolean, Map<String, Any?>?, String?) -> Unit
+    ) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            onComplete(false, null, "Desktop not connected.")
+            return
+        }
+
+        val data = mutableMapOf<String, Any>(
+            "ttl_seconds" to ttlSeconds,
+            "grant_ttl_seconds" to grantTtlSeconds
+        )
+        allowedCapabilities?.let { data["allowed_capabilities"] = it }
+        allowedDeviceIds?.let { data["allowed_device_ids"] = it }
+
+        client.sendRequest("federation_create_invite", data) { resp ->
+            repoScope.launch {
+                if (resp.isSuccess) {
+                    onComplete(true, resp.payload, null)
+                } else {
+                    val err = resp.error?.message ?: "Failed to create federation invite."
+                    onComplete(false, null, err)
+                }
+            }
+        }
+    }
+
+    fun acceptFederationInvite(
+        inviteCode: String,
+        peerNetworkId: String? = null,
+        peerNetworkName: String? = null,
+        onComplete: (Boolean, Map<String, Any?>?, String?) -> Unit
+    ) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            onComplete(false, null, "Desktop not connected.")
+            return
+        }
+
+        val data = mutableMapOf<String, Any>("code" to inviteCode)
+        peerNetworkId?.let { data["peer_network_id"] = it }
+        peerNetworkName?.let { data["peer_network_name"] = it }
+
+        client.sendRequest("federation_accept_invite", data) { resp ->
+            repoScope.launch {
+                if (resp.isSuccess) {
+                    onComplete(true, resp.payload, null)
+                } else {
+                    val err = resp.error?.message ?: "Failed to accept federation invite."
+                    onComplete(false, null, err)
+                }
+            }
+        }
+    }
+
+    fun listFederationGrants(
+        activeOnly: Boolean = false,
+        onComplete: (Boolean, List<Map<String, Any?>>?, String?) -> Unit
+    ) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            onComplete(false, null, "Desktop not connected.")
+            return
+        }
+
+        client.sendRequest("federation_list_grants", mapOf("active_only" to activeOnly)) { resp ->
+            repoScope.launch {
+                if (resp.isSuccess) {
+                    @Suppress("UNCHECKED_CAST")
+                    val grants = resp.payload?.get("grants") as? List<Map<String, Any?>> ?: emptyList()
+                    onComplete(true, grants, null)
+                } else {
+                    val err = resp.error?.message ?: "Failed to list federation grants."
+                    onComplete(false, null, err)
+                }
+            }
+        }
+    }
+
+    fun revokeFederationGrant(
+        grantId: String,
+        reason: String = "Revoked by Android owner",
+        onComplete: (Boolean, String?) -> Unit
+    ) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            onComplete(false, "Desktop not connected.")
+            return
+        }
+
+        client.sendRequest("federation_revoke", mapOf("grant_id" to grantId, "reason" to reason)) { resp ->
+            repoScope.launch {
+                if (resp.isSuccess) {
+                    onComplete(true, null)
+                } else {
+                    val err = resp.error?.message ?: "Failed to revoke federation grant."
+                    onComplete(false, err)
+                }
+            }
+        }
+    }
+
+    fun federationKillSwitch(
+        reason: String = "Emergency Global Kill Switch Activated from Android",
+        onComplete: (Boolean, String?) -> Unit
+    ) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            onComplete(false, "Desktop not connected.")
+            return
+        }
+
+        client.sendRequest("federation_kill_switch", mapOf("reason" to reason)) { resp ->
+            repoScope.launch {
+                if (resp.isSuccess) {
+                    onComplete(true, null)
+                } else {
+                    val err = resp.error?.message ?: "Failed to activate federation kill switch."
+                    onComplete(false, err)
+                }
+            }
+        }
     }
 }
 

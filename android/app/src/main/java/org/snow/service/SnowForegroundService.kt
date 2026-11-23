@@ -41,6 +41,7 @@ import org.snow.security.SafeLog
 import org.snow.security.SharedPreferencesTokenStorage
 import org.snow.transfer.FileTransferClient
 import org.snow.ui.MainActivity
+import org.snow.ui.SnowUiRepository
 
 /**
  * Foreground service maintaining active connection and heartbeat loop to the SNOW desktop core.
@@ -583,7 +584,23 @@ class SnowForegroundService : Service() {
                 return@launch
             }
 
-            // Step 4: Passive NetworkCallback remains registered (via registerNetworkCallback in onCreate)
+            if (userDisconnected) return@launch
+
+            // Step 4: Saved Remote Relay endpoint fallback
+            val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+            val relayEnabled = settingsPrefs.getBoolean("remote_relay_enabled", false)
+            val relayEndpoint = settingsPrefs.getString("remote_relay_endpoint", null)
+            val relayTokenStorage = SharedPreferencesTokenStorage(applicationContext, prefName = "snow_relay_security")
+            val relayTicket = relayTokenStorage.getToken()
+
+            if (relayEnabled && !relayEndpoint.isNullOrBlank() && !relayTicket.isNullOrBlank()) {
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Falling back to saved Remote Relay endpoint $relayEndpoint...")
+                startRelay(relayEndpoint)
+            } else {
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: No remote relay configured or enabled.")
+            }
+
+            // Passive NetworkCallback remains registered (via registerNetworkCallback in onCreate)
             SafeLog.i("SnowForegroundService", "AutoConnect cascade completed; passive network callback active.")
         }
     }

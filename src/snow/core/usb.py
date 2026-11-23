@@ -258,7 +258,24 @@ class UsbWatcher:
         self.adb_bin = adb_bin or find_adb_binary()
         self._task: Optional[asyncio.Task] = None
         self._running: bool = False
+        self._paused: bool = False
         self._configured_serials: set[str] = set()
+
+    def pause(self) -> None:
+        """Temporarily suspend USB polling during system pause mode."""
+        self._paused = True
+        logger.info("UsbWatcher monitoring paused.")
+
+    def resume(self) -> None:
+        """Resume USB polling when restoring from system pause mode."""
+        self._paused = False
+        self.current_interval = self.base_interval
+        logger.info("UsbWatcher monitoring resumed.")
+
+    @property
+    def is_paused(self) -> bool:
+        """Return True if USB monitoring is currently suspended."""
+        return self._paused
 
     async def start(self) -> None:
         """Start the USB device monitoring background loop."""
@@ -284,6 +301,13 @@ class UsbWatcher:
     async def _monitor_loop(self) -> None:
         """Periodic non-blocking check of USB devices and reverse mappings with adaptive backoff."""
         while self._running:
+            if self._paused:
+                try:
+                    await asyncio.sleep(self.base_interval)
+                except asyncio.CancelledError:
+                    break
+                continue
+
             state_changed = False
             try:
                 state_changed = await self._poll_once()

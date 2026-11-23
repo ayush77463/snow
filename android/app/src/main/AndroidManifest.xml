@@ -73,6 +73,14 @@
             android:taskAffinity="" />
 
         <activity
+            android:name=".ui.AutoConnectTrampolineActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity="" />
+
+        <activity
             android:name=".ui.PortraitCaptureActivity"
             android:screenOrientation="portrait"
             android:stateNotNeeded="true"

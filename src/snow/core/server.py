@@ -156,6 +156,8 @@ class SnowCoreServer:
         self.relay_group_id: str = getattr(self.config, "relay_group_id", "")
         self.relay_ticket: str = getattr(self.config, "relay_ticket", "")
         self.session_router.relay_enabled = self.relay_enabled
+        self._is_paused: bool = False
+        self._paused_state: dict[str, Any] = {}
 
     async def connect_peer(
         self,
@@ -642,6 +644,114 @@ class SnowCoreServer:
                 self._run_maintenance_once()
         except asyncio.CancelledError:
             pass
+
+    @property
+    def is_paused(self) -> bool:
+        """Return True if system is in pause mode."""
+        return self._is_paused
+
+    async def pause_system(self, reason: str = "Paused by owner") -> dict[str, Any]:
+        """Put the desktop core into pause mode.
+
+        Idempotent:
+        - If already paused, returns ALREADY_PAUSED.
+        - Pauses USB watcher.
+        - Pauses clipboard sync if enabled.
+        - Cleanly disconnects all active peer connections.
+        - Cleanly disconnects relay client if connected.
+        - Retains pre-pause state so resume restores valid services.
+        """
+        if self._is_paused:
+            return {"success": True, "status": "ALREADY_PAUSED", "state": "PAUSED", "reason": reason}
+
+        logger.info("System pause requested: %s", reason)
+        self._is_paused = True
+        self._paused_state.clear()
+
+        # 1. Pause USB watcher
+        if getattr(self, "usb_watcher", None):
+            self.usb_watcher.pause()
+            self._paused_state["usb_watcher"] = True
+
+        # 2. Pause clipboard sync
+        if hasattr(self, "capability_engine") and hasattr(self.capability_engine, "clipboard"):
+            cb = self.capability_engine.clipboard
+            if getattr(cb, "sync_enabled", False):
+                self._paused_state["clipboard_sync"] = True
+                cb.set_sync_enabled(False)
+
+        # 3. Disconnect active peers cleanly
+        if hasattr(self, "peer_clients"):
+            for p_id, p_client in list(self.peer_clients.items()):
+                try:
+                    await p_client.close()
+                except Exception:
+                    pass
+            self.peer_clients.clear()
+
+        # 4. Disconnect relay client
+        if getattr(self, "relay_client", None):
+            try:
+                await self.relay_client.disconnect()
+            except Exception:
+                pass
+            self.relay_client = None
+            self._paused_state["relay"] = True
+
+        # 5. Audit log
+        try:
+            self.db_manager.log_activity(
+                event_type="SYSTEM_PAUSED",
+                principal="OWNER_MANUAL",
+                target_device=self.config.device_id,
+                capability="core.system.pause",
+                outcome="SUCCESS",
+                details={"reason": reason},
+            )
+        except Exception:
+            pass
+
+        return {"success": True, "status": "PAUSED", "state": "PAUSED", "reason": reason}
+
+    async def resume_system(self) -> dict[str, Any]:
+        """Restore desktop core from pause mode to active mode.
+
+        Idempotent:
+        - If not paused, returns ALREADY_ACTIVE.
+        - Restores USB watcher.
+        - Restores clipboard sync if it was active before pause.
+        """
+        if not self._is_paused:
+            return {"success": True, "status": "ALREADY_ACTIVE", "state": "ACTIVE"}
+
+        logger.info("System resume requested.")
+        self._is_paused = False
+
+        # 1. Resume USB watcher
+        if getattr(self, "usb_watcher", None):
+            self.usb_watcher.resume()
+
+        # 2. Restore clipboard sync if it was active
+        if self._paused_state.get("clipboard_sync"):
+            if hasattr(self, "capability_engine") and hasattr(self.capability_engine, "clipboard"):
+                self.capability_engine.clipboard.set_sync_enabled(True)
+
+        self._paused_state.clear()
+
+        # 3. Audit log
+        try:
+            self.db_manager.log_activity(
+                event_type="SYSTEM_RESUMED",
+                principal="OWNER_MANUAL",
+                target_device=self.config.device_id,
+                capability="core.system.resume",
+                outcome="SUCCESS",
+                details={},
+            )
+        except Exception:
+            pass
+
+        return {"success": True, "status": "RESUMED", "state": "ACTIVE"}
 
     def request_shutdown(self) -> None:
         """Signal the running server loop to terminate gracefully.

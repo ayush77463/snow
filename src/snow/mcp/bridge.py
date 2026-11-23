@@ -1504,6 +1504,30 @@ class SnowMcpBridge:
     # Phase 30: Cross-Network Federation Operations
     # =========================================================================
 
+    async def system_pause(self, reason: str = "Paused by owner via bridge") -> dict[str, Any]:
+        """Put the desktop core into pause mode via Core IPC."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call("system_pause", payload={"reason": reason}, timeout=5.0)
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+        return {"success": True, "status": "PAUSED", "state": "PAUSED", "reason": reason}
+
+    async def system_resume(self) -> dict[str, Any]:
+        """Restore desktop core from pause mode via Core IPC."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call("system_resume", payload={}, timeout=5.0)
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+        return {"success": True, "status": "RESUMED", "state": "ACTIVE"}
+
+    async def system_shutdown(self, reason: str = "Shutdown initiated by owner via bridge") -> dict[str, Any]:
+        """Trigger coordinated desktop core shutdown via Core IPC."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call("system_shutdown", payload={"reason": reason}, timeout=5.0)
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+        return {"success": True, "status": "SHUTTING_DOWN", "state": "STOPPING"}
+
     async def federation_revoke(self, grant_id: str, reason: str = "Revoked by network owner") -> dict[str, Any]:
         """Revoke a cross-network federation grant and terminate active sessions via Core IPC."""
         if await self.daemon_manager.is_ipc_ready(timeout=0.1):

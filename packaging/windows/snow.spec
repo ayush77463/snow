@@ -24,6 +24,8 @@ datas = [
 ]
 if (REPO_ROOT / "snow.png").is_file():
     datas.append((str(REPO_ROOT / "snow.png"), "."))
+if (REPO_ROOT / "packaging" / "bin" / "cloudflared.exe").is_file():
+    datas.append((str(REPO_ROOT / "packaging" / "bin" / "cloudflared.exe"), "bin"))
 
 # Hidden imports required by dynamic dispatch and asyncio
 hiddenimports = [
