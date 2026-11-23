@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 
 def get_default_python_executable() -> str:
     """Resolve the active Python interpreter path with proper quoting if needed."""
+    if getattr(sys, "frozen", False):
+        exe_path = Path(sys.executable).resolve()
+        sibling_core = exe_path.with_name("snow.exe")
+        if sibling_core.is_file():
+            return str(sibling_core)
+        return str(exe_path)
+
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        installed_snow = Path(local_appdata) / "Programs" / "SNOW" / "snow.exe"
+        if installed_snow.is_file():
+            return str(installed_snow)
+
     return sys.executable
 
 

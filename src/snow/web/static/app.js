@@ -18,6 +18,56 @@
             .replace(/'/g, "&#039;");
     }
 
+    function showNotificationToast(msg, type = "info") {
+        if (!msg) return;
+        let container = document.getElementById("toast-container");
+        if (!container) {
+            container = document.createElement("div");
+            container.id = "toast-container";
+            container.style.position = "fixed";
+            container.style.bottom = "24px";
+            container.style.right = "24px";
+            container.style.zIndex = "99999";
+            container.style.display = "flex";
+            container.style.flexDirection = "column";
+            container.style.gap = "8px";
+            container.style.pointerEvents = "none";
+            document.body.appendChild(container);
+        }
+
+        const toast = document.createElement("div");
+        toast.className = `toast-pill toast-${type}`;
+        toast.style.pointerEvents = "auto";
+        toast.style.background = type === "error" ? "var(--color-danger, #ef4444)" :
+                                 type === "warning" ? "var(--color-warning, #f59e0b)" :
+                                 type === "success" ? "var(--color-success, #10b981)" : "var(--color-primary, #3b82f6)";
+        toast.style.color = "#ffffff";
+        toast.style.padding = "10px 16px";
+        toast.style.borderRadius = "8px";
+        toast.style.boxShadow = "0 4px 12px rgba(0,0,0,0.3)";
+        toast.style.fontSize = "0.875rem";
+        toast.style.fontWeight = "500";
+        toast.style.opacity = "0";
+        toast.style.transition = "opacity 0.2s ease, transform 0.2s ease";
+        toast.style.transform = "translateY(10px)";
+        toast.textContent = msg;
+
+        container.appendChild(toast);
+        requestAnimationFrame(() => {
+            toast.style.opacity = "1";
+            toast.style.transform = "translateY(0)";
+        });
+
+        setTimeout(() => {
+            toast.style.opacity = "0";
+            toast.style.transform = "translateY(-10px)";
+            setTimeout(() => {
+                if (toast.parentNode) toast.parentNode.removeChild(toast);
+            }, 300);
+        }, 4000);
+    }
+    window.showNotificationToast = showNotificationToast;
+
     // Application State
     let csrfToken = "";
     let currentTab = "overview";
@@ -2376,6 +2426,22 @@
                 if (btnCopyPublicMcp) btnCopyPublicMcp.style.display = "none";
             }
 
+            // Tunnel status integration
+            const tunnelVal = document.getElementById("tunnel-status-val");
+            const btnTunnelStart = document.getElementById("btn-tunnel-start");
+            const btnTunnelStop = document.getElementById("btn-tunnel-stop");
+            if (d.tunnel && tunnelVal) {
+                if (d.tunnel.active && d.tunnel.public_url) {
+                    tunnelVal.innerHTML = `<span class="badge badge-success">${escapeHtml(d.tunnel.provider || "Active")}: ${escapeHtml(d.tunnel.public_url)}</span>`;
+                    if (btnTunnelStart) btnTunnelStart.classList.add("d-none");
+                    if (btnTunnelStop) btnTunnelStop.classList.remove("d-none");
+                } else {
+                    tunnelVal.innerHTML = `<span class="badge badge-muted">Inactive</span>`;
+                    if (btnTunnelStart) btnTunnelStart.classList.remove("d-none");
+                    if (btnTunnelStop) btnTunnelStop.classList.add("d-none");
+                }
+            }
+
             if (hostsEl && Array.isArray(d.ai_hosts)) {
                 hostsEl.textContent = "";
                 if (d.ai_hosts.length === 0) {
@@ -2399,14 +2465,81 @@
                 if (st === "online") {
                     resBox.innerHTML = `<span class="text-success">✓ Gateway Online at ${d.endpoint} (OAuth 2.1 Protected)</span>`;
                 } else if (st === "offline") {
-                    resBox.innerHTML = `<span class="text-muted">Gateway is offline. Start in terminal with: <code>python -m snow mcp-gateway</code></span>`;
+                    resBox.innerHTML = `<span class="text-muted">Gateway is offline. Click 'Toggle Gateway' or run <code>snow mcp-gateway</code>.</span>`;
                 } else {
                     resBox.innerHTML = `<span class="text-warning">Gateway responding with status: ${st}</span>`;
                 }
             }
+            await loadOauthPendingList();
         } else {
             if (statusEl) statusEl.innerHTML = `<span class="badge badge-danger">Error</span>`;
             if (resBox) resBox.innerHTML = `<span class="text-danger">${escapeHtml((res && res.error) ? res.error : "Failed querying MCP gateway status")}</span>`;
+        }
+    }
+
+    async function loadOauthPendingList() {
+        const listEl = document.getElementById("oauth-pending-list");
+        if (!listEl) return;
+        try {
+            const res = await apiRequest("/api/mcp/oauth/pending");
+            if (res && res.success && Array.isArray(res.pending)) {
+                if (res.pending.length === 0) {
+                    listEl.innerHTML = '<span class="text-muted">No pending authorization requests.</span>';
+                } else {
+                    listEl.innerHTML = "";
+                    res.pending.forEach(item => {
+                        const itemDiv = document.createElement("div");
+                        itemDiv.className = "card p-2 mb-2";
+                        itemDiv.style.border = "1px solid var(--border-color)";
+                        itemDiv.style.background = "var(--bg-surface)";
+                        itemDiv.innerHTML = `
+                            <div class="d-flex justify-content-between align-items-center">
+                                <div>
+                                    <strong>${escapeHtml(item.client_name || item.client_id)}</strong>
+                                    <div class="text-xs text-muted">Scopes: <code>${escapeHtml(item.scope)}</code> · URI: <code>${escapeHtml(item.redirect_uri)}</code></div>
+                                </div>
+                                <div class="d-flex gap-2">
+                                    <button class="btn btn-primary btn-sm btn-oauth-approve" data-id="${escapeHtml(item.request_id)}">Approve</button>
+                                    <button class="btn btn-secondary btn-sm btn-oauth-reject" data-id="${escapeHtml(item.request_id)}">Reject</button>
+                                </div>
+                            </div>
+                        `;
+                        listEl.appendChild(itemDiv);
+                    });
+
+                    listEl.querySelectorAll(".btn-oauth-approve").forEach(b => {
+                        b.addEventListener("click", async () => {
+                            const reqId = b.dataset.id;
+                            b.disabled = true;
+                            b.textContent = "Approving...";
+                            const r = await apiRequest("/api/mcp/oauth/approve", "POST", { request_id: reqId });
+                            if (r && r.success) {
+                                showNotificationToast("OAuth Request Approved", "success");
+                            } else {
+                                showNotificationToast(r ? r.error : "Approval failed", "error");
+                            }
+                            await loadOauthPendingList();
+                        });
+                    });
+
+                    listEl.querySelectorAll(".btn-oauth-reject").forEach(b => {
+                        b.addEventListener("click", async () => {
+                            const reqId = b.dataset.id;
+                            b.disabled = true;
+                            b.textContent = "Rejecting...";
+                            const r = await apiRequest("/api/mcp/oauth/reject", "POST", { request_id: reqId });
+                            if (r && r.success) {
+                                showNotificationToast("OAuth Request Rejected", "info");
+                            } else {
+                                showNotificationToast(r ? r.error : "Rejection failed", "error");
+                            }
+                            await loadOauthPendingList();
+                        });
+                    });
+                }
+            }
+        } catch (e) {
+            listEl.innerHTML = '<span class="text-muted">Gateway offline.</span>';
         }
     }
 
@@ -3439,6 +3572,110 @@
         const btnTestMcp = document.getElementById("btn-test-mcp-health");
         if (btnTestMcp) {
             btnTestMcp.addEventListener("click", () => loadMcpGatewayStatus());
+        }
+
+        // Local MCP Handshake Test (Stage 3B)
+        const btnTestLocalMcp = document.getElementById("btn-test-local-mcp");
+        if (btnTestLocalMcp) {
+            btnTestLocalMcp.addEventListener("click", async () => {
+                const resBox = document.getElementById("local-mcp-test-result");
+                btnTestLocalMcp.disabled = true;
+                btnTestLocalMcp.textContent = "Testing...";
+                if (resBox) resBox.textContent = "Executing stdio handshake against SNOW MCP...";
+                const res = await apiRequest("/api/mcp/test-local", "POST", {});
+                btnTestLocalMcp.disabled = false;
+                btnTestLocalMcp.textContent = "⚡ Test Local MCP (stdio)";
+                if (res && res.success) {
+                    if (resBox) {
+                        resBox.innerHTML = `<span class="text-success">✓ Handshake Success: <strong>${res.tools_count}/${res.expected_count}</strong> Tools Verified (${res.latency_ms} ms) · Command: <code>${escapeHtml(res.command)}</code></span>`;
+                    }
+                    showNotificationToast(`MCP Verified: ${res.tools_count} tools online`, "success");
+                } else {
+                    if (resBox) {
+                        resBox.innerHTML = `<span class="text-danger">✗ Handshake Failed: ${escapeHtml((res && res.error) ? res.error : "Unknown error")}</span>`;
+                    }
+                    showNotificationToast("Local MCP Test Failed", "error");
+                }
+            });
+        }
+
+        // Host setup shortcuts
+        ["claude", "cursor", "gemini", "antigravity"].forEach(h => {
+            const btn = document.getElementById(`btn-setup-${h}`);
+            if (btn) {
+                btn.addEventListener("click", async () => {
+                    btn.disabled = true;
+                    btn.textContent = "Configuring...";
+                    const res = await apiRequest("/api/mcp/setup", "POST", { host: h });
+                    btn.disabled = false;
+                    btn.textContent = `Configure ${h.charAt(0).toUpperCase() + h.slice(1)}`;
+                    if (res && res.success) {
+                        showNotificationToast(`${h.toUpperCase()} Configured Successfully`, "success");
+                        await loadMcpGatewayStatus();
+                    } else {
+                        showNotificationToast((res && res.error) ? res.error : "Setup failed", "error");
+                    }
+                });
+            }
+        });
+
+        // Remote MCP Gateway Toggle
+        const btnToggleGw = document.getElementById("btn-toggle-gateway");
+        if (btnToggleGw) {
+            btnToggleGw.addEventListener("click", async () => {
+                btnToggleGw.disabled = true;
+                const statusEl = document.getElementById("mcp-gateway-status");
+                const isOnline = statusEl && statusEl.textContent.includes("Online");
+                const res = await apiRequest("/api/mcp/gateway/toggle", "POST", { enable: !isOnline });
+                btnToggleGw.disabled = false;
+                if (res && res.success) {
+                    showNotificationToast(`Gateway ${res.running ? 'Started' : 'Stopped'}`, "info");
+                    await loadMcpGatewayStatus();
+                } else {
+                    showNotificationToast((res && res.error) ? res.error : "Toggle failed", "error");
+                }
+            });
+        }
+
+        // Tunnel controls
+        const btnTunnelStart = document.getElementById("btn-tunnel-start");
+        if (btnTunnelStart) {
+            btnTunnelStart.addEventListener("click", async () => {
+                btnTunnelStart.disabled = true;
+                btnTunnelStart.textContent = "Starting...";
+                const res = await apiRequest("/api/mcp/tunnel/start", "POST", { provider: "cloudflared" });
+                btnTunnelStart.disabled = false;
+                btnTunnelStart.textContent = "🌐 Start Cloudflare Tunnel";
+                if (res && res.success) {
+                    showNotificationToast(`Tunnel Started: ${res.public_url}`, "success");
+                    await loadMcpGatewayStatus();
+                } else {
+                    showNotificationToast((res && res.error) ? res.error : "Tunnel start failed", "error");
+                }
+            });
+        }
+
+        const btnTunnelStop = document.getElementById("btn-tunnel-stop");
+        if (btnTunnelStop) {
+            btnTunnelStop.addEventListener("click", async () => {
+                btnTunnelStop.disabled = true;
+                btnTunnelStop.textContent = "Stopping...";
+                const res = await apiRequest("/api/mcp/tunnel/stop", "POST", {});
+                btnTunnelStop.disabled = false;
+                btnTunnelStop.textContent = "Stop Tunnel";
+                if (res && res.success) {
+                    showNotificationToast("Tunnel Stopped", "info");
+                    await loadMcpGatewayStatus();
+                } else {
+                    showNotificationToast((res && res.error) ? res.error : "Tunnel stop failed", "error");
+                }
+            });
+        }
+
+        // OAuth 2.1 Refresh Queue
+        const btnRefreshOauth = document.getElementById("btn-refresh-oauth-pending");
+        if (btnRefreshOauth) {
+            btnRefreshOauth.addEventListener("click", () => loadOauthPendingList());
         }
 
         const btnRefreshRelay = document.getElementById("btn-refresh-relay-status");

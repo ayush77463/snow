@@ -21,6 +21,7 @@ import logging
 import os
 from pathlib import Path
 import secrets
+import subprocess
 import sys
 import time
 from typing import Any, Optional
@@ -87,6 +88,8 @@ class SnowWebServer:
         self._mcp_gateway_instance: Optional[Any] = None
         self._mcp_gateway_lock = asyncio.Lock()
         self.gateway_port = 8771
+        from snow.mcp.tunnel import TunnelManager
+        self.tunnel_manager = TunnelManager(target_port=self.gateway_port)
 
         # Short-lived APK download tokens: token -> expires_at
         self._apk_download_tokens: dict[str, float] = {}
@@ -1036,8 +1039,12 @@ class SnowWebServer:
                 "scopes_supported": metadata.get("scopes_supported", []),
             }
 
+        tunnel_info = self.tunnel_manager.get_status()
         public_url = os.environ.get("SNOW_MCP_PUBLIC_URL")
-        public_endpoint = f"{public_url.rstrip('/')}/mcp" if public_url else (metadata.get("resource") if metadata and metadata.get("resource") and not metadata.get("resource").startswith("http://127.0.0.1") else None)
+        if tunnel_info.get("active") and tunnel_info.get("mcp_endpoint"):
+            public_endpoint = tunnel_info["mcp_endpoint"]
+        else:
+            public_endpoint = f"{public_url.rstrip('/')}/mcp" if public_url else (metadata.get("resource") if metadata and metadata.get("resource") and not metadata.get("resource").startswith("http://127.0.0.1") else None)
 
         from snow.mcp.registry import list_capabilities
         caps_count = len(list_capabilities())
@@ -1052,6 +1059,7 @@ class SnowWebServer:
                 "metadata": safe_metadata,
                 "ai_hosts": safe_hosts,
                 "capabilities_count": caps_count,
+                "tunnel": tunnel_info,
             }
         })
 
@@ -1993,6 +2001,8 @@ class SnowWebServer:
                     }, status=500)
             elif not target_enable and is_currently_running:
                 try:
+                    if hasattr(self, "tunnel_manager"):
+                        await self.tunnel_manager.stop_tunnel()
                     if self._mcp_gateway_runner:
                         await self._mcp_gateway_runner.cleanup()
                 except Exception as exc:
@@ -2010,6 +2020,207 @@ class SnowWebServer:
                 "port": gw_port,
                 "public_url": getattr(self._mcp_gateway_instance, "public_url", None) if is_currently_running else None,
             })
+
+    async def handle_api_mcp_test_local(self, request: web.Request) -> web.Response:
+        """Execute a genuine stdio JSON-RPC handshake against the SNOW MCP server."""
+        from snow.onboarding import get_canonical_mcp_entry
+        mcp_entry = get_canonical_mcp_entry()
+        cmd = mcp_entry["command"]
+        args = mcp_entry["args"]
+        cmd_args = [cmd] + args
+
+        t0 = time.perf_counter()
+        proc = None
+        try:
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags |= subprocess.CREATE_NO_WINDOW
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creation_flags,
+            )
+
+            # 1. Initialize request
+            init_req = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "snow-test-runner", "version": "4.1.0"},
+                },
+            }
+            if proc.stdin is None or proc.stdout is None:
+                raise RuntimeError("Failed opening subprocess pipes.")
+
+            proc.stdin.write((json.dumps(init_req) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+
+            # Read initialize response
+            init_line = await asyncio.wait_for(proc.stdout.readline(), timeout=5.0)
+            if not init_line:
+                raise RuntimeError("Process closed stdout before responding to initialize.")
+            init_resp = json.loads(init_line.decode("utf-8").strip())
+            if "error" in init_resp:
+                raise RuntimeError(f"Initialize error: {init_resp['error']}")
+
+            # 2. Initialized notification
+            notif = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+            proc.stdin.write((json.dumps(notif) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+
+            # 3. Tools list request
+            tools_req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+            proc.stdin.write((json.dumps(tools_req) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+
+            tools_line = await asyncio.wait_for(proc.stdout.readline(), timeout=5.0)
+            if not tools_line:
+                raise RuntimeError("Process closed stdout before responding to tools/list.")
+            tools_resp = json.loads(tools_line.decode("utf-8").strip())
+            if "error" in tools_resp:
+                raise RuntimeError(f"tools/list error: {tools_resp['error']}")
+
+            raw_tools = tools_resp.get("result", {}).get("tools", [])
+            tool_names = [t.get("name") for t in raw_tools]
+            tools_count = len(tool_names)
+
+            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "tools_count": tools_count,
+                "tools": tool_names,
+                "expected_count": 38,
+                "is_frozen": getattr(sys, "frozen", False),
+                "command": cmd,
+                "args": args,
+                "latency_ms": elapsed_ms,
+                "protocol_version": init_resp.get("result", {}).get("protocolVersion", "2024-11-05"),
+                "server_info": init_resp.get("result", {}).get("serverInfo", {}),
+            })
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            logger.warning("Local MCP test handshake failed: %s", exc)
+            return web.json_response({
+                "success": False,
+                "status": "HANDSHAKE_FAILED",
+                "error": str(exc),
+                "command": cmd,
+                "args": args,
+                "latency_ms": elapsed_ms,
+            }, status=500)
+        finally:
+            if proc:
+                try:
+                    if proc.stdin and not proc.stdin.is_closing():
+                        proc.stdin.close()
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+    async def handle_api_mcp_tunnel_start(self, request: web.Request) -> web.Response:
+        """Start public tunnel for the Remote MCP Gateway with live URL synchronization."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        provider = body.get("provider", "cloudflared")
+        custom_url = body.get("custom_url")
+
+        # 1. Ensure Remote MCP Gateway is running
+        async with self._mcp_gateway_lock:
+            if not self._mcp_gateway_runner:
+                try:
+                    from snow.mcp.remote_gateway import start_gateway_async
+                    runner, site, gateway = await start_gateway_async(
+                        host="127.0.0.1",
+                        port=self.gateway_port,
+                        bridge=self.bridge,
+                    )
+                    self._mcp_gateway_runner = runner
+                    self._mcp_gateway_site = site
+                    self._mcp_gateway_instance = gateway
+                except Exception as exc:
+                    logger.error("Failed starting Remote MCP Gateway for tunnel: %s", exc)
+                    return web.json_response({
+                        "success": False,
+                        "status": "GATEWAY_START_FAILED",
+                        "error": f"Could not start Remote MCP Gateway on port {self.gateway_port}: {exc}",
+                    }, status=500)
+
+        # 2. Start public tunnel
+        res = await self.tunnel_manager.start_tunnel(
+            provider=provider,
+            port=self.gateway_port,
+            custom_url=custom_url,
+        )
+
+        # 3. Synchronize live public URL into RemoteMcpGateway instance
+        if res.get("success") and res.get("public_url"):
+            if self._mcp_gateway_instance:
+                self._mcp_gateway_instance.set_public_url(res["public_url"])
+        else:
+            if self._mcp_gateway_instance:
+                self._mcp_gateway_instance.set_public_url(None)
+
+        return web.json_response(res, status=200 if res.get("success") else 400)
+
+    async def handle_api_mcp_tunnel_stop(self, request: web.Request) -> web.Response:
+        """Stop any active public tunnel and clear gateway public URL."""
+        res = await self.tunnel_manager.stop_tunnel()
+        if self._mcp_gateway_instance:
+            self._mcp_gateway_instance.set_public_url(None)
+        return web.json_response(res)
+
+    async def handle_api_mcp_tunnel_status(self, request: web.Request) -> web.Response:
+        """Query current tunnel status."""
+        return web.json_response({"success": True, **self.tunnel_manager.get_status()})
+
+    async def handle_api_mcp_oauth_pending(self, request: web.Request) -> web.Response:
+        """List active pending OAuth authorization requests."""
+        if not self._mcp_gateway_instance:
+            return web.json_response({"success": True, "pending": [], "gateway_online": False})
+        pending = self._mcp_gateway_instance.list_pending_authorizations()
+        return web.json_response({"success": True, "pending": pending, "gateway_online": True})
+
+    async def handle_api_mcp_oauth_approve(self, request: web.Request) -> web.Response:
+        """One-click owner approval of pending OAuth authorization request."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        req_id = body.get("request_id")
+        if not req_id:
+            return web.json_response({"success": False, "error": "Missing request_id."}, status=400)
+        if not self._mcp_gateway_instance:
+            return web.json_response({"success": False, "error": "MCP Gateway is not running."}, status=400)
+        res = self._mcp_gateway_instance.approve_authorization(req_id)
+        return web.json_response(res, status=200 if res.get("success") else 400)
+
+    async def handle_api_mcp_oauth_reject(self, request: web.Request) -> web.Response:
+        """Owner rejection of pending OAuth authorization request."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        req_id = body.get("request_id")
+        if not req_id:
+            return web.json_response({"success": False, "error": "Missing request_id."}, status=400)
+        if not self._mcp_gateway_instance:
+            return web.json_response({"success": False, "error": "MCP Gateway is not running."}, status=400)
+        res = self._mcp_gateway_instance.reject_authorization(req_id)
+        return web.json_response(res)
 
     # =========================================================================
     # Lifecycle
@@ -2099,12 +2310,19 @@ class SnowWebServer:
         app.router.add_post("/api/federation/revoke", self.handle_api_federation_revoke)
         app.router.add_post("/api/federation/kill-switch", self.handle_api_federation_kill_switch)
 
-        # USB Tethering and AI MCP Host Management (Batch 4)
+        # USB Tethering and AI MCP Host Management (Batch 4 & Stage 3B)
         app.router.add_get("/api/usb/status", self.handle_api_usb_status)
         app.router.add_post("/api/usb/connect", self.handle_api_usb_connect)
         app.router.add_post("/api/usb/disconnect", self.handle_api_usb_disconnect)
         app.router.add_post("/api/mcp/setup", self.handle_api_mcp_setup)
         app.router.add_post("/api/mcp/gateway/toggle", self.handle_api_mcp_gateway_toggle)
+        app.router.add_post("/api/mcp/test-local", self.handle_api_mcp_test_local)
+        app.router.add_post("/api/mcp/tunnel/start", self.handle_api_mcp_tunnel_start)
+        app.router.add_post("/api/mcp/tunnel/stop", self.handle_api_mcp_tunnel_stop)
+        app.router.add_get("/api/mcp/tunnel/status", self.handle_api_mcp_tunnel_status)
+        app.router.add_get("/api/mcp/oauth/pending", self.handle_api_mcp_oauth_pending)
+        app.router.add_post("/api/mcp/oauth/approve", self.handle_api_mcp_oauth_approve)
+        app.router.add_post("/api/mcp/oauth/reject", self.handle_api_mcp_oauth_reject)
 
         return app
 
@@ -2169,6 +2387,15 @@ class SnowWebServer:
                 self._ephemeral_apk_site = None
                 self._ephemeral_apk_app = None
                 self._ephemeral_apk_port = 0
+
+        # Stop active tunnel if one exists
+        if hasattr(self, "tunnel_manager"):
+            try:
+                await self.tunnel_manager.stop_tunnel()
+                if self._mcp_gateway_instance:
+                    self._mcp_gateway_instance.set_public_url(None)
+            except Exception as texc:
+                logger.warning("Error stopping tunnel on server stop: %s", texc)
 
         if not self._is_running:
             return

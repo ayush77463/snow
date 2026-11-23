@@ -970,8 +970,16 @@
                                 </div>
                                 <div class="diag-row">
                                     <span class="diag-label">stdio Command:</span>
-                                    <span class="diag-val"><code>py -3.13 -m snow.mcp</code></span>
+                                    <span class="diag-val"><code id="mcp-stdio-cmd-val">snow mcp</code></span>
                                 </div>
+                                <div class="mt-2 d-flex gap-2 flex-wrap">
+                                    <button class="btn btn-primary btn-sm" id="btn-test-local-mcp">⚡ Test Local MCP (stdio)</button>
+                                    <button class="btn btn-secondary btn-sm" id="btn-setup-claude">Configure Claude</button>
+                                    <button class="btn btn-secondary btn-sm" id="btn-setup-cursor">Configure Cursor</button>
+                                    <button class="btn btn-secondary btn-sm" id="btn-setup-gemini">Configure Gemini</button>
+                                    <button class="btn btn-secondary btn-sm" id="btn-setup-antigravity">Configure Antigravity</button>
+                                </div>
+                                <div id="local-mcp-test-result" class="mt-2 text-muted" style="font-size: 0.85rem;"></div>
                             </div>
 
                             <!-- Remote Streamable HTTP section -->
@@ -990,6 +998,10 @@
                                     <span class="diag-val"><code id="mcp-public-endpoint-val" style="color: var(--accent-color);">Not Configured</code></span>
                                 </div>
                                 <div class="diag-row">
+                                    <span class="diag-label">Tunnel Status:</span>
+                                    <span class="diag-val" id="tunnel-status-val"><span class="badge badge-muted">Inactive</span></span>
+                                </div>
+                                <div class="diag-row">
                                     <span class="diag-label">OAuth 2.1 Discovery:</span>
                                     <span class="diag-val"><code id="mcp-oauth-discovery-val">http://127.0.0.1:8771/.well-known/oauth-authorization-server</code></span>
                                 </div>
@@ -997,10 +1009,20 @@
                                     <span class="diag-label">Available Tools:</span>
                                     <span class="diag-val"><span id="mcp-capabilities-count">38</span> capabilities (Security: <code>AI_MCP</code> least privilege)</span>
                                 </div>
-                                <div class="diag-row">
-                                    <span class="diag-label">Public Tunnel Helper:</span>
-                                    <span class="diag-val"><code>snow expose --provider cloudflared</code></span>
+                                <div class="mt-2 d-flex gap-2 flex-wrap">
+                                    <button class="btn btn-secondary btn-sm" id="btn-toggle-gateway">Toggle Gateway</button>
+                                    <button class="btn btn-primary btn-sm" id="btn-tunnel-start">🌐 Start Cloudflare Tunnel</button>
+                                    <button class="btn btn-secondary btn-sm d-none" id="btn-tunnel-stop">Stop Tunnel</button>
                                 </div>
+                            </div>
+
+                            <!-- OAuth 2.1 Pending Approval Queue (Stage 3B) -->
+                            <div class="mcp-section mt-3 pt-2" style="border-top: 1px solid var(--border-color);">
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin: 0;">🔐 OAuth 2.1 Authorization Queue</h4>
+                                    <button class="btn btn-secondary btn-sm" id="btn-refresh-oauth-pending" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;">Refresh</button>
+                                </div>
+                                <div id="oauth-pending-list" class="text-xs text-muted" style="min-height: 24px;">No pending authorization requests.</div>
                             </div>
 
                             <!-- Host Connection Instructions Tabs -->

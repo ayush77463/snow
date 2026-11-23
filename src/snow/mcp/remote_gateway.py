@@ -169,10 +169,24 @@ class RemoteMcpGateway:
         self.register_rate_limiter = BoundedRateLimiter(limit=10, window_seconds=60.0)
         self.authorize_rate_limiter = BoundedRateLimiter(limit=10, window_seconds=60.0)
         self._consent_tokens: dict[str, dict[str, Any]] = {}
+        # Owner-friendly pending authorization queue and lock
+        self._pending_authorizations: dict[str, dict[str, Any]] = {}
+        self._pending_auth_lock = asyncio.Lock()
 
         self._active_sessions: dict[str, dict[str, Any]] = {}
         self.app = web.Application(middlewares=[self._security_middleware])
         self._setup_routes()
+
+    def set_public_url(self, public_url: Optional[str]) -> None:
+        """Update active public HTTPS URL and synchronize OAuth metadata issuer."""
+        clean_url = (public_url or "").strip().rstrip("/") or None
+        self.public_url = clean_url
+        if clean_url:
+            self.issuer = clean_url
+        else:
+            self.issuer = f"http://{self.host}:{self.port}".rstrip("/")
+        self.oauth_server.issuer = self.issuer
+        logger.info("Synchronized Remote MCP Gateway public URL: %s (issuer=%s)", self.public_url, self.issuer)
 
     @web.middleware
     async def _security_middleware(self, request: web.Request, handler: Any) -> web.Response:
@@ -230,6 +244,7 @@ class RemoteMcpGateway:
         self.app.router.add_post("/oauth/register", self.handle_oauth_register)
         self.app.router.add_get("/oauth/authorize", self.handle_oauth_authorize)
         self.app.router.add_post("/oauth/authorize", self.handle_oauth_authorize)
+        self.app.router.add_get("/oauth/status", self.handle_oauth_status)
         self.app.router.add_post("/oauth/token", self.handle_oauth_token)
         self.app.router.add_post("/oauth/revoke", self.handle_oauth_revoke)
 
@@ -386,13 +401,49 @@ class RemoteMcpGateway:
 
         # If GET request from browser: render interactive owner consent challenge screen
         if request.method == "GET":
+            # Cap pending authorizations queue to 50 entries and prune stale entries
+            MAX_PENDING_AUTHORIZATIONS = 50
+            now = time.time()
+            expired_auth = [
+                k for k, v in self._pending_authorizations.items()
+                if now > v.get("expires_at", 0) or v.get("status") in ("CONSUMED", "REJECTED")
+            ]
+            for k in expired_auth:
+                self._pending_authorizations.pop(k, None)
+
+            if len(self._pending_authorizations) >= MAX_PENDING_AUTHORIZATIONS:
+                logger.warning("Rejected OAuth authorization request: pending queue capacity (%d) reached.", MAX_PENDING_AUTHORIZATIONS)
+                return web.json_response(
+                    {"error": "temporarily_unavailable", "error_description": "Too many pending authorization requests. Please try again later."},
+                    status=429,
+                )
+
             # Generate anti-CSRF token for the consent transaction
             csrf_token = secrets.token_urlsafe(32)
-            now = time.time()
             self._consent_tokens[csrf_token] = {
                 "expires_at": now + 600.0,
                 "client_id": client_id,
                 "redirect_uri": redirect_uri,
+            }
+
+            # Register in pending authorization queue for 1-click dashboard approval
+            req_id = f"auth_req_{secrets.token_hex(8)}"
+            poll_token = secrets.token_urlsafe(32)
+            self._pending_authorizations[req_id] = {
+                "request_id": req_id,
+                "poll_token": poll_token,
+                "client_id": client_id,
+                "client_name": client.client_name,
+                "redirect_uri": redirect_uri,
+                "scope": scope,
+                "state": state,
+                "code_challenge": code_challenge,
+                "code_challenge_method": code_challenge_method,
+                "created_at": now,
+                "expires_at": now + 600.0,
+                "status": "PENDING",
+                "auth_code": None,
+                "redirect_url": None,
             }
 
             # Prune expired consent tokens
@@ -431,6 +482,9 @@ class RemoteMcpGateway:
 <body>
   <div class="card">
     <h1>❄️ SNOW MCP Authorization</h1>
+    <div style="background: rgba(14, 165, 233, 0.15); border: 1px solid #0284c7; border-radius: 8px; padding: 0.8rem; margin-bottom: 1rem; font-size: 0.85rem; color: #38bdf8;">
+      ⚡ <strong>One-Click Approval:</strong> You can approve or reject this request with 1-click in the <a href="http://127.0.0.1:8769" target="_blank" style="color: #fff; text-decoration: underline;">SNOW Web Dashboard</a> without typing secrets. This screen updates automatically.
+    </div>
     <p style="font-size: 0.9rem; color: #cbd5e1;">An AI client is requesting authorization to connect to your local SNOW capability bridge:</p>
     <div class="meta-box">
       <strong>Application:</strong> {safe_client_name}<br>
@@ -447,16 +501,39 @@ class RemoteMcpGateway:
       <input type="hidden" name="scope" value="{safe_scope}">
       <input type="hidden" name="state" value="{safe_state}">
       <input type="hidden" name="csrf_token" value="{csrf_token}">
-      <label for="ipc_secret" style="font-size:0.85rem;color:#94a3b8;font-weight:600;">Owner Authentication (IPC Secret from ~/.snow/ipc.secret):</label>
-      <input type="password" id="ipc_secret" name="ipc_secret" class="secret-input" placeholder="Paste owner IPC secret..." required>
+      <input type="hidden" name="request_id" value="{req_id}">
+      <label for="ipc_secret" style="font-size:0.85rem;color:#94a3b8;font-weight:600;">Owner Authentication (IPC Secret or Dashboard Approval):</label>
+      <input type="password" id="ipc_secret" name="ipc_secret" class="secret-input" placeholder="Paste owner IPC secret (or approve in Dashboard)...">
       <div class="actions">
         <button type="submit" name="decision" value="deny" class="btn-deny">✕ Deny</button>
         <button type="submit" name="decision" value="approve" class="btn-approve">✓ Authorize</button>
       </div>
     </form>
   </div>
+  <script>
+    const reqId = "{req_id}";
+    const pollTok = "{poll_token}";
+    if (reqId && pollTok) {{
+      const pollTimer = setInterval(async () => {{
+        try {{
+          const res = await fetch('/oauth/status?request_id=' + encodeURIComponent(reqId) + '&poll_token=' + encodeURIComponent(pollTok));
+          if (res.ok) {{
+            const data = await res.json();
+            if (data.status === 'APPROVED' && data.redirect_url) {{
+              clearInterval(pollTimer);
+              window.location.href = data.redirect_url;
+            }} else if (data.status === 'REJECTED') {{
+              clearInterval(pollTimer);
+              alert('Authorization request rejected by owner in Web Dashboard.');
+            }}
+          }}
+        }} catch (e) {{}}
+      }}, 1000);
+    }}
+  </script>
 </body>
 </html>"""
+            return web.Response(text=consent_html, content_type="text/html")
             return web.Response(text=consent_html, content_type="text/html")
 
         # POST Request Handling — Rate limit consent submissions
@@ -989,6 +1066,127 @@ class RemoteMcpGateway:
             self._active_sessions.pop(session_id, None)
             return web.Response(status=204, headers={"MCP-Protocol-Version": proto_ver})
         return web.Response(status=404, text="Session not found.", headers={"MCP-Protocol-Version": proto_ver})
+
+    # =========================================================================
+    # Owner-Friendly OAuth Approval Queue (Stage 3B)
+    # =========================================================================
+
+    def list_pending_authorizations(self) -> list[dict[str, Any]]:
+        """List active pending OAuth authorization requests awaiting owner consent."""
+        now = time.time()
+        expired = [k for k, v in self._pending_authorizations.items() if now > v.get("expires_at", 0)]
+        for k in expired:
+            self._pending_authorizations.pop(k, None)
+        return [
+            {
+                "request_id": v["request_id"],
+                "client_id": v["client_id"],
+                "client_name": v["client_name"],
+                "scope": v["scope"],
+                "redirect_uri": v["redirect_uri"],
+                "created_at": v["created_at"],
+                "status": v["status"],
+            }
+            for v in self._pending_authorizations.values()
+            if v["status"] == "PENDING"
+        ]
+
+    def approve_authorization(self, request_id: str) -> dict[str, Any]:
+        """Approve pending authorization request from owner dashboard without raw secret typing."""
+        rec = self._pending_authorizations.get(request_id)
+        if not rec:
+            return {"success": False, "error": "Authorization request not found or expired."}
+        if rec["status"] != "PENDING":
+            return {"success": False, "error": f"Request is already {rec['status']}."}
+
+        ok, code_or_err = self.oauth_server.create_authorization_code(
+            client_id=rec["client_id"],
+            redirect_uri=rec["redirect_uri"],
+            code_challenge=rec["code_challenge"],
+            code_challenge_method=rec["code_challenge_method"],
+            scope=rec["scope"],
+        )
+        if not ok:
+            return {"success": False, "error": str(code_or_err)}
+
+        rec["status"] = "APPROVED"
+        rec["auth_code"] = code_or_err
+        target_redirect = build_oauth_redirect_url(
+            rec["redirect_uri"],
+            {"code": code_or_err, "state": rec.get("state", "")}
+        )
+        rec["redirect_url"] = target_redirect
+        logger.info("Owner approved OAuth request [%s] for client [%s]", request_id, rec["client_id"])
+        return {
+            "success": True,
+            "status": "APPROVED",
+            "request_id": request_id,
+            "code": code_or_err,
+            "redirect_url": target_redirect,
+        }
+
+    def reject_authorization(self, request_id: str) -> dict[str, Any]:
+        """Reject pending authorization request from owner dashboard."""
+        rec = self._pending_authorizations.get(request_id)
+        if not rec:
+            return {"success": False, "error": "Authorization request not found or expired."}
+        rec["status"] = "REJECTED"
+        logger.info("Owner rejected OAuth request [%s] for client [%s]", request_id, rec["client_id"])
+        return {"success": True, "status": "REJECTED", "request_id": request_id}
+
+    async def handle_oauth_status(self, request: web.Request) -> web.Response:
+        """Poll authorization status for an active request_id with strict poll_token and single-read semantics."""
+        req_id = request.query.get("request_id")
+        poll_tok = request.query.get("poll_token")
+
+        if not req_id or not poll_tok:
+            return web.json_response(
+                {"error": "invalid_request", "error_description": "Both request_id and poll_token are required."},
+                status=400,
+            )
+
+        now = time.time()
+        async with self._pending_auth_lock:
+            rec = self._pending_authorizations.get(req_id)
+            if not rec:
+                return web.json_response({"status": "NOT_FOUND"}, status=404)
+
+            expected_token = rec.get("poll_token")
+            if not expected_token or not secrets.compare_digest(poll_tok, expected_token):
+                logger.warning("Rejected /oauth/status poll: invalid poll_token for request [%s]", req_id)
+                return web.json_response({"status": "NOT_FOUND"}, status=404)
+
+            if now > rec.get("expires_at", 0):
+                rec["status"] = "EXPIRED"
+                return web.json_response({"request_id": req_id, "status": "EXPIRED"}, status=410)
+
+            status = rec.get("status")
+            if status == "PENDING":
+                return web.json_response({"request_id": req_id, "status": "PENDING"})
+
+            if status == "REJECTED":
+                return web.json_response({"request_id": req_id, "status": "REJECTED"})
+
+            if status == "APPROVED":
+                # Single-read: atomically consume redirect_url and auth_code
+                redirect_url = rec.pop("redirect_url", None)
+                auth_code = rec.pop("auth_code", None)
+                rec["status"] = "CONSUMED"
+                return web.json_response({
+                    "request_id": req_id,
+                    "status": "APPROVED",
+                    "redirect_url": redirect_url,
+                    "code": auth_code,
+                })
+
+            if status == "CONSUMED":
+                return web.json_response({
+                    "request_id": req_id,
+                    "status": "CONSUMED",
+                    "error": "Authorization result has already been delivered.",
+                }, status=410)
+
+            return web.json_response({"request_id": req_id, "status": status})
 
 
 def create_gateway_app(
