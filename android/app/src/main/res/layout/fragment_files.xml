@@ -58,17 +58,35 @@
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 
-    <!-- Send File to PC Action Button -->
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/btn_send_file_to_pc"
+    <!-- Action Buttons Row: Send File & Terminal Console -->
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="12dp"
-        android:text="Send File to PC (Upload)"
-        android:textColor="@color/card_surface"
-        android:backgroundTint="@color/primary_blue"
-        app:icon="@drawable/ic_pc_file"
-        app:iconTint="@color/card_surface" />
+        android:orientation="horizontal"
+        android:layout_marginBottom="12dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_send_file_to_pc"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:text="Send File"
+            android:textColor="@color/card_surface"
+            android:backgroundTint="@color/primary_blue"
+            app:icon="@drawable/ic_pc_file"
+            app:iconTint="@color/card_surface" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_open_terminal"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="6dp"
+            android:text="Terminal"
+            style="@style/Widget.Material3.Button.TonalButton"
+            app:icon="@drawable/ic_nav_terminal" />
+    </LinearLayout>
 
     <!-- Remote PC Explorer Main Card -->
     <com.google.android.material.card.MaterialCardView

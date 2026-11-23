@@ -90,6 +90,21 @@ open class FileTransferClient(
         data class Error(val transferId: String?, val message: String, val code: Int? = null) : TransferResult()
     }
 
+    sealed interface WallpaperResult {
+        data class Updated(val bytes: ByteArray, val etag: String?) : WallpaperResult {
+            override fun equals(other: Any?): Boolean {
+                if (this === other) return true
+                if (other !is Updated) return false
+                return bytes.contentEquals(other.bytes) && etag == other.etag
+            }
+            override fun hashCode(): Int {
+                return 31 * bytes.contentHashCode() + (etag?.hashCode() ?: 0)
+            }
+        }
+        data object NotModified : WallpaperResult
+        data object Unavailable : WallpaperResult
+    }
+
     private val httpClient: OkHttpClient = customClient ?: buildHttpClient()
 
     private fun buildHttpClient(): OkHttpClient {
@@ -567,6 +582,52 @@ open class FileTransferClient(
         } catch (e: Exception) {
             SafeLog.w(TAG, "Screen stop POST error: ${e.message}")
             false
+        }
+    }
+
+    /**
+     * Retrieve scaled desktop wallpaper preview from the HTTPS transfer server.
+     * Supports ETag / If-None-Match for efficient 304 caching.
+     */
+    suspend fun getDesktopWallpaper(
+        serverHost: String,
+        transferPort: Int = 8766,
+        ifNoneMatch: String? = null
+    ): WallpaperResult = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val url = "$baseUrl/api/v1/desktop/wallpaper"
+        val reqBuilder = Request.Builder()
+            .url(url)
+            .get()
+            .addHeader("X-Snow-Device-Id", deviceId)
+
+        val token = getAuthToken()
+        if (!token.isNullOrBlank()) {
+            reqBuilder.addHeader("Authorization", "Bearer $token")
+        }
+        if (!ifNoneMatch.isNullOrBlank()) {
+            reqBuilder.addHeader("If-None-Match", ifNoneMatch)
+        }
+
+        try {
+            httpClient.newCall(reqBuilder.build()).execute().use { response ->
+                val etag = response.header("ETag")
+                if (response.code == 304) {
+                    return@withContext WallpaperResult.NotModified
+                }
+                if (!response.isSuccessful) {
+                    return@withContext WallpaperResult.Unavailable
+                }
+                val bodyBytes = response.body?.bytes()
+                if (bodyBytes != null && bodyBytes.isNotEmpty()) {
+                    WallpaperResult.Updated(bodyBytes, etag)
+                } else {
+                    WallpaperResult.Unavailable
+                }
+            }
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Wallpaper GET error: ${e.message}")
+            WallpaperResult.Unavailable
         }
     }
 }

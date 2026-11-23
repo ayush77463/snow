@@ -82,40 +82,68 @@
                 android:orientation="vertical"
                 android:padding="16dp">
 
-                <TextView
+                <LinearLayout
+                    android:id="@+id/header_device_identity"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:textSize="16sp"
-                    android:textStyle="bold"
-                    android:textColor="@color/primary_text"
-                    android:text="@string/title_device_identity" />
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true">
 
-                <TextView
-                    android:id="@+id/tv_device_name"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="8dp"
-                    android:textSize="13sp"
-                    android:textColor="@color/secondary_text"
-                    android:text="Name: Realme RMX5110" />
+                    <TextView
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:textSize="16sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/primary_text"
+                        android:text="@string/title_device_identity" />
 
-                <TextView
-                    android:id="@+id/tv_device_id"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:textSize="13sp"
-                    android:fontFamily="monospace"
-                    android:textColor="@color/secondary_text"
-                    android:text="ID: --" />
+                    <TextView
+                        android:id="@+id/tv_toggle_device_identity"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textSize="13sp"
+                        android:textColor="@color/primary_blue"
+                        android:text="▼ Expand" />
+                </LinearLayout>
 
-                <TextView
+                <LinearLayout
+                    android:id="@+id/layout_device_identity_body"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:textSize="13sp"
-                    android:textColor="@color/secondary_text"
-                    android:text="Platform: Android (API 34)" />
+                    android:orientation="vertical"
+                    android:visibility="gone">
+
+                    <TextView
+                        android:id="@+id/tv_device_name"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:textSize="13sp"
+                        android:textColor="@color/secondary_text"
+                        android:text="Name: Realme RMX5110" />
+
+                    <TextView
+                        android:id="@+id/tv_device_id"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:textSize="13sp"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/secondary_text"
+                        android:text="ID: --" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:textSize="13sp"
+                        android:textColor="@color/secondary_text"
+                        android:text="Platform: Android (API 34)" />
+                </LinearLayout>
 
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
@@ -566,10 +594,14 @@
                 android:padding="16dp">
 
                 <LinearLayout
+                    android:id="@+id/header_diagnostics"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:gravity="center_vertical"
-                    android:orientation="horizontal">
+                    android:orientation="horizontal"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:clickable="true"
+                    android:focusable="true">
 
                     <TextView
                         android:layout_width="0dp"
@@ -580,31 +612,55 @@
                         android:textColor="@color/primary_text"
                         android:text="@string/title_diagnostics" />
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btn_clear_diagnostics"
+                    <TextView
+                        android:id="@+id/tv_toggle_diagnostics"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Clear"
-                        style="@style/Widget.Material3.Button.TextButton" />
+                        android:textSize="13sp"
+                        android:textColor="@color/primary_blue"
+                        android:text="▼ Expand" />
                 </LinearLayout>
 
-                <ScrollView
+                <LinearLayout
+                    android:id="@+id/layout_diagnostics_body"
                     android:layout_width="match_parent"
-                    android:layout_height="180dp"
-                    android:layout_marginTop="8dp"
-                    android:background="@drawable/bg_input_field"
-                    android:padding="8dp">
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
 
-                    <TextView
-                        android:id="@+id/tv_diagnostics_log"
+                    <LinearLayout
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:fontFamily="monospace"
-                        android:textSize="11sp"
-                        android:textColor="@color/log_text"
-                        android:textIsSelectable="true"
-                        android:text="No diagnostic logs yet." />
-                </ScrollView>
+                        android:gravity="end"
+                        android:layout_marginTop="4dp"
+                        android:orientation="horizontal">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btn_clear_diagnostics"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Clear"
+                            style="@style/Widget.Material3.Button.TextButton" />
+                    </LinearLayout>
+
+                    <ScrollView
+                        android:layout_width="match_parent"
+                        android:layout_height="180dp"
+                        android:layout_marginTop="4dp"
+                        android:background="@drawable/bg_input_field"
+                        android:padding="8dp">
+
+                        <TextView
+                            android:id="@+id/tv_diagnostics_log"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:fontFamily="monospace"
+                            android:textSize="11sp"
+                            android:textColor="@color/log_text"
+                            android:textIsSelectable="true"
+                            android:text="No diagnostic logs yet." />
+                    </ScrollView>
+                </LinearLayout>
 
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>

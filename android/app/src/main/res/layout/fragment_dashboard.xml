@@ -162,6 +162,46 @@
                     android:textColor="@color/secondary_text"
                     android:text="@string/desc_no_connected_device" />
 
+                <!-- Device Screen / Wallpaper Preview Frame -->
+                <com.google.android.material.card.MaterialCardView
+                    android:id="@+id/card_wallpaper_preview"
+                    android:layout_width="match_parent"
+                    android:layout_height="140dp"
+                    android:layout_marginTop="12dp"
+                    android:visibility="gone"
+                    app:cardCornerRadius="12dp"
+                    app:cardElevation="0dp"
+                    app:strokeColor="@color/card_border"
+                    app:strokeWidth="1dp"
+                    app:cardBackgroundColor="@color/app_background">
+
+                    <FrameLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="match_parent">
+
+                        <ImageView
+                            android:id="@+id/iv_desktop_wallpaper"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent"
+                            android:scaleType="centerCrop"
+                            android:contentDescription="Desktop Wallpaper Preview" />
+
+                        <TextView
+                            android:id="@+id/tv_wallpaper_device_badge"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="bottom|start"
+                            android:layout_margin="8dp"
+                            android:paddingHorizontal="8dp"
+                            android:paddingVertical="3dp"
+                            android:background="@drawable/bg_pill_status"
+                            android:textSize="11sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/primary_text"
+                            android:text="🖥️ Windows PC" />
+                    </FrameLayout>
+                </com.google.android.material.card.MaterialCardView>
+
                 <!-- 3-Column PC Telemetry Strip: CPU | RAM | BATTERY -->
                 <LinearLayout
                     android:id="@+id/layout_pc_telemetry_strip"
@@ -284,13 +324,58 @@
                     android:textColor="@color/secondary_text"
                     android:text="Last updated: Just now" />
 
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btn_goto_devices"
-                    android:layout_width="wrap_content"
+                <!-- Quick Hero Actions: Lock PC & Send Files -->
+                <LinearLayout
+                    android:id="@+id/layout_hero_actions"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
-                    android:text="@string/btn_goto_devices"
-                    style="@style/Widget.Material3.Button.TonalButton" />
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_hero_lock_pc"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Lock PC"
+                        style="@style/Widget.Material3.Button.OutlinedButton" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_hero_send_files"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="8dp"
+                        android:text="Send Files"
+                        style="@style/Widget.Material3.Button" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_open_terminal"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginEnd="4dp"
+                        android:text="Terminal"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        app:icon="@drawable/ic_nav_terminal" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_goto_devices"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="4dp"
+                        android:text="@string/btn_goto_devices"
+                        style="@style/Widget.Material3.Button.TonalButton" />
+                </LinearLayout>
 
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
@@ -454,39 +539,6 @@
                     android:textColor="@color/secondary_text"
                     android:text="PC → Phone is instant; Phone → PC syncs when SNOW is open." />
 
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:orientation="horizontal">
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btn_push_clipboard"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:layout_marginEnd="6dp"
-                        android:text="@string/btn_push_clipboard"
-                        style="@style/Widget.Material3.Button.TonalButton" />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btn_pull_clipboard"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:layout_marginStart="6dp"
-                        android:text="@string/btn_pull_clipboard"
-                        style="@style/Widget.Material3.Button.TonalButton" />
-                </LinearLayout>
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btn_push_screenshot"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="8dp"
-                    android:text="Push Latest Screenshot to PC 📸"
-                    style="@style/Widget.Material3.Button.OutlinedButton" />
-
                 <!-- Shared Buffer (Phase 26B) -->
                 <View
                     android:layout_width="match_parent"
@@ -518,14 +570,6 @@
                         android:textSize="11sp"
                         style="@style/Widget.Material3.Button.TextButton" />
                 </LinearLayout>
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btn_copy_latest_buffer"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:text="📋 Copy Latest to Phone"
-                    style="@style/Widget.Material3.Button.TonalButton" />
 
                 <TextView
                     android:id="@+id/tv_buffer_empty"

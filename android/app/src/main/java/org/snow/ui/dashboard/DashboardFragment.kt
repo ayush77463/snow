@@ -159,8 +159,29 @@ class DashboardFragment : Fragment() {
             viewModel.refreshTelemetry()
         }
 
+        binding.btnHeroLockPc.setOnClickListener {
+            viewModel.lockPc { success, err ->
+                activity?.runOnUiThread {
+                    if (success) {
+                        Toast.makeText(requireContext(), "PC screen locked", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(requireContext(), "Failed to lock PC: $err", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+
+        binding.btnHeroSendFiles.setOnClickListener {
+            (activity as? MainActivity)?.selectTab(R.id.nav_files)
+        }
+
         binding.btnGotoDevices.setOnClickListener {
             (activity as? MainActivity)?.selectTab(R.id.nav_devices)
+        }
+
+        binding.btnOpenTerminal.setOnClickListener {
+            val dialog = org.snow.ui.terminal.TerminalBottomSheetDialog()
+            dialog.show(parentFragmentManager, org.snow.ui.terminal.TerminalBottomSheetDialog.TAG)
         }
 
         binding.btnBrowseFiles.setOnClickListener {
@@ -183,32 +204,6 @@ class DashboardFragment : Fragment() {
             }
         }
 
-        binding.btnPushClipboard.setOnClickListener {
-            ClipboardHandler.isAppInForeground = true
-            ClipboardHandler.isUserIntentGranted = true
-            viewModel.pushCurrentClipboard { success, resultOrErr ->
-                activity?.runOnUiThread {
-                    if (success) {
-                        Toast.makeText(requireContext(), "Pushed clipboard to PC", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(requireContext(), "Clipboard push failed: $resultOrErr", Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
-        }
-
-        binding.btnPullClipboard.setOnClickListener {
-            viewModel.pullClipboard { success, resultOrErr ->
-                activity?.runOnUiThread {
-                    if (success) {
-                        Toast.makeText(requireContext(), resultOrErr ?: "Copied PC clipboard to phone", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(requireContext(), "Clipboard pull failed: $resultOrErr", Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
-        }
-
         binding.btnLaunchAppSheet.setOnClickListener {
             val sheet = AppLauncherBottomSheet { target, friendlyName ->
                 viewModel.launchWindowsApp(target) { success, err ->
@@ -226,30 +221,6 @@ class DashboardFragment : Fragment() {
 
         binding.btnCancelTransfer.setOnClickListener {
             viewModel.cancelActiveTransfer()
-        }
-
-        binding.btnPushScreenshot.setOnClickListener {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
-                    requestMediaPermissionLauncher.launch(Manifest.permission.READ_MEDIA_IMAGES)
-                    return@setOnClickListener
-                }
-            } else {
-                if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                    requestMediaPermissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
-                    return@setOnClickListener
-                }
-            }
-            Toast.makeText(requireContext(), "Looking for recent screenshot...", Toast.LENGTH_SHORT).show()
-            viewModel.pushLatestScreenshot { success, resOrErr ->
-                activity?.runOnUiThread {
-                    if (success) {
-                        Toast.makeText(requireContext(), "Synced screenshot to PC: $resOrErr ❄️", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(requireContext(), "Screenshot sync: ${resOrErr ?: "None found"}", Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
         }
 
         binding.btnScreenConsent.setOnClickListener {
@@ -310,19 +281,6 @@ class DashboardFragment : Fragment() {
                         Toast.makeText(requireContext(), "Refresh failed: $msg", Toast.LENGTH_SHORT).show()
                     }
                 }
-            }
-        }
-
-        binding.btnCopyLatestBuffer.setOnClickListener {
-            val items = viewModel.clipboardBufferItems.value
-            if (items.isNotEmpty()) {
-                viewModel.applyBufferItem(items.first()) { success, msg ->
-                    activity?.runOnUiThread {
-                        Toast.makeText(requireContext(), msg ?: "Copied to clipboard", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            } else {
-                Toast.makeText(requireContext(), "Clipboard buffer is empty", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -493,6 +451,8 @@ class DashboardFragment : Fragment() {
         viewLifecycleOwner.lifecycleScope.launch {
             viewModel.pcTelemetry.collectLatest { pc ->
                 if (pc.isAvailable && pc.isConnected) {
+                    val isAndroid = pc.os?.contains("Android", ignoreCase = true) == true
+                    binding.tvWallpaperDeviceBadge.text = if (isAndroid) "📱 Android Phone" else "🖥️ Windows PC"
                     binding.tvPcBattery.text = if (pc.batteryPercent != null) "${pc.batteryPercent}%" else "AC Power"
                     binding.tvPcCharging.text = if (pc.isCharging == true) "Charging" else if (pc.batteryPercent != null) "Battery" else "Plugged in"
                     if (pc.hostname != null) {
@@ -682,6 +642,22 @@ class DashboardFragment : Fragment() {
                 binding.tvHeroStatusPill.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
                 binding.btnGotoDevices.visibility = View.GONE
                 refreshPendingApprovals()
+                viewLifecycleOwner.lifecycleScope.launch {
+                    val bitmap = SnowUiRepository.getInstance(requireContext()).loadDesktopWallpaper()
+                    if (_binding != null) {
+                        if (bitmap != null) {
+                            binding.ivDesktopWallpaper.setImageBitmap(bitmap)
+                            binding.ivDesktopWallpaper.imageTintList = null
+                            binding.ivDesktopWallpaper.scaleType = android.widget.ImageView.ScaleType.CENTER_CROP
+                            binding.cardWallpaperPreview.visibility = View.VISIBLE
+                        } else {
+                            // Polished SNOW Light/Dark fallback surface
+                            binding.ivDesktopWallpaper.setImageResource(R.drawable.ic_snow_logo)
+                            binding.ivDesktopWallpaper.scaleType = android.widget.ImageView.ScaleType.CENTER_INSIDE
+                            binding.cardWallpaperPreview.visibility = View.VISIBLE
+                        }
+                    }
+                }
             }
             ConnectionState.CONNECTING -> {
                 binding.tvHeroStatusPill.text = "CONNECTING..."
@@ -698,6 +674,7 @@ class DashboardFragment : Fragment() {
                 binding.tvHeroStatusPill.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
                 binding.tvHeroPeerName.text = getString(R.string.desc_no_connected_device)
                 binding.btnGotoDevices.visibility = View.VISIBLE
+                binding.cardWallpaperPreview.visibility = View.GONE
             }
         }
     }

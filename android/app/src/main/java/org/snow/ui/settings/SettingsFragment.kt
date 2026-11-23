@@ -280,6 +280,12 @@ class SettingsFragment : Fragment() {
         val id = viewModel.deviceIdentity
         binding.tvDeviceName.text = "Name: ${id.deviceName}"
         binding.tvDeviceId.text = "ID: ${id.deviceId}"
+
+        binding.headerDeviceIdentity.setOnClickListener {
+            val isGone = binding.layoutDeviceIdentityBody.visibility == View.GONE
+            binding.layoutDeviceIdentityBody.visibility = if (isGone) View.VISIBLE else View.GONE
+            binding.tvToggleDeviceIdentity.text = if (isGone) "▲ Collapse" else "▼ Expand"
+        }
     }
 
     private fun setupTrustControls() {
@@ -461,6 +467,12 @@ class SettingsFragment : Fragment() {
         binding.btnClearDiagnostics.setOnClickListener {
             viewModel.clearLogs()
             Toast.makeText(requireContext(), "Logs cleared", Toast.LENGTH_SHORT).show()
+        }
+
+        binding.headerDiagnostics.setOnClickListener {
+            val isGone = binding.layoutDiagnosticsBody.visibility == View.GONE
+            binding.layoutDiagnosticsBody.visibility = if (isGone) View.VISIBLE else View.GONE
+            binding.tvToggleDiagnostics.text = if (isGone) "▲ Collapse" else "▼ Expand"
         }
     }
 

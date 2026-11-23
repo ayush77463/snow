@@ -1,24 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Glacier Blue (Glacier Crisp) Design System Tokens -->
-    <color name="app_background">#F5F8FD</color>
+    <!-- Material 3 Light Mode Tokens -->
+    <color name="app_background">#F8FAFC</color>
     <color name="card_surface">#FFFFFF</color>
-    <color name="card_border">#E4EAF3</color>
+    <color name="card_border">#E2E8F0</color>
     <color name="primary_blue">#2563EB</color>
     <color name="secondary_cyan">#06B6D4</color>
     <color name="tertiary_blue">#1D4ED8</color>
-    <color name="primary_text">#172B4D</color>
-    <color name="secondary_text">#73839A</color>
+    <color name="primary_text">#0F172A</color>
+    <color name="secondary_text">#64748B</color>
     <color name="soft_blue_surface">#DBEAFE</color>
 
     <!-- Legacy / Compatibility Aliases -->
     <color name="primary">#2563EB</color>
     <color name="primary_dark">#1D4ED8</color>
     <color name="accent">#06B6D4</color>
-    <color name="background">#F5F8FD</color>
+    <color name="background">#F8FAFC</color>
     <color name="surface">#FFFFFF</color>
-    <color name="text_primary">#172B4D</color>
-    <color name="text_secondary">#73839A</color>
+    <color name="text_primary">#0F172A</color>
+    <color name="text_secondary">#64748B</color>
 
     <!-- Status Colors & Soft Pills -->
     <color name="status_connected">#10B981</color>

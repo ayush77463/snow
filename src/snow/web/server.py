@@ -822,6 +822,58 @@ class SnowWebServer:
             logger.error("Error reading capture file '%s': %s", file_name, exc)
             return web.Response(status=500, text="Internal error reading capture.")
 
+    async def handle_api_desktop_wallpaper(self, request: web.Request) -> web.Response:
+        """Serve scaled Windows desktop wallpaper preview with ETag and 304 support for Web UI."""
+        session = self._get_valid_session(request)
+        if not session:
+            return web.Response(status=401, text="Unauthorized: Authentication required.")
+
+        try:
+            from snow.capabilities.windows.wallpaper import get_desktop_wallpaper_preview
+            jpeg_bytes, etag = await asyncio.to_thread(get_desktop_wallpaper_preview)
+            if not jpeg_bytes:
+                return web.Response(status=404, text="Wallpaper not available.")
+
+            client_etag = request.headers.get("If-None-Match")
+            if client_etag and client_etag.strip() == etag:
+                return web.Response(status=304, headers={"ETag": etag})
+
+            return web.Response(
+                body=jpeg_bytes,
+                content_type="image/jpeg",
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "private, max-age=60, must-revalidate",
+                },
+            )
+        except Exception as exc:
+            logger.warning("Error serving web wallpaper preview: %s", exc)
+            return web.Response(status=500, text=str(exc))
+
+    async def handle_api_desktop_lock(self, request: web.Request) -> web.Response:
+        """Securely lock the host Windows workstation (OWNER_MANUAL only)."""
+        if sys.platform != "win32":
+            return web.json_response(
+                {"success": False, "error": "Workstation lock is only supported on Windows."},
+                status=501,
+            )
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.LockWorkStation.argtypes = []
+            user32.LockWorkStation.restype = wintypes.BOOL
+
+            res_val = await asyncio.to_thread(user32.LockWorkStation)
+            if res_val:
+                return web.json_response({"success": True, "message": "Workstation locked successfully."})
+            else:
+                return web.json_response({"success": False, "error": "LockWorkStation returned 0."}, status=500)
+        except Exception as exc:
+            logger.error("Failed to invoke native LockWorkStation: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
     async def handle_api_workflow_run(self, request: web.Request) -> web.Response:
         """Run an authorized declarative multi-step workflow from dashboard."""
         try:
@@ -1856,6 +1908,8 @@ class SnowWebServer:
         app.router.add_post("/api/approvals/resolve", self.handle_api_approvals_resolve)
         app.router.add_post("/api/approvals/{request_id}/resolve", self.handle_api_approvals_resolve)
         app.router.add_get("/api/captures/{file_name}", self.handle_api_capture_preview)
+        app.router.add_get("/api/desktop/wallpaper", self.handle_api_desktop_wallpaper)
+        app.router.add_post("/api/desktop/lock", self.handle_api_desktop_lock)
         app.router.add_get("/api/workflows", self.handle_api_workflows_list)
         app.router.add_post("/api/workflows/run", self.handle_api_workflow_run)
         app.router.add_get("/api/activity", self.handle_api_activity)

@@ -135,9 +135,23 @@
     // =========================================================================
 
     function switchTab(tabName) {
-        currentTab = tabName;
+        // Alias mapping for 5-view architecture
+        const aliasMap = {
+            home: "overview",
+            "files-apps": "files",
+            apps: "files",
+            notifications: "overview",
+            media: "overview",
+            share: "overview",
+            approvals: "settings",
+            activity: "settings",
+            federation: "devices",
+        };
+        const resolvedTab = aliasMap[tabName] || tabName;
+        currentTab = resolvedTab;
+
         navItems.forEach(item => {
-            if (item.getAttribute("data-tab") === tabName) {
+            if (item.getAttribute("data-tab") === resolvedTab) {
                 item.classList.add("active");
             } else {
                 item.classList.remove("active");
@@ -145,7 +159,7 @@
         });
 
         tabPanes.forEach(pane => {
-            if (pane.id === "section-" + tabName) {
+            if (pane.id === "section-" + resolvedTab || pane.id === "section-" + tabName) {
                 pane.classList.add("active");
             } else {
                 pane.classList.remove("active");
@@ -154,23 +168,17 @@
 
         // Update Title
         const titleMap = {
-            overview: "Overview",
-            devices: "Devices & Mesh",
-            files: "Phone Storage (SAF)",
-            notifications: "Android Notifications",
-            media: "Multimedia Controls",
-            share: "Share Link / Note",
-            approvals: "Security Approvals",
-            activity: "Activity Audit",
-            federation: "Federation & Sharing",
-            settings: "Settings & Diagnostics",
+            overview: "Home",
+            devices: "Devices",
+            files: "Files & Apps",
             clipboard: "Clipboard History",
             apps: "Android Applications",
+            settings: "AI & Settings",
         };
-        activeTabTitle.textContent = titleMap[tabName] || "Dashboard";
+        activeTabTitle.textContent = titleMap[resolvedTab] || "Dashboard";
 
         // Stop screen streaming poll when leaving overview
-        if (tabName !== "overview") {
+        if (resolvedTab !== "overview") {
             stopScreenPoll();
         }
 
@@ -196,12 +204,54 @@
                 } else if (action === "files") {
                     switchTab("files");
                 } else if (action === "notifs") {
-                    switchTab("notifications");
+                    switchTab("overview");
                 } else if (action === "share") {
-                    switchTab("share");
+                    switchTab("overview");
                 }
             });
         });
+
+        const btnTopbarApprovals = document.getElementById("btn-topbar-approvals");
+        if (btnTopbarApprovals) {
+            btnTopbarApprovals.addEventListener("click", () => switchTab("settings"));
+        }
+
+        const btnHeroLockPc = document.getElementById("btn-hero-lock-pc");
+        if (btnHeroLockPc) {
+            btnHeroLockPc.addEventListener("click", async () => {
+                btnHeroLockPc.disabled = true;
+                const orig = btnHeroLockPc.textContent;
+                btnHeroLockPc.textContent = "Locking...";
+                try {
+                    const res = await apiRequest("/api/desktop/lock", "POST", {});
+                    if (res && res.success) {
+                        alert("Windows workstation locked successfully.");
+                    } else {
+                        alert("Failed to lock PC: " + (res && res.error ? res.error : "Request error"));
+                    }
+                } catch (e) {
+                    alert("Lock error: " + e.message);
+                } finally {
+                    btnHeroLockPc.disabled = false;
+                    btnHeroLockPc.textContent = orig;
+                }
+            });
+        }
+
+        const btnHeroSendFile = document.getElementById("btn-hero-send-file");
+        if (btnHeroSendFile) {
+            btnHeroSendFile.addEventListener("click", () => switchTab("files"));
+        }
+
+        const btnHeroCapture = document.getElementById("btn-hero-capture-screen");
+        if (btnHeroCapture) {
+            btnHeroCapture.addEventListener("click", () => {
+                const btnCapturePc = document.getElementById("btn-wf-capture-pc");
+                if (btnCapturePc) btnCapturePc.click();
+            });
+        }
+
+        setupCommandPalette();
 
         if (btnGlobalRefresh) {
             btnGlobalRefresh.addEventListener("click", () => {
@@ -309,6 +359,7 @@
         const approvals = (data && Array.isArray(data.requests)) ? data.requests : ((data && Array.isArray(data.approvals)) ? data.approvals : ((data && data.data && Array.isArray(data.data.requests)) ? data.data.requests : []));
         const count = (data && data.success) ? approvals.length : 0;
         const badge = document.getElementById("badge-approvals");
+        const topbarBadge = document.getElementById("topbar-approvals-badge");
         const statApprovals = document.getElementById("stat-pending-approvals");
         if (badge) {
             if (count > 0) {
@@ -316,6 +367,14 @@
                 badge.style.display = "";
             } else {
                 badge.style.display = "none";
+            }
+        }
+        if (topbarBadge) {
+            if (count > 0) {
+                topbarBadge.textContent = count.toString();
+                topbarBadge.style.display = "inline-block";
+            } else {
+                topbarBadge.style.display = "none";
             }
         }
         if (statApprovals) statApprovals.textContent = count.toString();
@@ -437,6 +496,103 @@
         }
     }
 
+    function updateHeroCard(activeDev) {
+        const iconEl = document.getElementById("hero-device-icon");
+        const nameEl = document.getElementById("hero-device-name");
+        const pillEl = document.getElementById("hero-transport-pill");
+        const batEl = document.getElementById("hero-battery-indicator");
+        const bezelEl = document.querySelector(".laptop-bezel");
+        const lockBtn = document.getElementById("btn-hero-lock-pc");
+        const wallpaperImg = document.getElementById("desktop-wallpaper-img");
+
+        if (!activeDev || isLocalNode(activeDev)) {
+            // Local Host Workstation (Windows)
+            if (iconEl) iconEl.textContent = "💻";
+            if (nameEl) nameEl.textContent = "Host Workstation (Windows)";
+            if (pillEl) {
+                pillEl.textContent = "Wi-Fi • Local";
+                pillEl.className = "chip chip-success";
+            }
+            if (bezelEl) bezelEl.classList.remove("phone-bezel");
+            if (lockBtn) {
+                lockBtn.textContent = "🔒 Lock PC";
+                lockBtn.style.display = "";
+            }
+            if (batEl) batEl.textContent = "🔋 AC Power (Plugged In)";
+            if (wallpaperImg) {
+                wallpaperImg.src = "/api/desktop/wallpaper?t=" + Date.now();
+                wallpaperImg.style.display = "";
+            }
+        } else {
+            // Remote Peer
+            const isAndroid = (activeDev.platform === "android" || (activeDev.device_name && /android|phone|pixel|samsung|realme/i.test(activeDev.device_name)));
+            if (iconEl) iconEl.textContent = isAndroid ? "📱" : "💻";
+            if (nameEl) nameEl.textContent = `${activeDev.device_name || activeDev.device_id} (${isAndroid ? 'Android' : (activeDev.platform || 'Peer')})`;
+
+            if (pillEl) {
+                if (!activeDev.is_connected) {
+                    pillEl.textContent = "Offline";
+                    pillEl.className = "chip chip-neutral";
+                } else if (activeDev.transport === "usb" || activeDev.connection_mode === "usb_only") {
+                    pillEl.textContent = "USB • Offline";
+                    pillEl.className = "chip chip-primary";
+                } else if (activeDev.transport === "relay" || activeDev.connection_mode === "relay_only") {
+                    pillEl.textContent = "Relay • Remote";
+                    pillEl.className = "chip chip-warning";
+                } else {
+                    pillEl.textContent = "Wi-Fi • Local";
+                    pillEl.className = "chip chip-success";
+                }
+            }
+
+            if (bezelEl) {
+                if (isAndroid) {
+                    bezelEl.classList.add("phone-bezel");
+                } else {
+                    bezelEl.classList.remove("phone-bezel");
+                }
+            }
+
+            if (lockBtn) {
+                if (isAndroid) {
+                    lockBtn.style.display = "none";
+                } else {
+                    lockBtn.textContent = "🔒 Lock PC";
+                    lockBtn.style.display = "";
+                }
+            }
+
+            if (batEl) {
+                if (activeDev.battery_percent !== undefined && activeDev.battery_percent !== null) {
+                    batEl.textContent = `🔋 ${activeDev.battery_percent}%`;
+                } else {
+                    batEl.textContent = activeDev.is_connected ? "🔋 Connected" : "⚪ Disconnected";
+                }
+            }
+        }
+    }
+
+    function applyOfflineUsbDimming(devices) {
+        if (!Array.isArray(devices)) return;
+        const usbConnected = devices.some(d => d.is_connected && (d.transport === "usb" || d.connection_mode === "usb_only"));
+        const lanConnected = devices.some(d => d.is_connected && (d.transport === "lan" || d.transport === "tls"));
+        const isOfflineUsb = usbConnected && !lanConnected;
+
+        const relayCard = document.getElementById("card-relay-status");
+        const fedSection = document.getElementById("section-federation");
+        const mcpCard = document.getElementById("card-mcp-gateway-status");
+
+        [relayCard, fedSection, mcpCard].forEach(el => {
+            if (el) {
+                if (isOfflineUsb) {
+                    el.classList.add("offline-dimmed");
+                } else {
+                    el.classList.remove("offline-dimmed");
+                }
+            }
+        });
+    }
+
     // 4A. Overview
     async function loadOverview() {
         const devRes = await apiRequest("/api/devices");
@@ -467,6 +623,11 @@
             transportChip.textContent = primaryTransport;
             transportChip.className = "chip " + chipClass;
         }
+
+        // Dynamic Hero Card & Offline USB Dimming update
+        const activeDev = devList.find(d => d.device_id === activeDeviceId) || devList.find(d => !isLocalNode(d) && d.is_connected) || null;
+        updateHeroCard(activeDev);
+        applyOfflineUsbDimming(devList);
 
         // Recent Activity for Overview
         const actRes = await apiRequest("/api/activity?limit=5");
@@ -1912,14 +2073,13 @@
     // =========================================================================
 
     function initTheme() {
-        const savedTheme = localStorage.getItem("snow_theme") || "light";
+        const savedTheme = localStorage.getItem("snow_theme") || "system";
         applyTheme(savedTheme);
 
         if (btnThemeToggle) {
             btnThemeToggle.addEventListener("click", () => {
-                const current = document.body.classList.contains("theme-dark") ? "dark" : "light";
-                const next = current === "dark" ? "light" : "dark";
-                applyTheme(next);
+                const isDark = document.documentElement.classList.contains("theme-dark");
+                applyTheme(isDark ? "light" : "dark");
             });
         }
 
@@ -1930,19 +2090,154 @@
                 applyTheme(radio.value);
             });
         });
+
+        if (window.matchMedia) {
+            const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+            const onSystemThemeChange = () => {
+                if (localStorage.getItem("snow_theme") === "system") {
+                    applyTheme("system");
+                }
+            };
+            if (mediaQuery.addEventListener) {
+                mediaQuery.addEventListener("change", onSystemThemeChange);
+            } else if (mediaQuery.addListener) {
+                mediaQuery.addListener(onSystemThemeChange);
+            }
+        }
     }
 
     function applyTheme(theme) {
+        let isDark = false;
         if (theme === "dark") {
-            document.body.className = "theme-dark";
+            isDark = true;
+        } else if (theme === "light") {
+            isDark = false;
         } else {
-            document.body.className = "theme-light";
+            theme = "system";
+            isDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
         }
+
+        const themeClass = isDark ? "theme-dark" : "theme-light";
+        document.documentElement.className = themeClass;
+        document.body.className = themeClass;
         localStorage.setItem("snow_theme", theme);
 
         const radios = document.querySelectorAll('input[name="theme-choice"]');
         radios.forEach(r => {
             r.checked = (r.value === theme);
+        });
+    }
+
+    // =========================================================================
+    // Command Palette (Ctrl+K / Cmd+K)
+    // =========================================================================
+
+    function setupCommandPalette() {
+        const overlay = document.getElementById("command-palette-overlay");
+        const input = document.getElementById("command-palette-input");
+        const results = document.getElementById("command-palette-results");
+        const btnOpen = document.getElementById("btn-topbar-command-palette");
+
+        if (!overlay || !input || !results) return;
+
+        const commands = [
+            { id: "home", icon: "🏠", title: "Home", desc: "View workstation hero, wallpaper preview, and quick actions", action: () => switchTab("overview") },
+            { id: "devices", icon: "📱", title: "Devices", desc: "Manage paired PCs, phones, and permission profiles", action: () => switchTab("devices") },
+            { id: "files", icon: "📁", title: "Files & Apps", desc: "Browse files and launch remote authorized applications", action: () => switchTab("files") },
+            { id: "clipboard", icon: "📋", title: "Clipboard", desc: "View unified clipboard timeline and sync toggle", action: () => switchTab("clipboard") },
+            { id: "settings", icon: "⚙️", title: "AI & Settings", desc: "Security approvals, activity audit, and appearance", action: () => switchTab("settings") },
+            { id: "lock", icon: "🔒", title: "Lock PC", desc: "Lock current Windows workstation immediately", action: () => {
+                const b = document.getElementById("btn-hero-lock-pc");
+                if (b) b.click();
+            }},
+            { id: "capture", icon: "📸", title: "Capture Screen", desc: "Take a screenshot of current desktop", action: () => {
+                const b = document.getElementById("btn-wf-capture-pc");
+                if (b) b.click();
+            }},
+            { id: "pair", icon: "📲", title: "Pair New Device", desc: "Show pairing QR code and 6-digit PIN", action: () => {
+                switchTab("devices");
+                showPairingQr();
+            }},
+            { id: "theme", icon: "🌓", title: "Toggle Theme", desc: "Switch between Light Mode and Dark Mode", action: () => {
+                const isDark = document.documentElement.classList.contains("theme-dark");
+                applyTheme(isDark ? "light" : "dark");
+            }},
+            { id: "refresh", icon: "🔄", title: "Refresh Live State", desc: "Poll all connected devices and live metrics", action: () => refreshActiveTab() }
+        ];
+
+        function renderResults(filterText) {
+            results.innerHTML = "";
+            const q = (filterText || "").trim().toLowerCase();
+            const filtered = commands.filter(c => !q || c.title.toLowerCase().includes(q) || c.desc.toLowerCase().includes(q));
+
+            if (filtered.length === 0) {
+                const empty = document.createElement("div");
+                empty.className = "text-muted text-sm";
+                empty.style.padding = "1rem";
+                empty.textContent = "No matching commands found.";
+                results.appendChild(empty);
+                return;
+            }
+
+            filtered.forEach((cmd, idx) => {
+                const item = document.createElement("div");
+                item.className = "command-palette-item" + (idx === 0 ? " selected" : "");
+                item.innerHTML = `
+                    <span class="command-palette-item-icon">${cmd.icon}</span>
+                    <div>
+                        <div class="command-palette-item-title">${cmd.title}</div>
+                        <div class="command-palette-item-desc">${cmd.desc}</div>
+                    </div>
+                `;
+                item.addEventListener("click", () => {
+                    closePalette();
+                    cmd.action();
+                });
+                results.appendChild(item);
+            });
+        }
+
+        function openPalette() {
+            overlay.style.display = "flex";
+            input.value = "";
+            renderResults("");
+            setTimeout(() => input.focus(), 50);
+        }
+
+        function closePalette() {
+            overlay.style.display = "none";
+        }
+
+        if (btnOpen) {
+            btnOpen.addEventListener("click", openPalette);
+        }
+
+        overlay.addEventListener("click", (e) => {
+            if (e.target === overlay) closePalette();
+        });
+
+        input.addEventListener("input", () => {
+            renderResults(input.value);
+        });
+
+        window.addEventListener("keydown", (e) => {
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+                e.preventDefault();
+                if (overlay.style.display === "flex") {
+                    closePalette();
+                } else {
+                    openPalette();
+                }
+            } else if (e.key === "Escape" && overlay.style.display === "flex") {
+                e.preventDefault();
+                closePalette();
+            } else if (e.key === "Enter" && overlay.style.display === "flex") {
+                const selected = results.querySelector(".command-palette-item.selected") || results.querySelector(".command-palette-item");
+                if (selected) {
+                    e.preventDefault();
+                    selected.click();
+                }
+            }
         });
     }
 
@@ -2987,6 +3282,8 @@
                 const fileSelect = document.getElementById("files-device-select");
                 if (fileSelect) fileSelect.value = activeDeviceId;
                 populateGlobalTargetSelector(lastKnownPeerDevices);
+                const activeDev = lastKnownPeerDevices.find(d => d.device_id === activeDeviceId) || null;
+                updateHeroCard(activeDev);
                 if (currentTab === "files") {
                     currentSubpath = "";
                     updateBreadcrumbs();

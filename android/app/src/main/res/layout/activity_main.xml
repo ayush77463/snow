@@ -60,6 +60,36 @@
             android:textColor="@color/status_disconnected"
             android:background="@drawable/bg_pill_status"
             android:text="DISCONNECTED" />
+
+        <!-- Activity & Approvals Bell -->
+        <FrameLayout
+            android:id="@+id/btn_header_approvals"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="8dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Activity and Approvals">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:textSize="18sp"
+                android:text="🔔" />
+
+            <TextView
+                android:id="@+id/tv_header_approvals_badge"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:layout_gravity="top|end"
+                android:background="@drawable/bg_badge_soon"
+                android:gravity="center"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:visibility="gone"
+                android:text="0" />
+        </FrameLayout>
     </LinearLayout>
 
     <View

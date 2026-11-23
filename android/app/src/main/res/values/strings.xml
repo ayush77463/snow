@@ -99,7 +99,7 @@
     <string name="title_confirm_command">Owner Confirmation Required</string>
     <string name="btn_authorize_run">Authorize &amp; Run</string>
     <string name="title_appearance">Appearance</string>
-    <string name="theme_system">System Default</string>
+    <string name="theme_system">System</string>
     <string name="theme_light">Light Mode</string>
     <string name="theme_dark">Dark Mode</string>
     <string name="title_device_identity">Device Identity</string>

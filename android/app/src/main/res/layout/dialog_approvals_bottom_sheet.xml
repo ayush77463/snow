@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="@color/card_surface"
+    android:padding="16dp">
+
+    <!-- Drag Handle / Grabber -->
+    <View
+        android:layout_width="40dp"
+        android:layout_height="4dp"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginBottom="12dp"
+        android:background="@drawable/bg_pill_status"
+        android:backgroundTint="@color/card_border" />
+
+    <!-- Header Row -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:layout_marginBottom="12dp">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            android:textColor="@color/primary_text"
+            android:text="🛡️ Activity &amp; Approvals" />
+
+        <TextView
+            android:id="@+id/tv_sheet_approvals_count"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="3dp"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            android:textColor="@color/status_connecting_dark"
+            android:background="@drawable/bg_pill_status"
+            android:text="0" />
+
+        <ImageView
+            android:id="@+id/btn_sheet_refresh_approvals"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_marginStart="8dp"
+            android:padding="5dp"
+            android:background="?android:attr/selectableItemBackgroundBorderless"
+            android:src="@drawable/ic_pc_refresh"
+            app:tint="@color/primary_text"
+            android:contentDescription="Refresh Approvals" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="12sp"
+        android:textColor="@color/secondary_text"
+        android:layout_marginBottom="12dp"
+        android:text="AI requests awaiting your explicit authorization." />
+
+    <TextView
+        android:id="@+id/tv_sheet_approvals_empty"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:padding="24dp"
+        android:textSize="13sp"
+        android:textColor="@color/secondary_text"
+        android:text="No pending authorization requests 🛡️\nRequests from AI assistants will appear here." />
+
+    <androidx.core.widget.NestedScrollView
+        android:id="@+id/nsv_approvals_items"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:maxHeight="360dp">
+
+        <LinearLayout
+            android:id="@+id/layout_sheet_approvals_items"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+    </androidx.core.widget.NestedScrollView>
+
+</LinearLayout>

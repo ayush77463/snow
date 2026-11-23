@@ -231,7 +231,6 @@ class MainActivity : AppCompatActivity() {
             activeFragment = when (activeTabId) {
                 R.id.nav_devices -> devicesFragment
                 R.id.nav_files -> filesFragment
-                R.id.nav_terminal -> terminalFragment
                 R.id.nav_settings -> settingsFragment
                 else -> dashboardFragment
             }
@@ -243,7 +242,6 @@ class MainActivity : AppCompatActivity() {
                 R.id.nav_dashboard -> dashboardFragment
                 R.id.nav_devices -> devicesFragment
                 R.id.nav_files -> filesFragment
-                R.id.nav_terminal -> terminalFragment
                 R.id.nav_settings -> settingsFragment
                 else -> null
             }
@@ -275,6 +273,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun observeGlobalState() {
+        binding.btnHeaderApprovals.setOnClickListener {
+            val dialog = ApprovalsBottomSheetDialog()
+            dialog.show(supportFragmentManager, ApprovalsBottomSheetDialog.TAG)
+        }
+
+        lifecycleScope.launch {
+            repository.pendingApprovalsCount.collectLatest { count ->
+                if (count > 0) {
+                    binding.tvHeaderApprovalsBadge.visibility = View.VISIBLE
+                    binding.tvHeaderApprovalsBadge.text = count.toString()
+                } else {
+                    binding.tvHeaderApprovalsBadge.visibility = View.GONE
+                }
+            }
+        }
+
         lifecycleScope.launch {
             combine(repository.connectionState, repository.connectedEndpoint) { state, endpoint ->
                 Pair(state, endpoint)

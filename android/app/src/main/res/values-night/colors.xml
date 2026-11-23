@@ -1,24 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Obsidian Frost Design System Tokens (Pitch-Black Dark Mode) -->
-    <color name="app_background">#000000</color>
-    <color name="card_surface">#10141D</color>
-    <color name="card_border">#1F2937</color>
-    <color name="primary_blue">#2563EB</color>
-    <color name="secondary_cyan">#22D3EE</color>
-    <color name="tertiary_blue">#1D4ED8</color>
+    <!-- Material 3 Dark Mode Tokens -->
+    <color name="app_background">#0B0E17</color>
+    <color name="card_surface">#111827</color>
+    <color name="card_border">#1E293B</color>
+    <color name="primary_blue">#00E5FF</color>
+    <color name="secondary_cyan">#6366F1</color>
+    <color name="tertiary_blue">#38BDF8</color>
     <color name="primary_text">#F8FAFC</color>
-    <color name="secondary_text">#94A3B8</color>
-    <color name="soft_blue_surface">#131824</color>
+    <color name="secondary_text">#9CA3AF</color>
+    <color name="soft_blue_surface">#1F2937</color>
 
     <!-- Legacy / Compatibility Aliases -->
-    <color name="primary">#2563EB</color>
-    <color name="primary_dark">#1D4ED8</color>
-    <color name="accent">#22D3EE</color>
-    <color name="background">#000000</color>
-    <color name="surface">#10141D</color>
+    <color name="primary">#00E5FF</color>
+    <color name="primary_dark">#38BDF8</color>
+    <color name="accent">#6366F1</color>
+    <color name="background">#0B0E17</color>
+    <color name="surface">#111827</color>
     <color name="text_primary">#F8FAFC</color>
-    <color name="text_secondary">#94A3B8</color>
+    <color name="text_secondary">#9CA3AF</color>
 
     <!-- Status Colors & Soft Pills -->
     <color name="status_connected">#10B981</color>

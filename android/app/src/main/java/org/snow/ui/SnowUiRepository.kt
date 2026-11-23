@@ -102,6 +102,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _activeTransfer = MutableStateFlow<ActiveTransferInfo?>(null)
     val activeTransfer: StateFlow<ActiveTransferInfo?> = _activeTransfer.asStateFlow()
 
+    private val _pendingApprovalsCount = MutableStateFlow(0)
+    val pendingApprovalsCount: StateFlow<Int> = _pendingApprovalsCount.asStateFlow()
+
     private val _phoneTelemetry = MutableStateFlow(PhoneTelemetry.UNAVAILABLE)
     val phoneTelemetry: StateFlow<PhoneTelemetry> = _phoneTelemetry.asStateFlow()
 
@@ -227,6 +230,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     _fileTransferClient = null
                     _connectedEndpoint.value = null
                     connectedHost = ""
+                    invalidateWallpaperCache()
                 }
             }
         }
@@ -333,6 +337,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         serviceRef?.client?.disconnect()
         _connectedEndpoint.value = null
         connectedHost = ""
+        invalidateWallpaperCache()
         _connectionState.value = ConnectionState.DISCONNECTED
         _authState.value = AuthState.Disconnected
     }
@@ -345,6 +350,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         appContext.startService(intent)
         _connectedEndpoint.value = null
         connectedHost = ""
+        invalidateWallpaperCache()
         _connectionState.value = ConnectionState.DISCONNECTED
     }
 
@@ -956,6 +962,44 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             }
         } catch (e: Exception) {
             SafeLog.w(TAG, "Foreground clipboard check failed: ${e.message}")
+        }
+    }
+
+    private var cachedWallpaperBitmap: android.graphics.Bitmap? = null
+    private var cachedWallpaperBytes: ByteArray? = null
+    private var cachedWallpaperEtag: String? = null
+
+    fun invalidateWallpaperCache() {
+        cachedWallpaperBytes = null
+        cachedWallpaperEtag = null
+        cachedWallpaperBitmap = null
+    }
+
+    suspend fun loadDesktopWallpaper(): android.graphics.Bitmap? {
+        val targetHost = connectedHost.ifBlank { serviceRef?.client?.currentTargetHost ?: "" }
+        if (targetHost.isBlank() || _connectionState.value != ConnectionState.CONNECTED) {
+            return null
+        }
+        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: return null
+        return when (val result = transferClient.getDesktopWallpaper(targetHost, 8766, cachedWallpaperEtag)) {
+            is FileTransferClient.WallpaperResult.Updated -> {
+                cachedWallpaperBytes = result.bytes
+                cachedWallpaperEtag = result.etag
+                val bmp = android.graphics.BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.size)
+                cachedWallpaperBitmap = bmp
+                bmp
+            }
+            is FileTransferClient.WallpaperResult.NotModified -> {
+                cachedWallpaperBitmap ?: cachedWallpaperBytes?.let {
+                    val bmp = android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size)
+                    cachedWallpaperBitmap = bmp
+                    bmp
+                }
+            }
+            is FileTransferClient.WallpaperResult.Unavailable -> {
+                invalidateWallpaperCache()
+                null
+            }
         }
     }
 
@@ -2123,6 +2167,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                             } ?: emptyMap()
                         )
                     }
+                    _pendingApprovalsCount.value = items.size
                     callback(Result.success(items))
                 } else {
                     val err = resp.error?.message ?: (resp.payload?.get("error") as? String) ?: "Failed fetching approvals"

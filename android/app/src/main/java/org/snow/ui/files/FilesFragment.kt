@@ -106,6 +106,11 @@ class FilesFragment : Fragment() {
             sendFilePickerLauncher.launch(arrayOf("*/*"))
         }
 
+        binding.btnOpenTerminal.setOnClickListener {
+            val dialog = org.snow.ui.terminal.TerminalBottomSheetDialog()
+            dialog.show(parentFragmentManager, org.snow.ui.terminal.TerminalBottomSheetDialog.TAG)
+        }
+
         // Quick jump chips
         binding.chipCDrive.setOnClickListener { viewModel.loadDirectory("C:\\") }
         binding.chipDDrive.setOnClickListener { viewModel.loadDirectory("D:\\") }

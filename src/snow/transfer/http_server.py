@@ -95,6 +95,7 @@ class SnowHttpTransferServer:
         self.app.router.add_get("/api/v1/screen/frame", self.handle_get_screen_frame)
         self.app.router.add_post("/api/v1/screen/start", self.handle_screen_start)
         self.app.router.add_post("/api/v1/screen/stop", self.handle_screen_stop)
+        self.app.router.add_get("/api/v1/desktop/wallpaper", self.handle_desktop_wallpaper)
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler) -> web.StreamResponse:
@@ -763,6 +764,30 @@ class SnowHttpTransferServer:
             for d in list(self._screen_sessions.keys()):
                 self.set_session_state(d, "STOPPED")
         return web.json_response({"status": "STOPPED"})
+
+    async def handle_desktop_wallpaper(self, request: web.Request) -> web.Response:
+        """Serve scaled Windows desktop wallpaper preview with ETag and 304 support."""
+        try:
+            from snow.capabilities.windows.wallpaper import get_desktop_wallpaper_preview
+            jpeg_bytes, etag = await asyncio.to_thread(get_desktop_wallpaper_preview)
+            if not jpeg_bytes:
+                return web.Response(status=404, text="Wallpaper not available")
+
+            client_etag = request.headers.get("If-None-Match")
+            if client_etag and client_etag.strip() == etag:
+                return web.Response(status=304, headers={"ETag": etag})
+
+            return web.Response(
+                body=jpeg_bytes,
+                content_type="image/jpeg",
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "public, max-age=60, must-revalidate",
+                },
+            )
+        except Exception as exc:
+            logger.warning("Error serving wallpaper preview: %s", exc)
+            return web.Response(status=500, text=str(exc))
 
     async def start(self) -> None:
         """Start listening for incoming HTTP/HTTPS transfer requests."""
