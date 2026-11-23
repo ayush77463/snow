@@ -422,23 +422,26 @@ class TestBatch3MicroPatches(unittest.IsolatedAsyncioTestCase):
             # Crucial: route_request must NOT have been called with clipboard_push!
             mock_router.route_request.assert_not_called()
 
-    async def test_watchdog_spawned_only_when_listener_fails(self):
+    async def test_watchdog_spawned_unconditionally_on_windows(self):
         from snow.network.ws_server import SnowWebSocketServer
         server = SnowWebSocketServer(config=CoreConfig())
 
-        # Case 1: Listener starts successfully -> Watchdog MUST NOT spawn
+        # Case 1: Listener starts successfully -> Watchdog still spawned for headless/detached reliability
         with patch("snow.network.ws_server.WindowsClipboardListener") as mock_listener_cls:
             mock_inst = MagicMock()
             mock_listener_cls.return_value = mock_inst
             mock_inst.start.return_value = True
             server._clipboard_watchdog_task = None
 
-            started = server.start_clipboard_listener()
-            self.assertTrue(started)
-            self.assertIsNone(server._clipboard_watchdog_task)
+            with patch.object(server, "_clipboard_sequence_watchdog", new_callable=AsyncMock):
+                started = server.start_clipboard_listener()
+                self.assertTrue(started)
+                self.assertIsNotNone(server._clipboard_watchdog_task)
+                server._clipboard_watchdog_task.cancel()
 
-        # Case 2: Listener fails to start -> Watchdog MUST spawn as fallback
+        # Case 2: Listener fails to start -> Watchdog also spawned as backup
         server._clipboard_listener = None
+        server._clipboard_watchdog_task = None
         with patch("snow.network.ws_server.WindowsClipboardListener") as mock_listener_cls:
             mock_inst = MagicMock()
             mock_listener_cls.return_value = mock_inst

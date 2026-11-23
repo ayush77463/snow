@@ -88,6 +88,15 @@ class SnowWebServer:
         self._mcp_gateway_lock = asyncio.Lock()
         self.gateway_port = 8771
 
+        # Short-lived APK download tokens: token -> expires_at
+        self._apk_download_tokens: dict[str, float] = {}
+        # Ephemeral LAN APK download server
+        self._ephemeral_apk_app: Optional[web.Application] = None
+        self._ephemeral_apk_runner: Optional[web.AppRunner] = None
+        self._ephemeral_apk_site: Optional[web.TCPSite] = None
+        self._ephemeral_apk_port: int = 0
+        self._ephemeral_apk_lock = asyncio.Lock()
+
         # USB status caching (10-second TTL)
         self._usb_status_cache: Optional[dict[str, Any]] = None
         self._usb_status_cache_time: float = 0.0
@@ -132,8 +141,8 @@ class SnowWebServer:
 
         # 3. Authentication & CSRF validation for API routes
         if request.path.startswith("/api/"):
-            # Exclude bootstrap exchange endpoint from session / CSRF check
-            if request.path != "/api/auth/session":
+            # Exclude bootstrap exchange and APK download endpoints from global session / CSRF check
+            if request.path not in ("/api/auth/session", "/api/app/download-apk", "/api/install/android-apk"):
                 session = self._get_valid_session(request)
                 if not session:
                     return web.json_response(
@@ -1418,34 +1427,117 @@ class SnowWebServer:
         return web.json_response(res)
 
     # =========================================================================
-    # Distribution & Onboarding (Phase 29)
+    # Distribution & Onboarding (Phase 29 & Phase 3)
     # =========================================================================
 
-    async def handle_api_install_android_apk(self, request: web.Request) -> web.Response:
-        """Serve the compiled Android APK for local download (authenticated session required)."""
+    def _find_candidate_apk(self) -> Optional[Path]:
+        """Resolve the mobile APK binary across frozen, package output, and local build paths."""
         candidates = []
         env_apk = os.environ.get("SNOW_ANDROID_APK_PATH")
         if env_apk:
             candidates.append(Path(env_apk).resolve())
 
+        # Frozen sibling paths (for snow.exe / snow-tray.exe)
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "packaging" / "output" / "SNOW-Mobile-4.1.0.apk")
+        candidates.append(exe_dir / "SNOW-Mobile-4.1.0.apk")
+        candidates.append(exe_dir / "SNOW-Mobile.apk")
+
+        # Repository paths
         repo_root = Path(__file__).resolve().parent.parent.parent.parent
+        candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile-4.1.0.apk")
+        candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile.apk")
+        candidates.append(repo_root / "packaging" / "output" / "app-release.apk")
         candidates.append(repo_root / "android" / "app" / "build" / "outputs" / "apk" / "release" / "app-release.apk")
         candidates.append(repo_root / "android" / "app" / "build" / "outputs" / "apk" / "release" / "app-release-unsigned.apk")
         candidates.append(repo_root / "android" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk")
 
-        allowed_dirs = [os.path.realpath(str(repo_root / "android"))]
+        allowed_dirs = [
+            os.path.realpath(str(repo_root / "packaging" / "output")),
+            os.path.realpath(str(repo_root / "android")),
+            os.path.realpath(str(exe_dir)),
+            os.path.realpath(str(exe_dir / "packaging" / "output")),
+        ]
         if env_apk:
             allowed_dirs.append(os.path.realpath(os.path.dirname(os.path.abspath(env_apk))))
 
-        apk_path = None
         for candidate in candidates:
             if candidate.is_file():
                 real_path = os.path.realpath(str(candidate))
                 if real_path.lower().endswith(".apk") and os.path.isfile(real_path):
                     if any(real_path.startswith(ad + os.sep) or real_path == ad for ad in allowed_dirs):
-                        apk_path = Path(real_path)
-                        break
+                        return Path(real_path)
+        return None
 
+    async def _ensure_ephemeral_apk_server(self) -> int:
+        """Start or verify the ephemeral LAN server serving GET /download?token=... on port 0."""
+        async with self._ephemeral_apk_lock:
+            if self._ephemeral_apk_runner and self._ephemeral_apk_port > 0:
+                return self._ephemeral_apk_port
+
+            app = web.Application()
+
+            async def handle_ephemeral_download(request: web.Request) -> web.StreamResponse:
+                token = request.query.get("token")
+                now = time.time()
+                # Clean expired tokens
+                self._apk_download_tokens = {k: v for k, v in self._apk_download_tokens.items() if v > now}
+                if not token or token not in self._apk_download_tokens or self._apk_download_tokens[token] <= now:
+                    return web.Response(status=401, text="Unauthorized: Token missing or expired.")
+
+                apk_path = self._find_candidate_apk()
+                if not apk_path:
+                    return web.Response(status=404, text="APK not found.")
+
+                return web.FileResponse(
+                    apk_path,
+                    headers={
+                        "Content-Type": "application/vnd.android.package-archive",
+                        "Content-Disposition": 'attachment; filename="SNOW-Mobile-4.1.0.apk"',
+                    },
+                )
+
+            app.router.add_get("/download", handle_ephemeral_download)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, host="0.0.0.0", port=0)
+            await site.start()
+
+            bound_port = 0
+            for s in runner.sites:
+                if hasattr(s, "_server") and s._server and hasattr(s._server, "sockets"):
+                    for sock in s._server.sockets:
+                        bound_port = sock.getsockname()[1]
+                        break
+                if bound_port:
+                    break
+            if not bound_port:
+                for ep in runner.addresses:
+                    bound_port = ep[1]
+                    break
+
+            self._ephemeral_apk_app = app
+            self._ephemeral_apk_runner = runner
+            self._ephemeral_apk_site = site
+            self._ephemeral_apk_port = bound_port
+            logger.info("Ephemeral LAN APK download server listening on 0.0.0.0:%d", bound_port)
+            return bound_port
+
+    async def handle_api_install_android_apk(self, request: web.Request) -> web.Response:
+        """Serve the compiled Android APK for local download (supports session cookie or ?token=)."""
+        token = request.query.get("token")
+        now = time.time()
+        # Clean expired tokens
+        self._apk_download_tokens = {k: v for k, v in self._apk_download_tokens.items() if v > now}
+        is_token_valid = bool(token and token in self._apk_download_tokens and self._apk_download_tokens[token] > now)
+        session = self._get_valid_session(request)
+        if not is_token_valid and not session:
+            return web.json_response(
+                {"success": False, "status": "UNAUTHORIZED", "error": "Authentication required."},
+                status=401,
+            )
+
+        apk_path = self._find_candidate_apk()
         if not apk_path:
             return web.json_response(
                 {
@@ -1461,8 +1553,56 @@ class SnowWebServer:
 
         return web.FileResponse(
             apk_path,
-            headers={"Content-Disposition": 'attachment; filename="snow-mobile.apk"'},
+            headers={
+                "Content-Type": "application/vnd.android.package-archive",
+                "Content-Disposition": 'attachment; filename="SNOW-Mobile-4.1.0.apk"',
+            },
         )
+
+    async def handle_api_app_apk_info(self, request: web.Request) -> web.Response:
+        """Return mobile APK metadata, generate short-lived download token, start ephemeral server and SVG QR code."""
+        # Clean expired tokens
+        now = time.time()
+        self._apk_download_tokens = {k: v for k, v in self._apk_download_tokens.items() if v > now}
+
+        # Issue 10-minute token
+        token = secrets.token_urlsafe(24)
+        self._apk_download_tokens[token] = now + 600.0
+
+        apk_path = self._find_candidate_apk()
+        apk_found = apk_path is not None
+
+        # Resolve LAN IP
+        from snow.core.network import get_active_ip_addresses
+        ips = get_active_ip_addresses()
+        lan_ip = ips[0] if ips else "127.0.0.1"
+
+        # Ensure ephemeral LAN server is running for phone download
+        ephemeral_port = await self._ensure_ephemeral_apk_server()
+        qr_download_url = f"http://{lan_ip}:{ephemeral_port}/download?token={token}"
+        local_download_url = f"/api/app/download-apk?token={token}"
+
+        # Generate SVG QR code for mobile scanner
+        svg_content = ""
+        try:
+            import qrcode
+            import qrcode.image.svg
+            img = qrcode.make(qr_download_url, image_factory=qrcode.image.svg.SvgPathImage, box_size=8, border=2)
+            svg_content = img.to_string().decode("utf-8") if isinstance(img.to_string(), bytes) else str(img.to_string())
+        except Exception as qre:
+            logger.debug("Failed rendering APK download QR SVG: %s", qre)
+
+        return web.json_response({
+            "success": True,
+            "status": "SUCCESS",
+            "apk_available": apk_found,
+            "download_url": qr_download_url,
+            "local_download_url": local_download_url,
+            "token": token,
+            "version": "4.1.0",
+            "file_name": "SNOW-Mobile-4.1.0.apk",
+            "svg": svg_content,
+        })
 
     async def handle_api_onboarding_status(self, request: web.Request) -> web.Response:
         """Query consumer onboarding status and authoritative network identity."""
@@ -1943,8 +2083,10 @@ class SnowWebServer:
         app.router.add_get("/api/apps/android", self.handle_api_apps_android)
         app.router.add_post("/api/apps/android/launch", self.handle_api_apps_android_launch)
 
-        # Distribution & Onboarding (Phase 29)
+        # Distribution & Onboarding (Phase 29 & Phase 3)
         app.router.add_get("/api/install/android-apk", self.handle_api_install_android_apk)
+        app.router.add_get("/api/app/download-apk", self.handle_api_install_android_apk)
+        app.router.add_get("/api/app/apk-info", self.handle_api_app_apk_info)
         app.router.add_get("/api/onboarding/status", self.handle_api_onboarding_status)
         app.router.add_post("/api/onboarding/complete", self.handle_api_onboarding_complete)
         app.router.add_get("/api/account-discovery/status", self.handle_api_account_discovery_status)
@@ -2015,6 +2157,18 @@ class SnowWebServer:
                 self._mcp_gateway_runner = None
                 self._mcp_gateway_site = None
                 self._mcp_gateway_instance = None
+
+        # Stop active ephemeral APK server if one exists
+        if self._ephemeral_apk_runner:
+            try:
+                await self._ephemeral_apk_runner.cleanup()
+            except Exception as exc:
+                logger.warning("Error cleaning up ephemeral APK server on stop: %s", exc)
+            finally:
+                self._ephemeral_apk_runner = None
+                self._ephemeral_apk_site = None
+                self._ephemeral_apk_app = None
+                self._ephemeral_apk_port = 0
 
         if not self._is_running:
             return

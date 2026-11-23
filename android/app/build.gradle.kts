@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -19,10 +21,24 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystorePath = System.getenv("SNOW_KEYSTORE_PATH") ?: (project.findProperty("SNOW_KEYSTORE_PATH") as String?)
-            val keystorePassword = System.getenv("SNOW_KEYSTORE_PASSWORD") ?: (project.findProperty("SNOW_KEYSTORE_PASSWORD") as String?)
-            val keyAlias = System.getenv("SNOW_KEY_ALIAS") ?: (project.findProperty("SNOW_KEY_ALIAS") as String?)
-            val keyPassword = System.getenv("SNOW_KEY_PASSWORD") ?: (project.findProperty("SNOW_KEY_PASSWORD") as String?)
+            val keystorePropertiesFile = rootProject.file("keystore.properties")
+            val keystoreProperties = Properties()
+            if (keystorePropertiesFile.exists()) {
+                keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
+            }
+
+            val keystorePath = System.getenv("SNOW_KEYSTORE_PATH")
+                ?: (project.findProperty("SNOW_KEYSTORE_PATH") as String?)
+                ?: keystoreProperties.getProperty("storeFile")
+            val keystorePassword = System.getenv("SNOW_KEYSTORE_PASSWORD")
+                ?: (project.findProperty("SNOW_KEYSTORE_PASSWORD") as String?)
+                ?: keystoreProperties.getProperty("storePassword")
+            val keyAlias = System.getenv("SNOW_KEY_ALIAS")
+                ?: (project.findProperty("SNOW_KEY_ALIAS") as String?)
+                ?: keystoreProperties.getProperty("keyAlias")
+            val keyPassword = System.getenv("SNOW_KEY_PASSWORD")
+                ?: (project.findProperty("SNOW_KEY_PASSWORD") as String?)
+                ?: keystoreProperties.getProperty("keyPassword")
 
             if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
                 storeFile = file(keystorePath)

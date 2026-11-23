@@ -38,6 +38,9 @@ ipc.secret
 *.p12
 .snow/
 *device_identity*.json
+keystore.properties
+*.jks
+*.keystore
 
 # Local logs
 *.log

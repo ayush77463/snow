@@ -979,6 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="SNOW — Headless cross-device AI capability platform CLI",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+    parser.add_argument("--version", action="version", version="SNOW 4.1.0")
 
     # 1. setup
     setup_parser = subparsers.add_parser("setup", help="Configure SNOW as an MCP server in AI assistant clients")
@@ -1125,6 +1126,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Run in headless test mode without creating a Win32 taskbar icon",
     )
+
+    # MCP Stdio Server (Phase 3 standalone execution)
+    subparsers.add_parser("mcp", help="Run local FastMCP stdio server (38 static tools)")
 
     # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")
@@ -1300,6 +1304,10 @@ def main(args: Optional[list[str]] = None) -> int:
             auto_start_core=not parsed.no_auto_start,
             headless=parsed.headless,
         )
+    elif parsed.command == "mcp":
+        from snow.mcp.__main__ import main as run_mcp_main
+        run_mcp_main()
+        return 0
     elif parsed.command == "start":
         return run_daemon_start()
     elif parsed.command == "stop":
@@ -1312,4 +1320,8 @@ def main(args: Optional[list[str]] = None) -> int:
 if __name__ == "__main__":
     if len(sys.argv) >= 1 and "snow-tray" in sys.argv[0].lower():
         sys.exit(main(["tray"] + sys.argv[1:]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "-m" and "snow.mcp" in sys.argv:
+        from snow.mcp.__main__ import main as run_mcp_main
+        run_mcp_main()
+        sys.exit(0)
     sys.exit(main())

@@ -36,9 +36,10 @@ def get_default_python_executable() -> str:
 def get_canonical_mcp_entry(python_exe: Optional[str] = None) -> dict[str, Any]:
     """Generate the canonical stdio MCP server launch configuration for SNOW."""
     exe = python_exe or get_default_python_executable()
+    is_standalone_binary = Path(exe).name.lower() in ("snow.exe", "snow")
     return {
         "command": exe,
-        "args": ["-m", "snow.mcp"],
+        "args": ["mcp"] if is_standalone_binary else ["-m", "snow.mcp"],
     }
 
 

@@ -997,10 +997,45 @@ class SnowWebSocketServer:
     ) -> None:
         """Handle notification or request to apply a clipboard item."""
         item_id = data.get("item_id")
-        target = data.get("target", "android")
+        target = data.get("target") or (session.device_id if session else "android")
+        if target in ("phone", "android", "mobile") and session and session.device_id:
+            target = session.device_id
+        stage_only = bool(data.get("stage_only", False))
+
+        req = CapabilityRequest(
+            action="clipboard_buffer_apply",
+            params={"item_id": item_id, "target": target, "stage_only": stage_only},
+        )
+        ctx = ExecutionContext(
+            principal=ExecutionPrincipal.OWNER_MANUAL,
+            device_id=session.device_id if session else "unknown",
+            session_id=session.session_id if session else None,
+        )
+        res = await self.capability_engine.execute(req, ctx=ctx)
+        if not res.success:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.EXECUTION_FAILED,
+                message=res.error or "Failed to apply clipboard buffer item",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        res_data = res.data or {}
+        payload: dict[str, Any] = {
+            "status": "success",
+            "applied": True,
+            "item_id": item_id,
+            "target": target,
+            "data": res_data,
+        }
+        for k in ("transfer_id", "transfer_port", "sha256", "file_name", "mime_type", "size"):
+            if k in res_data:
+                payload[k] = res_data[k]
+
         response = SnowMessage.create_response(
             correlation_id=message.id,
-            payload={"status": "success", "applied": True, "item_id": item_id, "target": target},
+            payload=payload,
         )
         await client.websocket.send(response.to_json())
 
@@ -2377,12 +2412,14 @@ class SnowWebSocketServer:
             success = self._clipboard_listener.start()
             if success:
                 logger.info("WindowsClipboardListener successfully attached.")
-            else:
-                if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
-                    self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
+            # Unconditional watchdog: always run watchdog task on Windows for detached/headless reliability
+            if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
+                self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
             return success
         except Exception as exc:
             logger.warning("Failed starting WindowsClipboardListener: %s", exc)
+            if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
+                self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
             return False
 
     def stop_clipboard_listener(self) -> None:
@@ -2657,7 +2694,7 @@ class SnowWebSocketServer:
         last_seq = user32.GetClipboardSequenceNumber()
         while self._is_running:
             try:
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(1.0)
                 if not self._is_running:
                     break
                 curr_seq = user32.GetClipboardSequenceNumber()

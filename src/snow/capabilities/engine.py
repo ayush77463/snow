@@ -742,28 +742,31 @@ class CapabilityEngine:
                     return CapabilityResponse(success=False, status="DEVICE_OFFLINE", error="Session router not available.")
 
                 resolved_target = target
+                if resolved_target in ("android", "phone", "mobile", ""):
+                    if ctx and ctx.device_id and ctx.device_id not in ("unknown", "desktop_windows", "local"):
+                        resolved_target = ctx.device_id
+
                 reg = self.node_registry or getattr(self.session_router, "node_registry", None)
-                if reg and hasattr(reg, "resolve_target"):
+                if resolved_target in ("android", "phone", "mobile", "") and reg and hasattr(reg, "resolve_target"):
                     try:
-                        res = reg.resolve_target(target if target not in ("pc", "windows", "local") else "")
+                        res = reg.resolve_target(resolved_target if resolved_target not in ("pc", "windows", "local") else "")
                         if isinstance(res, tuple) and len(res) == 2:
                             node, err = res
                             if node:
                                 resolved_target = node.device_id
-                            elif err and target in ("android", "phone", ""):
+                            elif err and resolved_target in ("android", "phone", "mobile", ""):
                                 return CapabilityResponse(success=False, status=err, error=f"Target device resolution failed: {err}")
                     except Exception:
                         pass
-                elif self.core_server and hasattr(self.core_server, "session_manager"):
+                elif resolved_target in ("android", "phone", "mobile", "") and self.core_server and hasattr(self.core_server, "session_manager"):
                     sm = self.core_server.session_manager
-                    if target in ("android", "phone", ""):
-                        sessions = sm.get_all_sessions()
-                        if len(sessions) == 1:
-                            resolved_target = list(sessions.values())[0].device_id
-                        elif len(sessions) > 1:
-                            return CapabilityResponse(success=False, status="DEVICE_REQUIRED", error="Multiple active devices. Explicit target required.")
-                        else:
-                            return CapabilityResponse(success=False, status="DEVICE_NOT_FOUND", error="No active connected device found.")
+                    sessions = sm.get_all_sessions()
+                    if len(sessions) == 1:
+                        resolved_target = list(sessions.values())[0].device_id
+                    elif len(sessions) > 1:
+                        return CapabilityResponse(success=False, status="DEVICE_REQUIRED", error="Multiple active devices. Explicit target required.")
+                    else:
+                        return CapabilityResponse(success=False, status="DEVICE_NOT_FOUND", error="No active connected device found.")
 
                 stage_only = bool(params.get("stage_only", False))
                 if c_type == "text":
@@ -984,6 +987,24 @@ class CapabilityEngine:
                     error=f"Screenshot thread exception: {exc}",
                 )
             is_ok = res.get("success", False)
+            if is_ok and self.clipboard_buffer and res.get("file_path"):
+                try:
+                    fpath = Path(res["file_path"])
+                    if fpath.exists():
+                        img_bytes = fpath.read_bytes()
+                        buf_res = self.clipboard_buffer.add_image(
+                            image_bytes=img_bytes,
+                            mime_type="image/png",
+                            source_device_id="desktop_windows",
+                            source_device_name="Windows PC",
+                        )
+                        if buf_res.get("success") and buf_res.get("item"):
+                            res["buffer_item_id"] = buf_res["item"]["item_id"]
+                            if self.core_server and hasattr(self.core_server, "broadcast_clipboard_buffer_event"):
+                                asyncio.create_task(self.core_server.broadcast_clipboard_buffer_event(buf_res["item"]))
+                except Exception as b_err:
+                    logger.warning("Failed adding screenshot to clipboard buffer: %s", b_err)
+
             return CapabilityResponse(
                 success=is_ok,
                 status=res.get("status", "SUCCESS" if is_ok else "ERROR"),

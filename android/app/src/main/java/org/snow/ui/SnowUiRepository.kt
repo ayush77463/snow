@@ -1648,7 +1648,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 return
             }
             val targetHost = client.currentTargetHost.takeIf { it.isNotBlank() } ?: connectedHost
-            client.sendRequest("clipboard_buffer_apply", mapOf("item_id" to item.itemId, "target" to "phone", "stage_only" to true)) { resp ->
+            val targetDevice = identity.deviceId
+            client.sendRequest("clipboard_buffer_apply", mapOf("item_id" to item.itemId, "target" to targetDevice, "stage_only" to true)) { resp ->
                 if (resp.isSuccess) {
                     val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
                     val transferId = data?.get("transfer_id") as? String

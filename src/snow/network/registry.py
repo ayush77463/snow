@@ -522,6 +522,26 @@ class NodeRegistry:
             # Case B: Query-based resolution
             query = target_query.strip().lower()
 
+            # Generic mobile alias fast-path if query is a generic alias
+            if query in ("phone", "android", "mobile"):
+                connected_peers = [n for n in all_nodes if n.is_connected and n.is_paired]
+                if len(connected_peers) == 1:
+                    resolved = connected_peers[0]
+                    if required_capability and not resolved.supports_capability(required_capability):
+                        return None, "CAPABILITY_NOT_SUPPORTED"
+                    return resolved, None
+                elif len(connected_peers) > 1:
+                    return None, "DEVICE_REQUIRED"
+                else:
+                    paired_peers = [n for n in all_nodes if n.is_paired]
+                    if len(paired_peers) == 1:
+                        resolved = paired_peers[0]
+                        if required_capability and not resolved.supports_capability(required_capability):
+                            return None, "CAPABILITY_NOT_SUPPORTED"
+                        return resolved, None
+                    elif len(paired_peers) > 1:
+                        return None, "DEVICE_REQUIRED"
+
             # 1. Exact UUID match
             for node in all_nodes:
                 if node.device_id.lower() == query:

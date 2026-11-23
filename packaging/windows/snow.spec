@@ -22,6 +22,8 @@ SRC_DIR = REPO_ROOT / "src"
 datas = [
     (str(SRC_DIR / "snow" / "web" / "static"), "snow/web/static"),
 ]
+if (REPO_ROOT / "snow.png").is_file():
+    datas.append((str(REPO_ROOT / "snow.png"), "."))
 
 # Hidden imports required by dynamic dispatch and asyncio
 hiddenimports = [

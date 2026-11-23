@@ -3259,6 +3259,56 @@
             });
         }
 
+        // APK Download QR Modal handlers (Phase 3 Track 2)
+        function openApkDownloadModal(ev) {
+            if (ev) ev.preventDefault();
+            const card = document.getElementById("apk-download-card");
+            const container = document.getElementById("apk-qr-svg-container");
+            const directBtn = document.getElementById("btn-direct-apk-download");
+            const statusDiv = document.getElementById("apk-download-status");
+            if (!card) return;
+            card.classList.remove("d-none");
+            if (container) container.innerHTML = '<div class="text-sm text-muted" style="padding: 2rem;">Generating QR code...</div>';
+            if (statusDiv) statusDiv.textContent = "Requesting secure download link...";
+
+            fetchWithCsrf("/api/app/apk-info")
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        if (container && data.svg) {
+                            container.innerHTML = data.svg;
+                        }
+                        if (directBtn) {
+                            directBtn.href = data.local_download_url || data.download_url;
+                        }
+                        if (statusDiv) {
+                            statusDiv.textContent = data.apk_available
+                                ? `Ready: SNOW Mobile v${data.version} · Secure token generated`
+                                : "Note: Android APK is compiling or pending build in android/.";
+                        }
+                    } else {
+                        if (statusDiv) statusDiv.textContent = data.error || "Failed loading APK download information.";
+                    }
+                })
+                .catch(err => {
+                    if (statusDiv) statusDiv.textContent = "Error: " + err.message;
+                });
+        }
+
+        const btnDevicesApk = document.getElementById("btn-devices-download-apk");
+        if (btnDevicesApk) btnDevicesApk.addEventListener("click", openApkDownloadModal);
+
+        const btnWizardApk = document.getElementById("btn-wizard-download-apk");
+        if (btnWizardApk) btnWizardApk.addEventListener("click", openApkDownloadModal);
+
+        const btnCloseApk = document.getElementById("btn-close-apk-download");
+        if (btnCloseApk) {
+            btnCloseApk.addEventListener("click", () => {
+                const c = document.getElementById("apk-download-card");
+                if (c) c.classList.add("d-none");
+            });
+        }
+
         const btnRefreshFiles = document.getElementById("btn-refresh-files");
         if (btnRefreshFiles) btnRefreshFiles.addEventListener("click", loadSafFiles);
 

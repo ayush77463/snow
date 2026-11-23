@@ -118,13 +118,27 @@ class CoreDaemonManager:
             proc = psutil.Process(pid)
             if not proc.is_running():
                 return False
+            name = proc.name().lower()
+            if name in ("snow.exe", "snow"):
+                return True
             cmdline = " ".join(proc.cmdline()).lower()
-            return "snow.main" in cmdline or "snow.core.server" in cmdline or "-m snow" in cmdline
+            return "snow.main" in cmdline or "snow.core.server" in cmdline or "-m snow" in cmdline or "snow.exe" in cmdline
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             return False
         except Exception as exc:
             logger.debug("Error checking process %d: %s", pid, exc)
             return False
+
+    def _get_core_command(self) -> list[str]:
+        """Resolve the executable command for SNOW Desktop Core."""
+        if getattr(sys, "frozen", False):
+            # Running as a frozen executable (e.g. snow-tray.exe or snow.exe)
+            exe_path = Path(sys.executable).resolve()
+            sibling_core = exe_path.with_name("snow.exe")
+            if sibling_core.is_file():
+                return [str(sibling_core)]
+            return [str(exe_path)]
+        return [sys.executable, "-m", "snow.main"]
 
     async def ensure_core_running(self) -> dict[str, Any]:
         """Ensure SNOW Core daemon is running and accepting IPC connections.
@@ -163,8 +177,9 @@ class CoreDaemonManager:
             try:
                 # Open dedicated log file for daemon output
                 log_file = open(log_path, "a", encoding="utf-8")
+                cmd = self._get_core_command()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "snow.main"],
+                    cmd,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
