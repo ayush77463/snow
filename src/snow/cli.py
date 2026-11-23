@@ -1127,6 +1127,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run in headless test mode without creating a Win32 taskbar icon",
     )
 
+    # Desktop Core Foreground Server (Hotfix: snow core)
+    subparsers.add_parser("core", help="Run SNOW Desktop Core server in the foreground")
+
     # MCP Stdio Server (Phase 3 standalone execution)
     subparsers.add_parser("mcp", help="Run local FastMCP stdio server (38 static tools)")
 
@@ -1222,6 +1225,24 @@ def run_relay(action: str = "status") -> int:
 
 def main(args: Optional[list[str]] = None) -> int:
     """CLI entry point for the 'snow' command."""
+    if args is None:
+        args = list(sys.argv[1:])
+
+    # Legacy argument shim for frozen / script invocations
+    if len(args) >= 2 and args[0] == "-m":
+        target_module = args[1]
+        remainder = args[2:]
+        if target_module in ("snow.main", "snow.core.server"):
+            args = ["core"] + remainder
+        elif target_module in ("snow.mcp", "snow.mcp.__main__"):
+            args = ["mcp"] + remainder
+        elif target_module in ("snow.web", "snow.web.server"):
+            args = ["web"] + remainder
+        elif target_module in ("snow.mcp.remote_gateway",):
+            args = ["mcp-gateway"] + remainder
+        elif target_module == "snow.cli" and remainder:
+            args = remainder
+
     parser = build_parser()
     parsed = parser.parse_args(args)
 
@@ -1304,6 +1325,9 @@ def main(args: Optional[list[str]] = None) -> int:
             auto_start_core=not parsed.no_auto_start,
             headless=parsed.headless,
         )
+    elif parsed.command == "core":
+        from snow.main import main as run_core_main
+        return run_core_main()
     elif parsed.command == "mcp":
         from snow.mcp.__main__ import main as run_mcp_main
         run_mcp_main()
@@ -1319,6 +1343,13 @@ def main(args: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 1 and "snow-tray" in sys.argv[0].lower():
+        subcmds = {
+            "core", "web", "mcp", "daemon", "status", "doctor",
+            "setup", "pair", "usb", "devices", "peer", "relay",
+            "mcp-gateway", "expose", "start", "stop", "tray",
+        }
+        if len(sys.argv) >= 2 and sys.argv[1] in subcmds:
+            sys.exit(main(sys.argv[1:]))
         sys.exit(main(["tray"] + sys.argv[1:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "-m" and "snow.mcp" in sys.argv:
         from snow.mcp.__main__ import main as run_mcp_main

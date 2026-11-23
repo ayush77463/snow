@@ -37,12 +37,6 @@ def get_default_python_executable() -> str:
             return str(sibling_core)
         return str(exe_path)
 
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        installed_snow = Path(local_appdata) / "Programs" / "SNOW" / "snow.exe"
-        if installed_snow.is_file():
-            return str(installed_snow)
-
     return sys.executable
 
 

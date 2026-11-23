@@ -136,8 +136,12 @@ class CoreDaemonManager:
             exe_path = Path(sys.executable).resolve()
             sibling_core = exe_path.with_name("snow.exe")
             if sibling_core.is_file():
-                return [str(sibling_core)]
-            return [str(exe_path)]
+                return [str(sibling_core), "core"]
+            if exe_path.name.lower() == "snow.exe":
+                return [str(exe_path), "core"]
+            raise FileNotFoundError(
+                f"SNOW Core executable 'snow.exe' not found alongside {exe_path}"
+            )
         return [sys.executable, "-m", "snow.main"]
 
     async def ensure_core_running(self) -> dict[str, Any]:

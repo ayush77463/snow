@@ -308,7 +308,15 @@ class SnowTrayApp:
                 try:
                     import subprocess
                     if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
-                        cmd = [sys.executable, "web", "--port", str(self.dashboard_port), "--no-browser"]
+                        exe_path = Path(sys.executable).resolve()
+                        sibling_snow = exe_path.with_name("snow.exe")
+                        if sibling_snow.is_file():
+                            cmd = [str(sibling_snow), "web", "--port", str(self.dashboard_port), "--no-browser"]
+                        elif exe_path.name.lower() == "snow.exe":
+                            cmd = [str(exe_path), "web", "--port", str(self.dashboard_port), "--no-browser"]
+                        else:
+                            logger.error("Sibling snow.exe not found alongside %s", exe_path)
+                            return
                     else:
                         cmd = [sys.executable, "-m", "snow.cli", "web", "--port", str(self.dashboard_port), "--no-browser"]
 

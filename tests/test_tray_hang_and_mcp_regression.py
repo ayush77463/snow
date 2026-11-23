@@ -147,5 +147,147 @@ class TestLocalMcpStdioProtocol(unittest.TestCase):
                 proc.wait()
 
 
+class TestFrozenCommandResolution(unittest.TestCase):
+    """Regression test suite for frozen executable command resolution."""
+
+    def test_daemon_get_core_command_from_tray_frozen(self) -> None:
+        """When running frozen as snow-tray.exe, _get_core_command must target sibling snow.exe with 'core'."""
+        from pathlib import Path
+        from snow.daemon import CoreDaemonManager
+
+        mgr = CoreDaemonManager()
+        fake_tray = "C:\\Program Files\\SNOW\\snow-tray.exe"
+        fake_core = "C:\\Program Files\\SNOW\\snow.exe"
+
+        def fake_is_file(path_obj: Path) -> bool:
+            return str(path_obj).lower() == fake_core.lower()
+
+        with patch.object(sys, "frozen", True, create=True), \
+             patch.object(sys, "executable", fake_tray), \
+             patch.object(Path, "is_file", fake_is_file):
+            cmd = mgr._get_core_command()
+
+        self.assertEqual(len(cmd), 2)
+        self.assertEqual(cmd[0].lower(), fake_core.lower())
+        self.assertEqual(cmd[1], "core")
+        self.assertNotIn("snow-tray.exe", cmd[0].lower())
+        self.assertNotIn("-m", cmd)
+
+    def test_daemon_get_core_command_from_core_frozen(self) -> None:
+        """When running frozen as snow.exe, _get_core_command returns [snow.exe, core]."""
+        from pathlib import Path
+        from snow.daemon import CoreDaemonManager
+
+        mgr = CoreDaemonManager()
+        fake_core = "C:\\Program Files\\SNOW\\snow.exe"
+
+        def fake_is_file(path_obj: Path) -> bool:
+            return str(path_obj).lower() == fake_core.lower()
+
+        with patch.object(sys, "frozen", True, create=True), \
+             patch.object(sys, "executable", fake_core), \
+             patch.object(Path, "is_file", fake_is_file):
+            cmd = mgr._get_core_command()
+
+        self.assertEqual(len(cmd), 2)
+        self.assertEqual(cmd[0].lower(), fake_core.lower())
+        self.assertEqual(cmd[1], "core")
+
+    def test_daemon_get_core_command_missing_raises(self) -> None:
+        """When frozen and sibling snow.exe is missing, _get_core_command raises FileNotFoundError."""
+        from pathlib import Path
+        from snow.daemon import CoreDaemonManager
+
+        mgr = CoreDaemonManager()
+        fake_tray = "C:\\Program Files\\SNOW\\snow-tray.exe"
+
+        with patch.object(sys, "frozen", True, create=True), \
+             patch.object(sys, "executable", fake_tray), \
+             patch.object(Path, "is_file", return_value=False):
+            with self.assertRaises(FileNotFoundError):
+                mgr._get_core_command()
+
+    def test_tray_dashboard_worker_spawns_sibling_snow_web(self) -> None:
+        """When frozen in tray, dashboard worker launches sibling snow.exe web ..."""
+        from pathlib import Path
+        from snow.tray.app import SnowTrayApp
+
+        app = SnowTrayApp(headless=True, auto_start_core=False)
+        fake_tray = "C:\\Program Files\\SNOW\\snow-tray.exe"
+        fake_core = "C:\\Program Files\\SNOW\\snow.exe"
+
+        def fake_is_file(path_obj: Path) -> bool:
+            return str(path_obj).lower() == fake_core.lower()
+
+        spawned_cmd = None
+
+        def fake_popen(cmd, **kwargs):
+            nonlocal spawned_cmd
+            spawned_cmd = cmd
+            mock_proc = MagicMock()
+            return mock_proc
+
+        with patch.object(sys, "frozen", True, create=True), \
+             patch.object(sys, "executable", fake_tray), \
+             patch.object(Path, "is_file", fake_is_file), \
+             patch.object(app, "is_dashboard_listening", side_effect=[False, True]), \
+             patch("subprocess.Popen", side_effect=fake_popen):
+            app._dashboard_startup_worker()
+
+        self.assertIsNotNone(spawned_cmd)
+        self.assertEqual(spawned_cmd[0].lower(), fake_core.lower())
+        self.assertEqual(spawned_cmd[1], "web")
+        self.assertIn("--port", spawned_cmd)
+        self.assertIn("--no-browser", spawned_cmd)
+
+
+class TestCliCoreAndLegacyShims(unittest.TestCase):
+    """Test 'snow core' CLI subcommand and backward-compatible invocation shims."""
+
+    def test_parser_recognizes_core_subcommand(self) -> None:
+        """Verify build_parser recognizes 'core' subcommand."""
+        from snow.cli import build_parser
+
+        parser = build_parser()
+        parsed = parser.parse_args(["core"])
+        self.assertEqual(parsed.command, "core")
+
+    def test_cli_main_dispatches_core(self) -> None:
+        """Verify main(['core']) dispatches to snow.main.main."""
+        from snow.cli import main
+
+        with patch("snow.main.main", return_value=0) as mock_core:
+            rc = main(["core"])
+            self.assertEqual(rc, 0)
+            mock_core.assert_called_once()
+
+    def test_cli_legacy_shim_dash_m_main(self) -> None:
+        """Verify main(['-m', 'snow.main']) normalizes to core and dispatches cleanly."""
+        from snow.cli import main
+
+        with patch("snow.main.main", return_value=0) as mock_core:
+            rc = main(["-m", "snow.main"])
+            self.assertEqual(rc, 0)
+            mock_core.assert_called_once()
+
+    def test_cli_legacy_shim_dash_m_mcp(self) -> None:
+        """Verify main(['-m', 'snow.mcp']) normalizes to mcp and dispatches cleanly."""
+        from snow.cli import main
+
+        with patch("snow.mcp.__main__.main", return_value=0) as mock_mcp:
+            rc = main(["-m", "snow.mcp"])
+            self.assertEqual(rc, 0)
+            mock_mcp.assert_called_once()
+
+    def test_cli_legacy_shim_dash_m_web(self) -> None:
+        """Verify main(['-m', 'snow.web']) normalizes to web and dispatches cleanly."""
+        from snow.cli import main
+
+        with patch("snow.cli.run_web", return_value=0) as mock_web:
+            rc = main(["-m", "snow.web"])
+            self.assertEqual(rc, 0)
+            mock_web.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

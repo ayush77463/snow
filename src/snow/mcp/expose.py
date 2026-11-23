@@ -178,19 +178,36 @@ class ExposeManager:
             # 4. In default managed mode, spawn the managed RemoteMcpGateway subprocess with detected public URL
             if not self.external_gateway:
                 print(f"[*] Spawning managed RemoteMcpGateway with public URL: {detected_public_url}...", file=sys.stderr)
-                gw_cmd = [
-                    sys.executable,
-                    "-m",
-                    "snow.mcp.remote_gateway",
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(self.port),
-                    "--public-url",
-                    detected_public_url,
-                    "--trusted-proxies",
-                    self.trusted_proxies or "127.0.0.1,::1",
-                ]
+                if getattr(sys, "frozen", False):
+                    exe_path = Path(sys.executable).resolve()
+                    sibling_snow = exe_path.with_name("snow.exe")
+                    core_exe = str(sibling_snow) if sibling_snow.is_file() else str(exe_path)
+                    gw_cmd = [
+                        core_exe,
+                        "mcp-gateway",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(self.port),
+                        "--public-url",
+                        detected_public_url,
+                        "--trusted-proxies",
+                        self.trusted_proxies or "127.0.0.1,::1",
+                    ]
+                else:
+                    gw_cmd = [
+                        sys.executable,
+                        "-m",
+                        "snow.mcp.remote_gateway",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(self.port),
+                        "--public-url",
+                        detected_public_url,
+                        "--trusted-proxies",
+                        self.trusted_proxies or "127.0.0.1,::1",
+                    ]
                 self._gateway_process = subprocess.Popen(
                     gw_cmd,
                     stdout=subprocess.DEVNULL,
