@@ -632,7 +632,10 @@ class SnowWebServer:
         device_id = request.query.get("device_id", "")
         subpath = request.query.get("subpath", "")
         scope = request.query.get("scope", "full")
-        show_hidden = request.query.get("show_hidden", "false").lower() in ("true", "1")
+        if "hide_hidden" in request.query:
+            show_hidden = not (request.query.get("hide_hidden", "false").lower() in ("true", "1"))
+        else:
+            show_hidden = request.query.get("show_hidden", "false").lower() in ("true", "1")
         res = await self.bridge.android_file_list(
             subpath=subpath,
             device_id=device_id,
@@ -798,6 +801,9 @@ class SnowWebServer:
 
         request_id = request.match_info.get("request_id") or body.get("request_id", "")
         decision = (body.get("decision") or "").strip().lower()
+        status_val = (body.get("status") or "").strip().upper()
+        if not decision and status_val:
+            decision = "approve" if status_val in ("APPROVED", "APPROVE") else "deny"
 
         if not request_id or decision not in ("approve", "deny"):
             return web.json_response(

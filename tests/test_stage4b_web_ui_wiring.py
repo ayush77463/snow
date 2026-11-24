@@ -10,7 +10,13 @@ Validates:
    - POST /api/clipboard/sync
    - POST /api/files/upload
    - GET  /api/mcp/tunnel/qr
-5. Session and CSRF security middleware enforcement.
+5. Seven Stage 4B audited defect group closures:
+   - Remote AI Tunnel with cloudflared provider and OAuth 2.1 approvals queue.
+   - APK info endpoint, Relay tunnel controls, Federation grants & kill switch.
+   - Clipboard field normalization and deletion.
+   - Scoped files with hide_hidden parameter.
+   - AI gateway status and diagnostics integration.
+6. Session and CSRF security middleware enforcement.
 """
 
 from __future__ import annotations
@@ -117,7 +123,7 @@ class TestStage4BRouteParity(unittest.TestCase):
             normalized = re.sub(r'\$\{[^}]+\}', '{item_id}', ep)
             all_endpoints.add(normalized)
 
-        self.assertGreater(len(all_endpoints), 10, "Should have extracted at least 10 API endpoints from app.js")
+        self.assertGreater(len(all_endpoints), 15, "Should have extracted at least 15 API endpoints from app.js")
 
         for endpoint in all_endpoints:
             matched = False
@@ -256,9 +262,14 @@ class TestStage4BJsSyntaxAndBalancing(unittest.TestCase):
         stray = re.findall(r"(?<!\bshowNotificationToast)\bshowNotification\(", self.js_content)
         self.assertEqual(len(stray), 0, f"Found stray undefined showNotification calls: {stray}")
 
+    def test_cloudflared_provider_used(self):
+        """Web UI must send 'cloudflared' provider identifier for tunnels."""
+        self.assertIn('"cloudflared"', self.js_content)
+        self.assertNotIn('provider: "cloudflare"', self.js_content)
+
 
 class TestStage4BBackendHandlers(AioHTTPTestCase):
-    """Functional tests for the 5 newly wired backend capability endpoints in server.py."""
+    """Functional tests for the newly wired backend capability endpoints in server.py."""
 
     async def get_application(self) -> web.Application:
         self.bridge = MagicMock()
@@ -266,6 +277,8 @@ class TestStage4BBackendHandlers(AioHTTPTestCase):
         self.bridge.android_camera_capture = AsyncMock(return_value={"success": True, "status": "SUCCESS", "photo_url": "/api/camera/latest"})
         self.bridge.sync_clipboard = AsyncMock(return_value={"success": True, "direction": "both", "synced_items": 1})
         self.bridge.android_file_send = AsyncMock(return_value={"success": True, "status": "SUCCESS", "data": {"transferred": 1024}})
+        self.bridge.call = AsyncMock(return_value={"success": True, "status": "SUCCESS"})
+        self.bridge.android_file_list = AsyncMock(return_value={"success": True, "data": {"items": [{"name": "test.txt", "size": 100, "is_directory": False}]}})
 
         self.mock_transfer = MagicMock()
 
@@ -288,18 +301,14 @@ class TestStage4BBackendHandlers(AioHTTPTestCase):
 
     async def test_ring_endpoint_csrf_and_execution(self):
         """POST /api/devices/ring requires session, CSRF, and invokes bridge.android_ring."""
-        # Unauthenticated request rejected with 401
         resp_unauth = await self.client.post("/api/devices/ring", json={"device_id": "test_phone"})
         self.assertEqual(resp_unauth.status, 401)
 
-        # Authenticate
         csrf = await self._authenticate_session()
 
-        # Without CSRF rejected with 403
         resp_nocsrf = await self.client.post("/api/devices/ring", json={"device_id": "test_phone"})
         self.assertEqual(resp_nocsrf.status, 403)
 
-        # Valid request
         resp = await self.client.post(
             "/api/devices/ring",
             json={"device_id": "test_phone", "duration_seconds": 5},
@@ -371,6 +380,29 @@ class TestStage4BBackendHandlers(AioHTTPTestCase):
         self.assertIn("/mcp", data["url"])
         self.assertIn("svg", data)
         self.assertIn("<svg", data["svg"])
+
+    async def test_hide_hidden_files_parameter(self):
+        """GET /api/files parses hide_hidden parameter properly."""
+        await self._authenticate_session()
+        resp = await self.client.get("/api/files?hide_hidden=true")
+        self.assertEqual(resp.status, 200)
+        self.bridge.android_file_list.assert_called_with(
+            subpath="",
+            device_id="",
+            scope="full",
+            show_hidden=False,
+        )
+
+    async def test_approvals_resolve_status_parameter(self):
+        """POST /api/approvals/resolve accepts status='APPROVED'."""
+        csrf = await self._authenticate_session()
+        resp = await self.client.post(
+            "/api/approvals/resolve",
+            json={"request_id": "test_req", "status": "APPROVED"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(resp.status, 200)
+        self.bridge.call.assert_called_with("approval_approve", payload={"request_id": "test_req"})
 
 
 if __name__ == "__main__":

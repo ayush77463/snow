@@ -416,6 +416,33 @@
                                             <button id="btn-connect-9digit-code" class="btn btn-primary btn-sm btn-pill">Connect</button>
                                         </div>
                                         <div id="cross-network-status" class="text-xs text-muted mt-1"></div>
+                                        <div id="cross-network-grants-list" class="mt-2 text-xs"></div>
+                                        <div class="mt-2">
+                                            <button id="btn-federation-kill-switch" class="btn btn-outline-danger btn-xs btn-pill">🚨 Emergency Kill Switch</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Remote Device Access (Relay Tunnel) Card -->
+                            <div class="card remote-relay-card mt-3">
+                                <div class="card-header-clean">
+                                    <div class="header-left-cluster">
+                                        <h3>Remote Device Access (Relay)</h3>
+                                        <span id="relay-tunnel-badge" class="badge-pill badge-pill-muted">Relay Inactive</span>
+                                    </div>
+                                    <div class="header-right-cluster">
+                                        <span class="switch-label text-xs">Remote Relay Active</span>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="chk-relay-tunnel-toggle">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="card-body-clean">
+                                    <div class="remote-link-row">
+                                        <input type="text" id="relay-tunnel-url-pill" class="pill-display-input" value="Local Network Only" readonly />
+                                        <button id="btn-relay-copy-link" class="btn btn-outline-secondary btn-sm btn-pill">Copy URL</button>
                                     </div>
                                 </div>
                             </div>
@@ -738,6 +765,17 @@
                                         <div class="pending-actions-cluster">
                                             <button id="btn-approval-approve" class="btn-pill-action btn-pill-approve">Approve</button>
                                             <button id="btn-approval-deny" class="btn-pill-action btn-pill-deny">Deny</button>
+                                        </div>
+                                    </div>
+
+                                    <!-- Pending OAuth Request Item -->
+                                    <div id="settings-pending-oauth-item" class="pending-approval-box mb-3 d-none">
+                                        <div class="pending-meta">
+                                            <p id="settings-pending-oauth-text" class="text-sm"></p>
+                                        </div>
+                                        <div class="pending-actions-cluster">
+                                            <button id="btn-oauth-approve" class="btn-pill-action btn-pill-approve">Authorize</button>
+                                            <button id="btn-oauth-deny" class="btn-pill-action btn-pill-deny">Reject</button>
                                         </div>
                                     </div>
 
