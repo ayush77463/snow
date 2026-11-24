@@ -35,6 +35,7 @@ PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
 ; Uninstaller configuration
+SetupIconFile=snow.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} (AI Multi-Device Bridge)
 

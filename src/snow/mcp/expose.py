@@ -17,6 +17,8 @@ import time
 from typing import Optional
 import urllib.request
 
+from snow.core.subprocess_util import get_no_window_subprocess_kwargs
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_GATEWAY_PORT: int = 8771
@@ -132,6 +134,7 @@ class ExposeManager:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    **get_no_window_subprocess_kwargs(),
                 )
 
                 assert self._tunnel_process.stdout is not None
@@ -153,6 +156,7 @@ class ExposeManager:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    **get_no_window_subprocess_kwargs(),
                 )
 
                 assert self._tunnel_process.stdout is not None
@@ -213,6 +217,7 @@ class ExposeManager:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     text=True,
+                    **get_no_window_subprocess_kwargs(),
                 )
 
                 # Wait for managed gateway to be healthy

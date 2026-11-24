@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import json
 import logging
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Optional
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,63 @@ ALLOWED_TUNNEL_PORTS: frozenset[int] = frozenset({ALLOWED_TUNNEL_PORT, ALLOWED_R
 
 CLOUDFLARED_URL_REGEX = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 TAILSCALE_URL_REGEX = re.compile(r"https://[a-zA-Z0-9.-]+\.ts\.net(?::\d+)?")
+
+
+def get_default_tunnel_config_path() -> Path:
+    """Resolve the default configuration path for persistent tunnel settings (~/.snow/tunnel_config.json)."""
+    env_dir = os.getenv("SNOW_DATA_DIR")
+    target_dir = Path(env_dir.strip()) if env_dir and env_dir.strip() else (Path.home() / ".snow")
+    return target_dir / "tunnel_config.json"
+
+
+def load_tunnel_config(config_path: Optional[Path] = None) -> dict[str, Any]:
+    """Load persistent tunnel configuration, returning empty dict if missing or unreadable."""
+    path = config_path or get_default_tunnel_config_path()
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            logger.warning("Failed to load tunnel configuration from %s: %s", path, exc)
+    return {}
+
+
+def save_tunnel_config(config: dict[str, Any], config_path: Optional[Path] = None) -> None:
+    """Safely persist tunnel configuration to disk using atomic temp file replacement."""
+    path = config_path or get_default_tunnel_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.parent / f".{path.name}.tmp_{uuid.uuid4().hex[:8]}"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        temp_path.replace(path)
+    except Exception as exc:
+        logger.error("Failed to save tunnel configuration to %s: %s", path, exc)
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+        raise
+
+
+def redact_tunnel_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Recursively scrub tokens, secrets, and credentials before returning in status or logs."""
+    redacted: dict[str, Any] = {}
+    for k, v in config.items():
+        k_lower = str(k).lower()
+        if any(sec in k_lower for sec in ("token", "secret", "key", "password", "credential")):
+            if isinstance(v, str) and len(v) > 8:
+                redacted[k] = f"{v[:4]}***{v[-2:]}"
+            else:
+                redacted[k] = "[REDACTED]"
+        elif isinstance(v, dict):
+            redacted[k] = redact_tunnel_config(v)
+        else:
+            redacted[k] = v
+    return redacted
 
 
 def find_cloudflared_binary() -> Optional[str]:
@@ -205,6 +264,7 @@ class _TunnelInstance:
         port: Optional[int] = None,
         custom_url: Optional[str] = None,
         timeout: float = 12.0,
+        token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Start a public tunnel exposing this instance's verified port."""
         target_port = port if port is not None else self.target_port
@@ -232,17 +292,39 @@ class _TunnelInstance:
             await self._stop_tunnel_unlocked()
 
             provider_lower = provider.strip().lower()
+            tunnel_cfg = load_tunnel_config()
+            if self.purpose == "mcp":
+                resolved_token = (
+                    token
+                    or tunnel_cfg.get("mcp_cloudflare_token")
+                    or tunnel_cfg.get("cloudflare_token")
+                    or tunnel_cfg.get("token")
+                )
+                cfg_url = (
+                    tunnel_cfg.get("mcp_public_url")
+                    or tunnel_cfg.get("public_url")
+                    or tunnel_cfg.get("custom_url")
+                )
+            elif self.purpose == "relay":
+                # For relay, support relay_cloudflare_token. Do not accidentally use MCP token for relay tunnel.
+                resolved_token = token or tunnel_cfg.get("relay_cloudflare_token")
+                cfg_url = tunnel_cfg.get("relay_public_url")
+            else:
+                resolved_token = token or tunnel_cfg.get("cloudflare_token") or tunnel_cfg.get("token")
+                cfg_url = tunnel_cfg.get("public_url") or tunnel_cfg.get("custom_url")
+
+            resolved_custom_url = custom_url or cfg_url
 
             # Case A: Custom URL provider
             if provider_lower == "custom":
-                if not custom_url or not custom_url.startswith(("http://", "https://", "ws://", "wss://")):
+                if not resolved_custom_url or not resolved_custom_url.startswith(("http://", "https://", "ws://", "wss://")):
                     return {
                         "success": False,
                         "status": "INVALID_URL",
                         "error": "A valid public URL is required for custom tunnel provider.",
                     }
                 self._provider = "custom"
-                self._public_url = custom_url.rstrip("/")
+                self._public_url = resolved_custom_url.rstrip("/")
                 self._started_at = time.time()
                 logger.info("Configured custom [%s] public URL: %s", self.purpose, self._public_url)
                 res: dict[str, Any] = {
@@ -256,7 +338,7 @@ class _TunnelInstance:
                     res["mcp_endpoint"] = f"{self._public_url}/mcp"
                 return res
 
-            # Case B: Cloudflared Tunnel
+            # Case B: Cloudflared Tunnel (Named or Quick Tunnel)
             elif provider_lower == "cloudflared":
                 cf_bin = find_cloudflared_binary()
                 if not cf_bin:
@@ -269,7 +351,93 @@ class _TunnelInstance:
                         ),
                     }
 
-                # Construct tunnel command (both MCP Gateway and Relay listeners use HTTP/WebSocket)
+                creation_flags = 0
+                if sys.platform == "win32":
+                    creation_flags |= subprocess.CREATE_NO_WINDOW
+
+                # Subcase B1: Named Tunnel with explicit or configured token
+                if resolved_token:
+                    # Validate public URL: require a valid https:// public URL
+                    if not resolved_custom_url or not resolved_custom_url.strip().lower().startswith("https://"):
+                        return {
+                            "success": False,
+                            "status": "INVALID_URL",
+                            "error": f"A valid public https:// URL is required for named {self.purpose} tunnel.",
+                        }
+                    public_url = resolved_custom_url.strip().rstrip("/")
+                    if ".snow.internal" in public_url.lower():
+                        return {
+                            "success": False,
+                            "status": "INVALID_URL",
+                            "error": "Fabricated internal domains (*.snow.internal) cannot be used as public tunnel URLs.",
+                        }
+
+                    cmd = [
+                        cf_bin,
+                        "tunnel",
+                        "--no-autoupdate",
+                        "run",
+                        "--token",
+                        str(resolved_token).strip(),
+                    ]
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                            creationflags=creation_flags,
+                        )
+                    except Exception as exc:
+                        return {
+                            "success": False,
+                            "status": "SPAWN_FAILED",
+                            "error": f"Failed launching cloudflared named tunnel for {self.purpose}: {exc}",
+                        }
+
+                    self._proc = proc
+                    self._provider = "cloudflared"
+                    self._started_at = time.time()
+
+                    # Check for early failure
+                    await asyncio.sleep(0.3)
+                    if proc.returncode is not None:
+                        err_out = ""
+                        if proc.stderr:
+                            try:
+                                err_bytes = await asyncio.wait_for(proc.stderr.read(512), timeout=0.5)
+                                err_out = err_bytes.decode("utf-8", errors="replace").strip()
+                            except Exception:
+                                pass
+                        await self._stop_tunnel_unlocked()
+                        return {
+                            "success": False,
+                            "status": "TUNNEL_EXITED",
+                            "error": f"cloudflared named tunnel exited immediately (code={proc.returncode}): {err_out}",
+                        }
+
+                    self._public_url = public_url
+                    url_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                    self._reader_task = asyncio.create_task(
+                        self._drain_stderr(proc, "cloudflared", url_future)
+                    )
+                    logger.info("[%s tunnel] cloudflared named tunnel running: %s (pid=%s)", self.purpose, public_url, proc.pid)
+                    res = {
+                        "success": True,
+                        "status": "STARTED",
+                        "purpose": self.purpose,
+                        "provider": "cloudflared",
+                        "mode": "named",
+                        "public_url": public_url,
+                        "pid": proc.pid,
+                    }
+                    if self.purpose == "mcp":
+                        res["mcp_endpoint"] = f"{public_url}/mcp"
+                    elif self.purpose == "relay":
+                        clean_host = public_url.replace("https://", "").replace("http://", "").rstrip("/")
+                        res["relay_endpoint"] = f"wss://{clean_host}/v1/tunnel"
+                    return res
+
+                # Subcase B2: Quick Tunnel fallback
                 target_scheme = "http"
                 target_url = f"{target_scheme}://127.0.0.1:{target_port}"
                 cmd = [
@@ -279,10 +447,6 @@ class _TunnelInstance:
                     target_url,
                     "--no-autoupdate",
                 ]
-
-                creation_flags = 0
-                if sys.platform == "win32":
-                    creation_flags |= subprocess.CREATE_NO_WINDOW
 
                 try:
                     proc = await asyncio.create_subprocess_exec(
@@ -302,7 +466,7 @@ class _TunnelInstance:
                 self._provider = "cloudflared"
                 self._started_at = time.time()
 
-                url_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                url_future = asyncio.get_running_loop().create_future()
                 self._reader_task = asyncio.create_task(
                     self._drain_stderr(proc, "cloudflared", url_future)
                 )
@@ -324,6 +488,7 @@ class _TunnelInstance:
                     "status": "STARTED",
                     "purpose": self.purpose,
                     "provider": "cloudflared",
+                    "mode": "quick",
                     "public_url": public_url,
                     "pid": proc.pid,
                 }
@@ -475,6 +640,7 @@ class TunnelManager:
         port: int = ALLOWED_TUNNEL_PORT,
         custom_url: Optional[str] = None,
         timeout: float = 12.0,
+        token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Start a public tunnel exposing Remote MCP Gateway (port 8771).
 
@@ -489,7 +655,7 @@ class TunnelManager:
             logger.error(err)
             return {"success": False, "status": "PORT_RESTRICTED", "error": err}
 
-        return await self._mcp_tunnel.start(provider=provider, port=port, custom_url=custom_url, timeout=timeout)
+        return await self._mcp_tunnel.start(provider=provider, port=port, custom_url=custom_url, timeout=timeout, token=token)
 
     async def start_relay_tunnel(
         self,
@@ -497,6 +663,7 @@ class TunnelManager:
         port: int = ALLOWED_RELAY_TUNNEL_PORT,
         custom_url: Optional[str] = None,
         timeout: float = 12.0,
+        token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Start a public tunnel exposing Remote Device Relay (port 8770).
 
@@ -511,7 +678,7 @@ class TunnelManager:
             logger.error(err)
             return {"success": False, "status": "PORT_RESTRICTED", "error": err}
 
-        return await self._relay_tunnel.start(provider=provider, port=port, custom_url=custom_url, timeout=timeout)
+        return await self._relay_tunnel.start(provider=provider, port=port, custom_url=custom_url, timeout=timeout, token=token)
 
     async def stop_tunnel(self, port: Optional[int] = None) -> dict[str, Any]:
         """Safely terminate an active tunnel subprocess by port (defaults to MCP gateway port)."""
@@ -552,9 +719,10 @@ class TunnelManager:
         return self.get_status(port=ALLOWED_TUNNEL_PORT)
 
     def get_all_status(self) -> dict[str, Any]:
-        """Query current status of both isolated tunnel instances."""
+        """Query current status of both isolated tunnel instances and persistent config."""
         return {
             "mcp": self._mcp_tunnel.get_status(),
             "relay": self._relay_tunnel.get_status(),
             "available_providers": self.get_available_providers(),
+            "config": redact_tunnel_config(load_tunnel_config()),
         }

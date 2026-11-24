@@ -267,6 +267,20 @@ class SnowWebServer:
             return web.Response(status=404, text="File not found or forbidden.")
         return web.FileResponse(file_path)
 
+    async def handle_favicon(self, request: web.Request) -> web.Response:
+        """Serve browser favicon."""
+        file_path = self._resolve_static_file("favicon.ico")
+        if file_path:
+            return web.FileResponse(file_path)
+        return web.Response(status=404, text="Favicon not found.")
+
+    async def handle_snow_logo(self, request: web.Request) -> web.Response:
+        """Serve SNOW universal logo."""
+        file_path = self._resolve_static_file("snow_logo.png")
+        if file_path:
+            return web.FileResponse(file_path)
+        return web.Response(status=404, text="Logo not found.")
+
     async def handle_api_reset_web_ui_override(self, request: web.Request) -> web.Response:
         """Reset Web UI override to bundled version (OWNER_MANUAL)."""
         from snow.updater import reset_web_ui_override
@@ -423,9 +437,15 @@ class SnowWebServer:
         except Exception:
             usb_connected = False
 
+        from snow.security.identity import load_or_create_device_identity
+        identity = load_or_create_device_identity()
+
         data = {
             "success": True,
             "daemon_online": daemon_online,
+            "snow_id": identity.snow_id,
+            "device_id": identity.device_id,
+            "device_name": identity.device_name,
             "ipc_endpoint": f"127.0.0.1:{self.bridge.port}",
             "wss_port": 8765,
             "lan_ips": lan_ips,
@@ -451,8 +471,14 @@ class SnowWebServer:
         elif isinstance(res.get("devices"), list):
             devices = res["devices"]
 
-        # Populate live phone telemetry (battery, RAM, storage) for connected devices
+        # Populate live phone telemetry (battery, RAM, storage) and canonical snow_id
+        from snow.security.identity import generate_snow_id, is_valid_snow_id
         for dev in devices:
+            if not dev.get("snow_id"):
+                dev_id = dev.get("device_id")
+                if dev_id:
+                    dev["snow_id"] = generate_snow_id(seed=dev_id)
+
             if dev.get("is_connected") and (dev.get("platform") == "android" or not dev.get("platform") or dev.get("platform") == "generic"):
                 dev_id = dev.get("device_id")
                 if not dev.get("telemetry") and dev_id:
@@ -2331,6 +2357,85 @@ class SnowWebServer:
         """Query current tunnel status."""
         return web.json_response({"success": True, **self.tunnel_manager.get_status()})
 
+    async def handle_api_mcp_tunnel_config_get(self, request: web.Request) -> web.Response:
+        """Retrieve persistent tunnel configuration with all secrets redacted."""
+        from snow.mcp.tunnel import load_tunnel_config, redact_tunnel_config
+        cfg = load_tunnel_config()
+        redacted = redact_tunnel_config(cfg)
+        return web.json_response({"success": True, "config": redacted})
+
+    async def handle_api_mcp_tunnel_config_post(self, request: web.Request) -> web.Response:
+        """Update and persist tunnel configuration securely."""
+        from snow.mcp.tunnel import load_tunnel_config, save_tunnel_config, redact_tunnel_config
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"success": False, "status": "INVALID_JSON", "error": "Invalid JSON body."},
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"success": False, "status": "INVALID_PAYLOAD", "error": "Request body must be a JSON object."},
+                status=400,
+            )
+
+        allowed_keys = {
+            "provider",
+            "mcp_cloudflare_token",
+            "relay_cloudflare_token",
+            "cloudflare_token",
+            "mcp_public_url",
+            "relay_public_url",
+            "public_url",
+            "custom_url",
+        }
+
+        current_cfg = load_tunnel_config()
+        updated_cfg = dict(current_cfg)
+
+        for k, v in body.items():
+            if k not in allowed_keys:
+                continue
+            if v is None:
+                updated_cfg.pop(k, None)
+                continue
+            if not isinstance(v, str):
+                return web.json_response(
+                    {"success": False, "status": "INVALID_VALUE", "error": f"Field '{k}' must be a string or null."},
+                    status=400,
+                )
+            clean_v = v.strip()
+            if "url" in k and clean_v:
+                if not (clean_v.startswith("https://") or clean_v.startswith("http://") or clean_v.startswith("wss://") or clean_v.startswith("ws://")):
+                    return web.json_response(
+                        {"success": False, "status": "INVALID_URL", "error": f"Field '{k}' must start with https://, http://, wss://, or ws://."},
+                        status=400,
+                    )
+            if k == "provider" and clean_v:
+                if clean_v.lower() not in ("cloudflared", "tailscale", "custom"):
+                    return web.json_response(
+                        {"success": False, "status": "INVALID_PROVIDER", "error": "Provider must be 'cloudflared', 'tailscale', or 'custom'."},
+                        status=400,
+                    )
+            # Never overwrite real credential with redacted token
+            if any(sec in k for sec in ("token", "secret", "key")) and ("***" in clean_v or clean_v == "[REDACTED]"):
+                continue
+
+            updated_cfg[k] = clean_v
+
+        try:
+            save_tunnel_config(updated_cfg)
+        except Exception as exc:
+            logger.error("Failed persisting tunnel config: %s", exc)
+            return web.json_response(
+                {"success": False, "status": "PERSISTENCE_ERROR", "error": f"Failed to persist configuration: {exc}"},
+                status=500,
+            )
+
+        redacted = redact_tunnel_config(updated_cfg)
+        return web.json_response({"success": True, "status": "UPDATED", "config": redacted})
+
     # =========================================================================
     # Remote Device Relay Tunnel Endpoints (Phase 4 Stage 4A)
     # =========================================================================
@@ -2534,13 +2639,14 @@ class SnowWebServer:
         })
 
     async def handle_api_system_pause(self, request: web.Request) -> web.Response:
-        """Pause desktop background services and public tunnels under owner authorization."""
-        # 1. Stop all public tunnels
-        if hasattr(self, "tunnel_manager"):
+        """Pause desktop background services under owner authorization."""
+        # 1. Non-destructive pause: Keep public tunnels running to maintain stable URLs.
+        # Mark Remote MCP Gateway as paused so incoming requests return HTTP 503.
+        if getattr(self, "_mcp_gateway_instance", None):
             try:
-                await self.tunnel_manager.stop_all_tunnels()
+                self._mcp_gateway_instance.set_paused(True)
             except Exception as exc:
-                logger.warning("Error stopping tunnels during pause: %s", exc)
+                logger.warning("Error setting MCP gateway paused state: %s", exc)
 
         # 2. Invoke Core IPC system_pause via bridge
         core_res = {}
@@ -2563,6 +2669,14 @@ class SnowWebServer:
 
     async def handle_api_system_resume(self, request: web.Request) -> web.Response:
         """Resume desktop background services from pause mode under owner authorization."""
+        # 1. Clear Remote MCP Gateway paused state
+        if getattr(self, "_mcp_gateway_instance", None):
+            try:
+                self._mcp_gateway_instance.set_paused(False)
+            except Exception as exc:
+                logger.warning("Error clearing MCP gateway paused state: %s", exc)
+
+        # 2. Invoke Core IPC system_resume via bridge
         core_res = {}
         try:
             if hasattr(self.bridge, "system_resume"):
@@ -2630,6 +2744,8 @@ class SnowWebServer:
 
         # Main static UI
         app.router.add_get("/", self.handle_index)
+        app.router.add_get("/favicon.ico", self.handle_favicon)
+        app.router.add_get("/snow_logo.png", self.handle_snow_logo)
         app.router.add_get("/static/{path:.*}", self.handle_static_asset)
 
         # Allowlisted API routes
@@ -2721,6 +2837,8 @@ class SnowWebServer:
         app.router.add_post("/api/mcp/tunnel/start", self.handle_api_mcp_tunnel_start)
         app.router.add_post("/api/mcp/tunnel/stop", self.handle_api_mcp_tunnel_stop)
         app.router.add_get("/api/mcp/tunnel/status", self.handle_api_mcp_tunnel_status)
+        app.router.add_get("/api/mcp/tunnel/config", self.handle_api_mcp_tunnel_config_get)
+        app.router.add_post("/api/mcp/tunnel/config", self.handle_api_mcp_tunnel_config_post)
         app.router.add_get("/api/mcp/oauth/pending", self.handle_api_mcp_oauth_pending)
         app.router.add_post("/api/mcp/oauth/approve", self.handle_api_mcp_oauth_approve)
         app.router.add_post("/api/mcp/oauth/reject", self.handle_api_mcp_oauth_reject)

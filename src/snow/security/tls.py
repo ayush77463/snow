@@ -17,6 +17,8 @@ import subprocess
 import sys
 from typing import List, Optional, Set, Tuple
 
+from snow.core.subprocess_util import get_no_window_subprocess_kwargs
+
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -89,7 +91,7 @@ def set_private_key_permissions(key_path: Path) -> None:
                     check=True,
                     capture_output=True,
                     timeout=5,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    **get_no_window_subprocess_kwargs(),
                 )
             except Exception as exc:
                 logger.debug("icacls restriction failed on %s: %s", key_path, exc)

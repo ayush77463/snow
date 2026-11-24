@@ -243,6 +243,12 @@ class SnowMcpBridge:
         # Idempotent clipboard sync state: (device_id, direction) -> last_synced_sha256
         self._clipboard_sync_hashes: dict[tuple[str, str], str] = {}
         self._clipboard_sync_lock = asyncio.Lock()
+        self._is_paused: bool = False
+
+    @property
+    def is_paused(self) -> bool:
+        """Return whether the bridge currently considers the system paused."""
+        return self._is_paused
 
     def _get_secret(self) -> Optional[str]:
         """Resolve the IPC authentication secret."""
@@ -1506,6 +1512,7 @@ class SnowMcpBridge:
 
     async def system_pause(self, reason: str = "Paused by owner via bridge") -> dict[str, Any]:
         """Put the desktop core into pause mode via Core IPC."""
+        self._is_paused = True
         if await self.daemon_manager.is_ipc_ready(timeout=0.1):
             res = await self.call("system_pause", payload={"reason": reason}, timeout=5.0)
             if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
@@ -1514,6 +1521,7 @@ class SnowMcpBridge:
 
     async def system_resume(self) -> dict[str, Any]:
         """Restore desktop core from pause mode via Core IPC."""
+        self._is_paused = False
         if await self.daemon_manager.is_ipc_ready(timeout=0.1):
             res = await self.call("system_resume", payload={}, timeout=5.0)
             if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):

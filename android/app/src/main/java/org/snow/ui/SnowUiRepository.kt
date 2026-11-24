@@ -652,6 +652,155 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
+    // --- Phase 5A: Unified Connection Resolution & Relay Normalization ---
+
+    fun normalizeRelayUrl(raw: String): String {
+        var s = raw.trim()
+        if (s.isEmpty()) return ""
+        if (s.startsWith("http://", ignoreCase = true)) {
+            s = "ws://" + s.substring("http://".length)
+        } else if (s.startsWith("https://", ignoreCase = true)) {
+            s = "wss://" + s.substring("https://".length)
+        } else if (!s.startsWith("ws://", ignoreCase = true) && !s.startsWith("wss://", ignoreCase = true)) {
+            s = "wss://$s"
+        }
+
+        return try {
+            val uri = java.net.URI(s)
+            val scheme = uri.scheme ?: if (s.startsWith("ws://", ignoreCase = true)) "ws" else "wss"
+            val host = uri.host ?: s.substringAfter("://").substringBefore("/").substringBefore(":")
+            val port = uri.port
+            val path = uri.path
+            val hostPort = if (port != -1) "$host:$port" else host
+            val cleanPath = if (path.isNullOrBlank() || path == "/") "/v1/tunnel" else path
+            "$scheme://$hostPort$cleanPath"
+        } catch (_: Exception) {
+            val scheme = if (s.startsWith("ws://", ignoreCase = true)) "ws" else "wss"
+            val body = s.substringAfter("://")
+            val hostPort = body.substringBefore("/")
+            val path = body.substringAfter("/", "")
+            val cleanPath = if (path.isBlank()) "/v1/tunnel" else "/$path"
+            "$scheme://$hostPort$cleanPath"
+        }
+    }
+
+    fun connectRelay(normalizedRelayUrl: String) {
+        updateRemoteRelayConfig(true, normalizedRelayUrl)
+        appendLog("INFO", TAG, "Configured remote relay endpoint: $normalizedRelayUrl")
+    }
+
+    fun connectByInput(raw: String, onResult: (Boolean, String, String?) -> Unit) {
+        val input = raw.trim()
+        if (input.isEmpty()) {
+            onResult(false, "Input cannot be empty", null)
+            return
+        }
+
+        // 1. Check SNOW ID: Full (SNW-XXXX-XXXX) or Short (SNW-XXXX, DEV-XXXX)
+        val snowIdRegex = Regex("^(SNW-[A-Z0-9]{4}-[A-Z0-9]{4}|SNW-[A-Z0-9]{4}|DEV-[A-Z0-9]{4})$", RegexOption.IGNORE_CASE)
+        if (snowIdRegex.matches(input)) {
+            val upperSnowId = input.uppercase()
+            appendLog("INFO", TAG, "Resolving connection for SNOW ID: $upperSnowId")
+
+            val matchedPeer = _discoveredPeers.value.find { peer ->
+                peer.snowId.equals(upperSnowId, ignoreCase = true) ||
+                peer.deviceId.equals(upperSnowId, ignoreCase = true) ||
+                (upperSnowId.length == 8 && (peer.snowId?.startsWith(upperSnowId, ignoreCase = true) == true || peer.deviceId.startsWith(upperSnowId, ignoreCase = true)))
+            }
+            if (matchedPeer != null) {
+                appendLog("INFO", TAG, "Found discovered peer for $upperSnowId at ${matchedPeer.ipAddress}:${matchedPeer.port}")
+                connect(matchedPeer.ipAddress, matchedPeer.port)
+                onResult(true, "Connecting to discovered peer for $upperSnowId", "lan")
+                return
+            }
+
+            val savedDev = _savedDevices.value.find { dev ->
+                dev.snowId?.equals(upperSnowId, ignoreCase = true) == true ||
+                dev.deviceId.equals(upperSnowId, ignoreCase = true) ||
+                (upperSnowId.length == 8 && (dev.snowId?.startsWith(upperSnowId, ignoreCase = true) == true || dev.deviceId.startsWith(upperSnowId, ignoreCase = true)))
+            }
+            if (savedDev != null) {
+                val targetHost = savedDev.recentEndpoints.firstOrNull()?.host ?: savedDev.host
+                val targetPort = savedDev.recentEndpoints.firstOrNull()?.port ?: savedDev.port
+                appendLog("INFO", TAG, "Found saved device for $upperSnowId: $targetHost:$targetPort")
+                connect(targetHost, targetPort)
+                onResult(true, "Connecting to saved device for $upperSnowId", "saved")
+                return
+            }
+
+            // Fallback: If remote relay is configured and enabled, attempt connecting via Remote Relay
+            val relayEndpoint = getRemoteRelayEndpoint()
+            if (isRemoteRelayEnabled() && relayEndpoint.isNotBlank()) {
+                appendLog("INFO", TAG, "Local resolution failed for $upperSnowId; falling back to configured Remote Relay: $relayEndpoint")
+                connectRelay(relayEndpoint)
+                onResult(true, "Connecting to $upperSnowId via Remote Relay", "relay")
+                return
+            }
+
+            // Transport cascade fallback: USB loopback (127.0.0.1:8765) -> LAN discovery
+            appendLog("INFO", TAG, "Attempting transport cascade for $upperSnowId via USB loopback...")
+            connect("127.0.0.1", 8765)
+            onResult(true, "Initiated transport cascade for $upperSnowId", "cascade")
+            return
+        }
+
+        // 2. Check 6-digit PIN: ^\d{6}$
+        if (input.length == 6 && input.all { it.isDigit() }) {
+            appendLog("INFO", TAG, "Initiating pairing with 6-digit PIN: $input")
+            pairDevice(input) { state ->
+                when (state) {
+                    is PairingState.Paired -> onResult(true, "Pairing successful", "pin")
+                    is PairingState.WrongPin -> onResult(false, "Invalid PIN (${state.remainingAttempts} attempts remaining)", "pin")
+                    is PairingState.Expired -> onResult(false, "PIN expired", "pin")
+                    is PairingState.Locked -> onResult(false, "Pairing locked", "pin")
+                    is PairingState.Error -> onResult(false, state.message, "pin")
+                    else -> {}
+                }
+            }
+            return
+        }
+
+        // 3. Check 9-digit Federation code: ^\d{9}$ or ^\d{3}[-\s]?\d{3}[-\s]?\d{3}$
+        val cleanFedDigits = input.replace("-", "").replace(" ", "").trim()
+        if (cleanFedDigits.length == 9 && cleanFedDigits.all { it.isDigit() }) {
+            appendLog("INFO", TAG, "Processing 9-digit Federation code: $cleanFedDigits")
+            acceptFederationInvite(cleanFedDigits) { success, _, err ->
+                onResult(success, err ?: if (success) "Federation invite accepted" else "Failed to accept federation code", "federation")
+            }
+            return
+        }
+
+        // 4. Check Relay URL or Direct URL: starts with wss://, ws://, https://, http:// or contains trycloudflare / /v1/tunnel
+        if (input.startsWith("wss://", ignoreCase = true) || input.startsWith("ws://", ignoreCase = true) ||
+            input.startsWith("https://", ignoreCase = true) || input.startsWith("http://", ignoreCase = true) ||
+            input.contains(".trycloudflare.com", ignoreCase = true) || input.contains("/v1/tunnel", ignoreCase = true)) {
+            val normalizedRelay = normalizeRelayUrl(input)
+            appendLog("INFO", TAG, "Connecting via Normalized Relay URL: $normalizedRelay")
+            connectRelay(normalizedRelay)
+            onResult(true, "Connecting via Relay: $normalizedRelay", "relay")
+            return
+        }
+
+        // 5. Direct IP:Port or Host:Port or raw IP (default port 8765)
+        val hostPart = input.substringBeforeLast(":").trim()
+        val portPart = input.substringAfterLast(":", "").trim()
+        val parsedPort = portPart.toIntOrNull()
+
+        if (parsedPort != null && hostPart.isNotEmpty()) {
+            appendLog("INFO", TAG, "Connecting directly to host:port: $hostPart:$parsedPort")
+            connect(hostPart, parsedPort)
+            onResult(true, "Connecting to $hostPart:$parsedPort", "direct")
+            return
+        } else if (input.matches(Regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}$")) || input.equals("localhost", ignoreCase = true)) {
+            appendLog("INFO", TAG, "Connecting directly to IP on default port 8765: $input:8765")
+            connect(input, 8765)
+            onResult(true, "Connecting to $input:8765", "direct")
+            return
+        }
+
+        onResult(false, "Unrecognized connection format: $input", null)
+    }
+
     fun serializeSavedDevices(devices: List<SavedDevice>): String {
         val arr = org.json.JSONArray()
         for (d in devices) {
@@ -664,6 +813,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             obj.put("trustTier", d.trustTier)
             obj.put("certFingerprint", d.certFingerprint ?: "")
             obj.put("connectionMode", d.connectionMode)
+            obj.put("snowId", d.snowId ?: "")
             val epArr = org.json.JSONArray()
             for (ep in d.recentEndpoints) {
                 val epObj = org.json.JSONObject()
@@ -709,7 +859,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         trustTier = obj.optString("trustTier", "PEER"),
                         certFingerprint = obj.optString("certFingerprint", "").takeIf { it.isNotBlank() },
                         recentEndpoints = eps.take(5),
-                        connectionMode = obj.optString("connectionMode", "auto")
+                        connectionMode = obj.optString("connectionMode", "auto"),
+                        snowId = obj.optString("snowId", "").takeIf { it.isNotBlank() }
                     )
                 )
             }
@@ -2519,11 +2670,104 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Direct App Update Engine ---
 
+    internal fun extractHostFromEndpoint(endpoint: String?): String? {
+        if (endpoint.isNullOrBlank()) return null
+        val trimmed = endpoint.trim()
+
+        try {
+            val uri = if (trimmed.startsWith("relay:", ignoreCase = true)) {
+                java.net.URI("wss://${trimmed.substring("relay:".length).trimStart('/')}")
+            } else if (!trimmed.contains("://")) {
+                java.net.URI("dummy://$trimmed")
+            } else {
+                java.net.URI(trimmed)
+            }
+
+            val rawHost = uri.host
+            if (!rawHost.isNullOrBlank()) {
+                val host = if (rawHost.startsWith("[") && rawHost.endsWith("]")) {
+                    rawHost.substring(1, rawHost.length - 1)
+                } else {
+                    rawHost
+                }
+                val lower = host.lowercase()
+                if (lower != "wss" && lower != "relay" && lower != "ws" && lower != "http" && lower != "https") {
+                    return host
+                }
+            }
+        } catch (_: Exception) {
+            // Fall through to manual parsing
+        }
+
+        // Safe fallback string parser
+        var clean = trimmed
+        if (clean.startsWith("relay:", ignoreCase = true)) {
+            clean = clean.substring("relay:".length)
+        }
+        if (clean.contains("://")) {
+            clean = clean.substringAfter("://")
+        }
+        clean = clean.trimStart('/').substringBefore("/")
+        if (clean.startsWith("[")) {
+            val closing = clean.indexOf("]")
+            if (closing != -1) {
+                return clean.substring(1, closing)
+            }
+        }
+        val candidate = if (clean.contains(":")) clean.substringBefore(":") else clean
+        val candidateTrimmed = candidate.trim()
+        if (candidateTrimmed.isNotEmpty()) {
+            val lower = candidateTrimmed.lowercase()
+            if (lower != "wss" && lower != "relay" && lower != "ws" && lower != "http" && lower != "https") {
+                return candidateTrimmed
+            }
+        }
+        return null
+    }
+
+    fun resolveActiveConnectedHost(): String? {
+        val clientHost = serviceRef?.client?.currentTargetHost?.takeIf { it.isNotBlank() }
+        val parsedClientHost = extractHostFromEndpoint(clientHost)
+        if (parsedClientHost != null) return parsedClientHost
+
+        val ep = _connectedEndpoint.value?.takeIf { it.isNotBlank() }
+        val parsedEp = extractHostFromEndpoint(ep)
+        if (parsedEp != null) return parsedEp
+
+        val ch = connectedHost.takeIf { it.isNotBlank() }
+        val parsedCh = extractHostFromEndpoint(ch)
+        if (parsedCh != null) return parsedCh
+
+        if (_connectionState.value == ConnectionState.CONNECTED) {
+            return "127.0.0.1"
+        }
+
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val lastHost = prefs.getString("last_connected_host", null)?.takeIf { it.isNotBlank() }
+        val parsedLastHost = extractHostFromEndpoint(lastHost)
+        if (parsedLastHost != null) return parsedLastHost
+
+        val savedDev = _savedDevices.value.firstOrNull()
+        if (savedDev != null) {
+            val devHost = savedDev.recentEndpoints.firstOrNull()?.host ?: savedDev.host
+            val parsedDevHost = extractHostFromEndpoint(devHost)
+            if (parsedDevHost != null) return parsedDevHost
+        }
+
+        return "127.0.0.1"
+    }
+
     fun checkAppUpdate(onResult: (FileTransferClient.AppUpdateInfo?) -> Unit) {
-        val transferClient = serviceRef?.transferClient
-        val host = serviceRef?.client?.currentTargetHost
-        if (transferClient == null || host.isNullOrBlank() || _connectionState.value != ConnectionState.CONNECTED) {
-            appendLog("WARN", TAG, "Cannot check app update: desktop not connected")
+        val host = resolveActiveConnectedHost()
+        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: FileTransferClient(
+            context = appContext,
+            deviceId = "android-client",
+            certPinStorage = certPinStorage,
+            tokenStorage = tokenStorage,
+            useTls = true
+        )
+        if (host.isNullOrBlank()) {
+            appendLog("WARN", TAG, "Cannot check app update: no active desktop endpoint resolved")
             onResult(null)
             return
         }
@@ -2536,7 +2780,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     appendLog("INFO", TAG, "App update check result: available=${info?.available}, code=${info?.versionCode}")
                     onResult(info)
                 } else {
-                    appendLog("WARN", TAG, "App update check failed: ${res.exceptionOrNull()?.message}")
+                    appendLog("WARN", TAG, "App update check failed on $host:8766: ${res.exceptionOrNull()?.message}")
                     onResult(null)
                 }
             } catch (e: Exception) {
@@ -2551,10 +2795,16 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         onProgress: (Int) -> Unit,
         onComplete: (Boolean, String?) -> Unit
     ) {
-        val transferClient = serviceRef?.transferClient
-        val host = serviceRef?.client?.currentTargetHost
-        if (transferClient == null || host.isNullOrBlank() || _connectionState.value != ConnectionState.CONNECTED) {
-            onComplete(false, "Desktop not connected.")
+        val host = resolveActiveConnectedHost()
+        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: FileTransferClient(
+            context = appContext,
+            deviceId = "android-client",
+            certPinStorage = certPinStorage,
+            tokenStorage = tokenStorage,
+            useTls = true
+        )
+        if (host.isNullOrBlank()) {
+            onComplete(false, "No active desktop endpoint resolved.")
             return
         }
 
@@ -2688,7 +2938,8 @@ data class SavedDevice(
     val trustTier: String = "PEER",
     val certFingerprint: String? = null,
     val recentEndpoints: List<DeviceEndpoint> = emptyList(),
-    val connectionMode: String = "auto"
+    val connectionMode: String = "auto",
+    val snowId: String? = null
 )
 
 data class ActiveTransferInfo(

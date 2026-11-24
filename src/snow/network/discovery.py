@@ -43,12 +43,15 @@ class DiscoveryBeacon:
     timestamp: float = 0.0
     nonce: str = ""
     wake_target: Optional[str] = None
+    snow_id: Optional[str] = None
 
     def to_bytes(self) -> bytes:
         """Serialize beacon into compact JSON bytes."""
         data = asdict(self)
         if self.wake_target is None:
             data.pop("wake_target", None)
+        if self.snow_id is None:
+            data.pop("snow_id", None)
         raw = json.dumps(data, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         if len(raw) > MAX_BEACON_SIZE_BYTES:
             raise ValueError(f"Serialized beacon exceeds {MAX_BEACON_SIZE_BYTES} bytes")
@@ -118,6 +121,10 @@ class DiscoveryBeacon:
         if wake_target is not None and not isinstance(wake_target, str):
             wake_target = None
 
+        snow_id = payload.get("snow_id")
+        if snow_id is not None and not isinstance(snow_id, str):
+            snow_id = None
+
         return cls(
             proto=DISCOVERY_PROTOCOL_NAME,
             v=DISCOVERY_PROTOCOL_VERSION,
@@ -130,6 +137,7 @@ class DiscoveryBeacon:
             timestamp=float(ts),
             nonce=nonce,
             wake_target=wake_target,
+            snow_id=snow_id,
         )
 
 
@@ -146,6 +154,7 @@ class DiscoveredPeerRecord:
     cert_fingerprint: str
     last_seen_timestamp: float
     is_paired: bool = False
+    snow_id: Optional[str] = None
 
     @property
     def is_stale(self) -> bool:
@@ -240,6 +249,7 @@ class SnowDiscoveryService:
             timestamp=time.time(),
             nonce=secrets.token_hex(16),
             wake_target=wake_target,
+            snow_id=getattr(self.device_identity, "snow_id", None),
         )
 
     def _get_broadcast_destinations(self) -> List[str]:
@@ -307,6 +317,7 @@ class SnowDiscoveryService:
             cert_fingerprint=beacon.cert_fingerprint,
             last_seen_timestamp=now,
             is_paired=is_paired,
+            snow_id=beacon.snow_id,
         )
 
         self._discovered_peers[beacon.device_id] = record

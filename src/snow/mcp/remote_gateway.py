@@ -174,8 +174,27 @@ class RemoteMcpGateway:
         self._pending_auth_lock = asyncio.Lock()
 
         self._active_sessions: dict[str, dict[str, Any]] = {}
+        self._is_paused: bool = False
         self.app = web.Application(middlewares=[self._security_middleware])
         self._setup_routes()
+
+    @property
+    def is_paused(self) -> bool:
+        """Query if the gateway or underlying desktop core is currently paused."""
+        if self._is_paused:
+            return True
+        raw = getattr(self.bridge, "is_paused", False)
+        if callable(raw):
+            try:
+                val = raw()
+                return val if isinstance(val, bool) else False
+            except Exception:
+                return False
+        return raw if isinstance(raw, bool) else False
+
+    def set_paused(self, paused: bool) -> None:
+        """Update gateway pause state."""
+        self._is_paused = bool(paused)
 
     def set_public_url(self, public_url: Optional[str]) -> None:
         """Update active public HTTPS URL and synchronize OAuth metadata issuer."""
@@ -228,6 +247,15 @@ class RemoteMcpGateway:
             if origin_host not in allowed_base_hosts:
                 logger.warning("Rejected cross-origin request from Origin: '%s'", origin_header)
                 return web.Response(status=403, text="Forbidden: Cross-origin access disallowed.")
+
+        # Check system pause for /mcp requests
+        if request.path.rstrip("/") == "/mcp" and self.is_paused:
+            logger.info("Rejected /mcp request: SNOW is paused by owner (HTTP 503)")
+            return web.Response(
+                status=503,
+                text="SNOW is paused by owner",
+                content_type="text/plain",
+            )
 
         return await handler(request)
 

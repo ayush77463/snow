@@ -15,6 +15,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import uuid
 
 from snow.protocol.constants import ErrorCode
+from snow.security.identity import generate_snow_id, is_valid_snow_id
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +383,7 @@ def create_qr_pairing_payload(
     relay_url: Optional[str] = None,
     relay_ticket: Optional[str] = None,
     group_id: Optional[str] = None,
+    snow_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Construct a validated QR pairing payload for SNOW zero-friction onboarding.
 
@@ -445,9 +447,17 @@ def create_qr_pairing_payload(
         raise ValueError("At least one reachable, non-loopback candidate IPv4 address is required for QR pairing.")
 
     clean_tier = "peer" if str(trust_tier).lower() == "peer" else "owner"
+    if snow_id is None:
+        clean_snow_id = generate_snow_id(seed=clean_id)
+    else:
+        clean_snow_id = str(snow_id).strip().upper()
+        if not is_valid_snow_id(clean_snow_id):
+            raise ValueError(f"Invalid snow_id in QR payload: '{clean_snow_id}'. Must match ^SNW-[A-Z0-9]{{4}}-[A-Z0-9]{{4}}$.")
+
     payload: dict[str, Any] = {
         "v": 1,
         "id": clean_id,
+        "snow_id": clean_snow_id,
         "ips": filtered_ips,
         "port": port,
         "fp": raw_fp,
@@ -544,9 +554,18 @@ def validate_qr_pairing_payload(
 
     tier = str(payload.get("tier", "owner")).strip().lower()
     clean_tier = "peer" if tier == "peer" else "owner"
+    raw_snow_id = payload.get("snow_id")
+    if raw_snow_id is not None:
+        clean_snow_id = str(raw_snow_id).strip().upper()
+        if not is_valid_snow_id(clean_snow_id):
+            raise ValueError(f"Invalid snow_id in QR payload: '{clean_snow_id}'. Must match ^SNW-[A-Z0-9]{{4}}-[A-Z0-9]{{4}}$.")
+    else:
+        clean_snow_id = generate_snow_id(seed=node_id.strip())
+
     res: dict[str, Any] = {
         "v": 1,
         "id": node_id.strip(),
+        "snow_id": clean_snow_id,
         "ips": filtered_ips,
         "port": port,
         "fp": fp,

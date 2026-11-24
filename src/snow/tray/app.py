@@ -31,6 +31,7 @@ import time
 from typing import Any, Callable, Optional
 import webbrowser
 
+from snow.core.subprocess_util import get_no_window_subprocess_kwargs
 from snow.tray.autostart import (
     is_autostart_enabled,
     set_autostart,
@@ -140,6 +141,16 @@ if sys.platform == "win32":
 
     _user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
     _user32.LoadIconW.restype = wintypes.HICON
+
+    _user32.LoadImageW.argtypes = [
+        wintypes.HINSTANCE,
+        wintypes.LPCWSTR,
+        wintypes.UINT,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    _user32.LoadImageW.restype = wintypes.HICON
 
     _user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
     _user32.LoadCursorW.restype = wintypes.HICON
@@ -301,9 +312,8 @@ class SnowTrayApp:
                 target_url = f"{self.dashboard_url}{path_suffix}"
             if not self.is_dashboard_listening():
                 logger.info("Web dashboard offline on port %d; spawning background daemon...", self.dashboard_port)
-                creation_flags = 0
-                if sys.platform == "win32":
-                    creation_flags |= 0x08000000 | 0x00000008  # CREATE_NO_WINDOW | DETACHED_PROCESS
+                detached = 0x00000008 if sys.platform == "win32" else 0
+                no_win_kwargs = get_no_window_subprocess_kwargs(extra_creationflags=detached)
 
                 try:
                     import subprocess
@@ -325,8 +335,8 @@ class SnowTrayApp:
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         stdin=subprocess.DEVNULL,
-                        creationflags=creation_flags,
                         close_fds=True,
+                        **no_win_kwargs,
                     )
                     self._dashboard_proc = proc
                 except Exception as exc:
@@ -624,6 +634,43 @@ class SnowTrayApp:
             ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
             self._nid = None
 
+    def _resolve_snow_icon(self, hinstance: int) -> int:
+        """Resolve and load the branded SNOW icon handle, falling back to IDI_APPLICATION."""
+        if not HAS_WIN32:
+            return 0
+        from pathlib import Path
+        import sys
+
+        candidates = [
+            Path(__file__).resolve().parent.parent.parent.parent / "packaging" / "windows" / "snow.ico",
+            Path(sys.executable).parent / "packaging" / "windows" / "snow.ico",
+            Path(sys.executable).parent / "snow.ico",
+            Path(getattr(sys, "_MEIPASS", "")) / "packaging" / "windows" / "snow.ico",
+            Path(getattr(sys, "_MEIPASS", "")) / "snow.ico",
+        ]
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x00000010
+        LR_DEFAULTSIZE = 0x00000040
+
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    h_icon = _user32.LoadImageW(
+                        0,
+                        str(candidate.resolve()),
+                        IMAGE_ICON,
+                        0,
+                        0,
+                        LR_LOADFROMFILE | LR_DEFAULTSIZE,
+                    )
+                    if h_icon:
+                        logger.debug("Loaded branded tray icon from %s", candidate)
+                        return h_icon
+            except Exception:
+                pass
+
+        return _user32.LoadIconW(0, ctypes.c_wchar_p(IDI_APPLICATION))
+
     def _background_monitor(self) -> None:
         """Periodically refresh core status and tooltip in the background."""
         while not self._stop_event.is_set():
@@ -674,7 +721,9 @@ class SnowTrayApp:
         wcex.style = 0
         wcex.lpfnWndProc = self._wnd_proc_ref
         wcex.hInstance = hinstance
-        wcex.hIcon = user32.LoadIconW(0, ctypes.c_wchar_p(IDI_APPLICATION))
+        snow_icon = self._resolve_snow_icon(hinstance)
+        wcex.hIcon = snow_icon
+        wcex.hIconSm = snow_icon
         wcex.hCursor = user32.LoadCursorW(0, ctypes.c_wchar_p(32512))
         wcex.lpszClassName = class_name
 
@@ -703,7 +752,7 @@ class SnowTrayApp:
         self._nid.uID = 1
         self._nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         self._nid.uCallbackMessage = WM_TRAYICON
-        self._nid.hIcon = wcex.hIcon
+        self._nid.hIcon = self._resolve_snow_icon(hinstance)
         self._nid.szTip = self.compute_tooltip()
 
         add_ok = False

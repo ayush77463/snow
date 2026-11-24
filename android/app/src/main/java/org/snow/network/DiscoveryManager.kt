@@ -33,7 +33,8 @@ data class DiscoveredPeer(
     val transferPort: Int,
     val certFingerprint: String,
     val lastSeenTimestamp: Long = System.currentTimeMillis(),
-    val isPaired: Boolean = false
+    val isPaired: Boolean = false,
+    val snowId: String? = null
 ) {
     val isStale: Boolean
         get() = (System.currentTimeMillis() - lastSeenTimestamp) > DiscoveryManager.STALE_TIMEOUT_MS
@@ -89,6 +90,7 @@ class DiscoveryManager(
 
                 val xferPort = json.optInt("transfer_port", 0)
                 val certFp = json.optString("cert_fingerprint", "")
+                val snowId = json.optString("snow_id", "").takeIf { it.isNotBlank() }
 
                 val ts = json.optDouble("timestamp", Double.NaN)
                 if (ts.isNaN()) return null
@@ -107,7 +109,8 @@ class DiscoveryManager(
                     port = peerPort,
                     transferPort = xferPort,
                     certFingerprint = certFp,
-                    lastSeenTimestamp = currentTimeMs
+                    lastSeenTimestamp = currentTimeMs,
+                    snowId = snowId
                 )
             } catch (e: Exception) {
                 SafeLog.w(TAG, "Failed parsing discovery beacon: ${e.message}")

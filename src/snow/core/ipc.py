@@ -31,6 +31,8 @@ import time
 from typing import Any, Dict, Optional, Set
 import uuid
 
+from snow.core.subprocess_util import get_no_window_subprocess_kwargs
+
 from snow.capabilities.engine import (
     CapabilityEngine,
     CapabilityRequest,
@@ -93,6 +95,7 @@ def enforce_file_permissions(file_path: Path) -> bool:
                 text=True,
                 timeout=5.0,
                 check=False,
+                **get_no_window_subprocess_kwargs(),
             )
             if result.returncode == 0:
                 logger.debug("Successfully applied Windows user ACL to %s", resolved)

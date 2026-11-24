@@ -24,6 +24,9 @@ datas = [
 ]
 if (REPO_ROOT / "snow.png").is_file():
     datas.append((str(REPO_ROOT / "snow.png"), "."))
+if (REPO_ROOT / "packaging" / "windows" / "snow.ico").is_file():
+    datas.append((str(REPO_ROOT / "packaging" / "windows" / "snow.ico"), "packaging/windows"))
+    datas.append((str(REPO_ROOT / "packaging" / "windows" / "snow.ico"), "."))
 if (REPO_ROOT / "packaging" / "bin" / "cloudflared.exe").is_file():
     datas.append((str(REPO_ROOT / "packaging" / "bin" / "cloudflared.exe"), "bin"))
 
@@ -89,6 +92,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(REPO_ROOT / "packaging" / "windows" / "snow.ico") if (REPO_ROOT / "packaging" / "windows" / "snow.ico").is_file() else None,
 )
 
 exe_tray = EXE(
@@ -107,6 +111,7 @@ exe_tray = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(REPO_ROOT / "packaging" / "windows" / "snow.ico") if (REPO_ROOT / "packaging" / "windows" / "snow.ico").is_file() else None,
 )
 
 coll = COLLECT(

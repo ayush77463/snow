@@ -138,9 +138,46 @@ class SettingsFragment : Fragment() {
             )
             binding.btnGrantNotificationAccess.text = "Grant Notification Access"
             binding.btnGrantNotificationAccess.setOnClickListener {
-                openNotificationListenerSettings()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    showRestrictedSettingsGuideDialog()
+                } else {
+                    openNotificationListenerSettings()
+                }
             }
         }
+    }
+
+    fun showRestrictedSettingsGuideDialog() {
+        val ctx = context ?: return
+        com.google.android.material.dialog.MaterialAlertDialogBuilder(ctx)
+            .setTitle("Notification Access on Android 14+")
+            .setMessage(
+                "On Android 13 and 14+, sideloaded applications require allowing restricted settings before notification access can be toggled:\n\n" +
+                "1. Tap 'Open App Info' below.\n" +
+                "2. Tap the 3-dot overflow menu (⋮) in the top-right corner.\n" +
+                "3. Select 'Allow restricted settings' and confirm with biometric/PIN.\n" +
+                "4. Return to SNOW and tap 'Open Notification Settings' to toggle SNOW on."
+            )
+            .setPositiveButton("Open App Info") { _, _ ->
+                openAppDetailsSettings()
+            }
+            .setNeutralButton("Open Notification Settings") { _, _ ->
+                openNotificationListenerSettings()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    fun openAppDetailsSettings(): Intent {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.parse("package:${requireContext().packageName}")
+        }
+        try {
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(context, "Unable to open App Info: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+        return intent
     }
 
     fun openNotificationListenerSettings(): Intent {

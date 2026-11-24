@@ -15,6 +15,8 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+from snow.core.subprocess_util import get_no_window_subprocess_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +49,7 @@ def get_connected_adb_devices(adb_bin: Optional[Path] = None) -> list[dict[str, 
             text=True,
             timeout=8.0,
             check=False,
+            **get_no_window_subprocess_kwargs(),
         )
         for line in res.stdout.splitlines():
             line = line.strip()
@@ -108,6 +111,7 @@ def get_usb_status(
                 text=True,
                 timeout=5.0,
                 check=False,
+                **get_no_window_subprocess_kwargs(),
             )
             mappings = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
             port_wss = f"tcp:{port}"
@@ -168,6 +172,7 @@ def setup_usb_reverse(
             text=True,
             timeout=8.0,
             check=False,
+            **get_no_window_subprocess_kwargs(),
         )
         r2 = subprocess.run(
             [str(bin_path), "-s", dev_serial, "reverse", f"tcp:{port + 1}", f"tcp:{port + 1}"],
@@ -175,6 +180,7 @@ def setup_usb_reverse(
             text=True,
             timeout=8.0,
             check=False,
+            **get_no_window_subprocess_kwargs(),
         )
         if r1.returncode != 0 or r2.returncode != 0:
             err = (r1.stderr + " " + r2.stderr).strip()
@@ -221,6 +227,7 @@ def remove_usb_reverse(
             text=True,
             timeout=5.0,
             check=False,
+            **get_no_window_subprocess_kwargs(),
         )
         subprocess.run(
             [str(bin_path), "-s", dev_serial, "reverse", "--remove", f"tcp:{port + 1}"],
@@ -228,6 +235,7 @@ def remove_usb_reverse(
             text=True,
             timeout=5.0,
             check=False,
+            **get_no_window_subprocess_kwargs(),
         )
         return True, f"Removed SNOW reverse port mappings from device {dev_name}."
     except Exception as exc:

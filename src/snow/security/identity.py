@@ -2,15 +2,20 @@
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import re
+import secrets
 import socket
 from typing import Any, Dict, Optional, Union
 import uuid
 
 logger = logging.getLogger(__name__)
+
+SNOW_ID_REGEX = re.compile(r"^SNW-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 
 
 def is_valid_uuidv4(val: Any) -> bool:
@@ -22,6 +27,31 @@ def is_valid_uuidv4(val: Any) -> bool:
         return parsed.version == 4
     except (ValueError, TypeError, AttributeError):
         return False
+
+
+def is_valid_snow_id(val: Any) -> bool:
+    """Validate whether a value conforms to the canonical SNOW ID format (^SNW-[A-Z0-9]{4}-[A-Z0-9]{4}$)."""
+    if not isinstance(val, str) or not val.strip():
+        return False
+    return bool(SNOW_ID_REGEX.match(val.strip().upper()))
+
+
+def generate_snow_id(seed: Optional[str] = None) -> str:
+    """Generate a canonical human-readable SNOW identifier in SNW-XXXX-XXXX format.
+
+    If seed is provided, generates deterministically using SHA-256 digest.
+    Otherwise, generates cryptographically random uppercase alphanumeric characters.
+    """
+    if seed:
+        digest = hashlib.sha256(str(seed).encode("utf-8")).hexdigest().upper()
+        p1 = digest[:4]
+        p2 = digest[4:8]
+        return f"SNW-{p1}-{p2}"
+    else:
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        p1 = "".join(secrets.choice(alphabet) for _ in range(4))
+        p2 = "".join(secrets.choice(alphabet) for _ in range(4))
+        return f"SNW-{p1}-{p2}"
 
 
 def get_default_device_name() -> str:
@@ -40,6 +70,7 @@ class DeviceIdentity:
     device_id: str
     device_name: str
     created_at: str
+    snow_id: str = ""
 
     def __post_init__(self) -> None:
         """Validate device identity invariants."""
@@ -49,6 +80,10 @@ class DeviceIdentity:
             raise ValueError(f"Invalid device_name: must be a non-empty string, got {self.device_name!r}")
         if not isinstance(self.created_at, str) or not self.created_at.strip():
             raise ValueError(f"Invalid created_at: must be a non-empty string, got {self.created_at!r}")
+        if not self.snow_id:
+            object.__setattr__(self, "snow_id", generate_snow_id(seed=self.device_id))
+        elif not is_valid_snow_id(self.snow_id):
+            raise ValueError(f"Invalid snow_id: must match ^SNW-[A-Z0-9]{{4}}-[A-Z0-9]{{4}}$, got {self.snow_id!r}")
 
     def to_dict(self) -> Dict[str, str]:
         """Convert the identity to a dictionary representation."""
@@ -56,6 +91,7 @@ class DeviceIdentity:
             "device_id": self.device_id,
             "device_name": self.device_name,
             "created_at": self.created_at,
+            "snow_id": self.snow_id,
         }
 
     def to_json(self) -> str:
@@ -91,7 +127,7 @@ def load_or_create_device_identity(
         device_name: Optional override for device name when generating a new identity.
 
     Returns:
-        A validated, immutable DeviceIdentity.
+        A validated, immutable DeviceIdentity with persistent SNOW ID.
     """
     target_dir = Path(data_dir) if data_dir is not None else get_default_data_dir()
     identity_path = target_dir / file_name
@@ -105,14 +141,28 @@ def load_or_create_device_identity(
                 dev_id = raw_data.get("device_id")
                 dev_name = raw_data.get("device_name") or (device_name or get_default_device_name())
                 created = raw_data.get("created_at") or datetime.now(timezone.utc).isoformat()
+                snow_id = raw_data.get("snow_id") or ""
 
                 if is_valid_uuidv4(dev_id):
-                    logger.debug("Loaded existing device identity [%s] from %s", dev_id, identity_path)
-                    return DeviceIdentity(
+                    if not is_valid_snow_id(snow_id):
+                        snow_id = generate_snow_id(seed=str(dev_id))
+                    identity = DeviceIdentity(
                         device_id=str(dev_id),
                         device_name=str(dev_name),
                         created_at=str(created),
+                        snow_id=str(snow_id),
                     )
+                    # Persist snow_id if previously absent in file
+                    if "snow_id" not in raw_data:
+                        try:
+                            temp_path = target_dir / f".{file_name}.tmp_{uuid.uuid4().hex[:8]}"
+                            with open(temp_path, "w", encoding="utf-8") as f:
+                                f.write(identity.to_json() + "\n")
+                            temp_path.replace(identity_path)
+                        except Exception:
+                            pass
+                    logger.debug("Loaded existing device identity [%s] (SNOW ID: %s) from %s", dev_id, identity.snow_id, identity_path)
+                    return identity
 
             logger.warning(
                 "Identity file '%s' contained invalid or non-UUIDv4 data. Regenerating identity.",
@@ -129,7 +179,13 @@ def load_or_create_device_identity(
     new_id = str(uuid.uuid4())
     name = device_name or get_default_device_name()
     created_at = datetime.now(timezone.utc).isoformat()
-    identity = DeviceIdentity(device_id=new_id, device_name=name, created_at=created_at)
+    new_snow_id = generate_snow_id(seed=new_id)
+    identity = DeviceIdentity(
+        device_id=new_id,
+        device_name=name,
+        created_at=created_at,
+        snow_id=new_snow_id,
+    )
 
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
