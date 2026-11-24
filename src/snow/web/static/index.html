@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SNOW — Multi-Device AI Platform</title>
+    <title>SNOW — Multi-Device AI Capability Bridge</title>
     <link rel="stylesheet" href="/static/app.css">
     <script>
         (function() {
@@ -18,6 +18,7 @@
 </head>
 
 <body class="theme-light">
+    <!-- Local Authentication Overlay -->
     <div id="auth-overlay" class="overlay">
         <div class="overlay-card">
             <div class="snowflake-icon">❄</div>
@@ -27,1193 +28,725 @@
         </div>
     </div>
 
-    <!-- Guided Consumer Onboarding Wizard (Phase 29) -->
-    <div id="onboarding-overlay" class="overlay" style="display: none; z-index: 9998; background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(8px);">
-        <div class="overlay-card" style="max-width: 580px; width: 90%; text-align: left; padding: 2rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.25rem;">
-                <div style="display: flex; align-items: center; gap: 0.5rem;">
-                    <span style="font-size: 1.5rem;">❄</span>
-                    <h2 style="margin: 0; font-size: 1.25rem;">Welcome to SNOW</h2>
-                </div>
-                <button id="btn-skip-onboarding" class="btn btn-secondary" style="font-size: 0.8rem; padding: 0.25rem 0.6rem;">Skip Setup</button>
-            </div>
-
-            <!-- Step Progress Indicator -->
-            <div style="display: flex; justify-content: space-between; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 0.75rem;">
-                <div id="step-tab-1" class="step-pill" style="font-size: 0.85rem; font-weight: 600; color: var(--accent-primary);">1. Network Name</div>
-                <div id="step-tab-2" class="step-pill" style="font-size: 0.85rem; font-weight: 600; color: var(--text-muted);">2. Connect Phone</div>
-                <div id="step-tab-3" class="step-pill" style="font-size: 0.85rem; font-weight: 600; color: var(--text-muted);">3. Connect AI</div>
-            </div>
-
-            <!-- Step 1: Network Name -->
-            <div id="wizard-step-1" class="wizard-step">
-                <h3 style="font-size: 1.1rem; margin-bottom: 0.5rem;">Name Your SNOW Network</h3>
-                <p class="text-muted" style="font-size: 0.9rem; margin-bottom: 1rem;">Choose a friendly name for your personal multi-device mesh (e.g., "Home Mesh", "Ayush's Network").</p>
-                <div class="form-group" style="margin-bottom: 1.5rem;">
-                    <label for="wizard-network-name" style="display: block; font-weight: 500; margin-bottom: 0.4rem;">Network Name</label>
-                    <input type="text" id="wizard-network-name" class="form-control" value="My SNOW Network" placeholder="Enter network name..." style="width: 100%; padding: 0.5rem; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-surface); color: var(--text-primary);">
-                </div>
-                <div style="display: flex; justify-content: flex-end;">
-                    <button id="btn-wizard-next-1" class="btn btn-primary">Next: Connect Phone →</button>
-                </div>
-            </div>
-
-            <!-- Step 2: QR Pairing -->
-            <div id="wizard-step-2" class="wizard-step" style="display: none;">
-                <h3 style="font-size: 1.1rem; margin-bottom: 0.5rem;">Connect Your Android Device</h3>
-                <p class="text-muted" style="font-size: 0.9rem; margin-bottom: 1rem;">Install SNOW on your phone, open the app, and scan this QR code or enter the pairing PIN below.</p>
-
-                <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; background: var(--bg-surface); border: 1px solid var(--border-color); padding: 1rem; border-radius: 8px;">
-                    <div id="wizard-qr-container" style="min-width: 130px; height: 130px; background: #fff; display: flex; align-items: center; justify-content: center; border-radius: 4px; overflow: hidden; border: 1px solid var(--border-color);">
-                        <img id="wizard-qr-img" src="" alt="Pairing QR Code" style="width: 100%; height: 100%; object-fit: contain;">
-                    </div>
-                    <div style="flex: 1;">
-                        <div style="font-size: 0.85rem; font-weight: 600; margin-bottom: 0.25rem;">Pairing PIN:</div>
-                        <div id="wizard-pin-display" style="font-size: 1.4rem; font-family: monospace; font-weight: bold; letter-spacing: 2px; color: var(--accent-primary);">------</div>
-                        <div style="margin-top: 0.5rem;">
-                            <a id="btn-wizard-download-apk" href="/api/install/android-apk" target="_blank" class="btn btn-secondary" style="font-size: 0.8rem; padding: 0.3rem 0.6rem;">📱 Download Android App</a>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="wizard-device-status-box" style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.5rem;">
-                    Checking for connected devices...
-                </div>
-
-                <div style="display: flex; justify-content: space-between;">
-                    <button id="btn-wizard-back-2" class="btn btn-secondary">← Back</button>
-                    <button id="btn-wizard-next-2" class="btn btn-primary">Next: Connect AI →</button>
-                </div>
-            </div>
-
-            <!-- Step 3: Optional AI Connect -->
-            <div id="wizard-step-3" class="wizard-step" style="display: none;">
-                <h3 style="font-size: 1.1rem; margin-bottom: 0.5rem;">Connect Your AI Assistants</h3>
-                <p class="text-muted" style="font-size: 0.9rem; margin-bottom: 1rem;">SNOW gives Claude, Gemini, ChatGPT, or Cursor permissioned access to your devices via MCP.</p>
-
-                <div style="background: var(--bg-surface); border: 1px solid var(--border-color); padding: 1rem; border-radius: 8px; margin-bottom: 1.5rem;">
-                    <div style="font-size: 0.85rem; font-weight: 600; margin-bottom: 0.5rem;">Quick One-Click Integration:</div>
-                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem;">Run this command in PowerShell to automatically configure Claude Desktop or Gemini:</p>
-                    <div style="background: var(--chip-bg); padding: 0.5rem; border-radius: 4px; font-family: monospace; font-size: 0.8rem; display: flex; justify-content: space-between; align-items: center;">
-                        <code id="wizard-cli-setup-cmd">snow setup</code>
-                        <button id="btn-wizard-copy-cmd" class="btn btn-secondary" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;">Copy</button>
-                    </div>
-                </div>
-
-                <div style="display: flex; justify-content: space-between;">
-                    <button id="btn-wizard-back-3" class="btn btn-secondary">← Back</button>
-                    <button id="btn-wizard-finish" class="btn btn-primary">Complete Setup & Open Dashboard ✓</button>
-                </div>
+    <!-- Power-Off Modal Confirmation -->
+    <div id="poweroff-modal" class="modal-overlay d-none">
+        <div class="modal-card">
+            <div class="modal-icon text-danger">⏻</div>
+            <h3>Power Off SNOW Desktop?</h3>
+            <p class="text-sm text-muted">This will safely terminate SNOW Desktop Core, all active WebSocket connections, and background tunnels.</p>
+            <div class="modal-actions mt-4">
+                <button id="btn-poweroff-cancel" class="btn btn-secondary">Cancel</button>
+                <button id="btn-poweroff-confirm" class="btn btn-danger">Confirm Shutdown</button>
             </div>
         </div>
     </div>
 
+    <!-- Remote MCP QR Modal -->
+    <div id="mcp-qr-modal" class="modal-overlay d-none">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3>Remote AI Link QR</h3>
+                <button id="btn-close-mcp-qr" class="btn-icon">✕</button>
+            </div>
+            <p class="text-sm text-muted">Scan with Claude Mobile or your remote AI client to connect to your SNOW MCP tools.</p>
+            <div id="mcp-qr-svg-container" class="qr-svg-box mt-3"></div>
+            <div class="form-group mt-3">
+                <input type="text" id="mcp-qr-link-input" class="form-input text-xs" readonly />
+            </div>
+            <div class="modal-actions mt-3">
+                <button id="btn-mcp-modal-copy" class="btn btn-primary btn-sm">Copy Link</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Media / Capture Preview Modal -->
+    <div id="media-preview-modal" class="modal-overlay d-none">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3 id="media-preview-title">Preview</h3>
+                <button id="btn-close-media-preview" class="btn-icon">✕</button>
+            </div>
+            <div class="media-preview-container mt-3">
+                <img id="media-preview-img" src="" alt="Media Preview" class="img-fluid rounded" style="max-height: 480px; width: auto; margin: 0 auto; display: block;" />
+            </div>
+            <div class="modal-actions mt-3">
+                <a id="btn-download-preview" href="#" download="preview.jpg" class="btn btn-primary btn-sm">Download Image</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Reply Modal -->
+    <div id="notif-reply-modal" class="modal-overlay d-none">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3 id="notif-reply-title">Reply to Notification</h3>
+                <button id="btn-close-notif-reply" class="btn-icon">✕</button>
+            </div>
+            <p id="notif-reply-snippet" class="text-xs text-muted mt-2"></p>
+            <div class="form-group mt-3">
+                <textarea id="notif-reply-text" class="form-input text-sm" rows="3" placeholder="Type your reply..."></textarea>
+            </div>
+            <div class="modal-actions mt-3">
+                <button id="btn-notif-reply-send" class="btn btn-primary btn-sm">Send Reply</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Command Palette (Ctrl+K) -->
+    <div id="command-palette-overlay" class="modal-overlay d-none">
+        <div class="command-palette-card">
+            <div class="command-palette-search-row">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="command-palette-input" placeholder="Search devices, files, actions, or tools..." autofocus />
+                <span class="esc-hint">ESC</span>
+            </div>
+            <div id="command-palette-results" class="command-palette-results">
+                <div class="palette-group-title">Navigation</div>
+                <div class="palette-item" data-action="nav-overview">🏠 Home</div>
+                <div class="palette-item" data-action="nav-devices">📱 Devices &amp; Network</div>
+                <div class="palette-item" data-action="nav-files">📁 Files &amp; Apps</div>
+                <div class="palette-item" data-action="nav-clipboard">📋 Shared Clipboard</div>
+                <div class="palette-item" data-action="nav-settings">⚙️ AI &amp; Settings</div>
+                <div class="palette-group-title">Actions</div>
+                <div class="palette-item" data-action="act-ring">📞 Ring Connected Phone</div>
+                <div class="palette-item" data-action="act-capture-phone">📱 Capture Phone Screen</div>
+                <div class="palette-item" data-action="act-camera">📷 Take Camera Photo</div>
+                <div class="palette-item" data-action="act-sync-clip">📋 Sync Clipboard Now</div>
+                <div class="palette-item" data-action="act-pair-qr">📲 Generate Pairing QR</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Application Shell -->
     <div class="app-container">
-        <!-- Sidebar Navigation -->
+        <!-- Sidebar Navigation Rail -->
         <aside class="sidebar">
             <div class="sidebar-header">
                 <div class="brand">
                     <span class="brand-icon">❄</span>
                     <span class="brand-name">SNOW</span>
-                    <span class="brand-ver">v4</span>
                 </div>
             </div>
 
             <nav class="nav-menu">
                 <button class="nav-item active" data-tab="overview">
-                    <span class="nav-icon">🏠</span> Home
+                    <span class="nav-icon">🏠</span> <span class="nav-label">Home</span>
                 </button>
                 <button class="nav-item" data-tab="devices">
-                    <span class="nav-icon">📱</span> Devices
+                    <span class="nav-icon">📱</span> <span class="nav-label">Devices</span>
                 </button>
                 <button class="nav-item" data-tab="files">
-                    <span class="nav-icon">📁</span> Files &amp; Apps
+                    <span class="nav-icon">📁</span> <span class="nav-label">Files &amp; Apps</span>
                 </button>
                 <button class="nav-item" data-tab="clipboard">
-                    <span class="nav-icon">📋</span> Clipboard
+                    <span class="nav-icon">📋</span> <span class="nav-label">Clipboard</span>
                 </button>
                 <button class="nav-item" data-tab="settings">
-                    <span class="nav-icon">⚙️</span> AI &amp; Settings
+                    <span class="nav-icon">⚙️</span> <span class="nav-label">AI &amp; Settings</span>
                 </button>
             </nav>
 
             <div class="sidebar-footer">
-                <div class="connection-status">
-                    <span id="core-status-dot" class="status-dot dot-offline"></span>
-                    <span id="core-status-text">Core Checking...</span>
+                <div class="connection-status mb-2">
+                    <span id="core-status-dot" class="status-dot dot-active"></span>
+                    <span id="core-status-text">Core Online</span>
+                </div>
+                <div class="sidebar-core-controls">
+                    <button id="btn-desktop-pause" class="btn-xs btn-outline-secondary" title="Pause background syncing and listeners">⏸ Pause</button>
+                    <button id="btn-desktop-poweroff" class="btn-xs btn-outline-danger" title="Power off desktop daemon">⏻ Power Off</button>
                 </div>
             </div>
         </aside>
 
         <!-- Main Content Area -->
         <main class="main-content">
+            <!-- Top Header Bar -->
             <header class="topbar">
-                <div class="page-title">
-                    <h1 id="active-tab-title">Overview</h1>
-                </div>
-                <div id="pending-approval-banner" class="topbar-approval-banner d-none">
-                    <span class="banner-badge">SECURITY</span>
-                    <span id="pending-approval-banner-text" class="banner-text">1 pending AI request requires your
-                        approval</span>
-                    <button id="btn-jump-approvals" class="btn-xs btn-primary">Review & Resolve →</button>
-                </div>
-                <div class="topbar-actions">
-                    <div id="topbar-session-indicator" class="topbar-session-indicator" style="display: none; align-items: center; gap: 0.5rem; background: rgba(239, 68, 68, 0.12); border: 1px solid var(--danger-color); padding: 0.25rem 0.6rem; border-radius: 6px;">
-                        <span class="status-dot dot-active" style="background-color: var(--danger-color); animation: pulse 1.5s infinite;"></span>
-                        <span id="topbar-session-text" style="font-size: 0.8rem; font-weight: 600; color: var(--danger-color);">Remote Session Active</span>
-                        <button id="btn-topbar-kill-switch" class="btn btn-danger btn-xs" style="padding: 0.2rem 0.5rem; font-size: 0.75rem; font-weight: bold;" title="Emergency Global Kill Switch — Terminate all federation and remote access immediately">🛑 KILL SWITCH</button>
-                    </div>
-                    <div class="topbar-target-selector" id="topbar-target-selector-container">
-                        <select id="global-target-select" class="form-select form-select-sm" title="Active Target Peer Device">
-                            <option value="">No Active Peer</option>
+                <div class="topbar-left">
+                    <div class="device-switcher-pill" id="topbar-device-pill">
+                        <span id="topbar-device-dot" class="status-dot dot-neutral"></span>
+                        <select id="global-target-select" class="clean-select" title="Active Peer Device">
+                            <option value="">No Active Device</option>
                         </select>
-                        <span id="global-target-transport-chip" class="chip chip-neutral" style="margin-left: 0.5rem; font-size: 0.75rem;">Offline</span>
+                        <span id="global-target-transport-chip" class="chip chip-sm chip-neutral">Offline</span>
                     </div>
-                    <button id="btn-topbar-command-palette" class="btn-secondary" title="Command Palette (Ctrl+K)">🔍 <span class="shortcut-hint">Ctrl+K</span></button>
-                    <button id="btn-topbar-approvals" class="btn-secondary btn-bell" title="Activity &amp; Approvals">
-                        <span class="bell-icon">🔔</span>
-                        <span id="topbar-approvals-badge" style="display: none;">0</span>
+                </div>
+
+                <div class="topbar-center">
+                    <button id="btn-topbar-command-palette" class="search-pill-btn" title="Open Command Palette (Ctrl+K)">
+                        <span class="search-badge">Ctrl+K</span>
+                        <span class="search-placeholder">Search...</span>
                     </button>
-                    <button id="btn-theme-toggle" class="btn-secondary" title="Toggle Theme">🌓 Theme</button>
-                    <button id="btn-global-refresh" class="btn-primary" title="Refresh Live State">🔄 Refresh</button>
+                </div>
+
+                <div class="topbar-actions">
+                    <button id="btn-topbar-approvals" class="icon-circle-btn" title="Pending Approvals &amp; Activity">
+                        <span class="bell-icon">🔔</span>
+                        <span id="topbar-approvals-badge" class="notif-badge d-none">0</span>
+                    </button>
+                    <button id="btn-theme-toggle" class="theme-toggle-pill" title="Toggle Light / Dark Mode">
+                        <span class="theme-sun">☀️</span>
+                        <span class="theme-moon">🌙</span>
+                    </button>
+                    <button id="btn-global-refresh" class="btn btn-sm btn-outline-secondary" title="Refresh Live State">
+                        🔄 Refresh
+                    </button>
                 </div>
             </header>
 
+            <!-- Content Body Views -->
             <div class="content-body">
-                <!-- 1. Home / Overview Section -->
+                <!-- ======================================================= -->
+                <!-- VIEW 1: HOME (data-tab="overview")                     -->
+                <!-- ======================================================= -->
                 <section id="section-overview" class="tab-pane active">
-                    <!-- Material 3 Hero Workstation / Laptop Card -->
-                    <div class="hero-desktop-card">
-                        <div class="hero-desktop-header">
-                            <div class="hero-desktop-title">
-                                <span id="hero-device-icon">💻</span>
-                                <span id="hero-device-name">Host Workstation (Windows)</span>
-                                <span id="hero-transport-pill" class="chip chip-success">Wi-Fi · Local</span>
-                            </div>
-                            <div id="hero-battery-indicator" class="text-sm text-muted">🔋 100% (Plugged In)</div>
-                        </div>
-                        <div class="laptop-preview-container">
-                            <div class="laptop-bezel">
-                                <div class="laptop-screen">
-                                    <img id="desktop-wallpaper-img" src="/api/desktop/wallpaper" alt="Desktop Wallpaper Preview" onerror="this.onerror=null; this.src=''; this.style.display='none'; document.getElementById('wallpaper-fallback').style.display='flex';" />
-                                    <div id="wallpaper-fallback" style="display: none; width: 100%; height: 100%; align-items: center; justify-content: center; background: linear-gradient(135deg, #1E293B, #0F172A); color: var(--accent-primary); font-size: 2.5rem;">❄</div>
-                                </div>
-                            </div>
-                            <div class="laptop-base"></div>
-                        </div>
-                        <div class="hero-actions-bar">
-                            <button id="btn-hero-lock-pc" class="btn-primary" style="padding: 0.5rem 1.1rem;">🔒 Lock PC</button>
-                            <button id="btn-hero-send-file" class="btn-secondary" style="padding: 0.5rem 1.1rem;">📂 Send Files</button>
-                            <button id="btn-hero-capture-screen" class="btn-secondary" style="padding: 0.5rem 1.1rem;">📸 Capture Screen</button>
-                        </div>
-                    </div>
-                    <div class="grid-overview">
-                        <div class="stat-card">
-                            <div class="stat-title">Active Devices</div>
-                            <div id="stat-connected-devices" class="stat-val">0</div>
-                            <div id="stat-transport-chip" class="chip chip-neutral">No Active Session</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-title">Pending Approvals</div>
-                            <div id="stat-pending-approvals" class="stat-val">0</div>
-                            <div class="stat-desc">Security requests awaiting action</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-title">Core IPC Port</div>
-                            <div class="stat-val">8767</div>
-                            <div class="stat-desc">Loopback authenticated JSON-RPC</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-title">System Status</div>
-                            <div id="stat-sys-status" class="stat-val">Healthy</div>
-                            <div id="stat-sys-details" class="stat-desc">Desktop Core operational</div>
-                        </div>
-                    </div>
-
-                    <!-- Connection Info Banner -->
-                    <div class="connection-banner card mt-4">
-                        <div class="card-body connection-banner-body">
-                            <div class="conn-item">
-                                <span class="conn-label">💻 Desktop Host LAN IP:</span>
-                                <code id="overview-lan-ip" class="conn-ip">Checking LAN...</code>
-                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋
-                                    Copy</button>
-                            </div>
-                            <div class="conn-item">
-                                <span class="conn-label">🔌 USB ADB Reverse:</span>
-                                <code class="conn-ip">127.0.0.1:8765</code>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h2>Quick Actions</h2>
-                        </div>
-                        <div class="card-body action-bar">
-                            <button class="btn-secondary" data-quick="qr">📲 Generate Pairing QR</button>
-                            <button class="btn-secondary" data-quick="files">📂 Browse Phone Files</button>
-                            <button class="btn-secondary" data-quick="notifs">🔔 View Notifications</button>
-                            <button class="btn-secondary" data-quick="share">🔗 Quick Share</button>
-                        </div>
-                    </div>
-
-                    <!-- Capture & Workflows Panel (Phase 24) -->
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h2>📸 Capture & Workflows</h2>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-sm text-muted">Execute bounded multi-step operations and consent-gated visual
-                                captures.</p>
-                            <div class="action-bar mt-3">
-                                <button id="btn-wf-capture-pc" class="btn-secondary">🖥️ Capture PC Screen</button>
-                                <button id="btn-wf-capture-phone" class="btn-secondary">📱 Capture Phone Screen</button>
-                                <button id="btn-wf-health" class="btn-secondary">🩺 Device Health Snapshot</button>
-                                <button id="btn-wf-pc-to-phone" class="btn-secondary">📲 Capture PC → Phone</button>
-                                <button id="btn-wf-clipboard" class="btn-secondary">📋 Sync Clipboard</button>
-                            </div>
-
-                            <div id="workflow-run-box" class="mt-4 d-none">
-                                <div class="section-toolbar">
-                                    <h4 id="workflow-name-display">Workflow Execution</h4>
-                                    <span id="workflow-status-badge" class="badge badge-info">RUNNING</span>
-                                </div>
-                                <div id="workflow-summary-card" class="workflow-summary-card mt-3 d-none"></div>
-                                <details class="workflow-technical-details mt-3" id="workflow-steps-details">
-                                    <summary class="workflow-tech-summary">Execution Steps</summary>
-                                    <div id="workflow-steps-list" class="workflow-steps mt-2"></div>
-                                </details>
-                                <div id="capture-preview-box" class="mt-3 d-none">
-                                    <div id="capture-summary-banner" class="capture-summary-banner mb-2"></div>
-                                    <h4>Screenshot Preview</h4>
-                                    <div class="preview-img-wrapper mt-2">
-                                        <img id="capture-preview-img" src="" alt="Capture Preview"
-                                            style="max-width: 100%; border-radius: 6px; border: 1px solid var(--border-color);" />
+                    <div class="home-2col-layout">
+                        <!-- Left Column: Hero Device Card + 2x3 Actions + Now Playing -->
+                        <div class="home-left-col">
+                            <!-- Hero Device Card -->
+                            <div class="hero-desktop-card">
+                                <div class="hero-card-inner">
+                                    <div class="hero-device-visual">
+                                        <div class="laptop-bezel phone-bezel">
+                                            <div class="laptop-screen">
+                                                <img id="desktop-wallpaper-img" src="/api/desktop/wallpaper" alt="Device Wallpaper Preview" onerror="this.onerror=null; this.src=''; this.style.display='none'; document.getElementById('wallpaper-fallback').style.display='flex';" />
+                                                <div id="wallpaper-fallback" style="display: none; width: 100%; height: 100%; align-items: center; justify-content: center; background: linear-gradient(135deg, #1E293B, #0F172A); color: var(--accent-primary); font-size: 2.5rem;">❄</div>
+                                            </div>
+                                        </div>
                                     </div>
-                                    <div id="capture-error-box" class="empty-state text-danger mt-2 d-none">Failed
-                                        loading preview image.</div>
+                                    <div class="hero-device-meta">
+                                        <div class="hero-title-row">
+                                            <span id="hero-device-icon" class="d-none">📱</span>
+                                            <h2 id="hero-device-name">No Device Selected</h2>
+                                        </div>
+                                        <div class="hero-status-row">
+                                            <span id="hero-transport-pill" class="badge-pill badge-pill-muted">Offline</span>
+                                        </div>
+                                        <div class="hero-telemetry-row">
+                                            <span id="hero-battery-indicator" class="telemetry-item d-none"></span>
+                                        </div>
+                                        <div class="hero-resource-bar-row">
+                                            <div class="resource-labels">
+                                                <span id="hero-ram-text">--</span>
+                                                <span id="hero-storage-text">--</span>
+                                            </div>
+                                            <div class="resource-progress-track">
+                                                <div id="hero-resource-progress" class="resource-progress-fill" style="width: 0%;"></div>
+                                            </div>
+                                        </div>
+                                        <div class="hero-actions-bar">
+                                            <button id="btn-hero-lock-pc" class="btn btn-sm btn-outline-secondary">🔒 Lock PC</button>
+                                            <button id="btn-hero-send-file" class="btn btn-sm btn-outline-secondary">🚀 Send Files</button>
+                                            <button id="btn-hero-ring-phone" class="btn btn-sm btn-outline-secondary d-none">📞 Ring Phone</button>
+                                            <button id="btn-hero-capture-screen" class="btn btn-sm btn-outline-secondary">📸 Capture Screen</button>
+                                        </div>
+                                    </div>
                                 </div>
-                                <div id="workflow-output-box" class="mt-3 d-none">
-                                    <details class="workflow-technical-details">
-                                        <summary class="workflow-tech-summary">View Technical JSON</summary>
-                                        <div class="code-box mt-2">
-                                            <pre id="workflow-output-pre"></pre>
+                            </div>
+
+                            <!-- Quick Action 2x3 Grid -->
+                            <div class="quick-actions-card card mt-3">
+                                <div class="quick-grid-2x3">
+                                    <button id="btn-quick-ring" class="action-tile-btn">
+                                        <span class="tile-icon">📞</span>
+                                        <span class="tile-label">Ring Phone</span>
+                                    </button>
+                                    <button id="btn-quick-capture-screen" class="action-tile-btn">
+                                        <span class="tile-icon">📱</span>
+                                        <span class="tile-label">Capture Screen</span>
+                                    </button>
+                                    <button id="btn-quick-camera" class="action-tile-btn">
+                                        <span class="tile-icon">📷</span>
+                                        <span class="tile-label">Camera Photo</span>
+                                    </button>
+                                    <button id="btn-quick-media" class="action-tile-btn">
+                                        <span class="tile-icon">🎵</span>
+                                        <span class="tile-label">Media</span>
+                                    </button>
+                                    <button id="btn-quick-send-files" class="action-tile-btn">
+                                        <span class="tile-icon">🚀</span>
+                                        <span class="tile-label">Send Files</span>
+                                    </button>
+                                    <button id="btn-quick-share-note" class="action-tile-btn">
+                                        <span class="tile-icon">📝</span>
+                                        <span class="tile-label">Share Note</span>
+                                    </button>
+                                </div>
+                                <!-- Now Playing Bar -->
+                                <div class="now-playing-bar">
+                                    <div class="now-playing-label">Now Playing</div>
+                                    <div class="media-controls-cluster">
+                                        <button id="btn-media-prev" class="media-ctrl-btn" title="Previous Track">⏮</button>
+                                        <button id="btn-media-play" class="media-ctrl-btn" title="Play / Pause">⏯</button>
+                                        <button id="btn-media-next" class="media-ctrl-btn" title="Next Track">⏭</button>
+                                    </div>
+                                    <div class="volume-slider-cluster">
+                                        <span class="vol-icon">🔈</span>
+                                        <input type="range" id="media-volume-slider" min="0" max="100" value="70" class="clean-slider" />
+                                        <span class="eq-icon">🎚</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Right Column: Shared Clipboard + Notifications -->
+                        <div class="home-right-col">
+                            <!-- Shared Clipboard Widget -->
+                            <div class="card shared-clipboard-widget">
+                                <div class="card-header-clean">
+                                    <div class="header-left-cluster">
+                                        <h3>Shared Clipboard</h3>
+                                        <span id="home-clipboard-count" class="badge-pill badge-pill-muted">0</span>
+                                    </div>
+                                    <div class="header-right-cluster">
+                                        <span class="switch-label text-xs">Instant Sync</span>
+                                        <label class="toggle-switch">
+                                            <input type="checkbox" id="chk-home-instant-sync" checked>
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="card-body-clean">
+                                    <div id="home-clipboard-items" class="mini-clipboard-list">
+                                        <div class="empty-state text-muted text-xs p-3">No clipboard items yet</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Phone Notifications Widget -->
+                            <div class="card notifications-widget mt-3">
+                                <div class="card-header-clean">
+                                    <div class="header-left-cluster">
+                                        <h3>Phone Notifications</h3>
+                                        <span id="home-notif-count" class="text-sm text-muted">(0)</span>
+                                    </div>
+                                </div>
+                                <div class="card-body-clean">
+                                    <div id="home-notifications-list" class="notif-cards-list">
+                                        <div class="empty-state text-muted text-xs p-3">No active notifications</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ======================================================= -->
+                <!-- VIEW 2: DEVICES & NETWORK (data-tab="devices")         -->
+                <!-- ======================================================= -->
+                <section id="section-devices" class="tab-pane">
+                    <div class="devices-view-header">
+                        <div class="devices-title-group">
+                            <h2>Devices &amp; Network</h2>
+                            <div class="filter-pills-row">
+                                <button class="filter-pill active" data-filter="all">All (<span id="devices-count-all">0</span>)</button>
+                                <button class="filter-pill" data-filter="pc">PCs (<span id="devices-count-pc">0</span>)</button>
+                                <button class="filter-pill" data-filter="phone">Phones (<span id="devices-count-phone">0</span>)</button>
+                            </div>
+                        </div>
+                        <div class="devices-header-actions">
+                            <button id="btn-device-pair-qr" class="btn btn-primary btn-pill">＋ Pair New Device</button>
+                        </div>
+                    </div>
+
+                    <div class="devices-2col-layout mt-3">
+                        <!-- Left Column: Device Cards List -->
+                        <div class="devices-list-col" id="devices-cards-container">
+                            <div class="empty-state text-muted text-xs p-3">Scanning for devices...</div>
+                        </div>
+
+                        <!-- Dynamic fallback container for API devices -->
+                        <div id="devices-list" class="cards-grid mt-3 d-none"></div>
+
+                        <!-- Right Column: Pair or Install Card + Cross-Network Sharing -->
+                        <div class="devices-pair-col">
+                            <!-- Pair or Install Card -->
+                            <div class="card pair-install-card">
+                                <div class="subtabs-bar">
+                                    <button id="tab-pair-device" class="subtab-btn active">Pair Device</button>
+                                    <button id="tab-install-apk" class="subtab-btn">Install Android App</button>
+                                </div>
+                                <div class="subtab-content p-3">
+                                    <!-- Tab 1: Pair Device -->
+                                    <div id="subpane-pair-device">
+                                        <div class="qr-center-box">
+                                            <div id="qr-svg-container" class="qr-svg-box-centered">
+                                                <div class="qr-placeholder-scan">❄ Generating secure pairing QR...</div>
+                                            </div>
+                                            <div id="qr-pin-code" class="qr-pin-text">PIN: --</div>
+                                            <div id="qr-countdown" class="text-xs text-muted"></div>
+                                        </div>
+                                        <div class="pin-entry-group mt-3">
+                                            <label class="text-xs text-muted mb-1 d-block">Connect Peer by 6-Digit PIN</label>
+                                            <div class="pin-boxes-row">
+                                                <input type="text" maxlength="1" class="pin-digit-box" id="pin-box-1" />
+                                                <input type="text" maxlength="1" class="pin-digit-box" id="pin-box-2" />
+                                                <input type="text" maxlength="1" class="pin-digit-box" id="pin-box-3" />
+                                                <input type="text" maxlength="1" class="pin-digit-box" id="pin-box-4" />
+                                                <input type="text" maxlength="1" class="pin-digit-box" id="pin-box-5" />
+                                                <input type="text" maxlength="1" class="pin-digit-box" id="pin-box-6" />
+                                                <button id="btn-pin-connect" class="btn btn-primary btn-sm btn-pill ml-2">Connect</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Tab 2: Install Android App -->
+                                    <div id="subpane-install-apk" class="d-none">
+                                        <div class="qr-center-box">
+                                            <div id="apk-qr-svg-container" class="qr-svg-box-centered"></div>
+                                            <p class="text-xs text-muted mt-2">Scan with your phone's camera on the same Wi-Fi network to install SNOW directly.</p>
+                                            <div class="mt-2">
+                                                <a id="btn-devices-download-apk" href="/api/install/android-apk" target="_blank" class="btn btn-sm btn-outline-secondary">💾 Download APK to PC</a>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Cross-Network Sharing Card -->
+                            <div class="card cross-network-card mt-3">
+                                <div class="card-header-clean">
+                                    <h3>Cross-Network Sharing</h3>
+                                </div>
+                                <div class="card-body-clean">
+                                    <div class="cross-network-actions">
+                                        <button id="btn-gen-9digit-code" class="btn btn-outline-secondary btn-sm btn-pill">Generate 9-Digit Code</button>
+                                        <div class="code-entry-row mt-2">
+                                            <input type="text" id="input-9digit-code" placeholder="Enter 9-digit code..." class="form-input form-input-sm" maxlength="11" />
+                                            <button id="btn-connect-9digit-code" class="btn btn-primary btn-sm btn-pill">Connect</button>
+                                        </div>
+                                        <div id="cross-network-status" class="text-xs text-muted mt-1"></div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Connect to Peer Host Card (Preserved for Direct Peer Regression Tests) -->
+                            <div class="card peer-connect-legacy-card mt-3">
+                                <details>
+                                    <summary class="text-xs text-muted">Direct Peer Connection (IP / Port)</summary>
+                                    <div class="mt-2">
+                                        <input type="text" id="connect-peer-host" placeholder="Peer IP (192.168.1.X)" class="form-input form-input-sm mb-1" />
+                                        <input type="number" id="connect-peer-port" value="8765" class="form-input form-input-sm mb-1" />
+                                        <input type="text" id="connect-peer-pin" placeholder="PIN (optional)" class="form-input form-input-sm mb-1" />
+                                        <input type="text" id="connect-peer-fp" placeholder="Fingerprint (optional)" class="form-input form-input-sm mb-1" />
+                                        <button id="btn-connect-peer-submit" class="btn btn-primary btn-xs">Connect to Peer Host</button>
+                                    </div>
+                                </details>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- ======================================================= -->
+                <!-- VIEW 3: FILES & APPS (data-tab="files")                -->
+                <!-- ======================================================= -->
+                <section id="section-files" class="tab-pane">
+                    <!-- Top Subnav Filter Bar -->
+                    <div class="files-subnav-bar">
+                        <div class="subnav-pills-cluster">
+                            <button class="filter-pill active" id="pill-files-mode">Files</button>
+                            <button class="filter-pill" id="pill-apps-mode">Remote Apps</button>
+                            <button class="filter-pill" id="pill-screen-cam-mode">Screen &amp; Camera</button>
+                        </div>
+                        <div class="subnav-search-cluster">
+                            <input type="text" id="files-search-input" placeholder="🔍 Search" class="clean-search-input" />
+                            <label class="toggle-hidden-cluster ml-3">
+                                <span class="text-xs text-muted">Hide hidden files</span>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="chk-show-hidden" checked>
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="files-2col-layout mt-3">
+                        <!-- Left Column: Drive-style File Explorer -->
+                        <div class="files-explorer-col">
+                            <div class="card explorer-main-card">
+                                <div class="card-header-clean">
+                                    <div class="breadcrumbs-row">
+                                        <span id="files-breadcrumb-root" class="breadcrumb-item">Shared Storage</span>
+                                        <span class="breadcrumb-sep">&gt;</span>
+                                        <span id="files-breadcrumb-sub" class="breadcrumb-item active">Root</span>
+                                    </div>
+                                    <select id="files-device-select" class="clean-select-sm">
+                                        <option value="">Target Device...</option>
+                                    </select>
+                                </div>
+                                <div class="card-body-clean">
+                                    <!-- Drag & Drop Upload Zone -->
+                                    <div id="file-dropzone" class="file-dropzone-box">
+                                        <div class="dropzone-label">
+                                            <span id="file-dropzone-label">📤 Drop files here to send to device ✈</span>
+                                        </div>
+                                        <input type="file" id="file-input-hidden" class="d-none" multiple />
+                                        <div id="transfer-progress-pill" class="transfer-progress-pill d-none">
+                                            <span id="transfer-progress-text"></span>
+                                            <span class="spinner-small">↻</span>
+                                        </div>
+                                    </div>
+
+                                    <!-- Files List -->
+                                    <div id="files-list-table" class="files-list-table mt-3">
+                                        <div class="empty-state text-muted text-xs p-3">Select a folder or device to view files</div>
+                                    </div>
+
+                                    <!-- Execution Steps (Preserved for Screen/Camera Regression Tests) -->
+                                    <details class="workflow-technical-details mt-3" id="workflow-steps-details">
+                                        <summary class="workflow-tech-summary">Execution Steps</summary>
+                                        <div id="workflow-steps-list" class="workflow-steps-list p-2 text-xs text-muted">
+                                            <p>No active workflow running.</p>
                                         </div>
                                     </details>
                                 </div>
                             </div>
                         </div>
-                    </div>
 
-                    <!-- Live Phone Screen Viewer (Phase 26A) -->
-                    <div class="card mt-4" id="card-live-screen">
-                        <div class="card-header">
-                            <h2>📱 Live Phone Screen</h2>
-                            <div class="screen-controls">
-                                <span id="screen-status-badge" class="badge badge-muted">IDLE</span>
-                                <button id="btn-stop-screen-share" class="btn-danger btn-sm d-none">Stop
-                                    Sharing</button>
-                            </div>
-                        </div>
-                        <div class="card-body">
-                            <div id="screen-viewer-container" class="screen-viewer-container">
-                                <div id="screen-idle-message" class="empty-state">
-                                    No active screen sharing session. Tap "Share Screen" on your Android phone.
+                        <!-- Right Column: Quick Launch Apps + Screen & Camera -->
+                        <div class="files-sidebar-col">
+                            <!-- Quick Launch Apps Card -->
+                            <div class="card quick-launch-card">
+                                <div class="card-header-clean">
+                                    <div class="header-left-cluster">
+                                        <h3>Quick Launch Apps</h3>
+                                        <span class="grid-icon">🎛</span>
+                                    </div>
                                 </div>
-                                <img id="screen-frame-img" src="" alt="Live Phone Screen"
-                                    class="screen-frame-img d-none" />
-                            </div>
-                            <div id="screen-stats-bar" class="screen-stats-bar d-none">
-                                <span id="screen-stat-fps">FPS: --</span>
-                                <span id="screen-stat-resolution">--×--</span>
-                                <span id="screen-stat-bandwidth">-- KiB/frame</span>
-                                <span id="screen-stat-last-update">Last: --</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Camera Photo Auto-Delivery (Phase 26A) -->
-                    <div class="card mt-4" id="card-camera-delivery">
-                        <div class="card-header">
-                            <h2>📷 Camera Photo Delivery</h2>
-                        </div>
-                        <div class="card-body">
-                            <div id="camera-idle-message" class="empty-state">
-                                No camera photos delivered yet. Tap "Camera Photo" on your Android phone.
-                            </div>
-                            <div id="camera-preview-container" class="camera-preview-container d-none">
-                                <img id="camera-latest-img" src="" alt="Latest Camera Photo"
-                                    class="camera-latest-img" />
-                                <div id="camera-delivery-info" class="text-sm text-muted mt-2"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Unified Clipboard & Capture Hub (Phase 26B) -->
-                    <div class="card mt-4" id="card-clipboard-hub-overview">
-                        <div class="card-header">
-                            <h2>📋 Unified Clipboard & Capture Hub</h2>
-                            <div class="header-actions">
-                                <span id="hub-buffer-count-badge" class="badge badge-info">0 items</span>
-                            </div>
-                        </div>
-                        <div class="card-body">
-                            <div class="action-bar hub-quick-actions">
-                                <button id="btn-hub-cap-pc-clip" class="btn-secondary"
-                                    title="Capture text or image from Windows clipboard">📋 Capture PC Clip</button>
-                                <button id="btn-hub-pull-phone" class="btn-secondary"
-                                    title="Pull clipboard from connected phone">📲 Pull from Phone</button>
-                                <button id="btn-hub-apply-pc" class="btn-primary"
-                                    title="Apply newest item to PC clipboard">⚡ Apply Latest to PC</button>
-                                <button id="btn-hub-cap-screen" class="btn-secondary"
-                                    title="Take a PC screenshot and add to buffer">🖥️ Capture PC Screen</button>
-                                <button id="btn-hub-clear-unpinned" class="btn-danger"
-                                    title="Clear all unpinned buffer items">🗑️ Clear Unpinned</button>
-                            </div>
-                            <div id="hub-overview-status" class="hub-status-text text-sm text-muted mt-2"></div>
-                            <div id="hub-overview-timeline" class="clipboard-timeline mt-3">
-                                <div class="empty-state">No items in clipboard buffer yet.</div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h2>Recent Activity</h2>
-                        </div>
-                        <div class="card-body">
-                            <div id="overview-activity-list" class="activity-feed">
-                                <div class="empty-state">Loading recent operations...</div>
-                            </div>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- 2. Devices Section -->
-                <section id="section-devices" class="tab-pane">
-                    <div class="section-toolbar">
-                        <h2>Connected & Paired Devices</h2>
-                        <div class="toolbar-actions">
-                            <a id="btn-devices-download-apk" href="/api/install/android-apk" target="_blank" class="btn btn-secondary" title="Download Android APK">📱 Download App</a>
-                            <button id="btn-clean-ghosts" class="btn-secondary"
-                                title="Remove all disconnected ghost devices">Clean Offline Ghosts</button>
-                            <button id="btn-device-pair-qr" class="btn-primary">Generate Pairing QR</button>
-                        </div>
-                    </div>
-
-                    <!-- Connection Info Banner -->
-                    <div class="connection-banner card mt-4">
-                        <div class="card-body connection-banner-body">
-                            <div class="conn-item">
-                                <span class="conn-label">💻 Desktop Host LAN IP:</span>
-                                <code id="devices-lan-ip" class="conn-ip">Checking LAN...</code>
-                                <button class="btn-xs btn-secondary btn-copy-lan-ip" title="Copy LAN IP:Port">📋
-                                    Copy</button>
-                            </div>
-                            <div class="conn-item">
-                                <span class="conn-label">🔌 USB ADB Reverse:</span>
-                                <code class="conn-ip">127.0.0.1:8765</code>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Local Host Card Container -->
-                    <div id="local-host-card-container" class="mt-4"></div>
-
-                    <!-- QR / Live Pairing Modal Container -->
-                    <div id="qr-display-card" class="card mt-4 hidden">
-                        <div class="card-header">
-                            <h3>Zero-Friction Mobile Pairing</h3>
-                            <button id="btn-close-qr" class="btn-icon">✕</button>
-                        </div>
-                        <div class="card-body">
-                            <!-- Trust Tier Selector -->
-                            <div class="pairing-tier-selector mb-3">
-                                <label class="label text-xs">Provision New Device As:</label>
-                                <div class="tier-toggle-group">
-                                    <button id="btn-tier-owner" class="tier-btn active" data-tier="owner" type="button">
-                                        ★ OWNER (Personal Phone — Full Access)
-                                    </button>
-                                    <button id="btn-tier-peer" class="tier-btn" data-tier="peer" type="button">
-                                        👥 PEER (Guest / AI Integration — Restricted)
-                                    </button>
+                                <div class="card-body-clean">
+                                    <div id="quick-apps-list" class="apps-items-list">
+                                        <div class="empty-state text-muted text-xs p-3">Loading available applications...</div>
+                                    </div>
                                 </div>
                             </div>
 
-                            <div class="qr-layout mt-3">
-                                <div id="qr-svg-container" class="qr-svg-box"></div>
-                                <div class="qr-details">
-                                    <div class="pin-display-container">
-                                        <div class="pin-label">Temporary PIN:</div>
-                                        <div id="qr-pin-code" class="pin-badge">------</div>
-                                        <div id="qr-countdown" class="countdown-badge">⏳ 60s remaining</div>
-                                    </div>
-                                    <div id="pending-device-alert" class="pending-device-badge hidden">
-                                        📲 <span id="pending-device-name">Phone</span> connected, awaiting PIN entry...
-                                    </div>
-                                    <p class="text-sm mt-2">Scan with SNOW on Android (Devices &gt; Scan QR) or enter
-                                        the 6-digit PIN manually into the pairing card on your phone.</p>
-                                    <p class="text-xs text-muted mt-1" id="qr-meta-text"></p>
-                                    <div class="qr-actions mt-3">
-                                        <button id="btn-regenerate-pin" class="btn-secondary btn-sm" type="button">🔄
-                                            Generate Fresh PIN</button>
+                            <!-- Screen & Camera Card -->
+                            <div class="card screen-camera-card mt-3">
+                                <div class="card-header-clean">
+                                    <h3>Screen &amp; Camera</h3>
+                                </div>
+                                <div class="card-body-clean">
+                                    <div class="screen-camera-actions-row">
+                                        <button id="btn-files-capture-screen" class="screen-cam-btn">
+                                            <span class="cam-btn-icon">📱</span>
+                                            <span class="cam-btn-text">Capture Phone Screen</span>
+                                        </button>
+                                        <button id="btn-files-camera-photo" class="screen-cam-btn">
+                                            <span class="cam-btn-icon">📷</span>
+                                            <span class="cam-btn-text">Take Camera Photo</span>
+                                        </button>
                                     </div>
                                 </div>
                             </div>
                         </div>
                     </div>
-
-                    <!-- Android App Download QR Modal Container (Phase 3 Track 2) -->
-                    <div id="apk-download-card" class="card mt-4 d-none">
-                        <div class="card-header">
-                            <h3>📱 Download SNOW Mobile (v4.1.0)</h3>
-                            <button id="btn-close-apk-download" class="btn-icon">✕</button>
-                        </div>
-                        <div class="card-body">
-                            <div class="qr-layout mt-3">
-                                <div id="apk-qr-svg-container" class="qr-svg-box"></div>
-                                <div class="qr-details">
-                                    <h4 style="margin-top:0;">Install Directly on Phone (No ADB or Cable)</h4>
-                                    <ol class="text-sm text-muted" style="padding-left: 1.2rem; margin-top: 0.5rem; line-height: 1.6;">
-                                        <li>Connect your phone to the same local Wi-Fi network.</li>
-                                        <li>Open your phone's camera or QR scanner.</li>
-                                        <li>Scan the QR code to download and install <strong>SNOW-Mobile-4.1.0.apk</strong>.</li>
-                                    </ol>
-                                    <div class="mt-3">
-                                        <a id="btn-direct-apk-download" href="#" target="_blank" class="btn btn-secondary text-sm">💾 Download APK directly to PC</a>
-                                    </div>
-                                    <div id="apk-download-status" class="text-xs text-muted mt-2"></div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Connect to Peer Host Card (Phase 22 / Phase 30) -->
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h3>🔗 Connect to Peer Host</h3>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-sm text-muted">Directly federate with another SNOW Core or Android Peer Host on your local network.</p>
-                            <div class="row mt-2" style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end;">
-                                <div style="flex: 2; min-width: 140px;">
-                                    <label for="connect-peer-host" class="label text-xs">Peer Host / IP:</label>
-                                    <input type="text" id="connect-peer-host" class="form-input form-input-sm" placeholder="192.168.1.X" />
-                                </div>
-                                <div style="flex: 1; min-width: 80px;">
-                                    <label for="connect-peer-port" class="label text-xs">Port:</label>
-                                    <input type="number" id="connect-peer-port" class="form-input form-input-sm" value="8765" />
-                                </div>
-                                <div style="flex: 1; min-width: 100px;">
-                                    <label for="connect-peer-pin" class="label text-xs">Pairing PIN:</label>
-                                    <input type="text" id="connect-peer-pin" class="form-input form-input-sm" placeholder="PIN (optional)" />
-                                </div>
-                                <div style="flex: 2; min-width: 160px;">
-                                    <label for="connect-peer-fp" class="label text-xs">Fingerprint (optional):</label>
-                                    <input type="text" id="connect-peer-fp" class="form-input form-input-sm" placeholder="SHA-256 fingerprint" />
-                                </div>
-                                <div>
-                                    <button id="btn-connect-peer-submit" class="btn btn-primary btn-sm" type="button">Connect to Peer</button>
-                                </div>
-                            </div>
-                            <div id="connect-peer-status" class="text-xs mt-1"></div>
-                        </div>
-                    </div>
-
-                    <div id="devices-list" class="cards-grid mt-4">
-                        <div class="empty-state">No devices found. Ensure SNOW Desktop Core is running.</div>
-                    </div>
                 </section>
 
-                <!-- 3. Phone Files Section -->
-                <section id="section-files" class="tab-pane">
-                    <div class="section-toolbar">
-                        <div>
-                            <div class="files-title-row">
-                                <h2>Phone Storage Explorer</h2>
-                                <span id="files-storage-badge" class="badge badge-muted">Checking Storage...</span>
-                            </div>
-                            <p class="text-sm text-muted">Browse and download files from your phone's accessible storage
-                                (Full Shared Storage or SAF folder).</p>
-                        </div>
-                        <div class="toolbar-actions">
-                            <select id="files-device-select" class="form-select">
-                                <option value="">Select target Android device...</option>
-                            </select>
-                            <label class="toggle-hidden-label" title="Show hidden files and folders (.dotfiles)">
-                                <input type="checkbox" id="chk-show-hidden"> Hidden files
-                            </label>
-                            <button id="btn-refresh-files" class="btn-secondary">Refresh</button>
-                        </div>
-                    </div>
-
-                    <!-- Quick Navigation Chips (Phase 22) -->
-                    <div class="quick-nav-chips mt-2" id="quick-nav-chips">
-                        <button class="chip-btn" data-chip="">📁 Root</button>
-                        <button class="chip-btn" data-chip="Download">📥 Download</button>
-                        <button class="chip-btn" data-chip="DCIM">📷 DCIM</button>
-                        <button class="chip-btn" data-chip="Documents">📄 Documents</button>
-                        <button class="chip-btn" data-chip="Pictures">🖼 Pictures</button>
-                        <button class="chip-btn" data-chip="Music">🎵 Music</button>
-                        <button class="chip-btn" data-chip="Movies">🎬 Movies</button>
-                    </div>
-
-                    <div class="breadcrumbs-bar mt-2" id="files-breadcrumbs">
-                        <span class="crumb active" data-subpath="">Root</span>
-                    </div>
-
-                    <div class="card mt-2">
-                        <div class="table-responsive">
-                            <table class="data-table">
-                                <thead>
-                                    <tr>
-                                        <th>Name</th>
-                                        <th>Type</th>
-                                        <th>Size</th>
-                                        <th>Last Modified</th>
-                                        <th>Action</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="files-table-body">
-                                    <tr>
-                                        <td colspan="5" class="empty-state">Select a device to view SAF files.</td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- 4. Notifications Section -->
-                <section id="section-notifications" class="tab-pane">
-                    <div class="section-toolbar">
-                        <div>
-                            <h2>Android Notification Mirror</h2>
-                            <p class="text-sm text-muted">Real-time non-sensitive notifications mirrored from your
-                                connected Android phone.</p>
-                        </div>
-                        <div class="toolbar-actions">
-                            <button id="btn-refresh-notifs" class="btn-secondary">Refresh</button>
-                        </div>
-                    </div>
-
-                    <div id="notifications-list" class="notifications-feed mt-4">
-                        <div class="empty-state">No active notifications.</div>
-                    </div>
-                </section>
-
-                <!-- 5. Media Controls Section -->
-                <section id="section-media" class="tab-pane">
-                    <div class="section-toolbar">
-                        <h2>Multimedia & Volume Controls</h2>
-                    </div>
-
-                    <div class="media-container mt-4">
-                        <div class="media-target-selector">
-                            <span class="label">Control Target:</span>
-                            <div class="toggle-group">
-                                <button class="btn-toggle active" data-target="windows">💻 Windows (Desktop)</button>
-                                <button class="btn-toggle" data-target="phone">📱 Phone (Android)</button>
-                            </div>
-                        </div>
-
-                        <div class="media-card mt-4">
-                            <div class="media-controls-row">
-                                <button class="btn-media" data-action="prev_track" title="Previous Track">⏮
-                                    Previous</button>
-                                <button class="btn-media btn-primary" data-action="play_pause" title="Play / Pause">⏯
-                                    Play / Pause</button>
-                                <button class="btn-media" data-action="next_track" title="Next Track">⏭ Next</button>
-                            </div>
-
-                            <div class="volume-controls-row mt-4">
-                                <button class="btn-media" data-action="volume_down" title="Volume Down">🔉 Vol
-                                    -</button>
-                                <button class="btn-media" data-action="mute" title="Toggle Mute">🔇 Mute</button>
-                                <button class="btn-media" data-action="volume_up" title="Volume Up">🔊 Vol +</button>
-                            </div>
-                            <div id="media-feedback" class="feedback-msg mt-2"></div>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- 6. Share Section -->
-                <section id="section-share" class="tab-pane">
-                    <div class="section-toolbar">
-                        <h2>Share Link or Text</h2>
-                        <p class="text-sm text-muted">Send verified web URLs or text notes to connected devices.</p>
-                    </div>
-
-                    <div class="card mt-4 share-card">
-                        <div class="form-group">
-                            <label for="share-target-select">Destination Device:</label>
-                            <select id="share-target-select" class="form-select">
-                                <option value="phone">Connected Phone (Android)</option>
-                                <option value="windows">This Laptop (Windows)</option>
-                            </select>
-                        </div>
-
-                        <div class="form-group mt-3">
-                            <label for="share-url-input">HTTP / HTTPS Web Link:</label>
-                            <input type="url" id="share-url-input" class="form-input" placeholder="https://example.com">
-                        </div>
-
-                        <div class="form-group mt-3">
-                            <label for="share-text-input">Text Note / Snippet:</label>
-                            <textarea id="share-text-input" class="form-textarea" rows="3"
-                                placeholder="Enter text or note to share..."></textarea>
-                        </div>
-
-                        <div class="mt-4">
-                            <button id="btn-send-share" class="btn-primary">Send to Device</button>
-                        </div>
-                        <div id="share-status-msg" class="feedback-msg mt-3"></div>
-                    </div>
-                </section>
-
-                <!-- 7. Approvals Section -->
-                <section id="section-approvals" class="tab-pane">
-                    <div class="section-toolbar">
-                        <div>
-                            <h2>Security Approval Queue</h2>
-                            <p class="text-sm text-muted">Human-in-the-loop authorization for sensitive AI or remote
-                                operations.</p>
-                        </div>
-                        <button id="btn-refresh-approvals" class="btn-secondary">Refresh</button>
-                    </div>
-
-                    <div id="approvals-list" class="approvals-feed mt-4">
-                        <div class="empty-state">No pending approval requests.</div>
-                    </div>
-                </section>
-
-                <!-- 8. Activity Audit Section -->
-                <section id="section-activity" class="tab-pane">
-                    <div class="section-toolbar">
-                        <div>
-                            <h2>Activity Audit Log</h2>
-                            <p class="text-sm text-muted">Cryptographic, secret-redacted audit history from Core SQLite
-                                storage.</p>
-                        </div>
-                        <button id="btn-refresh-activity" class="btn-secondary">Refresh</button>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="table-responsive">
-                            <table class="data-table">
-                                <thead>
-                                    <tr>
-                                        <th>Timestamp</th>
-                                        <th>Event Type</th>
-                                        <th>Principal</th>
-                                        <th>Device</th>
-                                        <th>Details</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="activity-table-body">
-                                    <tr>
-                                        <td colspan="5" class="empty-state">Loading activity history...</td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- Clipboard Hub Section (Phase 26B) -->
+                <!-- ======================================================= -->
+                <!-- VIEW 4: SHARED CLIPBOARD (data-tab="clipboard")        -->
+                <!-- ======================================================= -->
                 <section id="section-clipboard" class="tab-pane">
-                    <div class="section-toolbar">
-                        <h2>📋 Shared Clipboard Ring Buffer</h2>
-                        <div class="toolbar-actions">
-                            <button id="btn-clipboard-refresh" class="btn-secondary">🔄 Refresh Buffer</button>
-                            <button id="btn-clipboard-clear-unpinned" class="btn-danger">🗑️ Clear Unpinned</button>
+                    <div class="clipboard-view-header">
+                        <div class="clipboard-title-group">
+                            <h2>Shared Clipboard</h2>
+                            <p class="text-sm text-muted">Automatically synced across all connected devices • <span id="clipboard-total-count">0 items</span></p>
+                        </div>
+                        <div class="clipboard-header-actions">
+                            <span class="switch-label text-xs">Instant Sync</span>
+                            <label class="toggle-switch mr-3">
+                                <input type="checkbox" id="chk-clipboard-instant-sync" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <input type="text" id="clipboard-search-input" placeholder="🔍 Search" class="clean-search-input mr-2" />
+                            <button id="btn-clipboard-clear-unpinned" class="btn btn-sm btn-outline-danger btn-pill">Clear Unpinned</button>
                         </div>
                     </div>
 
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h3>Quick Actions</h3>
-                        </div>
-                        <div class="card-body action-bar">
-                            <button id="btn-hub-tab-cap-pc" class="btn-secondary">📋 Capture PC Clipboard</button>
-                            <button id="btn-hub-tab-pull-phone" class="btn-secondary">📲 Pull from Phone</button>
-                            <button id="btn-hub-tab-apply-pc" class="btn-primary">⚡ Apply Latest to PC</button>
-                            <button id="btn-hub-tab-cap-screen" class="btn-secondary">🖥️ Capture PC Screen</button>
-                        </div>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h3>Add Custom Text to Buffer</h3>
-                        </div>
-                        <div class="card-body">
-                            <div class="form-group">
-                                <textarea id="input-clipboard-text" class="form-control" rows="3"
-                                    placeholder="Enter text to push to shared buffer (max 64 KiB)..."></textarea>
-                            </div>
-                            <div class="form-actions mt-2"
-                                style="display: flex; align-items: center; justify-content: space-between;">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="check-clipboard-pin"> Pin this item
-                                </label>
-                                <button id="btn-clipboard-add-text" class="btn-primary">Add to Shared Buffer</button>
-                            </div>
-                            <div id="clipboard-add-status" class="text-sm mt-2"></div>
-                        </div>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="card-header"
-                            style="display: flex; justify-content: space-between; align-items: center;">
-                            <h3>Shared Timeline (Latest 10 Items)</h3>
-                            <span id="clipboard-detail-count" class="badge badge-info">0 / 10 items (0 pinned)</span>
-                        </div>
-                        <div class="card-body">
-                            <div id="clipboard-full-timeline" class="clipboard-timeline">
-                                <div class="empty-state">Loading clipboard buffer...</div>
-                            </div>
-                        </div>
+                    <!-- 2-Column Responsive Card Grid -->
+                    <div id="clipboard-grid-container" class="clipboard-grid-2col mt-3">
+                        <div class="empty-state text-muted text-xs p-3">No clipboard items captured yet</div>
                     </div>
                 </section>
 
-                <!-- Remote Apps Section (Phase 26B) -->
-                <section id="section-apps" class="tab-pane">
-                    <div class="section-toolbar">
-                        <h2>🚀 Authorized Remote App Launcher</h2>
-                        <div class="toolbar-actions">
-                            <button id="btn-apps-refresh-android" class="btn-secondary">🔄 Refresh Android Apps</button>
-                        </div>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h3>💻 Authorized Windows Applications</h3>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-sm text-muted">Allowlisted Windows utilities executed securely with strict
-                                parameter validation.</p>
-                            <div id="windows-apps-grid" class="apps-grid mt-3">
-                                <button class="btn-app" data-win-app="notepad">📝 Notepad</button>
-                                <button class="btn-app" data-win-app="calc">🧮 Calculator</button>
-                                <button class="btn-app" data-win-app="explorer">📁 File Explorer</button>
-                                <button class="btn-app" data-win-app="taskmgr">⚡ Task Manager</button>
-                                <button class="btn-app" data-win-app="mspaint">🎨 Paint</button>
-                                <button class="btn-app" data-win-app="code">💻 VS Code</button>
-                                <button class="btn-app" data-win-app="chrome">🌐 Google Chrome</button>
-                                <button class="btn-app" data-win-app="msedge">🌐 Microsoft Edge</button>
-                            </div>
-                            <div id="windows-app-status" class="text-sm mt-2"></div>
-                        </div>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="card-header"
-                            style="display: flex; justify-content: space-between; align-items: center;">
-                            <h3>📱 Android Applications</h3>
-                            <input type="text" id="android-app-filter" class="form-control-sm"
-                                placeholder="Filter apps..." style="max-width: 200px;" />
-                        </div>
-                        <div class="card-body">
-                            <p class="text-sm text-muted">User-launchable applications discovered on the connected
-                                Android phone.</p>
-                            <div id="android-apps-container" class="apps-list mt-3">
-                                <div class="empty-state">Connect an Android device and tap "Refresh Android Apps" to
-                                    load applications.</div>
-                            </div>
-                            <div id="android-app-status" class="text-sm mt-2"></div>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- 9. Settings Section -->
+                <!-- ======================================================= -->
+                <!-- VIEW 5: AI & SETTINGS (data-tab="settings")             -->
+                <!-- ======================================================= -->
                 <section id="section-settings" class="tab-pane">
-                    <div class="section-toolbar">
-                        <h2>Dashboard Settings & Diagnostics</h2>
-                    </div>
-
-                    <div class="card mt-4">
-                        <div class="card-header">
-                            <h3>Appearance</h3>
-                        </div>
-                        <div class="card-body">
-                            <p>Choose your visual theme:</p>
-                            <div class="theme-options mt-2">
-                                <label class="radio-label">
-                                    <input type="radio" name="theme-choice" value="system" checked>
-                                    <strong>System</strong> (Follows system appearance)
-                                </label>
-                                <label class="radio-label mt-2">
-                                    <input type="radio" name="theme-choice" value="light">
-                                    <strong>Light Mode</strong>
-                                </label>
-                                <label class="radio-label mt-2">
-                                    <input type="radio" name="theme-choice" value="dark">
-                                    <strong>Dark Mode</strong>
-                                </label>
-                            </div>
-                        </div>
-                    </div>
-
-                    <details class="advanced-accordion mt-4">
-                        <summary>🛠️ Advanced &amp; Diagnostics</summary>
-                        <div class="advanced-accordion-body">
-                            <div class="card">
-                                <div class="card-header">
-                                    <h3>Environment &amp; Diagnostics</h3>
+                    <!-- Section 1: Connect AI Assistants -->
+                    <div class="settings-ai-section">
+                        <h2 class="section-heading mb-3">Connect AI Assistants</h2>
+                        <div class="ai-assistants-grid">
+                            <!-- Assistant 1: Claude -->
+                            <div class="card ai-assistant-card">
+                                <div class="ai-card-header">
+                                    <h3>Claude</h3>
+                                    <span id="badge-status-claude" class="badge-pill badge-pill-muted">Configured</span>
                                 </div>
-                                <div class="card-body">
-                                    <div class="diag-row">
-                                        <span class="diag-label">Dashboard Host:</span>
-                                        <span class="diag-val">127.0.0.1 (Loopback only)</span>
-                                    </div>
-                                    <div class="diag-row">
-                                        <span class="diag-label">Dashboard Port:</span>
-                                        <span class="diag-val" id="diag-port">8769</span>
-                                    </div>
-                                    <div class="diag-row">
-                                        <span class="diag-label">Core IPC Port:</span>
-                                        <span class="diag-val">8767</span>
-                                    </div>
-                                    <div class="diag-row">
-                                        <span class="diag-label">WSS Port:</span>
-                                        <span class="diag-val">8765</span>
-                                    </div>
-                                    <div class="diag-row">
-                                        <span class="diag-label">HTTPS Transfer Port:</span>
-                                        <span class="diag-val">8766</span>
-                                    </div>
-                                    <div class="diag-row">
-                                        <span class="diag-label">Transfer Directory:</span>
-                                        <span class="diag-val">~/.snow/transfers/download/</span>
-                                    </div>
+                                <p class="text-xs text-muted mt-1">Desktop, Web &amp; Mobile</p>
+                                <div class="ai-card-action mt-3">
+                                    <button id="btn-setup-claude" class="btn btn-sm btn-outline-secondary btn-pill w-100">Test Tools</button>
+                                </div>
+                            </div>
+
+                            <!-- Assistant 2: ChatGPT -->
+                            <div class="card ai-assistant-card">
+                                <div class="ai-card-header">
+                                    <h3>ChatGPT</h3>
+                                    <span id="badge-status-chatgpt" class="badge-pill badge-pill-muted">Ready</span>
+                                </div>
+                                <p class="text-xs text-muted mt-1">Web &amp; Mobile Connector</p>
+                                <div class="ai-card-action mt-3">
+                                    <button id="btn-setup-chatgpt" class="btn btn-sm btn-primary btn-pill w-100">Connect</button>
+                                </div>
+                            </div>
+
+                            <!-- Assistant 3: Gemini & Antigravity -->
+                            <div class="card ai-assistant-card">
+                                <div class="ai-card-header">
+                                    <h3>Gemini &amp; Antigravity</h3>
+                                    <span id="badge-status-antigravity" class="badge-pill badge-pill-muted">Local</span>
+                                </div>
+                                <p class="text-xs text-muted mt-1">Local IDE &amp; CLI</p>
+                                <div class="ai-card-action mt-3">
+                                    <button id="btn-setup-antigravity" class="btn btn-sm btn-outline-secondary btn-pill w-100">Test Tools</button>
+                                    <button id="btn-setup-gemini" class="d-none">Gemini</button>
+                                </div>
+                            </div>
+
+                            <!-- Assistant 4: Cursor -->
+                            <div class="card ai-assistant-card">
+                                <div class="ai-card-header">
+                                    <h3>Cursor</h3>
+                                    <span id="badge-status-cursor" class="badge-pill badge-pill-muted">Configured</span>
+                                </div>
+                                <p class="text-xs text-muted mt-1">Local Code Editor</p>
+                                <div class="ai-card-action mt-3">
+                                    <button id="btn-setup-cursor" class="btn btn-sm btn-primary btn-pill w-100">Connect</button>
                                 </div>
                             </div>
                         </div>
-                    </details>
+                    </div>
 
-                    <!-- Remote Relay Card (Phase 22 & Phase 28A) -->
-                    <div class="card mt-4" id="card-relay-status">
-                        <div class="card-header">
-                            <h3>Remote Relay (Zero-Trust Tunnel)</h3>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-muted">Direct TLS 1.3 MemoryBIO fallback tunnel for mobile reachability when
-                                off local Wi-Fi.</p>
-                            <div class="diag-row mt-2">
-                                <span class="diag-label">Relay Service:</span>
-                                <span class="diag-val" id="relay-status-val"><span
-                                        class="badge badge-muted">Checking...</span></span>
+                    <!-- Section 2: Remote AI Link (Full-width card) -->
+                    <div class="card remote-ai-link-card mt-4">
+                        <div class="card-header-clean">
+                            <div class="header-left-cluster">
+                                <h3>Remote AI Link</h3>
+                                <span id="mcp-tunnel-badge" class="badge-pill badge-pill-muted">Tunnel Inactive</span>
                             </div>
-                            <div class="diag-row">
-                                <span class="diag-label">Client Tunnel:</span>
-                                <span class="diag-val" id="relay-client-status-val"><span
-                                        class="badge badge-muted">Disconnected</span></span>
-                            </div>
-                            <div class="diag-row">
-                                <span class="diag-label">Relay Endpoint:</span>
-                                <span class="diag-val"><code id="relay-endpoint-val">Not Configured</code></span>
-                            </div>
-                            <div class="diag-row">
-                                <span class="diag-label">Max Frame Size:</span>
-                                <span class="diag-val" id="relay-max-frame-val">25 MiB</span>
-                            </div>
-                            <div class="diag-row">
-                                <span class="diag-label">Transport Priority:</span>
-                                <span class="diag-val">Local Wi-Fi → USB ADB → Remote Relay</span>
-                            </div>
-
-                            <hr class="mt-3 mb-3" style="border: 0; border-top: 1px solid var(--border-color);">
-
-                            <h4 style="font-size: 0.95rem; margin-bottom: 0.5rem;">Relay Client Configuration</h4>
-                            <div class="form-group mb-2">
-                                <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer;">
-                                    <input type="checkbox" id="relay-enable-toggle">
-                                    <span>Enable Outbound Remote Relay Client</span>
+                            <div class="header-right-cluster">
+                                <span class="switch-label text-xs">Remote Tunnel Active</span>
+                                <label class="toggle-switch mr-3">
+                                    <input type="checkbox" id="chk-mcp-tunnel-toggle">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="switch-label text-xs">1-Click Owner Approval Enabled</span>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="chk-mcp-approval-toggle" checked>
+                                    <span class="toggle-slider"></span>
                                 </label>
                             </div>
-                            <div class="form-group mb-2">
-                                <label for="relay-url-input" class="text-xs text-muted">Relay WebSocket URL</label>
-                                <input type="text" id="relay-url-input" class="form-control form-control-sm" placeholder="ws://127.0.0.1:8770/v1/tunnel">
-                            </div>
-                            <div class="form-group mb-2">
-                                <label for="relay-group-input" class="text-xs text-muted">Destination Group ID</label>
-                                <input type="text" id="relay-group-input" class="form-control form-control-sm" placeholder="default_group">
-                            </div>
-                            <div class="form-group mb-2">
-                                <label for="relay-ticket-input" class="text-xs text-muted">HMAC Authentication Ticket</label>
-                                <input type="password" id="relay-ticket-input" class="form-control form-control-sm" placeholder="Enter relay access ticket">
-                            </div>
-
-                            <div class="mt-3" style="display: flex; gap: 0.5rem; align-items: center;">
-                                <button class="btn btn-primary btn-sm" id="btn-save-relay-config">Save & Apply</button>
-                                <button class="btn btn-secondary btn-sm" id="btn-refresh-relay-status">Refresh Status</button>
-                            </div>
-                            <div id="relay-test-result" class="mt-2 text-muted" style="font-size: 0.85rem;"></div>
                         </div>
-                    </div>
-
-                    <!-- AI Connectors & Remote MCP Card (Phase 23 & 28B) -->
-                    <div class="card mt-4" id="card-mcp-gateway-status">
-                        <div class="card-header">
-                            <h3>🤖 Connect Your AI & Remote MCP Platform</h3>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-muted">Connect external AI assistants (Claude, ChatGPT, Gemini, IDEs) to SNOW via local stdio or secure Remote Streamable HTTP + OAuth 2.1.</p>
-
-                            <!-- Local stdio section -->
-                            <div class="mcp-section mt-3">
-                                <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;">💻 Local Integration (stdio)</h4>
-                                <div class="diag-row">
-                                    <span class="diag-label">Configured Local Hosts:</span>
-                                    <span class="diag-val" id="mcp-hosts-val"><span class="badge badge-muted">Checking...</span></span>
-                                </div>
-                                <div class="diag-row">
-                                    <span class="diag-label">stdio Command:</span>
-                                    <span class="diag-val"><code id="mcp-stdio-cmd-val">snow mcp</code></span>
-                                </div>
-                                <div class="mt-2 d-flex gap-2 flex-wrap">
-                                    <button class="btn btn-primary btn-sm" id="btn-test-local-mcp">⚡ Test Local MCP (stdio)</button>
-                                    <button class="btn btn-secondary btn-sm" id="btn-setup-claude">Configure Claude</button>
-                                    <button class="btn btn-secondary btn-sm" id="btn-setup-cursor">Configure Cursor</button>
-                                    <button class="btn btn-secondary btn-sm" id="btn-setup-gemini">Configure Gemini</button>
-                                    <button class="btn btn-secondary btn-sm" id="btn-setup-antigravity">Configure Antigravity</button>
-                                </div>
-                                <div id="local-mcp-test-result" class="mt-2 text-muted" style="font-size: 0.85rem;"></div>
-                            </div>
-
-                            <!-- Remote Streamable HTTP section -->
-                            <div class="mcp-section mt-3 pt-2" style="border-top: 1px solid var(--border-color);">
-                                <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;">🌐 Remote Integration (Streamable HTTP)</h4>
-                                <div class="diag-row">
-                                    <span class="diag-label">Gateway Service:</span>
-                                    <span class="diag-val" id="mcp-gateway-status"><span class="badge badge-muted">Checking...</span></span>
-                                </div>
-                                <div class="diag-row">
-                                    <span class="diag-label">Local MCP Endpoint:</span>
-                                    <span class="diag-val"><code id="mcp-endpoint-val">http://127.0.0.1:8771/mcp</code></span>
-                                </div>
-                                <div class="diag-row" id="row-public-mcp-endpoint" style="display: none;">
-                                    <span class="diag-label">Public HTTPS Endpoint:</span>
-                                    <span class="diag-val"><code id="mcp-public-endpoint-val" style="color: var(--accent-color);">Not Configured</code></span>
-                                </div>
-                                <div class="diag-row">
-                                    <span class="diag-label">Tunnel Status:</span>
-                                    <span class="diag-val" id="tunnel-status-val"><span class="badge badge-muted">Inactive</span></span>
-                                </div>
-                                <div class="diag-row">
-                                    <span class="diag-label">OAuth 2.1 Discovery:</span>
-                                    <span class="diag-val"><code id="mcp-oauth-discovery-val">http://127.0.0.1:8771/.well-known/oauth-authorization-server</code></span>
-                                </div>
-                                <div class="diag-row">
-                                    <span class="diag-label">Available Tools:</span>
-                                    <span class="diag-val"><span id="mcp-capabilities-count">38</span> capabilities (Security: <code>AI_MCP</code> least privilege)</span>
-                                </div>
-                                <div class="mt-2 d-flex gap-2 flex-wrap">
-                                    <button class="btn btn-secondary btn-sm" id="btn-toggle-gateway">Toggle Gateway</button>
-                                    <button class="btn btn-primary btn-sm" id="btn-tunnel-start">🌐 Start Cloudflare Tunnel</button>
-                                    <button class="btn btn-secondary btn-sm d-none" id="btn-tunnel-stop">Stop Tunnel</button>
-                                </div>
-                            </div>
-
-                            <!-- OAuth 2.1 Pending Approval Queue (Stage 3B) -->
-                            <div class="mcp-section mt-3 pt-2" style="border-top: 1px solid var(--border-color);">
-                                <div class="d-flex justify-content-between align-items-center mb-2">
-                                    <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin: 0;">🔐 OAuth 2.1 Authorization Queue</h4>
-                                    <button class="btn btn-secondary btn-sm" id="btn-refresh-oauth-pending" style="font-size: 0.75rem; padding: 0.2rem 0.5rem;">Refresh</button>
-                                </div>
-                                <div id="oauth-pending-list" class="text-xs text-muted" style="min-height: 24px;">No pending authorization requests.</div>
-                            </div>
-
-                            <!-- Host Connection Instructions Tabs -->
-                            <div class="mcp-instructions mt-3 pt-2" style="border-top: 1px solid var(--border-color);">
-                                <h4 style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin-bottom: 0.5rem;">📖 Client Setup Instructions</h4>
-                                <div style="font-size: 0.85rem; color: var(--text-secondary); line-height: 1.5;">
-                                    <details class="mt-1" style="cursor: pointer;">
-                                        <summary><strong>Claude Desktop / Claude Web</strong></summary>
-                                        <p class="mt-1">
-                                            • <strong>Local stdio:</strong> Run <code>snow setup --host claude</code> to auto-configure.<br>
-                                            • <strong>Remote HTTP:</strong> Add MCP Server with URL <code class="mcp-url-copy">http://127.0.0.1:8771/mcp</code> (or your public HTTPS endpoint). OAuth 2.1 authentication initiates automatically.
-                                        </p>
-                                    </details>
-                                    <details class="mt-1" style="cursor: pointer;">
-                                        <summary><strong>ChatGPT (Custom Connectors / Developer Mode)</strong></summary>
-                                        <p class="mt-1">
-                                            • Requires a public HTTPS endpoint (use <code>snow expose</code> or Docker/Caddy).<br>
-                                            • Endpoint URL: <code class="mcp-url-copy">https://&lt;your-domain&gt;/mcp</code>.<br>
-                                            • Auth: OAuth 2.1 Code Flow with PKCE S256.
-                                        </p>
-                                    </details>
-                                    <details class="mt-1" style="cursor: pointer;">
-                                        <summary><strong>Gemini Antigravity / Cursor IDE</strong></summary>
-                                        <p class="mt-1">
-                                            • <strong>Gemini / Antigravity:</strong> Run <code>snow setup --host gemini</code> or connect to the Remote MCP endpoint.<br>
-                                            • <strong>Cursor:</strong> Run <code>snow setup --host cursor</code> to write configuration to <code>.cursor/mcp.json</code>.
-                                        </p>
-                                    </details>
-                                </div>
-                            </div>
-
-                            <div class="mt-3">
-                                <button class="btn btn-secondary btn-sm" id="btn-copy-mcp-url">Copy Local Endpoint</button>
-                                <button class="btn btn-secondary btn-sm" id="btn-copy-public-mcp-url" style="display: none;">Copy Public Endpoint</button>
-                                <button class="btn btn-secondary btn-sm" id="btn-test-mcp-health">Verify Gateway</button>
-                            </div>
-                            <div id="mcp-test-result" class="mt-2 text-muted" style="font-size: 0.85rem;"></div>
-                        </div>
-                    </div>
-
-                    <!-- SNOW Network Identity Card (Phase 27) -->
-                    <div class="card mt-4" id="card-network-identity">
-                        <div class="card-header">
-                            <h3>🌐 SNOW Network Identity</h3>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-muted">Configure the human-readable display name for this local mesh network.</p>
-                            <div class="form-group mt-3" style="max-width: 450px;">
-                                <label for="input-network-name">Network Name:</label>
-                                <div style="display: flex; gap: 0.5rem; align-items: center; margin-top: 0.25rem;">
-                                    <input type="text" id="input-network-name" class="form-control" placeholder="My SNOW Network" maxlength="64" />
-                                    <button id="btn-save-network-name" class="btn btn-secondary btn-sm">Save</button>
-                                </div>
-                                <span id="network-name-status" class="text-xs text-muted mt-1 d-block"></span>
-                            </div>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- 10. Federation & Sharing Section (Phase 30) -->
-                <section id="section-federation" class="tab-pane">
-                    <div class="card">
-                        <div class="card-header">
-                            <h3>🌐 Cross-Network Federation & Session Controls</h3>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-muted">
-                                Authorize scoped capability sharing between independent SNOW networks.
-                                Enforces mutual 9-digit owner PIN verification, zero privilege inheritance,
-                                strict anti-transitivity, and instant revocation.
-                            </p>
-
-                            <div style="display: flex; gap: 1rem; align-items: center; margin-top: 1rem; padding: 0.75rem 1rem; background: var(--chip-bg); border-radius: 6px; font-size: 0.85rem;">
-                                <div><strong>Local Network ID:</strong> <code id="fed-local-net-id">Loading...</code></div>
-                                <div><strong>Network Name:</strong> <span id="fed-local-net-name" class="chip chip-primary">Loading...</span></div>
+                        <div class="card-body-clean">
+                            <div class="remote-link-row">
+                                <input type="text" id="mcp-tunnel-url-pill" class="pill-display-input" value="Remote MCP Tunnel Idle" readonly />
+                                <button id="btn-mcp-copy-link" class="btn btn-primary btn-sm btn-pill">Copy Link</button>
+                                <button id="btn-mcp-show-qr" class="btn btn-outline-secondary btn-sm btn-pill">Show QR</button>
                             </div>
                         </div>
                     </div>
 
-                    <div class="grid-overview mt-4" style="grid-template-columns: 1fr 1fr;">
-                        <!-- Create Invitation Box -->
-                        <div class="card">
-                            <div class="card-header">
-                                <h4>🤝 Create Federation Invitation</h4>
-                            </div>
-                            <div class="card-body">
-                                <p class="text-muted text-xs">Generate a temporary 9-digit PIN to authorize an incoming peer network (10-minute expiry).</p>
-
-                                <div class="form-group mt-2">
-                                    <label for="fed-grant-ttl" class="text-xs">Grant Duration (TTL):</label>
-                                    <select id="fed-grant-ttl" class="form-select form-select-sm">
-                                        <option value="3600">1 Hour</option>
-                                        <option value="86400" selected>24 Hours (Default)</option>
-                                        <option value="604800">7 Days</option>
-                                    </select>
+                    <!-- Section 3: Bottom Row 2 Columns -->
+                    <div class="settings-bottom-2col mt-4">
+                        <!-- Left Column: Appearance + Advanced Diagnostics -->
+                        <div class="settings-left-col">
+                            <!-- Appearance Card -->
+                            <div class="card appearance-card">
+                                <div class="card-header-clean">
+                                    <h3>Appearance</h3>
                                 </div>
-
-                                <div class="form-group mt-2">
-                                    <label class="text-xs">Allowed Capabilities:</label>
-                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.25rem; font-size: 0.8rem; margin-top: 0.25rem;">
-                                        <label><input type="checkbox" class="fed-cap-checkbox" value="android.status" checked> Android Status</label>
-                                        <label><input type="checkbox" class="fed-cap-checkbox" value="desktop.system.info" checked> Desktop Info</label>
-                                        <label><input type="checkbox" class="fed-cap-checkbox" value="android.notifications.read"> Notifications</label>
-                                        <label><input type="checkbox" class="fed-cap-checkbox" value="desktop.clipboard.read"> Clipboard Read</label>
+                                <div class="card-body-clean">
+                                    <div class="segmented-control">
+                                        <label class="seg-item">
+                                            <input type="radio" name="theme-radio" value="system" />
+                                            <span>System</span>
+                                        </label>
+                                        <label class="seg-item active">
+                                            <input type="radio" name="theme-radio" value="light" checked />
+                                            <span>Light Mode</span>
+                                        </label>
+                                        <label class="seg-item">
+                                            <input type="radio" name="theme-radio" value="dark" />
+                                            <span>Dark Mode</span>
+                                        </label>
                                     </div>
                                 </div>
-
-                                <div class="mt-3">
-                                    <button id="btn-fed-create-invite" class="btn btn-primary btn-sm">Generate 9-Digit Code</button>
-                                </div>
-
-                                <div id="fed-invite-result-box" class="mt-3" style="display: none; background: var(--bg-surface); border: 2px dashed var(--accent-primary); border-radius: 8px; padding: 1rem; text-align: center;">
-                                    <div class="text-xs text-muted">Temporary Mutual Pairing Code:</div>
-                                    <div id="fed-display-code" style="font-size: 1.8rem; font-family: monospace; font-weight: bold; letter-spacing: 3px; color: var(--accent-primary); margin: 0.5rem 0;">--- --- ---</div>
-                                    <div class="text-xs text-muted" id="fed-invite-timer">Expires in: 10:00</div>
-                                    <button id="btn-fed-copy-code" class="btn btn-secondary btn-xs mt-2">📋 Copy Code</button>
-                                </div>
                             </div>
+
+                            <!-- Advanced & Diagnostics Collapsed Accordion -->
+                            <details class="advanced-accordion card mt-3">
+                                <summary class="advanced-summary">
+                                    <div class="summary-left">
+                                        <h3>Advanced &amp; Diagnostics</h3>
+                                        <span class="text-xs text-muted">Hiding all ports, IPs, or logs</span>
+                                    </div>
+                                    <span class="accordion-arrow">⌵</span>
+                                </summary>
+                                <div class="accordion-body p-3">
+                                    <div class="diag-ports-grid" id="diag-port">
+                                        <div class="diag-port-item">
+                                            <span class="diag-label">Control WSS:</span>
+                                            <code>8765</code>
+                                        </div>
+                                        <div class="diag-port-item">
+                                            <span class="diag-label">Transfer HTTPS:</span>
+                                            <code>8766</code>
+                                        </div>
+                                        <div class="diag-port-item">
+                                            <span class="diag-label">Dashboard Web:</span>
+                                            <code>8769</code>
+                                        </div>
+                                        <div class="diag-port-item">
+                                            <span class="diag-label">Relay WSS:</span>
+                                            <code>8770</code>
+                                        </div>
+                                        <div class="diag-port-item">
+                                            <span class="diag-label">Remote MCP:</span>
+                                            <code>8771</code>
+                                        </div>
+                                    </div>
+                                    <div class="diag-actions-row mt-3">
+                                        <button id="btn-diag-copy-logs" class="btn btn-xs btn-outline-secondary">Copy Debug Logs</button>
+                                        <button id="btn-diag-reset-tokens" class="btn btn-xs btn-outline-danger">Reset Tokens</button>
+                                    </div>
+                                </div>
+                            </details>
                         </div>
 
-                        <!-- Accept Invitation Box -->
-                        <div class="card">
-                            <div class="card-header">
-                                <h4>🔗 Connect to Peer Network</h4>
-                            </div>
-                            <div class="card-body">
-                                <p class="text-muted text-xs">Enter a 9-digit federation code provided by another SNOW network owner.</p>
-
-                                <div class="form-group mt-2">
-                                    <label for="fed-input-code" class="text-xs">9-Digit PIN (XXX-XXX-XXX):</label>
-                                    <input type="text" id="fed-input-code" class="form-input form-input-sm" placeholder="123-456-789" maxlength="11" />
+                        <!-- Right Column: Approvals & Activity -->
+                        <div class="settings-right-col">
+                            <div class="card approvals-activity-card">
+                                <div class="card-header-clean">
+                                    <h3>Approvals &amp; Activity</h3>
                                 </div>
+                                <div class="card-body-clean">
+                                    <!-- Pending Approval Item -->
+                                    <div id="settings-pending-approval-item" class="pending-approval-box mb-3 d-none">
+                                        <div class="pending-meta">
+                                            <p id="settings-pending-approval-text" class="text-sm"></p>
+                                        </div>
+                                        <div class="pending-actions-cluster">
+                                            <button id="btn-approval-approve" class="btn-pill-action btn-pill-approve">Approve</button>
+                                            <button id="btn-approval-deny" class="btn-pill-action btn-pill-deny">Deny</button>
+                                        </div>
+                                    </div>
 
-                                <div class="form-group mt-2">
-                                    <label for="fed-peer-net-name" class="text-xs">Peer Network Name (Optional):</label>
-                                    <input type="text" id="fed-peer-net-name" class="form-input form-input-sm" placeholder="e.g. Office Mesh" />
+                                    <!-- Activity Timeline Items -->
+                                    <div id="activity-timeline-list" class="activity-timeline-list">
+                                        <div class="empty-state text-muted text-xs">No recent activity</div>
+                                    </div>
                                 </div>
-
-                                <div class="mt-3">
-                                    <button id="btn-fed-accept-code" class="btn btn-secondary btn-sm">Verify & Establish Federation</button>
-                                </div>
-                                <div id="fed-accept-status" class="mt-2 text-xs"></div>
                             </div>
-                        </div>
-                    </div>
-
-                    <!-- Active Grants Table -->
-                    <div class="card mt-4">
-                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
-                            <h4>🤝 Active Federation Grants</h4>
-                            <button id="btn-fed-refresh-grants" class="btn btn-secondary btn-xs">🔄 Refresh Grants</button>
-                        </div>
-                        <div class="card-body">
-                            <div class="table-responsive">
-                                <table class="table" style="width: 100%; font-size: 0.85rem;">
-                                    <thead>
-                                        <tr>
-                                            <th>Network / Node</th>
-                                            <th>Direction</th>
-                                            <th>Status</th>
-                                            <th>Capabilities</th>
-                                            <th>Expires</th>
-                                            <th>Actions</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody id="fed-grants-tbody">
-                                        <tr>
-                                            <td colspan="6" class="empty-state text-muted">No cross-network federation grants active.</td>
-                                        </tr>
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Global Kill Switch Card -->
-                    <div class="card mt-4" style="border: 1px solid var(--danger-color); background: rgba(239, 68, 68, 0.04);">
-                        <div class="card-header" style="border-bottom: 1px solid rgba(239, 68, 68, 0.2);">
-                            <h4 style="color: var(--danger-color);">🛑 Global Kill Switch (Nuclear Revocation)</h4>
-                        </div>
-                        <div class="card-body">
-                            <p class="text-muted text-xs">
-                                Immediately revokes all inbound and outbound federation grants, terminates all active remote and peer sessions,
-                                and invalidates pending invitations across all networks.
-                            </p>
-                            <div class="mt-3">
-                                <button id="btn-fed-nuclear-kill-switch" class="btn btn-danger btn-sm" style="font-weight: bold;">
-                                    🚨 Trigger Global Kill Switch (Revoke All Federation)
-                                </button>
-                            </div>
-                            <div id="fed-kill-switch-status" class="mt-2 text-xs"></div>
                         </div>
                     </div>
                 </section>
@@ -1221,20 +754,10 @@
         </main>
     </div>
 
-    <!-- Command Palette Overlay (Ctrl+K / Cmd+K) -->
-    <div id="command-palette-overlay" class="command-palette-overlay" style="display: none;">
-        <div class="command-palette-card">
-            <div class="command-palette-header">
-                <span style="font-size: 1.2rem;">🔍</span>
-                <input type="text" id="command-palette-input" class="command-palette-input" placeholder="Type a command or view (Home, Devices, Files, Clipboard, Settings, Lock PC, Theme)..." autocomplete="off" />
-                <span class="command-palette-esc-hint">ESC</span>
-            </div>
-            <div id="command-palette-results" class="command-palette-results">
-                <!-- Dynamically populated via app.js -->
-            </div>
-        </div>
-    </div>
+    <!-- Notification Toasts Mount Point -->
+    <div id="toast-container"></div>
 
+    <!-- App Script -->
     <script src="/static/app.js"></script>
 </body>
 

@@ -2276,6 +2276,119 @@ class SnowWebServer:
         return web.json_response(res)
 
     # =========================================================================
+    # Additional Native Capability Endpoints (Phase 4 Stage 4B)
+    # =========================================================================
+
+    async def handle_api_devices_ring(self, request: web.Request) -> web.Response:
+        """Ring the connected Android phone."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = body.get("device_id", "")
+        duration = int(body.get("duration_seconds", 5))
+        duration = max(1, min(duration, 30))
+        res = await self.bridge.android_ring(duration_seconds=duration, device_id=device_id)
+        return web.json_response(res)
+
+    async def handle_api_camera_capture(self, request: web.Request) -> web.Response:
+        """Trigger a camera photo capture on the connected Android phone."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        device_id = body.get("device_id", "")
+        approval_id = body.get("approval_id", "")
+        res = await self.bridge.android_camera_capture(device_id=device_id, approval_id=approval_id)
+        return web.json_response(res)
+
+    async def handle_api_clipboard_sync(self, request: web.Request) -> web.Response:
+        """Trigger bidirectional or directed clipboard synchronization."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        direction = body.get("direction", "both")
+        device_id = body.get("device_id", "")
+        res = await self.bridge.sync_clipboard(direction=direction, device_id=device_id)
+        return web.json_response(res)
+
+    async def handle_api_files_upload(self, request: web.Request) -> web.Response:
+        """Upload a file from Desktop Web to the connected Android phone."""
+        if not request.content_type.startswith("multipart/"):
+            return web.json_response({"success": False, "error": "Expected multipart/form-data."}, status=400)
+
+        import tempfile
+        stage_dir = Path(tempfile.gettempdir()) / "snow_web_uploads"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        reader = await request.multipart()
+        device_id = ""
+        staged_file = None
+        filename = "uploaded_file"
+
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name == "device_id":
+                device_id = (await part.text()).strip()
+            elif part.name == "file":
+                filename = Path(part.filename or "uploaded_file").name
+                staged_file = stage_dir / f"{secrets.token_hex(8)}_{filename}"
+                total_bytes = 0
+                with open(staged_file, "wb") as f:
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        if total_bytes > 100 * 1024 * 1024:
+                            staged_file.unlink(missing_ok=True)
+                            return web.json_response({"success": False, "error": "File exceeds 100MB limit."}, status=413)
+                        f.write(chunk)
+
+        if not staged_file or not staged_file.exists():
+            return web.json_response({"success": False, "error": "No file uploaded."}, status=400)
+
+        try:
+            res = await self.bridge.android_file_send(file_path=str(staged_file), device_id=device_id)
+            return web.json_response({
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS"),
+                "filename": filename,
+                "data": res.get("data", {}),
+                "error": res.get("error"),
+            })
+        finally:
+            staged_file.unlink(missing_ok=True)
+
+    async def handle_api_mcp_tunnel_qr(self, request: web.Request) -> web.Response:
+        """Generate vector SVG QR code encoding the public Remote AI MCP Gateway endpoint."""
+        status = self.tunnel_manager.get_status()
+        public_url = status.get("public_url")
+        if public_url:
+            mcp_url = f"{public_url.rstrip('/')}/mcp"
+        else:
+            mcp_url = "http://127.0.0.1:8771/mcp"
+
+        svg_content = ""
+        try:
+            import qrcode
+            import qrcode.image.svg
+            img = qrcode.make(mcp_url, image_factory=qrcode.image.svg.SvgPathImage, box_size=8, border=2)
+            svg_content = img.to_string().decode("utf-8") if isinstance(img.to_string(), bytes) else str(img.to_string())
+        except Exception as qre:
+            logger.debug("Failed rendering MCP QR SVG: %s", qre)
+
+        return web.json_response({
+            "success": True,
+            "url": mcp_url,
+            "active": bool(public_url),
+            "svg": svg_content,
+        })
+
+    # =========================================================================
     # System Lifecycle Endpoints (Phase 4 Stage 4A)
     # =========================================================================
 
@@ -2497,7 +2610,29 @@ class SnowWebServer:
         app.router.add_post("/api/system/resume", self.handle_api_system_resume)
         app.router.add_post("/api/system/shutdown", self.handle_api_system_shutdown)
 
+        # Additional Native Capability Endpoints (Phase 4 Stage 4B)
+        app.router.add_post("/api/devices/ring", self.handle_api_devices_ring)
+        app.router.add_post("/api/camera/capture", self.handle_api_camera_capture)
+        app.router.add_post("/api/clipboard/sync", self.handle_api_clipboard_sync)
+        app.router.add_post("/api/files/upload", self.handle_api_files_upload)
+        app.router.add_get("/api/mcp/tunnel/qr", self.handle_api_mcp_tunnel_qr)
+
+        # Route aliases for client compatibility and resilience
+        app.router.add_post("/api/mcp/hosts/setup", self.handle_api_mcp_setup)
+        app.router.add_post("/api/mesh/connect", self.handle_api_devices_connect_peer)
+        app.router.add_post("/api/pair/pin", self.handle_api_devices_connect_peer)
+        app.router.add_post("/api/federation/connect", self.handle_api_federation_accept)
+        app.router.add_post("/api/clipboard/sync/toggle", self.handle_api_clipboard_sync)
+        app.router.add_post("/api/clipboard/clear", self.handle_api_clipboard_buffer_clear)
+        app.router.add_get("/api/approvals/pending", self.handle_api_approvals)
+        app.router.add_post("/api/transfer/upload", self.handle_api_files_upload)
+        app.router.add_get("/api/apps", self.handle_api_apps_android)
+
         return app
+
+    def create_app(self) -> web.Application:
+        """Alias for _build_app to construct the aiohttp application."""
+        return self._build_app()
 
     async def start(self) -> None:
         """Start the Web Dashboard listener on loopback port."""
