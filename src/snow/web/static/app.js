@@ -1906,6 +1906,102 @@
                 }
             });
         }
+
+        // Direct Product Updates & Hot-Swap UI
+        let pendingUpdate = null;
+        const btnCheckUpdates = document.getElementById("btn-check-updates");
+        const btnApplyUpdate = document.getElementById("btn-apply-update");
+        const btnResetUiOverride = document.getElementById("btn-reset-ui-override");
+        const updateStatusBadge = document.getElementById("update-status-badge");
+        const updateNotesContainer = document.getElementById("update-notes-container");
+
+        if (btnCheckUpdates) {
+            btnCheckUpdates.addEventListener("click", async () => {
+                if (updateStatusBadge) updateStatusBadge.textContent = "Checking...";
+                try {
+                    const res = await apiRequest("/api/system/update-check");
+                    if (res && res.success) {
+                        if (res.available) {
+                            pendingUpdate = res;
+                            if (updateStatusBadge) {
+                                updateStatusBadge.textContent = `v${res.latest_version} available (${res.update_type})`;
+                                updateStatusBadge.className = "badge text-xs bg-primary text-white";
+                            }
+                            if (btnApplyUpdate) btnApplyUpdate.classList.remove("d-none");
+                            if (updateNotesContainer && res.release_notes) {
+                                updateNotesContainer.textContent = res.release_notes;
+                                updateNotesContainer.classList.remove("d-none");
+                            }
+                            showNotificationToast(`Update available: v${res.latest_version}`, "info");
+                        } else {
+                            pendingUpdate = null;
+                            if (updateStatusBadge) {
+                                updateStatusBadge.textContent = `v${res.current_version} • Up to date`;
+                                updateStatusBadge.className = "badge text-xs";
+                            }
+                            if (btnApplyUpdate) btnApplyUpdate.classList.add("d-none");
+                            if (updateNotesContainer) updateNotesContainer.classList.add("d-none");
+                            showNotificationToast("SNOW is up to date.", "success");
+                        }
+                    } else {
+                        if (updateStatusBadge) updateStatusBadge.textContent = "Check failed";
+                        showNotificationToast(res.error || "Update check failed", "danger");
+                    }
+                } catch (e) {
+                    if (updateStatusBadge) updateStatusBadge.textContent = "Check error";
+                    showNotificationToast(`Error: ${e.message}`, "danger");
+                }
+            });
+        }
+
+        if (btnApplyUpdate) {
+            btnApplyUpdate.addEventListener("click", async () => {
+                if (!pendingUpdate) return;
+                const msg = pendingUpdate.update_type === "desktop"
+                    ? `Apply full desktop update to v${pendingUpdate.latest_version}? The Core daemon will restart.`
+                    : `Apply Web UI hot-swap update to v${pendingUpdate.latest_version}?`;
+                if (!confirm(msg)) return;
+
+                btnApplyUpdate.disabled = true;
+                btnApplyUpdate.textContent = "Applying...";
+                try {
+                    const res = await apiRequest("/api/system/update-apply", "POST", {
+                        update_type: pendingUpdate.update_type,
+                        url: pendingUpdate.url,
+                        sha256: pendingUpdate.sha256
+                    });
+                    if (res && res.success) {
+                        showNotificationToast(res.message || "Update applied!", "success");
+                        setTimeout(() => window.location.reload(), 1500);
+                    } else {
+                        btnApplyUpdate.disabled = false;
+                        btnApplyUpdate.textContent = "Apply Update";
+                        showNotificationToast(res.error || "Update application failed.", "danger");
+                    }
+                } catch (e) {
+                    btnApplyUpdate.disabled = false;
+                    btnApplyUpdate.textContent = "Apply Update";
+                    showNotificationToast(`Error: ${e.message}`, "danger");
+                }
+            });
+        }
+
+        if (btnResetUiOverride) {
+            btnResetUiOverride.addEventListener("click", async () => {
+                if (!confirm("Reset to bundled Web UI assets and discard local overrides?")) return;
+                try {
+                    const res = await apiRequest("/api/web-ui/reset-override", "POST", {});
+                    if (res && res.success) {
+                        showNotificationToast("Reset complete. Reloading...", "success");
+                        setTimeout(() => window.location.reload(), 1000);
+                    } else {
+                        showNotificationToast(res.error || "Failed resetting Web UI override.", "danger");
+                    }
+                } catch (e) {
+                    showNotificationToast(`Error: ${e.message}`, "danger");
+                }
+            });
+        }
     }
 
     async function loadAiHostStatus() {

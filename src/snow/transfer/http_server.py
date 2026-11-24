@@ -97,6 +97,10 @@ class SnowHttpTransferServer:
         self.app.router.add_post("/api/v1/screen/stop", self.handle_screen_stop)
         self.app.router.add_get("/api/v1/desktop/wallpaper", self.handle_desktop_wallpaper)
 
+        # Direct Signed APK update routes (Port 8766)
+        self.app.router.add_get("/api/v1/app/update-info", self.handle_app_update_info)
+        self.app.router.add_get("/api/v1/app/apk", self.handle_app_apk_download)
+
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler) -> web.StreamResponse:
         """Authenticate all /api/ requests using device bearer tokens against SQLite."""
@@ -788,6 +792,76 @@ class SnowHttpTransferServer:
         except Exception as exc:
             logger.warning("Error serving wallpaper preview: %s", exc)
             return web.Response(status=500, text=str(exc))
+
+    def _get_staged_apk_path(self) -> Optional[Path]:
+        """Resolve and validate the staged signed Android APK path with strict containment."""
+        configured = getattr(self.config, "staged_apk_path", None)
+        if configured:
+            p = Path(configured).resolve()
+            if p.is_file() and p.suffix.lower() == ".apk":
+                return p
+
+        repo_root = Path(__file__).resolve().parent.parent.parent.parent
+        expected_dir = (repo_root / "packaging" / "output").resolve()
+        candidate = (expected_dir / "SNOW-Mobile-4.1.0.apk").resolve()
+        try:
+            if candidate.is_relative_to(expected_dir) and candidate.is_file():
+                return candidate
+        except (ValueError, OSError):
+            pass
+
+        cwd_expected = (Path.cwd() / "packaging" / "output").resolve()
+        cwd_candidate = (cwd_expected / "SNOW-Mobile-4.1.0.apk").resolve()
+        try:
+            if cwd_candidate.is_relative_to(cwd_expected) and cwd_candidate.is_file():
+                return cwd_candidate
+        except (ValueError, OSError):
+            pass
+
+        return None
+
+    async def handle_app_update_info(self, request: web.Request) -> web.Response:
+        """Return metadata for the staged signed Android APK."""
+        apk_path = self._get_staged_apk_path()
+        if not apk_path or not apk_path.is_file():
+            return web.json_response({
+                "available": False,
+                "version_code": 0,
+                "version_name": "",
+                "size_bytes": 0,
+                "sha256": ""
+            })
+
+        import hashlib
+        h = hashlib.sha256()
+        with open(apk_path, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        sha256 = h.hexdigest()
+        size_bytes = apk_path.stat().st_size
+
+        return web.json_response({
+            "available": True,
+            "version_code": 1,
+            "version_name": "4.1.0",
+            "size_bytes": size_bytes,
+            "sha256": sha256
+        })
+
+    async def handle_app_apk_download(self, request: web.Request) -> web.StreamResponse:
+        """Stream the staged signed APK to authenticated paired device."""
+        apk_path = self._get_staged_apk_path()
+        if not apk_path or not apk_path.is_file():
+            return web.Response(status=404, text="No staged APK available for download.")
+
+        response = web.FileResponse(
+            apk_path,
+            headers={
+                "Content-Type": "application/vnd.android.package-archive",
+                "Content-Disposition": f'attachment; filename="{apk_path.name}"'
+            }
+        )
+        return response
 
     async def start(self) -> None:
         """Start listening for incoming HTTP/HTTPS transfer requests."""

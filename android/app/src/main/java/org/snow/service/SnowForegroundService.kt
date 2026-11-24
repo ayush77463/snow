@@ -161,6 +161,12 @@ class SnowForegroundService : Service() {
                     SafeLog.i("SnowForegroundService", "Network restored but userDisconnected == true; suppressing reconnection.")
                     return
                 }
+                val autoConnectEnabled = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+                    .getBoolean(SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, true)
+                if (!autoConnectEnabled) {
+                    SafeLog.i("SnowForegroundService", "Network restored but autoConnectEnabled == false; suppressing reconnection.")
+                    return
+                }
                 if (client.connectionState.value == ConnectionState.DISCONNECTED ||
                     client.connectionState.value == ConnectionState.RECONNECTING) {
                     val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
@@ -230,6 +236,9 @@ class SnowForegroundService : Service() {
         super.onCreate()
         createNotificationChannel()
         registerNetworkCallback()
+        val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val savedProfile = settingsPrefs.getString("permission_profile", "full_control") ?: "full_control"
+        capabilityDispatcher.activePermissionProfile = savedProfile
         org.snow.ui.SnowUiRepository.getInstance(applicationContext).bindService(this)
         client.requestDispatcher = { action, data ->
             capabilityDispatcher.dispatch(
@@ -525,6 +534,13 @@ class SnowForegroundService : Service() {
         autoConnectJob?.cancel()
         autoConnectJob = serviceScope.launch {
             SafeLog.i("SnowForegroundService", "Starting auto-connect cascade...")
+
+            val autoConnectEnabled = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+                .getBoolean(SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, true)
+            if (!autoConnectEnabled) {
+                SafeLog.i("SnowForegroundService", "Auto-connect cascade suppressed: Auto-Connect Nearby is disabled.")
+                return@launch
+            }
 
             if (client.connectionState.value == ConnectionState.CONNECTED) {
                 return@launch

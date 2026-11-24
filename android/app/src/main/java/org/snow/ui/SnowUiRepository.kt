@@ -56,6 +56,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         const val PREFS_SETTINGS = "snow_settings"
         const val PREF_KEY_INSTANT_SYNC = "instant_clipboard_sync"
         const val PREF_KEY_AUTO_SYNC_SCREENSHOTS = "auto_sync_screenshots"
+        const val PREF_KEY_AUTO_CONNECT_ENABLED = "auto_connect_nearby"
         const val PREF_KEY_REMOTE_RELAY_ENABLED = "remote_relay_enabled"
         const val PREF_KEY_REMOTE_RELAY_ENDPOINT = "remote_relay_endpoint"
 
@@ -87,6 +88,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     private val _connectedEndpoint = MutableStateFlow<String?>(null)
     val connectedEndpoint: StateFlow<String?> = _connectedEndpoint.asStateFlow()
+    val currentTargetHost: String get() = connectedHost.ifBlank { serviceRef?.client?.currentTargetHost ?: "" }
 
     private val _authState = MutableStateFlow<AuthState>(AuthState.Disconnected)
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
@@ -715,6 +717,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         return list
     }
 
+    fun updateDeviceTrustTier(deviceId: String, tier: String) {
+        val current = _savedDevices.value.toMutableList()
+        val idx = current.indexOfFirst { it.deviceId == deviceId }
+        if (idx >= 0) {
+            current[idx] = current[idx].copy(trustTier = tier)
+            _savedDevices.value = current
+            val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+            prefsV2.edit().putString("devices_json", serializeSavedDevices(current)).apply()
+        }
+    }
+
     fun updateDeviceConnectionMode(deviceId: String, mode: String) {
         val current = _savedDevices.value.toMutableList()
         val idx = current.indexOfFirst { it.deviceId == deviceId }
@@ -851,14 +864,153 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Quick Actions & Clipboard ---
 
-    fun ringPhone() {
+    var activePermissionProfile: String
+        get() {
+            val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            return serviceRef?.capabilityDispatcher?.activePermissionProfile
+                ?: prefs.getString("active_permission_profile", "full_control") ?: "full_control"
+        }
+        set(value) {
+            val canonical = when (value.lowercase()) {
+                "files_and_clipboard" -> "files_and_clipboard"
+                "clipboard_only" -> "clipboard_only"
+                else -> "full_control"
+            }
+            serviceRef?.capabilityDispatcher?.activePermissionProfile = canonical
+            val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            prefs.edit().putString("active_permission_profile", canonical).apply()
+            appendLog("INFO", TAG, "Active permission profile updated to $canonical")
+        }
+
+    fun ringLocalPhone(durationSeconds: Int = 5) {
         repoScope.launch {
             try {
                 val ringer = RingerHandler(appContext)
-                val res = ringer.ringPhone(5)
-                appendLog("INFO", TAG, "Triggered phone ringer: ${res["status"]}")
+                val res = ringer.ringPhone(durationSeconds)
+                appendLog("INFO", TAG, "Triggered local phone ringer: ${res["status"]}")
             } catch (e: Exception) {
-                appendLog("ERROR", TAG, "Phone ringer error: ${e.message}")
+                appendLog("ERROR", TAG, "Local phone ringer error: ${e.message}")
+            }
+        }
+    }
+
+    fun ringPhone(durationSeconds: Int = 5) {
+        ringLocalPhone(durationSeconds)
+    }
+
+    fun ringPeerPhone(durationSeconds: Int = 5, onComplete: ((Boolean, String?) -> Unit)? = null) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            appendLog("WARN", TAG, "Cannot ring peer phone: not connected")
+            onComplete?.invoke(false, "Not connected to peer.")
+            return
+        }
+        repoScope.launch {
+            try {
+                client.sendRequest(
+                    action = "ring_phone",
+                    data = mapOf("duration_seconds" to durationSeconds)
+                ) { response ->
+                    val success = response.isSuccess
+                    val err = response.error?.message
+                    appendLog("INFO", TAG, "Ring peer phone result: isSuccess=$success, err=$err")
+                    onComplete?.invoke(success, err)
+                }
+            } catch (e: Exception) {
+                appendLog("ERROR", TAG, "Error ringing peer phone: ${e.message}")
+                onComplete?.invoke(false, e.message)
+            }
+        }
+    }
+
+    fun sendMediaKey(action: String, onComplete: ((Boolean, String?) -> Unit)? = null) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            appendLog("WARN", TAG, "Cannot send media key: not connected")
+            onComplete?.invoke(false, "Not connected.")
+            return
+        }
+        val canonical = when (action.trim().lowercase()) {
+            "play", "pause", "play_pause", "toggle" -> "play_pause"
+            "next", "next_track" -> "next"
+            "prev", "previous", "previous_track" -> "previous"
+            "volume_up", "vol_up" -> "volume_up"
+            "volume_down", "vol_down" -> "volume_down"
+            "mute", "unmute", "toggle_mute" -> "volume_mute"
+            "stop" -> "stop"
+            else -> action.lowercase()
+        }
+        repoScope.launch {
+            try {
+                client.sendRequest(
+                    action = "media_control",
+                    data = mapOf("action" to canonical)
+                ) { response ->
+                    val success = response.isSuccess
+                    val err = response.error?.message
+                    appendLog("INFO", TAG, "Media control '$canonical' result: isSuccess=$success, err=$err")
+                    onComplete?.invoke(success, err)
+                }
+            } catch (e: Exception) {
+                appendLog("ERROR", TAG, "Error sending media key: ${e.message}")
+                onComplete?.invoke(false, e.message)
+            }
+        }
+    }
+
+    fun shareLink(url: String?, text: String?, onComplete: ((Boolean, String?) -> Unit)? = null) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            appendLog("WARN", TAG, "Cannot share link: not connected")
+            onComplete?.invoke(false, "Not connected.")
+            return
+        }
+        if (url.isNullOrBlank() && text.isNullOrBlank()) {
+            onComplete?.invoke(false, "Both URL and text cannot be empty.")
+            return
+        }
+        repoScope.launch {
+            try {
+                val data = mutableMapOf<String, Any>()
+                if (!url.isNullOrBlank()) data["url"] = url.trim()
+                if (!text.isNullOrBlank()) data["text"] = text.trim()
+                client.sendRequest(
+                    action = "share_link",
+                    data = data
+                ) { response ->
+                    val success = response.isSuccess
+                    val err = response.error?.message
+                    appendLog("INFO", TAG, "Share link result: isSuccess=$success, err=$err")
+                    onComplete?.invoke(success, err)
+                }
+            } catch (e: Exception) {
+                appendLog("ERROR", TAG, "Error sharing link: ${e.message}")
+                onComplete?.invoke(false, e.message)
+            }
+        }
+    }
+
+    fun triggerCameraCapture(onComplete: ((Boolean, String?) -> Unit)? = null) {
+        val client = serviceRef?.client
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
+            appendLog("WARN", TAG, "Cannot trigger camera: not connected")
+            onComplete?.invoke(false, "Not connected.")
+            return
+        }
+        repoScope.launch {
+            try {
+                client.sendRequest(
+                    action = "camera_capture",
+                    data = emptyMap()
+                ) { response ->
+                    val success = response.isSuccess
+                    val err = response.error?.message
+                    appendLog("INFO", TAG, "Camera capture result: isSuccess=$success, err=$err")
+                    onComplete?.invoke(success, err)
+                }
+            } catch (e: Exception) {
+                appendLog("ERROR", TAG, "Error triggering camera capture: ${e.message}")
+                onComplete?.invoke(false, e.message)
             }
         }
     }
@@ -1471,28 +1623,6 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                 "desktop_clipboard_set",
                                 mapOf(
                                     "type" to "image",
-                                    "transfer_id" to upRes.transferId,
-                                    "sha256" to upRes.sha256,
-                                    "file_name" to stagedFile.name
-                                )
-                            ) { resp ->
-                                repoScope.launch(Dispatchers.Main) {
-                                    if (resp.isSuccess) {
-                                        appendLog("INFO", TAG, "Image pushed to PC clipboard.")
-                                        onComplete(true, "Image pushed to PC")
-                                    } else {
-                                        val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
-                                        onComplete(false, err)
-                                    }
-                                }
-                            }
-                        }
-                        is FileTransferClient.TransferResult.Duplicate -> {
-                            recordIncomingClipboardText(upRes.sha256)
-                            client.sendRequest(
-                                "desktop_clipboard_set",
-                                mapOf(
-                                    "type" to "image",
                                     "sha256" to upRes.sha256,
                                     "file_name" to stagedFile.name
                                 )
@@ -1511,6 +1641,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         is FileTransferClient.TransferResult.Error -> {
                             repoScope.launch(Dispatchers.Main) {
                                 onComplete(false, "Upload failed: ${upRes.message}")
+                            }
+                        }
+                        else -> {
+                            repoScope.launch(Dispatchers.Main) {
+                                onComplete(false, "Upload did not succeed.")
                             }
                         }
                     }
@@ -2380,6 +2515,148 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 }
             }
         }
+    }
+
+    // --- Direct App Update Engine ---
+
+    fun checkAppUpdate(onResult: (FileTransferClient.AppUpdateInfo?) -> Unit) {
+        val transferClient = serviceRef?.transferClient
+        val host = serviceRef?.client?.currentTargetHost
+        if (transferClient == null || host.isNullOrBlank() || _connectionState.value != ConnectionState.CONNECTED) {
+            appendLog("WARN", TAG, "Cannot check app update: desktop not connected")
+            onResult(null)
+            return
+        }
+
+        repoScope.launch {
+            try {
+                val res = transferClient.getAppUpdateInfo(host, 8766)
+                if (res.isSuccess) {
+                    val info = res.getOrNull()
+                    appendLog("INFO", TAG, "App update check result: available=${info?.available}, code=${info?.versionCode}")
+                    onResult(info)
+                } else {
+                    appendLog("WARN", TAG, "App update check failed: ${res.exceptionOrNull()?.message}")
+                    onResult(null)
+                }
+            } catch (e: Exception) {
+                appendLog("ERROR", TAG, "App update check error: ${e.message}")
+                onResult(null)
+            }
+        }
+    }
+
+    fun downloadAndInstallUpdate(
+        updateInfo: FileTransferClient.AppUpdateInfo,
+        onProgress: (Int) -> Unit,
+        onComplete: (Boolean, String?) -> Unit
+    ) {
+        val transferClient = serviceRef?.transferClient
+        val host = serviceRef?.client?.currentTargetHost
+        if (transferClient == null || host.isNullOrBlank() || _connectionState.value != ConnectionState.CONNECTED) {
+            onComplete(false, "Desktop not connected.")
+            return
+        }
+
+        repoScope.launch {
+            try {
+                val updatesDir = File(appContext.cacheDir, "updates")
+                updatesDir.mkdirs()
+                val targetApk = File(updatesDir, "snow-update-${updateInfo.versionCode}.apk")
+
+                appendLog("INFO", TAG, "Starting direct signed APK download (${updateInfo.sizeBytes} bytes)...")
+                val downloadRes = transferClient.downloadAppApk(
+                    serverHost = host,
+                    transferPort = 8766,
+                    destFile = targetApk,
+                    expectedSha256 = updateInfo.sha256,
+                    onProgress = onProgress
+                )
+
+                if (!downloadRes.isSuccess) {
+                    val err = downloadRes.exceptionOrNull()?.message ?: "Download failed"
+                    appendLog("ERROR", TAG, "APK download failed: $err")
+                    onComplete(false, err)
+                    return@launch
+                }
+
+                val apkFile = downloadRes.getOrNull()
+                if (apkFile == null || !apkFile.exists()) {
+                    onComplete(false, "Downloaded APK file not found.")
+                    return@launch
+                }
+
+                // Verify package signature & package name
+                if (!verifyApkSignature(apkFile)) {
+                    apkFile.delete()
+                    val err = "Security violation: Downloaded APK signature does not match installed application."
+                    appendLog("ERROR", TAG, err)
+                    onComplete(false, err)
+                    return@launch
+                }
+
+                appendLog("INFO", TAG, "APK verified successfully; launching package installer.")
+                launchApkInstaller(apkFile)
+                onComplete(true, null)
+            } catch (e: Exception) {
+                appendLog("ERROR", TAG, "Error during update download/install: ${e.message}")
+                onComplete(false, e.message)
+            }
+        }
+    }
+
+    fun verifyApkSignature(apkFile: File): Boolean {
+        try {
+            val pm = appContext.packageManager
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES
+            } else {
+                @Suppress("DEPRECATION")
+                android.content.pm.PackageManager.GET_SIGNATURES
+            }
+
+            val pkgInfo = pm.getPackageArchiveInfo(apkFile.absolutePath, flags) ?: return false
+
+            if (pkgInfo.packageName != appContext.packageName) {
+                appendLog("ERROR", TAG, "APK package name mismatch: ${pkgInfo.packageName} != ${appContext.packageName}")
+                return false
+            }
+
+            val installedPkgInfo = pm.getPackageInfo(appContext.packageName, flags)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val apkSigner = pkgInfo.signingInfo ?: return false
+                val installedSigner = installedPkgInfo.signingInfo ?: return false
+                val apkSigs = apkSigner.apkContentsSigners
+                val installedSigs = installedSigner.apkContentsSigners
+                if (apkSigs.isEmpty() || installedSigs.isEmpty()) return false
+                return apkSigs[0] == installedSigs[0]
+            } else {
+                @Suppress("DEPRECATION")
+                val apkSigs = pkgInfo.signatures ?: return false
+                @Suppress("DEPRECATION")
+                val installedSigs = installedPkgInfo.signatures ?: return false
+                if (apkSigs.isEmpty() || installedSigs.isEmpty()) return false
+                return apkSigs[0] == installedSigs[0]
+            }
+        } catch (e: Exception) {
+            appendLog("ERROR", TAG, "Failed verifying APK signature: ${e.message}")
+            return false
+        }
+    }
+
+    fun launchApkInstaller(apkFile: File) {
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            appContext,
+            "org.snow.fileprovider",
+            apkFile
+        )
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        appContext.startActivity(intent)
     }
 }
 

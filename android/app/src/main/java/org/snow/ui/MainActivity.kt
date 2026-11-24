@@ -161,7 +161,11 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, SnowForegroundService::class.java)
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         if (!SnowForegroundService.isDisconnectedByUser(this)) {
-            SnowForegroundService.startAutoConnect(this)
+            val autoConnectEnabled = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+                .getBoolean(SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, true)
+            if (autoConnectEnabled) {
+                SnowForegroundService.startAutoConnect(this)
+            }
         }
     }
 
@@ -278,6 +282,10 @@ class MainActivity : AppCompatActivity() {
             dialog.show(supportFragmentManager, ApprovalsBottomSheetDialog.TAG)
         }
 
+        binding.headerStatusPill.setOnClickListener {
+            showDeviceSwitcherDialog()
+        }
+
         lifecycleScope.launch {
             repository.pendingApprovalsCount.collectLatest { count ->
                 if (count > 0) {
@@ -290,7 +298,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         lifecycleScope.launch {
-            combine(repository.connectionState, repository.connectedEndpoint) { state, endpoint ->
+            combine(repository.connectionState, repository.connectedEndpoint, repository.savedDevices) { state, endpoint, _ ->
                 Pair(state, endpoint)
             }.collectLatest { (state, endpoint) ->
                 renderHeaderStatus(state, endpoint)
@@ -298,26 +306,76 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showDeviceSwitcherDialog() {
+        val saved = repository.savedDevices.value
+        val hostState = repository.peerHostState.value
+        val items = mutableListOf<String>()
+        val actions = mutableListOf<() -> Unit>()
+        val curHost = repository.currentTargetHost
+
+        if (saved.isNotEmpty()) {
+            saved.forEach { d ->
+                val isActive = repository.connectionState.value == ConnectionState.CONNECTED && (d.host == curHost || (curHost == "127.0.0.1" && d.host == "127.0.0.1"))
+                val activeIndicator = if (isActive) " (Active)" else ""
+                val mode = d.connectionMode.replaceFirstChar { it.uppercase() }
+                items.add("🖥 ${d.deviceName} • $mode$activeIndicator")
+                actions.add {
+                    repository.connect(d.host, d.port)
+                }
+            }
+        }
+
+        if (hostState.isActive && hostState.peerCount > 0) {
+            items.add("📱 Peer Host (${hostState.peerCount} linked)")
+            actions.add { }
+        }
+
+        if (items.isEmpty()) {
+            items.add("No devices paired yet. Tap to Pair New Device")
+            actions.add {
+                selectTab(R.id.nav_devices)
+            }
+        }
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Switch Active Device")
+            .setItems(items.toTypedArray()) { _, which ->
+                actions.getOrNull(which)?.invoke()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun renderHeaderStatus(state: ConnectionState, endpoint: String?) {
         val cleanEndpoint = endpoint ?: ""
         val isUsb = cleanEndpoint.startsWith("127.0.0.1") || cleanEndpoint.startsWith("localhost")
         val isRelay = cleanEndpoint.startsWith("relay:") || cleanEndpoint.contains("tunnel") || cleanEndpoint.contains(":8770")
+        val transport = if (isRelay) "Relay" else if (isUsb) "USB" else if (cleanEndpoint.isNotBlank()) "Wi-Fi" else "Auto"
+        val activeDev = repository.savedDevices.value.find { it.host == repository.currentTargetHost }
+        val targetName = activeDev?.deviceName ?: repository.pcTelemetry.value?.hostname ?: "SNOW Core"
+
         when (state) {
             ConnectionState.CONNECTED -> {
-                binding.headerStatusPill.text = if (isRelay) "CONNECTED • RELAY" else if (isUsb) "CONNECTED • USB" else if (cleanEndpoint.isNotBlank()) "CONNECTED • WI-FI" else "CONNECTED"
+                binding.headerStatusPill.text = "• $targetName • $transport ∨"
                 binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connected))
             }
             ConnectionState.CONNECTING -> {
-                binding.headerStatusPill.text = "CONNECTING..."
+                binding.headerStatusPill.text = "• Connecting... ∨"
                 binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connecting))
             }
             ConnectionState.RECONNECTING -> {
-                binding.headerStatusPill.text = "RECONNECTING..."
+                binding.headerStatusPill.text = "• Reconnecting... ∨"
                 binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_reconnecting))
             }
             ConnectionState.DISCONNECTED -> {
-                binding.headerStatusPill.text = "DISCONNECTED"
-                binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected))
+                val peerHostActive = repository.peerHostState.value.isActive
+                if (peerHostActive) {
+                    binding.headerStatusPill.text = "• Peer Host • WSS ∨"
+                    binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connected))
+                } else {
+                    binding.headerStatusPill.text = "Disconnected ∨"
+                    binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected))
+                }
             }
         }
     }

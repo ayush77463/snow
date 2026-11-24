@@ -10,6 +10,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
@@ -268,6 +269,103 @@ class DashboardFragment : Fragment() {
             viewModel.dismissCameraDelivery()
         }
 
+        // 5 PC Capability Tiles
+        binding.btnTileScreen.setOnClickListener { binding.btnScreenConsent.performClick() }
+        binding.btnTileCamera.setOnClickListener { binding.btnCameraCapture.performClick() }
+        binding.btnTileMedia.setOnClickListener {
+            Toast.makeText(requireContext(), "Toggling PC Media Playback...", Toast.LENGTH_SHORT).show()
+            SnowUiRepository.getInstance(requireContext()).sendMediaKey("PLAY_PAUSE")
+        }
+        binding.btnTileApps.setOnClickListener { binding.btnLaunchAppSheet.performClick() }
+        binding.btnTileTerminal.setOnClickListener { binding.btnOpenTerminal.performClick() }
+
+        // 6 Phone Peer Capability Grid Tiles
+        binding.btnPhoneHeroRing.setOnClickListener {
+            Toast.makeText(requireContext(), "Ringing peer phone...", Toast.LENGTH_SHORT).show()
+            SnowUiRepository.getInstance(requireContext()).ringPeerPhone(durationSeconds = 5) { success, err ->
+                activity?.runOnUiThread {
+                    if (success) {
+                        Toast.makeText(requireContext(), "Peer phone is ringing", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(requireContext(), "Failed to ring peer: $err", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+        binding.btnPhoneHeroSend.setOnClickListener { binding.btnHeroSendFiles.performClick() }
+
+        // Phone Hero Profile Selector
+        fun updateProfileButtonText() {
+            val prof = SnowUiRepository.getInstance(requireContext()).activePermissionProfile
+            val label = when (prof) {
+                "clipboard_only" -> "Clipboard Only"
+                "files_and_clipboard" -> "Files & Clipboard"
+                else -> "Full Control"
+            }
+            binding.btnPhoneHeroProfile.text = "👤 $label ▾"
+        }
+        updateProfileButtonText()
+
+        binding.btnPhoneHeroProfile.setOnClickListener {
+            val profiles = arrayOf("Full Control", "Files & Clipboard", "Clipboard Only")
+            val canonicalIds = arrayOf("full_control", "files_and_clipboard", "clipboard_only")
+            AlertDialog.Builder(requireContext())
+                .setTitle("Select Access Profile")
+                .setItems(profiles) { _, which ->
+                    val chosen = canonicalIds[which]
+                    SnowUiRepository.getInstance(requireContext()).activePermissionProfile = chosen
+                    updateProfileButtonText()
+                    Toast.makeText(requireContext(), "Active profile: ${profiles[which]}", Toast.LENGTH_SHORT).show()
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
+        binding.btnPhoneTileClipboard.setOnClickListener {
+            binding.switchInstantSync.requestFocus()
+            Toast.makeText(requireContext(), "Shared Clipboard active", Toast.LENGTH_SHORT).show()
+        }
+        binding.btnPhoneTileNotifications.setOnClickListener {
+            val dialog = org.snow.ui.ApprovalsBottomSheetDialog()
+            dialog.show(parentFragmentManager, org.snow.ui.ApprovalsBottomSheetDialog.TAG)
+        }
+        binding.btnPhoneTileApps.setOnClickListener { binding.btnLaunchAppSheet.performClick() }
+        binding.btnPhoneTileMedia.setOnClickListener {
+            Toast.makeText(requireContext(), "Toggling peer media...", Toast.LENGTH_SHORT).show()
+            SnowUiRepository.getInstance(requireContext()).sendMediaKey("PLAY_PAUSE")
+        }
+        binding.btnPhoneTileFiles.setOnClickListener {
+            (activity as? org.snow.ui.MainActivity)?.selectTab(R.id.nav_files)
+        }
+        binding.btnPhoneTileShare.setOnClickListener {
+            val input = android.widget.EditText(requireContext()).apply {
+                hint = "https://example.com or message"
+            }
+            AlertDialog.Builder(requireContext())
+                .setTitle("Share Link or Text with Peer")
+                .setMessage("Enter a verified URL or text note to send directly to this peer:")
+                .setView(input)
+                .setPositiveButton("Send") { _, _ ->
+                    val raw = input.text.toString().trim()
+                    if (raw.isNotEmpty()) {
+                        val isUrl = raw.startsWith("http://", ignoreCase = true) || raw.startsWith("https://", ignoreCase = true)
+                        val url = if (isUrl) raw else null
+                        val text = if (!isUrl) raw else null
+                        SnowUiRepository.getInstance(requireContext()).shareLink(url, text) { success, err ->
+                            activity?.runOnUiThread {
+                                if (success) {
+                                    Toast.makeText(requireContext(), "Shared with peer successfully", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Toast.makeText(requireContext(), "Failed to share: $err", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
         binding.btnRefreshApprovals.setOnClickListener {
             refreshPendingApprovals()
         }
@@ -452,19 +550,42 @@ class DashboardFragment : Fragment() {
             viewModel.pcTelemetry.collectLatest { pc ->
                 if (pc.isAvailable && pc.isConnected) {
                     val isAndroid = pc.os?.contains("Android", ignoreCase = true) == true
-                    binding.tvWallpaperDeviceBadge.text = if (isAndroid) "📱 Android Phone" else "🖥️ Windows PC"
-                    binding.tvPcBattery.text = if (pc.batteryPercent != null) "${pc.batteryPercent}%" else "AC Power"
-                    binding.tvPcCharging.text = if (pc.isCharging == true) "Charging" else if (pc.batteryPercent != null) "Battery" else "Plugged in"
-                    if (pc.hostname != null) {
-                        val endpoint = viewModel.connectedEndpoint.value ?: ""
-                        val transportSuffix = if (endpoint.startsWith("127.0.0.1") || endpoint.startsWith("localhost")) " • USB" else " • Wi-Fi"
-                        binding.tvHeroPeerName.text = "${pc.hostname} (${pc.os ?: "Windows"})$transportSuffix"
+                    if (isAndroid) {
+                        binding.layoutPcHero.visibility = View.GONE
+                        binding.layoutPhoneHero.visibility = View.VISIBLE
+                        binding.layoutPcCapabilityTiles.visibility = View.GONE
+                        binding.layoutPhoneCapabilityTiles.visibility = View.VISIBLE
+
+                        binding.tvPhoneHeroTitle.text = pc.hostname ?: "Android Peer"
+                        binding.tvPhoneHeroStatusPill.text = "CONNECTED • PEER"
+                        binding.tvPhoneHeroStatusPill.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
+                        binding.tvPhoneRamStats.text = if (pc.memoryPercent != null) String.format(Locale.getDefault(), "%.1f%% Used", pc.memoryPercent) else "--"
+                        binding.tvPhoneStorageStats.text = "--"
+                    } else {
+                        binding.layoutPcHero.visibility = View.VISIBLE
+                        binding.layoutPhoneHero.visibility = View.GONE
+                        binding.layoutPcCapabilityTiles.visibility = View.VISIBLE
+                        binding.layoutPhoneCapabilityTiles.visibility = View.GONE
+
+                        binding.tvWallpaperDeviceBadge.text = "🖥️ Windows PC"
+                        binding.tvPcBattery.text = if (pc.batteryPercent != null) "${pc.batteryPercent}%" else "AC Power"
+                        binding.tvPcCharging.text = if (pc.isCharging == true) "Charging" else if (pc.batteryPercent != null) "Battery" else "Plugged in"
+                        if (pc.hostname != null) {
+                            val endpoint = viewModel.connectedEndpoint.value ?: ""
+                            val transportSuffix = if (endpoint.startsWith("127.0.0.1") || endpoint.startsWith("localhost")) " • USB" else " • Wi-Fi"
+                            binding.tvHeroPeerName.text = "${pc.hostname} (${pc.os ?: "Windows"})$transportSuffix"
+                        }
+                        binding.tvPcCpu.text = if (pc.cpuPercent != null) String.format(Locale.getDefault(), "%.1f%%", pc.cpuPercent) else "0.0%"
+                        binding.tvPcRam.text = if (pc.memoryPercent != null) String.format(Locale.getDefault(), "%.1f%%", pc.memoryPercent) else "0.0%"
+                        val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(pc.lastUpdated))
+                        binding.tvTelemetryUpdated.text = "Last updated: $timeStr"
                     }
-                    binding.tvPcCpu.text = if (pc.cpuPercent != null) String.format(Locale.getDefault(), "%.1f%%", pc.cpuPercent) else "0.0%"
-                    binding.tvPcRam.text = if (pc.memoryPercent != null) String.format(Locale.getDefault(), "%.1f%%", pc.memoryPercent) else "0.0%"
-                    val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(pc.lastUpdated))
-                    binding.tvTelemetryUpdated.text = "Last updated: $timeStr"
                 } else {
+                    binding.layoutPcHero.visibility = View.VISIBLE
+                    binding.layoutPhoneHero.visibility = View.GONE
+                    binding.layoutPcCapabilityTiles.visibility = View.VISIBLE
+                    binding.layoutPhoneCapabilityTiles.visibility = View.GONE
+
                     binding.tvPcBattery.text = "--%"
                     binding.tvPcCharging.text = "Disconnected"
                     binding.tvPcCpu.text = "--%"

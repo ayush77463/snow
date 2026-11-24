@@ -51,7 +51,11 @@ class SettingsFragment : Fragment() {
         setupPeerHostControls()
         setupTrustControls()
         setupDiagnostics()
+        setupManualConnect()
+        setupAppUpdate()
         setupQuickSettingsTileControl()
+        setupSyncPreferences()
+        setupAdvancedAccordion()
         observeLogs()
     }
 
@@ -169,6 +173,16 @@ class SettingsFragment : Fragment() {
             powerMgr?.isIgnoringBatteryOptimizations(ctx.packageName) == true
         } else true
 
+        if (batteryIgnored) {
+            binding.tvBatteryOptimizationStatus.text = "Status: Granted (Unrestricted)"
+            binding.tvBatteryOptimizationStatus.setTextColor(ContextCompat.getColor(ctx, R.color.status_connected))
+            binding.btnGrantBatteryAccess.text = "Granted"
+        } else {
+            binding.tvBatteryOptimizationStatus.text = "Status: Standard (Optimized)"
+            binding.tvBatteryOptimizationStatus.setTextColor(ContextCompat.getColor(ctx, R.color.secondary_text))
+            binding.btnGrantBatteryAccess.text = "Allow"
+        }
+
         val sb = StringBuilder()
         sb.append("• Background Connectivity: Active (Foreground Service)\n")
         sb.append("• Notification Sync: ").append(if (notifGranted) "✓ Active (Granted)" else "○ Optional (Disabled)").append("\n")
@@ -177,6 +191,46 @@ class SettingsFragment : Fragment() {
         sb.append("• Battery Optimization: ").append(if (batteryIgnored) "✓ Unrestricted" else "○ Standard (Optimized)")
 
         binding.tvPermissionsChecklist.text = sb.toString()
+    }
+
+    private fun setupSyncPreferences() {
+        val prefs = requireContext().getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+        binding.swAutoConnectNearby.isChecked = prefs.getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, true)
+        binding.swAutoSyncScreenshots.isChecked = prefs.getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, true)
+
+        binding.swAutoConnectNearby.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, isChecked).apply()
+        }
+        binding.swAutoSyncScreenshots.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, isChecked).apply()
+        }
+
+        binding.btnGrantBatteryAccess.setOnClickListener {
+            openBatteryOptimizationSettings()
+        }
+    }
+
+    private fun setupAdvancedAccordion() {
+        binding.headerAdvancedDiagnostics.setOnClickListener {
+            val isGone = binding.layoutAdvancedDiagnosticsBody.visibility == View.GONE
+            binding.layoutAdvancedDiagnosticsBody.visibility = if (isGone) View.VISIBLE else View.GONE
+            binding.tvToggleAdvancedDiagnostics.text = if (isGone) "▲ Collapse" else "▼ Expand"
+        }
+    }
+
+    private fun openBatteryOptimizationSettings() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:${requireContext().packageName}")
+            }
+            try {
+                startActivity(intent)
+            } catch (_: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (_: Exception) {}
+            }
+        }
     }
 
     private fun setupQuickSettingsTileControl() {
@@ -278,7 +332,8 @@ class SettingsFragment : Fragment() {
 
     private fun setupDeviceIdentity() {
         val id = viewModel.deviceIdentity
-        binding.tvDeviceName.text = "Name: ${id.deviceName}"
+        val devName = if (id.deviceName.isNotBlank()) id.deviceName else Build.MODEL
+        binding.tvDeviceName.text = "Name: $devName"
         binding.tvDeviceId.text = "ID: ${id.deviceId}"
 
         binding.headerDeviceIdentity.setOnClickListener {
@@ -466,13 +521,103 @@ class SettingsFragment : Fragment() {
     private fun setupDiagnostics() {
         binding.btnClearDiagnostics.setOnClickListener {
             viewModel.clearLogs()
+            binding.tvDiagnosticsLog.text = "No diagnostic logs yet."
             Toast.makeText(requireContext(), "Logs cleared", Toast.LENGTH_SHORT).show()
+        }
+
+        binding.btnCopyDiagnostics.setOnClickListener {
+            val logs = binding.tvDiagnosticsLog.text.toString()
+            val redacted = logs.replace(Regex("(?i)(token|secret|ticket|key)\\s*[=:]\\s*['\"]?[a-zA-Z0-9_-]{12,}['\"]?"), "$1=[REDACTED]")
+            val clipboard = requireContext().getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val clip = android.content.ClipData.newPlainText("SNOW Diagnostics", redacted)
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(requireContext(), "Diagnostic logs copied to clipboard (tokens redacted)", Toast.LENGTH_SHORT).show()
         }
 
         binding.headerDiagnostics.setOnClickListener {
             val isGone = binding.layoutDiagnosticsBody.visibility == View.GONE
             binding.layoutDiagnosticsBody.visibility = if (isGone) View.VISIBLE else View.GONE
             binding.tvToggleDiagnostics.text = if (isGone) "▲ Collapse" else "▼ Expand"
+        }
+    }
+
+    private fun setupManualConnect() {
+        binding.btnSettingsManualConnect.setOnClickListener {
+            val host = binding.etSettingsManualHost.text?.toString()?.trim() ?: ""
+            val portStr = binding.etSettingsManualPort.text?.toString()?.trim() ?: ""
+            val port = portStr.toIntOrNull() ?: 8765
+
+            if (host.isBlank()) {
+                Toast.makeText(requireContext(), "Please enter an IP address or hostname", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            Toast.makeText(requireContext(), "Connecting to $host:$port...", Toast.LENGTH_SHORT).show()
+            org.snow.ui.SnowUiRepository.getInstance(requireContext()).connect(host, port)
+        }
+    }
+
+    private fun setupAppUpdate() {
+        val repo = org.snow.ui.SnowUiRepository.getInstance(requireContext())
+        binding.btnCheckAppUpdate.setOnClickListener {
+            binding.tvAppUpdateStatus.text = "Status: Checking paired desktop..."
+            binding.tvAppUpdateStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
+
+            repo.checkAppUpdate { info ->
+                activity?.runOnUiThread {
+                    if (_binding == null) return@runOnUiThread
+                    if (info == null) {
+                        binding.tvAppUpdateStatus.text = "Status: Could not reach desktop or not connected"
+                        binding.tvAppUpdateStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
+                        Toast.makeText(requireContext(), "Could not retrieve update information from desktop", Toast.LENGTH_SHORT).show()
+                        return@runOnUiThread
+                    }
+
+                    val currentCode = org.snow.BuildConfig.VERSION_CODE
+                    val currentName = org.snow.BuildConfig.VERSION_NAME
+                    if (!info.available || info.versionCode <= currentCode) {
+                        binding.tvAppUpdateStatus.text = "Status: Up to date (v$currentName, build $currentCode)"
+                        binding.tvAppUpdateStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
+                        Toast.makeText(requireContext(), "SNOW is up to date (v$currentName)", Toast.LENGTH_SHORT).show()
+                    } else {
+                        binding.tvAppUpdateStatus.text = "Status: Update available (v${info.versionName}, build ${info.versionCode})"
+                        binding.tvAppUpdateStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_blue))
+
+                        AlertDialog.Builder(requireContext())
+                            .setTitle("Direct App Update Available")
+                            .setMessage("Version ${info.versionName} (Build ${info.versionCode}) is staged on your paired PC.\n\nSize: ${info.sizeBytes / 1024} KB\nSHA-256: ${info.sha256.take(16)}...\n\nDownload and install now?")
+                            .setPositiveButton("Download & Install") { _, _ ->
+                                binding.tvAppUpdateStatus.text = "Status: Downloading update (0%)..."
+                                repo.downloadAndInstallUpdate(
+                                    updateInfo = info,
+                                    onProgress = { pct ->
+                                        activity?.runOnUiThread {
+                                            if (_binding != null) {
+                                                binding.tvAppUpdateStatus.text = "Status: Downloading update ($pct%)..."
+                                            }
+                                        }
+                                    },
+                                    onComplete = { success, errorMsg ->
+                                        activity?.runOnUiThread {
+                                            if (_binding != null) {
+                                                if (success) {
+                                                    binding.tvAppUpdateStatus.text = "Status: Installer launched"
+                                                    binding.tvAppUpdateStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_connected))
+                                                } else {
+                                                    binding.tvAppUpdateStatus.text = "Status: Update failed: $errorMsg"
+                                                    binding.tvAppUpdateStatus.setTextColor(ContextCompat.getColor(requireContext(), R.color.status_disconnected))
+                                                    Toast.makeText(requireContext(), "Update failed: $errorMsg", Toast.LENGTH_LONG).show()
+                                                }
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+                            .setNegativeButton("Later", null)
+                            .show()
+                    }
+                }
+            }
         }
     }
 

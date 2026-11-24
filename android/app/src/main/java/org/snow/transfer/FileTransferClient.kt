@@ -105,6 +105,14 @@ open class FileTransferClient(
         data object Unavailable : WallpaperResult
     }
 
+    data class AppUpdateInfo(
+        val versionCode: Int,
+        val versionName: String,
+        val sizeBytes: Long,
+        val sha256: String,
+        val available: Boolean
+    )
+
     private val httpClient: OkHttpClient = customClient ?: buildHttpClient()
 
     private fun buildHttpClient(): OkHttpClient {
@@ -628,6 +636,115 @@ open class FileTransferClient(
         } catch (e: Exception) {
             SafeLog.w(TAG, "Wallpaper GET error: ${e.message}")
             WallpaperResult.Unavailable
+        }
+    }
+
+    /**
+     * Query paired desktop for signed APK update metadata.
+     */
+    suspend fun getAppUpdateInfo(serverHost: String, transferPort: Int = 8766): Result<AppUpdateInfo> = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val url = "$baseUrl/api/v1/app/update-info"
+        val reqBuilder = Request.Builder()
+            .url(url)
+            .get()
+            .addHeader("X-Snow-Device-Id", deviceId)
+
+        val token = getAuthToken()
+        if (!token.isNullOrBlank()) {
+            reqBuilder.addHeader("Authorization", "Bearer $token")
+        }
+
+        try {
+            httpClient.newCall(reqBuilder.build()).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(Exception("Update info request failed with HTTP ${response.code}"))
+                }
+                val bodyStr = response.body?.string() ?: return@withContext Result.failure(Exception("Empty update info response"))
+                val json = JSONObject(bodyStr)
+                val info = AppUpdateInfo(
+                    versionCode = json.optInt("version_code", 0),
+                    versionName = json.optString("version_name", ""),
+                    sizeBytes = json.optLong("size_bytes", 0L),
+                    sha256 = json.optString("sha256", ""),
+                    available = json.optBoolean("available", false)
+                )
+                Result.success(info)
+            }
+        } catch (e: Exception) {
+            SafeLog.e(TAG, "getAppUpdateInfo error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Download signed APK directly from paired desktop into destFile with streaming SHA-256 verification.
+     */
+    suspend fun downloadAppApk(
+        serverHost: String,
+        transferPort: Int = 8766,
+        destFile: File,
+        expectedSha256: String,
+        onProgress: ((Int) -> Unit)? = null
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val url = "$baseUrl/api/v1/app/apk"
+        val reqBuilder = Request.Builder()
+            .url(url)
+            .get()
+            .addHeader("X-Snow-Device-Id", deviceId)
+
+        val token = getAuthToken()
+        if (!token.isNullOrBlank()) {
+            reqBuilder.addHeader("Authorization", "Bearer $token")
+        }
+
+        destFile.parentFile?.mkdirs()
+        val tempFile = File(destFile.parentFile, "${destFile.name}.part")
+        if (tempFile.exists()) tempFile.delete()
+
+        try {
+            httpClient.newCall(reqBuilder.build()).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(Exception("APK download failed with HTTP ${response.code}"))
+                }
+                val body = response.body ?: return@withContext Result.failure(Exception("Empty APK response body"))
+                val contentLength = body.contentLength()
+                var bytesRead = 0L
+
+                body.byteStream().use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        val buffer = ByteArray(CHUNK_SIZE)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            bytesRead += read
+                            if (contentLength > 0 && onProgress != null) {
+                                val pct = ((bytesRead * 100) / contentLength).toInt().coerceIn(0, 100)
+                                onProgress(pct)
+                            }
+                        }
+                        output.flush()
+                    }
+                }
+            }
+
+            val actualSha256 = computeSha256(tempFile)
+            if (expectedSha256.isNotBlank() && !actualSha256.equals(expectedSha256, ignoreCase = true)) {
+                tempFile.delete()
+                return@withContext Result.failure(SecurityException("SHA-256 mismatch for APK: expected $expectedSha256, got $actualSha256"))
+            }
+
+            if (destFile.exists()) destFile.delete()
+            if (!tempFile.renameTo(destFile)) {
+                tempFile.copyTo(destFile, overwrite = true)
+                tempFile.delete()
+            }
+            Result.success(destFile)
+        } catch (e: Exception) {
+            SafeLog.e(TAG, "downloadAppApk error: ${e.message}")
+            if (tempFile.exists()) tempFile.delete()
+            Result.failure(e)
         }
     }
 }

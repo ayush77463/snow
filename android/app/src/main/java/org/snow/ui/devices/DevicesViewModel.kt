@@ -84,6 +84,27 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         repository.updateDeviceConnectionMode(deviceId, mode)
     }
 
+    fun updateDeviceTrustTier(deviceId: String, tier: String) {
+        repository.updateDeviceTrustTier(deviceId, tier)
+    }
+
+    fun isPeerHostEnabled(): Boolean = repository.isPeerHostEnabled()
+    fun isPeerHostActive(): Boolean = repository.isPeerHostActive()
+    fun startPeerHost() = repository.startPeerHost()
+    fun stopPeerHost() = repository.stopPeerHost()
+    fun generatePeerHostPin(): String? = repository.generatePeerHostPin()
+    val peerHostState: StateFlow<org.snow.network.PeerHostState> get() = repository.peerHostState
+    val identity get() = repository.identity
+    fun generatePairingQrJson(): String? = repository.getPeerHostManager()?.generatePairingQrJson(repository.identity.deviceId)
+
+    fun filterDevices(devices: List<SavedDevice>, filter: String): List<SavedDevice> {
+        return when (filter.lowercase()) {
+            "pcs" -> devices.filter { !it.deviceName.contains("phone", ignoreCase = true) && !it.deviceName.contains("pixel", ignoreCase = true) && !it.deviceName.contains("android", ignoreCase = true) }
+            "phones" -> devices.filter { it.deviceName.contains("phone", ignoreCase = true) || it.deviceName.contains("pixel", ignoreCase = true) || it.deviceName.contains("android", ignoreCase = true) }
+            else -> devices
+        }
+    }
+
     fun refreshDevices() {
         repository.loadSavedDevices()
     }

@@ -60,6 +60,7 @@ class CoreConfig:
     relay_url: str = ""
     relay_group_id: str = ""
     relay_ticket: str = ""
+    staged_apk_path: str | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration invariants upon instantiation."""

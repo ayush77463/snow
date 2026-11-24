@@ -204,12 +204,129 @@ class SnowWebServer:
     # Route Handlers
     # =========================================================================
 
+    def _get_active_static_dir(self) -> Path:
+        """Return the user override directory if valid and complete, else bundled STATIC_DIR."""
+        override_dir = (Path.home() / ".snow" / "web_override").resolve()
+        if override_dir.is_dir():
+            idx = override_dir / "index.html"
+            js = override_dir / "app.js"
+            css = override_dir / "app.css"
+            try:
+                if (idx.is_file() and idx.stat().st_size > 0 and
+                    js.is_file() and js.stat().st_size > 0 and
+                    css.is_file() and css.stat().st_size > 0):
+                    return override_dir
+            except OSError:
+                pass
+        return STATIC_DIR
+
+    def _resolve_static_file(self, rel_path: str) -> Optional[Path]:
+        """Resolve a static asset enforcing strict extension allowlist and traversal protection."""
+        clean_rel = rel_path.lstrip("/").replace("\\", "/")
+        if ".." in clean_rel or ":" in clean_rel:
+            return None
+
+        from snow.updater import ALLOWED_STATIC_EXTENSIONS
+        target_ext = Path(clean_rel).suffix.lower()
+        if target_ext not in ALLOWED_STATIC_EXTENSIONS:
+            return None
+
+        active_dir = self._get_active_static_dir()
+        candidate = (active_dir / clean_rel).resolve()
+        try:
+            if candidate.is_relative_to(active_dir.resolve()) and candidate.is_file():
+                return candidate
+        except (ValueError, OSError):
+            pass
+
+        if active_dir != STATIC_DIR:
+            bundled = (STATIC_DIR / clean_rel).resolve()
+            try:
+                if bundled.is_relative_to(STATIC_DIR.resolve()) and bundled.is_file():
+                    return bundled
+            except (ValueError, OSError):
+                pass
+
+        return None
+
     async def handle_index(self, request: web.Request) -> web.Response:
-        """Serve index.html."""
-        index_file = STATIC_DIR / "index.html"
+        """Serve index.html with override precedence."""
+        active_dir = self._get_active_static_dir()
+        index_file = active_dir / "index.html"
+        if not index_file.is_file():
+            index_file = STATIC_DIR / "index.html"
         if not index_file.is_file():
             return web.Response(status=404, text="Static index.html not found.")
         return web.FileResponse(index_file)
+
+    async def handle_static_asset(self, request: web.Request) -> web.Response:
+        """Serve static assets with strict extension allowlist, traversal protection, and override precedence."""
+        rel_path = request.match_info.get("path", "")
+        file_path = self._resolve_static_file(rel_path)
+        if not file_path:
+            return web.Response(status=404, text="File not found or forbidden.")
+        return web.FileResponse(file_path)
+
+    async def handle_api_reset_web_ui_override(self, request: web.Request) -> web.Response:
+        """Reset Web UI override to bundled version (OWNER_MANUAL)."""
+        from snow.updater import reset_web_ui_override
+        success = reset_web_ui_override()
+        if success:
+            return web.json_response({"success": True, "message": "Successfully reset to bundled Web UI."})
+        return web.json_response({"success": False, "error": "Failed to remove Web UI override directory."}, status=500)
+
+    async def handle_api_system_update_check(self, request: web.Request) -> web.Response:
+        """Check for updates against configured release manifest without executing any installer."""
+        from snow.updater import check_for_updates
+        manifest_source = request.query.get("source")
+        try:
+            result = check_for_updates(manifest_source=manifest_source)
+            return web.json_response({"success": True, **result})
+        except Exception as e:
+            logger.error("Update check failed: %s", e)
+            return web.json_response({"success": False, "error": str(e)}, status=500)
+
+    async def handle_api_system_update_apply(self, request: web.Request) -> web.Response:
+        """Apply a verified update (OWNER_MANUAL only). Rejects AI_MCP calls."""
+        principal = request.headers.get("X-Snow-Principal", "OWNER_MANUAL")
+        if principal != "OWNER_MANUAL":
+            return web.json_response({
+                "success": False,
+                "status": "FORBIDDEN",
+                "error": "Security violation: Direct updates may only be initiated by the device owner."
+            }, status=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        update_type = body.get("update_type", "web_ui")
+        url_or_path = body.get("url") or body.get("path")
+        expected_sha256 = body.get("sha256")
+
+        if not url_or_path or not expected_sha256:
+            return web.json_response({"success": False, "error": "Missing required 'url'/'path' or 'sha256'."}, status=400)
+
+        from snow.updater import apply_web_ui_update, apply_desktop_installer_update
+
+        try:
+            if update_type == "web_ui":
+                apply_web_ui_update(archive_source=url_or_path, expected_sha256=expected_sha256)
+                return web.json_response({"success": True, "message": "Web UI update applied successfully. Refresh to reload."})
+            elif update_type == "desktop":
+                apply_desktop_installer_update(
+                    installer_path=url_or_path,
+                    expected_sha256=expected_sha256,
+                    execute=True,
+                    daemon_manager=getattr(self.bridge, "daemon_manager", None)
+                )
+                return web.json_response({"success": True, "message": "Installer launched. Core will restart shortly."})
+            else:
+                return web.json_response({"success": False, "error": f"Unknown update type: '{update_type}'"}, status=400)
+        except Exception as e:
+            logger.error("Failed to apply update: %s", e)
+            return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_auth_session(self, request: web.Request) -> web.Response:
         """Exchange single-use bootstrap token for session cookie and CSRF token."""
@@ -2513,10 +2630,13 @@ class SnowWebServer:
 
         # Main static UI
         app.router.add_get("/", self.handle_index)
-        app.router.add_static("/static", path=str(STATIC_DIR), name="static")
+        app.router.add_get("/static/{path:.*}", self.handle_static_asset)
 
         # Allowlisted API routes
         app.router.add_post("/api/auth/session", self.handle_auth_session)
+        app.router.add_post("/api/web-ui/reset-override", self.handle_api_reset_web_ui_override)
+        app.router.add_get("/api/system/update-check", self.handle_api_system_update_check)
+        app.router.add_post("/api/system/update-apply", self.handle_api_system_update_apply)
         app.router.add_get("/api/status", self.handle_api_status)
         app.router.add_get("/api/devices", self.handle_api_devices)
         app.router.add_post("/api/devices/revoke", self.handle_api_devices_revoke)

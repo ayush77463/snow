@@ -746,6 +746,20 @@
                                         <button id="btn-diag-copy-logs" class="btn btn-xs btn-outline-secondary">Copy Debug Logs</button>
                                         <button id="btn-diag-reset-tokens" class="btn btn-xs btn-outline-danger">Reset Tokens</button>
                                     </div>
+
+                                    <!-- Direct Updates & Hot-Swap UI -->
+                                    <div class="diag-updates-section mt-3 pt-3 border-top">
+                                        <div class="d-flex justify-content-between align-items-center mb-2">
+                                            <span class="text-sm font-semibold">Product Updates:</span>
+                                            <span id="update-status-badge" class="badge text-xs">v4.1.0 • Up to date</span>
+                                        </div>
+                                        <div class="d-flex gap-2 align-items-center flex-wrap">
+                                            <button id="btn-check-updates" class="btn btn-xs btn-outline-primary">Check for Updates</button>
+                                            <button id="btn-apply-update" class="btn btn-xs btn-primary d-none">Apply Update</button>
+                                            <button id="btn-reset-ui-override" class="btn btn-xs btn-outline-secondary">Reset to Bundled UI</button>
+                                        </div>
+                                        <div id="update-notes-container" class="mt-2 text-xs text-muted d-none"></div>
+                                    </div>
                                 </div>
                             </details>
                         </div>
