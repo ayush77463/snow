@@ -68,6 +68,43 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 instance ?: SnowUiRepository(context.applicationContext).also { instance = it }
             }
         }
+
+        fun deriveCanonicalSnowId(seed: String): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val hash = digest.digest(seed.toByteArray(Charsets.UTF_8))
+            val hex = hash.joinToString("") { "%02X".format(it) }
+            return "SNW-${hex.substring(0, 4)}-${hex.substring(4, 8)}"
+        }
+
+        fun normalizeRelayUrl(raw: String): String {
+            var s = raw.trim()
+            if (s.isEmpty()) return ""
+            if (s.startsWith("http://", ignoreCase = true)) {
+                s = "ws://" + s.substring("http://".length)
+            } else if (s.startsWith("https://", ignoreCase = true)) {
+                s = "wss://" + s.substring("https://".length)
+            } else if (!s.startsWith("ws://", ignoreCase = true) && !s.startsWith("wss://", ignoreCase = true)) {
+                s = "wss://$s"
+            }
+
+            return try {
+                val uri = java.net.URI(s)
+                val scheme = uri.scheme ?: if (s.startsWith("ws://", ignoreCase = true)) "ws" else "wss"
+                val host = uri.host ?: s.substringAfter("://").substringBefore("/").substringBefore(":")
+                val port = uri.port
+                val path = uri.path
+                val hostPort = if (port != -1) "$host:$port" else host
+                val cleanPath = if (path.isNullOrBlank() || path == "/") "/v1/tunnel" else path
+                "$scheme://$hostPort$cleanPath"
+            } catch (_: Exception) {
+                val scheme = if (s.startsWith("ws://", ignoreCase = true)) "ws" else "wss"
+                val body = s.substringAfter("://")
+                val hostPort = body.substringBefore("/")
+                val path = body.substringAfter("/", "")
+                val cleanPath = if (path.isBlank()) "/v1/tunnel" else "/$path"
+                "$scheme://$hostPort$cleanPath"
+            }
+        }
     }
 
     private val repoScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -76,6 +113,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // Persistent storage helpers
     val identity: DeviceIdentity by lazy { DeviceIdentity.getOrCreate(appContext) }
+    val canonicalSnowId: String by lazy { deriveCanonicalSnowId(identity.deviceId) }
     val tokenStorage: SharedPreferencesTokenStorage by lazy { SharedPreferencesTokenStorage(appContext) }
     val certPinStorage: EncryptedCertPinStorage by lazy { EncryptedCertPinStorage(appContext) }
     val safFolderManager: SafFolderManager by lazy { SafFolderManager(appContext) }
@@ -154,6 +192,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     private val _clipboardBufferItems = MutableStateFlow<List<ClipboardItemDto>>(emptyList())
     val clipboardBufferItems: StateFlow<List<ClipboardItemDto>> = _clipboardBufferItems.asStateFlow()
+
+    // Desktop Wallpaper Preview StateFlow
+    private val _desktopWallpaper = MutableStateFlow<android.graphics.Bitmap?>(null)
+    val desktopWallpaper: StateFlow<android.graphics.Bitmap?> = _desktopWallpaper.asStateFlow()
 
     // Phase 27 Direct Phone-to-Phone Peer Host state
     private val _peerHostState = MutableStateFlow(org.snow.network.PeerHostState())
@@ -495,6 +537,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         prefsV2.edit().putString("devices_json", serializeSavedDevices(updated)).apply()
     }
 
+    fun removeSavedDevice(deviceId: String) {
+        val updated = _savedDevices.value.filter { it.deviceId != deviceId }
+        _savedDevices.value = updated
+        val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+        prefsV2.edit().putString("devices_json", serializeSavedDevices(updated)).apply()
+    }
+
+    fun clearTerminalOutput() {
+        _terminalState.value = TerminalExecutionState()
+    }
+
     private fun clearSavedDevices() {
         _savedDevices.value = emptyList()
         val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
@@ -654,35 +707,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Phase 5A: Unified Connection Resolution & Relay Normalization ---
 
-    fun normalizeRelayUrl(raw: String): String {
-        var s = raw.trim()
-        if (s.isEmpty()) return ""
-        if (s.startsWith("http://", ignoreCase = true)) {
-            s = "ws://" + s.substring("http://".length)
-        } else if (s.startsWith("https://", ignoreCase = true)) {
-            s = "wss://" + s.substring("https://".length)
-        } else if (!s.startsWith("ws://", ignoreCase = true) && !s.startsWith("wss://", ignoreCase = true)) {
-            s = "wss://$s"
-        }
-
-        return try {
-            val uri = java.net.URI(s)
-            val scheme = uri.scheme ?: if (s.startsWith("ws://", ignoreCase = true)) "ws" else "wss"
-            val host = uri.host ?: s.substringAfter("://").substringBefore("/").substringBefore(":")
-            val port = uri.port
-            val path = uri.path
-            val hostPort = if (port != -1) "$host:$port" else host
-            val cleanPath = if (path.isNullOrBlank() || path == "/") "/v1/tunnel" else path
-            "$scheme://$hostPort$cleanPath"
-        } catch (_: Exception) {
-            val scheme = if (s.startsWith("ws://", ignoreCase = true)) "ws" else "wss"
-            val body = s.substringAfter("://")
-            val hostPort = body.substringBefore("/")
-            val path = body.substringAfter("/", "")
-            val cleanPath = if (path.isBlank()) "/v1/tunnel" else "/$path"
-            "$scheme://$hostPort$cleanPath"
-        }
-    }
+    fun normalizeRelayUrl(raw: String): String = Companion.normalizeRelayUrl(raw)
 
     fun connectRelay(normalizedRelayUrl: String) {
         updateRemoteRelayConfig(true, normalizedRelayUrl)
@@ -693,6 +718,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val input = raw.trim()
         if (input.isEmpty()) {
             onResult(false, "Input cannot be empty", null)
+            return
+        }
+
+        // 0. Check JSON QR payload format
+        if (input.startsWith("{")) {
+            processScannedQr(input, onResult)
             return
         }
 
@@ -801,6 +832,16 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         onResult(false, "Unrecognized connection format: $input", null)
     }
 
+    fun processScannedQr(qrText: String, onResult: (Boolean, String, String?) -> Unit) {
+        handleQrScanPayload(qrText) { success, errorMsg ->
+            if (success) {
+                onResult(true, "Pairing connected successfully!", "qr")
+            } else {
+                onResult(false, errorMsg ?: "Failed to process QR code", null)
+            }
+        }
+    }
+
     fun serializeSavedDevices(devices: List<SavedDevice>): String {
         val arr = org.json.JSONArray()
         for (d in devices) {
@@ -814,6 +855,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             obj.put("certFingerprint", d.certFingerprint ?: "")
             obj.put("connectionMode", d.connectionMode)
             obj.put("snowId", d.snowId ?: "")
+            obj.put("deviceType", d.deviceType)
             val epArr = org.json.JSONArray()
             for (ep in d.recentEndpoints) {
                 val epObj = org.json.JSONObject()
@@ -849,6 +891,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         )
                     }
                 }
+                val parsedType = obj.optString("deviceType", obj.optString("platform", "")).takeIf { it.isNotBlank() }
+                    ?: if (obj.optString("deviceName", "").lowercase().contains("phone") ||
+                           obj.optString("deviceName", "").lowercase().contains("android") ||
+                           obj.optString("connectionMode", "").lowercase().contains("phone")) "phone" else "pc"
                 list.add(
                     SavedDevice(
                         deviceId = obj.getString("deviceId"),
@@ -860,7 +906,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         certFingerprint = obj.optString("certFingerprint", "").takeIf { it.isNotBlank() },
                         recentEndpoints = eps.take(5),
                         connectionMode = obj.optString("connectionMode", "auto"),
-                        snowId = obj.optString("snowId", "").takeIf { it.isNotBlank() }
+                        snowId = obj.optString("snowId", "").takeIf { it.isNotBlank() },
+                        deviceType = parsedType
                     )
                 )
             }
@@ -1015,6 +1062,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Quick Actions & Clipboard ---
 
+    private val _permissionProfileState = MutableStateFlow("full_control")
+    val permissionProfileState: StateFlow<String> = _permissionProfileState.asStateFlow()
+
     var activePermissionProfile: String
         get() {
             val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
@@ -1030,8 +1080,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             serviceRef?.capabilityDispatcher?.activePermissionProfile = canonical
             val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             prefs.edit().putString("active_permission_profile", canonical).apply()
+            _permissionProfileState.value = canonical
             appendLog("INFO", TAG, "Active permission profile updated to $canonical")
         }
+
+    fun setAccessProfile(profileKey: String) {
+        activePermissionProfile = profileKey
+    }
 
     fun ringLocalPhone(durationSeconds: Int = 5) {
         repoScope.launch {
@@ -1299,6 +1354,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         cachedWallpaperBytes = null
         cachedWallpaperEtag = null
         cachedWallpaperBitmap = null
+        _desktopWallpaper.value = null
+    }
+
+    fun refreshDesktopWallpaper() {
+        repoScope.launch {
+            loadDesktopWallpaper()
+        }
     }
 
     suspend fun loadDesktopWallpaper(): android.graphics.Bitmap? {
@@ -1313,14 +1375,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 cachedWallpaperEtag = result.etag
                 val bmp = android.graphics.BitmapFactory.decodeByteArray(result.bytes, 0, result.bytes.size)
                 cachedWallpaperBitmap = bmp
+                _desktopWallpaper.value = bmp
                 bmp
             }
             is FileTransferClient.WallpaperResult.NotModified -> {
-                cachedWallpaperBitmap ?: cachedWallpaperBytes?.let {
+                (cachedWallpaperBitmap ?: cachedWallpaperBytes?.let {
                     val bmp = android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size)
                     cachedWallpaperBitmap = bmp
                     bmp
-                }
+                })?.also { _desktopWallpaper.value = it }
             }
             is FileTransferClient.WallpaperResult.Unavailable -> {
                 invalidateWallpaperCache()
@@ -2068,12 +2131,68 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
+    fun pinClipboardBufferItem(itemId: String, isPinned: Boolean, onComplete: ((Boolean, String?) -> Unit)? = null) {
+        val client = serviceRef?.client ?: run {
+            onComplete?.invoke(false, "Client disconnected")
+            return
+        }
+        client.sendRequest("clipboard_buffer_pin", mapOf("item_id" to itemId, "is_pinned" to isPinned)) { resp ->
+            repoScope.launch(Dispatchers.Main) {
+                if (resp.isSuccess) {
+                    fetchClipboardBuffer()
+                    onComplete?.invoke(true, null)
+                } else {
+                    onComplete?.invoke(false, resp.error?.message ?: "Failed to pin item")
+                }
+            }
+        }
+    }
+
+    fun clearClipboardBuffer(onComplete: ((Boolean, String?) -> Unit)? = null) {
+        val client = serviceRef?.client ?: run {
+            onComplete?.invoke(false, "Client disconnected")
+            return
+        }
+        client.sendRequest("clipboard_buffer_clear", emptyMap()) { resp ->
+            repoScope.launch(Dispatchers.Main) {
+                if (resp.isSuccess) {
+                    _clipboardBufferItems.value = emptyList()
+                    onComplete?.invoke(true, null)
+                } else {
+                    onComplete?.invoke(false, resp.error?.message ?: "Failed to clear clipboard")
+                }
+            }
+        }
+    }
+
+    fun createShareIntentForClipboardItem(item: ClipboardItemDto): Intent {
+        val intent = Intent(Intent.ACTION_SEND)
+        if (item.type == "image") {
+            val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
+            val files = cacheDir.listFiles { f -> f.name.contains(item.itemId.take(8)) }
+            val file = files?.firstOrNull()
+            if (file != null && file.exists()) {
+                val uri = androidx.core.content.FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
+                intent.type = if (file.extension.equals("jpg", ignoreCase = true)) "image/jpeg" else "image/png"
+                intent.putExtra(Intent.EXTRA_STREAM, uri)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } else {
+                intent.type = "text/plain"
+                intent.putExtra(Intent.EXTRA_TEXT, item.previewText)
+            }
+        } else {
+            intent.type = "text/plain"
+            intent.putExtra(Intent.EXTRA_TEXT, item.previewText)
+        }
+        return Intent.createChooser(intent, "Share via SNOW").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
     // --- Terminal Console with Stage 19A Confirmation Tickets ---
 
     fun executeTerminalCommand(
         command: String,
         ticket: String? = null,
-        onResult: (TerminalResult) -> Unit
+        onResult: (TerminalResult) -> Unit = {}
     ) {
         val client = serviceRef?.client
         val cleanCmd = command.trim()
@@ -2515,6 +2634,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun isPeerHostActive(): Boolean = serviceRef?.peerHostManager?.isHostModeActive() ?: false
     fun getPeerHostManager(): org.snow.network.AndroidPeerHostManager? = serviceRef?.peerHostManager
 
+    fun generatePeerHostQrJson(): String? {
+        val service = serviceRef ?: return null
+        return service.peerHostManager.generatePairingQrJson(identity.deviceId)
+    }
+
     fun startPeerHost() {
         val intent = Intent(appContext, SnowForegroundService::class.java).apply {
             action = SnowForegroundService.ACTION_START_PEER_HOST
@@ -2939,8 +3063,12 @@ data class SavedDevice(
     val certFingerprint: String? = null,
     val recentEndpoints: List<DeviceEndpoint> = emptyList(),
     val connectionMode: String = "auto",
-    val snowId: String? = null
-)
+    val snowId: String? = null,
+    val deviceType: String = "pc"
+) {
+    val isPhone: Boolean get() = deviceType.equals("phone", ignoreCase = true) || deviceType.equals("android", ignoreCase = true)
+    val isPc: Boolean get() = !isPhone
+}
 
 data class ActiveTransferInfo(
     val transferId: String,

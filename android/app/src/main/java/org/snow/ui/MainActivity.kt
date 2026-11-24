@@ -4,75 +4,97 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
-import android.view.View
+import android.provider.OpenableColumns
+import android.widget.Toast
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
-import androidx.core.content.ContextCompat
-import androidx.core.view.ViewCompat
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.view.WindowCompat
-import androidx.core.view.WindowInsetsCompat
-import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.combine
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import org.snow.R
-import org.snow.databinding.ActivityMainBinding
-import org.snow.network.ConnectionState
 import org.snow.security.SafeLog
 import org.snow.service.SnowForegroundService
-import org.snow.ui.dashboard.DashboardFragment
-import org.snow.ui.devices.DevicesFragment
-import org.snow.ui.files.FilesFragment
-import org.snow.ui.settings.SettingsFragment
 import org.snow.ui.settings.SettingsViewModel
-import org.snow.ui.terminal.TerminalFragment
 
 /**
- * Primary host activity providing Material 3 five-tab navigation across:
- * 1. Dashboard
- * 2. Devices
- * 3. Files
- * 4. Terminal
- * 5. Settings
+ * Primary host activity providing Material 3 Jetpack Compose Flagship UI.
  */
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
-        private const val KEY_ACTIVE_TAB = "key_active_tab"
-        private const val TAG_DASHBOARD = "tag_dashboard"
-        private const val TAG_DEVICES = "tag_devices"
-        private const val TAG_FILES = "tag_files"
-        private const val TAG_TERMINAL = "tag_terminal"
-        private const val TAG_SETTINGS = "tag_settings"
     }
 
-    private lateinit var binding: ActivityMainBinding
     private lateinit var repository: SnowUiRepository
-
-    private var activeTabId: Int = R.id.nav_dashboard
-    private var activeFragment: Fragment? = null
-    private lateinit var dashboardFragment: Fragment
-    private lateinit var devicesFragment: Fragment
-    private lateinit var filesFragment: Fragment
-    private lateinit var terminalFragment: Fragment
-    private lateinit var settingsFragment: Fragment
-
     private var service: SnowForegroundService? = null
     private var isBound = false
 
+    private var currentThemeMode by mutableIntStateOf(SettingsViewModel.THEME_SYSTEM)
+
     private val screenCaptureLauncher = registerForActivityResult(
-        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+        ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK && result.data != null) {
+        if (result.resultCode == RESULT_OK && result.data != null) {
             SafeLog.i(TAG, "MediaProjection screen capture consent granted by user; delegating to ForegroundService.")
-            org.snow.service.SnowForegroundService.startOneTimeScreenCapture(this, result.resultCode, result.data!!)
+            SnowForegroundService.startOneTimeScreenCapture(this, result.resultCode, result.data!!)
         } else {
             org.snow.capabilities.ScreenCaptureHandler.resetConsent()
             SafeLog.w(TAG, "MediaProjection screen capture consent cancelled or denied.")
+        }
+    }
+
+    private val qrScanLauncher = registerForActivityResult(ScanContract()) { result ->
+        val qrText = result.contents
+        if (!qrText.isNullOrBlank()) {
+            repository.connectByInput(qrText) { success, message, _ ->
+                runOnUiThread {
+                    if (success) {
+                        Toast.makeText(this, "Pairing connected successfully!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Pairing failed: $message", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
+    private val safFolderPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val success = repository.safFolderManager.persistFolderUri(uri)
+            if (success) {
+                Toast.makeText(this, "Download destination set to: ${repository.safFolderManager.getDestinationDisplayName()}", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Failed to persist SAF folder permission", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val (fileName, fileSize) = resolveUriMetadata(uri)
+            repository.startFileUpload(uri, fileName, fileSize) { success, errOrName ->
+                runOnUiThread {
+                    if (success) {
+                        Toast.makeText(this, "Upload complete: $errOrName", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Upload failed: $errOrName", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
         }
     }
 
@@ -96,19 +118,53 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         // Apply persisted appearance preference before super.onCreate
         val prefs = getSharedPreferences("snow_settings", Context.MODE_PRIVATE)
-        val savedTheme = prefs.getInt(SettingsViewModel.KEY_THEME_MODE, SettingsViewModel.THEME_SYSTEM)
-        AppCompatDelegate.setDefaultNightMode(savedTheme)
+        currentThemeMode = prefs.getInt(SettingsViewModel.KEY_THEME_MODE, SettingsViewModel.THEME_SYSTEM)
+        AppCompatDelegate.setDefaultNightMode(currentThemeMode)
 
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-
         repository = SnowUiRepository.getInstance(applicationContext)
 
         setupWindowInsets()
-        setupBottomNavigation(savedInstanceState)
-        observeGlobalState()
+
+        setContent {
+            SnowApp(
+                repository = repository,
+                onLaunchQrScanner = {
+                    val options = ScanOptions().apply {
+                        setPrompt("Scan SNOW Pairing QR Code")
+                        setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                        setCameraId(0)
+                        setBeepEnabled(false)
+                        setOrientationLocked(true)
+                        setCaptureActivity(PortraitCaptureActivity::class.java)
+                    }
+                    qrScanLauncher.launch(options)
+                },
+                onPickFilesToUpload = {
+                    filePickerLauncher.launch(arrayOf("*/*"))
+                },
+                onPickSafFolder = {
+                    safFolderPickerLauncher.launch(null)
+                },
+                onToggleScreenShareConsent = {
+                    val projMgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
+                    val captureIntent = projMgr?.createScreenCaptureIntent()
+                    if (captureIntent != null) {
+                        screenCaptureLauncher.launch(captureIntent)
+                    }
+                },
+                themeMode = currentThemeMode,
+                onThemeModeChanged = { mode ->
+                    currentThemeMode = mode
+                }
+            )
+        }
+
         checkScreenCaptureRequest(intent)
+    }
+
+    fun selectTab(tabId: Int) {
+        // Legacy fragment callback compatibility
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -132,7 +188,7 @@ class MainActivity : AppCompatActivity() {
         org.snow.capabilities.ClipboardHandler.onActivityResumed("MainActivity")
         org.snow.capabilities.ClipboardHandler.isUserIntentGranted = true
         lifecycleScope.launch {
-            kotlinx.coroutines.delay(150)
+            delay(150)
             repository.checkAndSyncForegroundClipboard()
         }
     }
@@ -145,7 +201,7 @@ class MainActivity : AppCompatActivity() {
             lifecycleScope.launch {
                 // 150ms delay required on Android 10+ / Android 17 (ColorOS) for window focus
                 // to settle before primary clipboard read is permitted by the OS.
-                kotlinx.coroutines.delay(150)
+                delay(150)
                 repository.checkAndSyncForegroundClipboard()
             }
         }
@@ -183,200 +239,21 @@ class MainActivity : AppCompatActivity() {
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
         insetsController.isAppearanceLightStatusBars = !isNight
         insetsController.isAppearanceLightNavigationBars = !isNight
-
-        ViewCompat.setOnApplyWindowInsetsListener(binding.rootLayout) { _, insets ->
-            val systemBars = insets.getInsets(
-                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
-            )
-            binding.appHeader.setPadding(
-                binding.appHeader.paddingLeft,
-                systemBars.top + 12,
-                binding.appHeader.paddingRight,
-                binding.appHeader.paddingBottom
-            )
-            binding.bottomNavigation.setPadding(
-                binding.bottomNavigation.paddingLeft,
-                binding.bottomNavigation.paddingTop,
-                binding.bottomNavigation.paddingRight,
-                systemBars.bottom
-            )
-            insets
-        }
     }
 
-    private fun setupBottomNavigation(savedInstanceState: Bundle?) {
-        val fm = supportFragmentManager
-
-        if (savedInstanceState == null) {
-            dashboardFragment = DashboardFragment()
-            devicesFragment = DevicesFragment()
-            filesFragment = FilesFragment()
-            terminalFragment = TerminalFragment()
-            settingsFragment = SettingsFragment()
-
-            fm.beginTransaction()
-                .add(R.id.fragment_container, dashboardFragment, TAG_DASHBOARD)
-                .add(R.id.fragment_container, devicesFragment, TAG_DEVICES).hide(devicesFragment)
-                .add(R.id.fragment_container, filesFragment, TAG_FILES).hide(filesFragment)
-                .add(R.id.fragment_container, terminalFragment, TAG_TERMINAL).hide(terminalFragment)
-                .add(R.id.fragment_container, settingsFragment, TAG_SETTINGS).hide(settingsFragment)
-                .commit()
-
-            activeTabId = R.id.nav_dashboard
-            activeFragment = dashboardFragment
-        } else {
-            activeTabId = savedInstanceState.getInt(KEY_ACTIVE_TAB, R.id.nav_dashboard)
-            dashboardFragment = fm.findFragmentByTag(TAG_DASHBOARD) ?: DashboardFragment()
-            devicesFragment = fm.findFragmentByTag(TAG_DEVICES) ?: DevicesFragment()
-            filesFragment = fm.findFragmentByTag(TAG_FILES) ?: FilesFragment()
-            terminalFragment = fm.findFragmentByTag(TAG_TERMINAL) ?: TerminalFragment()
-            settingsFragment = fm.findFragmentByTag(TAG_SETTINGS) ?: SettingsFragment()
-
-            activeFragment = when (activeTabId) {
-                R.id.nav_devices -> devicesFragment
-                R.id.nav_files -> filesFragment
-                R.id.nav_settings -> settingsFragment
-                else -> dashboardFragment
-            }
-        }
-
-        binding.bottomNavigation.selectedItemId = activeTabId
-        binding.bottomNavigation.setOnItemSelectedListener { item ->
-            val target = when (item.itemId) {
-                R.id.nav_dashboard -> dashboardFragment
-                R.id.nav_devices -> devicesFragment
-                R.id.nav_files -> filesFragment
-                R.id.nav_settings -> settingsFragment
-                else -> null
-            }
-            if (target != null) {
-                activeTabId = item.itemId
-                switchFragment(target)
-                true
-            } else {
-                false
-            }
-        }
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
-        outState.putInt(KEY_ACTIVE_TAB, activeTabId)
-    }
-
-    private fun switchFragment(target: Fragment) {
-        if (activeFragment == target) return
-        val tx = supportFragmentManager.beginTransaction()
-        activeFragment?.let { tx.hide(it) }
-        tx.show(target).commit()
-        activeFragment = target
-    }
-
-    fun selectTab(tabId: Int) {
-        binding.bottomNavigation.selectedItemId = tabId
-    }
-
-    private fun observeGlobalState() {
-        binding.btnHeaderApprovals.setOnClickListener {
-            val dialog = ApprovalsBottomSheetDialog()
-            dialog.show(supportFragmentManager, ApprovalsBottomSheetDialog.TAG)
-        }
-
-        binding.headerStatusPill.setOnClickListener {
-            showDeviceSwitcherDialog()
-        }
-
-        lifecycleScope.launch {
-            repository.pendingApprovalsCount.collectLatest { count ->
-                if (count > 0) {
-                    binding.tvHeaderApprovalsBadge.visibility = View.VISIBLE
-                    binding.tvHeaderApprovalsBadge.text = count.toString()
-                } else {
-                    binding.tvHeaderApprovalsBadge.visibility = View.GONE
+    private fun resolveUriMetadata(uri: Uri): Pair<String, Long> {
+        var name = "upload_file"
+        var size = 0L
+        try {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (cursor.moveToFirst()) {
+                    if (nameIdx != -1) name = cursor.getString(nameIdx) ?: name
+                    if (sizeIdx != -1) size = cursor.getLong(sizeIdx)
                 }
             }
-        }
-
-        lifecycleScope.launch {
-            combine(repository.connectionState, repository.connectedEndpoint, repository.savedDevices) { state, endpoint, _ ->
-                Pair(state, endpoint)
-            }.collectLatest { (state, endpoint) ->
-                renderHeaderStatus(state, endpoint)
-            }
-        }
-    }
-
-    private fun showDeviceSwitcherDialog() {
-        val saved = repository.savedDevices.value
-        val hostState = repository.peerHostState.value
-        val items = mutableListOf<String>()
-        val actions = mutableListOf<() -> Unit>()
-        val curHost = repository.currentTargetHost
-
-        if (saved.isNotEmpty()) {
-            saved.forEach { d ->
-                val isActive = repository.connectionState.value == ConnectionState.CONNECTED && (d.host == curHost || (curHost == "127.0.0.1" && d.host == "127.0.0.1"))
-                val activeIndicator = if (isActive) " (Active)" else ""
-                val mode = d.connectionMode.replaceFirstChar { it.uppercase() }
-                items.add("🖥 ${d.deviceName} • $mode$activeIndicator")
-                actions.add {
-                    repository.connect(d.host, d.port)
-                }
-            }
-        }
-
-        if (hostState.isActive && hostState.peerCount > 0) {
-            items.add("📱 Peer Host (${hostState.peerCount} linked)")
-            actions.add { }
-        }
-
-        if (items.isEmpty()) {
-            items.add("No devices paired yet. Tap to Pair New Device")
-            actions.add {
-                selectTab(R.id.nav_devices)
-            }
-        }
-
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Switch Active Device")
-            .setItems(items.toTypedArray()) { _, which ->
-                actions.getOrNull(which)?.invoke()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun renderHeaderStatus(state: ConnectionState, endpoint: String?) {
-        val cleanEndpoint = endpoint ?: ""
-        val isUsb = cleanEndpoint.startsWith("127.0.0.1") || cleanEndpoint.startsWith("localhost")
-        val isRelay = cleanEndpoint.startsWith("relay:") || cleanEndpoint.contains("tunnel") || cleanEndpoint.contains(":8770")
-        val transport = if (isRelay) "Relay" else if (isUsb) "USB" else if (cleanEndpoint.isNotBlank()) "Wi-Fi" else "Auto"
-        val activeDev = repository.savedDevices.value.find { it.host == repository.currentTargetHost }
-        val targetName = activeDev?.deviceName ?: repository.pcTelemetry.value?.hostname ?: "SNOW Core"
-
-        when (state) {
-            ConnectionState.CONNECTED -> {
-                binding.headerStatusPill.text = "• $targetName • $transport ∨"
-                binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connected))
-            }
-            ConnectionState.CONNECTING -> {
-                binding.headerStatusPill.text = "• Connecting... ∨"
-                binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connecting))
-            }
-            ConnectionState.RECONNECTING -> {
-                binding.headerStatusPill.text = "• Reconnecting... ∨"
-                binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_reconnecting))
-            }
-            ConnectionState.DISCONNECTED -> {
-                val peerHostActive = repository.peerHostState.value.isActive
-                if (peerHostActive) {
-                    binding.headerStatusPill.text = "• Peer Host • WSS ∨"
-                    binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_connected))
-                } else {
-                    binding.headerStatusPill.text = "Disconnected ∨"
-                    binding.headerStatusPill.setTextColor(ContextCompat.getColor(this, R.color.status_disconnected))
-                }
-            }
-        }
+        } catch (_: Exception) { }
+        return Pair(name, size)
     }
 }
