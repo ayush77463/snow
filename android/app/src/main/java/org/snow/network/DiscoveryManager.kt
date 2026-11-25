@@ -34,7 +34,8 @@ data class DiscoveredPeer(
     val certFingerprint: String,
     val lastSeenTimestamp: Long = System.currentTimeMillis(),
     val isPaired: Boolean = false,
-    val snowId: String? = null
+    val snowId: String? = null,
+    val wakeTarget: String? = null
 ) {
     val isStale: Boolean
         get() = (System.currentTimeMillis() - lastSeenTimestamp) > DiscoveryManager.STALE_TIMEOUT_MS
@@ -51,7 +52,9 @@ class DiscoveryManager(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     var certPinStorage: CertPinStorage? = null,
     var tokenStorage: TokenStorage? = null,
-    private val port: Int = Constants.DEFAULT_DISCOVERY_PORT
+    private val port: Int = Constants.DEFAULT_DISCOVERY_PORT,
+    var localDeviceId: String? = null,
+    var onWakeTargetMatched: ((DiscoveredPeer) -> Unit)? = null
 ) {
     companion object {
         const val TAG = "DiscoveryManager"
@@ -91,6 +94,7 @@ class DiscoveryManager(
                 val xferPort = json.optInt("transfer_port", 0)
                 val certFp = json.optString("cert_fingerprint", "")
                 val snowId = json.optString("snow_id", "").takeIf { it.isNotBlank() }
+                val wakeTarget = json.optString("wake_target", "").takeIf { it.isNotBlank() }
 
                 val ts = json.optDouble("timestamp", Double.NaN)
                 if (ts.isNaN()) return null
@@ -110,7 +114,8 @@ class DiscoveryManager(
                     transferPort = xferPort,
                     certFingerprint = certFp,
                     lastSeenTimestamp = currentTimeMs,
-                    snowId = snowId
+                    snowId = snowId,
+                    wakeTarget = wakeTarget
                 )
             } catch (e: Exception) {
                 SafeLog.w(TAG, "Failed parsing discovery beacon: ${e.message}")
@@ -194,6 +199,12 @@ class DiscoveryManager(
         val enriched = peer.copy(isPaired = isPaired)
         peerMap[peer.deviceId] = enriched
         publishPeers()
+
+        val targetId = peer.wakeTarget?.trim()
+        val myId = localDeviceId?.trim()
+        if (isPaired && !targetId.isNullOrBlank() && !myId.isNullOrBlank() && targetId == myId) {
+            onWakeTargetMatched?.invoke(enriched)
+        }
     }
 
     private fun pruneStalePeers() {

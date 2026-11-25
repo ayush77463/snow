@@ -69,6 +69,55 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             }
         }
 
+        fun resolveUiConnectionState(transport: ConnectionState, auth: AuthState): ConnectionState {
+            return when {
+                transport == ConnectionState.CONNECTED && auth is AuthState.Authenticated -> ConnectionState.CONNECTED
+                transport == ConnectionState.CONNECTED && (
+                    auth is AuthState.ConnectedUnauthenticated || auth is AuthState.Connecting
+                ) -> ConnectionState.CONNECTING
+                transport == ConnectionState.CONNECTED -> ConnectionState.DISCONNECTED
+                auth is AuthState.AuthFailed ||
+                    auth is AuthState.FingerprintConfirmationRequired ||
+                    auth is AuthState.FingerprintMismatch -> ConnectionState.DISCONNECTED
+                else -> transport
+            }
+        }
+
+        fun isSessionTrulyConnected(transport: ConnectionState, auth: AuthState): Boolean {
+            return transport == ConnectionState.CONNECTED && auth is AuthState.Authenticated
+        }
+
+        fun parseSemverTuple(raw: String): Triple<Int, Int, Int>? {
+            val cleaned = raw.trim().removePrefix("v").removePrefix("V")
+            val m = Regex("^(\\d+)\\.(\\d+)\\.(\\d+)$").matchEntire(cleaned) ?: return null
+            val major = m.groupValues[1].toIntOrNull() ?: return null
+            val minor = m.groupValues[2].toIntOrNull() ?: return null
+            val patch = m.groupValues[3].toIntOrNull() ?: return null
+            return Triple(major, minor, patch)
+        }
+
+        fun compareSemver(a: Triple<Int, Int, Int>, b: Triple<Int, Int, Int>): Int {
+            if (a.first != b.first) return a.first.compareTo(b.first)
+            if (a.second != b.second) return a.second.compareTo(b.second)
+            return a.third.compareTo(b.third)
+        }
+
+        fun isUpdateStrictlyNewer(
+            remoteInfo: FileTransferClient.AppUpdateInfo?,
+            installedVersionCode: Int,
+            installedVersionName: String
+        ): Boolean {
+            if (remoteInfo == null || !remoteInfo.available) return false
+            if (remoteInfo.versionCode <= 0 || remoteInfo.versionCode <= installedVersionCode) return false
+            if (remoteInfo.sizeBytes <= 0L) return false
+            val sha = remoteInfo.sha256.trim()
+            if (sha.length != 64 || !sha.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return false
+            val remoteVer = parseSemverTuple(remoteInfo.versionName) ?: return false
+            val localVer = parseSemverTuple(installedVersionName)
+            if (localVer != null && compareSemver(remoteVer, localVer) < 0) return false
+            return true
+        }
+
         @Volatile
         private var instance: SnowUiRepository? = null
 
@@ -133,12 +182,22 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
+    private val _uiConnectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
+    val uiConnectionState: StateFlow<ConnectionState> = _uiConnectionState.asStateFlow()
+
     private val _connectedEndpoint = MutableStateFlow<String?>(null)
     val connectedEndpoint: StateFlow<String?> = _connectedEndpoint.asStateFlow()
     val currentTargetHost: String get() = connectedHost.ifBlank { serviceRef?.client?.currentTargetHost ?: "" }
 
     private val _authState = MutableStateFlow<AuthState>(AuthState.Disconnected)
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
+
+    private val _revocationNotice = MutableStateFlow<String?>(null)
+    val revocationNotice: StateFlow<String?> = _revocationNotice.asStateFlow()
+
+    fun clearRevocationNotice() {
+        _revocationNotice.value = null
+    }
 
     val pairingState: StateFlow<PairingState> get() = pairingFlow.state
 
@@ -280,11 +339,19 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     private fun observeClientFlows(client: SnowWebSocketClient) {
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        client.autoReconnectEnabled = prefs.getBoolean(PREF_KEY_AUTO_CONNECT_ENABLED, true)
+        client.onDeviceRevoked = { reason ->
+            onDeviceRevokedReceived(reason)
+        }
+
         clientConnectionJob?.cancel()
         clientConnectionJob = repoScope.launch {
             client.connectionState.collectLatest { state ->
                 _connectionState.value = state
-                if (state == ConnectionState.CONNECTED) {
+                val currentAuth = client.authState.value
+                _uiConnectionState.value = resolveUiConnectionState(state, currentAuth)
+                if (state == ConnectionState.CONNECTED && currentAuth is AuthState.Authenticated) {
                     connectionAttemptCount = 0
                     if (client.currentTargetHost.isNotBlank()) {
                         connectedHost = client.currentTargetHost
@@ -305,11 +372,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         clientAuthJob = repoScope.launch {
             client.authState.collectLatest { auth ->
                 _authState.value = auth
-                if (auth is AuthState.Authenticated) {
+                val currentConn = client.connectionState.value
+                _uiConnectionState.value = resolveUiConnectionState(currentConn, auth)
+                if (auth is AuthState.Authenticated && currentConn == ConnectionState.CONNECTED) {
+                    connectionAttemptCount = 0
                     val host = client.currentTargetHost.takeIf { it.isNotBlank() } ?: connectedHost
                     val port = client.currentTargetPort
                     if (host.isNotBlank()) {
                         connectedHost = host
+                        _connectedEndpoint.value = "$host:$port"
                     }
                     // Initialize dedicated FileTransferClient tied to this authenticated session
                     _fileTransferClient = FileTransferClient(
@@ -320,13 +391,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         useTls = true
                     )
                     // Auto-restore Instant Sync (enabled by default unless user explicitly disabled)
-                    val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                    if (prefs.getBoolean(PREF_KEY_INSTANT_SYNC, true)) {
+                    val sPrefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                    if (sPrefs.getBoolean(PREF_KEY_INSTANT_SYNC, true)) {
                         toggleInstantClipboardSync(true)
                     }
-                    if (prefs.getBoolean(PREF_KEY_AUTO_SYNC_SCREENSHOTS, false)) {
+                    if (sPrefs.getBoolean(PREF_KEY_AUTO_SYNC_SCREENSHOTS, false)) {
                         screenshotObserver.register()
                     }
+                    queryPcStatus()
                     // Fetch latest shared clipboard buffer items and pending approvals immediately on auth
                     fetchClipboardBuffer()
                     refreshPendingApprovals(force = true)
@@ -337,10 +409,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         sessionId = auth.sessionId,
                         tier = auth.trustTier,
                         peerDeviceName = auth.peerDeviceName,
-                        peerDeviceType = auth.peerDeviceType
+                        peerDeviceType = auth.peerDeviceType,
+                        peerDeviceId = auth.peerDeviceId,
+                        peerSnowId = auth.peerSnowId
                     )
                 } else {
                     _fileTransferClient = null
+                    _connectedEndpoint.value = null
+                    if (auth !is AuthState.Connecting && auth !is AuthState.ConnectedUnauthenticated) {
+                        _pcTelemetry.value = PcTelemetry.UNAVAILABLE
+                        connectedHost = ""
+                    }
                     screenshotObserver.unregister()
                     approvalsEpoch.incrementAndGet()
                     approvalsFetchInFlight.set(false)
@@ -382,10 +461,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
         // Reset retry counter and manual-disconnect lock on explicit manual connection attempt
         SnowForegroundService.setDisconnectedByUser(appContext, false)
+        serviceRef?.client?.autoReconnectEnabled = prefs.getBoolean(PREF_KEY_AUTO_CONNECT_ENABLED, true)
         connectionAttemptCount = 0
         connectedHost = cleanHost
-        _connectedEndpoint.value = "$cleanHost:$port"
+        _connectedEndpoint.value = null
         _connectionState.value = ConnectionState.CONNECTING
+        _uiConnectionState.value = ConnectionState.CONNECTING
         appendLog("INFO", TAG, "Connecting to $cleanHost:$port...")
 
         val intent = Intent(appContext, SnowForegroundService::class.java).apply {
@@ -426,40 +507,52 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         appendLog("INFO", TAG, "Disconnecting from desktop.")
         cancelActiveTransfer()
         SnowForegroundService.setDisconnectedByUser(appContext, true)
+        serviceRef?.cancelAutoConnect()
+        serviceRef?.client?.disconnect()
         val intent = Intent(appContext, SnowForegroundService::class.java).apply {
             action = SnowForegroundService.ACTION_DISCONNECT
         }
-        appContext.startService(intent)
+        try {
+            appContext.startService(intent)
+        } catch (_: Exception) {}
         approvalsEpoch.incrementAndGet()
         approvalsPendingQueued.set(false)
         _pendingApprovals.value = emptyList()
         _pendingApprovalsCount.value = 0
         _connectedEndpoint.value = null
         connectedHost = ""
+        _pcTelemetry.value = PcTelemetry.UNAVAILABLE
         invalidateWallpaperCache()
         _authState.value = AuthState.Disconnected
         _connectionState.value = ConnectionState.DISCONNECTED
+        _uiConnectionState.value = ConnectionState.DISCONNECTED
     }
 
     fun disconnectAll() {
         appendLog("INFO", TAG, "Disconnect All requested by user.")
         cancelActiveTransfer()
         SnowForegroundService.setDisconnectedByUser(appContext, true)
+        serviceRef?.cancelAutoConnect()
         serviceRef?.stopRelay()
         stopPeerHost()
+        serviceRef?.client?.disconnect()
         val intent = Intent(appContext, SnowForegroundService::class.java).apply {
             action = SnowForegroundService.ACTION_DISCONNECT
         }
-        appContext.startService(intent)
+        try {
+            appContext.startService(intent)
+        } catch (_: Exception) {}
         approvalsEpoch.incrementAndGet()
         approvalsPendingQueued.set(false)
         _pendingApprovals.value = emptyList()
         _pendingApprovalsCount.value = 0
         _connectedEndpoint.value = null
         connectedHost = ""
+        _pcTelemetry.value = PcTelemetry.UNAVAILABLE
         invalidateWallpaperCache()
         _authState.value = AuthState.Disconnected
         _connectionState.value = ConnectionState.DISCONNECTED
+        _uiConnectionState.value = ConnectionState.DISCONNECTED
     }
 
     fun setAutoReconnectEnabled(enabled: Boolean) {
@@ -467,11 +560,39 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             .edit()
             .putBoolean(PREF_KEY_AUTO_CONNECT_ENABLED, enabled)
             .apply()
+        serviceRef?.client?.autoReconnectEnabled = enabled
         if (enabled) {
             SnowForegroundService.setDisconnectedByUser(appContext, false)
         } else {
             serviceRef?.cancelAutoConnect()
         }
+    }
+
+    fun onDeviceRevokedReceived(reason: String? = null) {
+        appendLog("WARN", TAG, "Remote device revocation processed: ${reason ?: "revoked by host"}")
+        tokenStorage.clearToken()
+        SnowForegroundService.setDisconnectedByUser(appContext, true)
+        serviceRef?.cancelAutoConnect()
+        cancelActiveTransfer()
+        val auth = _authState.value as? AuthState.Authenticated
+        val currentHostSnapshot = connectedHost.ifBlank { _connectedEndpoint.value?.substringBeforeLast(":") ?: "" }
+        val updated = _savedDevices.value.filterNot { dev ->
+            (auth?.peerSnowId != null && dev.snowId == auth.peerSnowId) ||
+                (auth?.peerDeviceId != null && dev.deviceId == auth.peerDeviceId) ||
+                (currentHostSnapshot.isNotBlank() && dev.host == currentHostSnapshot)
+        }
+        _savedDevices.value = updated
+        val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+        prefsV2.edit().putString("devices_json", serializeSavedDevices(updated)).apply()
+
+        _connectedEndpoint.value = null
+        connectedHost = ""
+        _pcTelemetry.value = PcTelemetry.UNAVAILABLE
+        invalidateWallpaperCache()
+        _authState.value = AuthState.Disconnected
+        _connectionState.value = ConnectionState.DISCONNECTED
+        _uiConnectionState.value = ConnectionState.DISCONNECTED
+        _revocationNotice.value = reason?.takeIf { it.isNotBlank() } ?: "Device access revoked by PC host."
     }
 
     fun pairDevice(pin: String, onStateChanged: ((PairingState) -> Unit)? = null) {
@@ -501,21 +622,59 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
-    fun unpairDevice() {
-        appendLog("INFO", TAG, "Unpairing device and clearing auth token.")
-        tokenStorage.clearToken()
-        _authState.value = AuthState.Disconnected
-        serviceRef?.client?.disconnect()
-        _connectionState.value = ConnectionState.DISCONNECTED
+    fun unpairDevice(targetDevice: SavedDevice? = null) {
+        appendLog("INFO", TAG, "Unpairing device${targetDevice?.let { " [${it.deviceId}]" } ?: ""} and clearing auth token.")
+        val client = serviceRef?.client
+        val currentToken = tokenStorage.getToken()
+        val devId = identity.deviceId
+        val activeAuth = _authState.value as? AuthState.Authenticated
+        val shouldDisconnectCurrent = targetDevice == null ||
+            (activeAuth?.peerSnowId != null && targetDevice.snowId == activeAuth.peerSnowId) ||
+            (activeAuth?.peerDeviceId != null && targetDevice.deviceId == activeAuth.peerDeviceId) ||
+            (connectedHost.isNotBlank() && targetDevice.host == connectedHost)
+
+        if (client != null && client.connectionState.value == ConnectionState.CONNECTED && !currentToken.isNullOrBlank() && shouldDisconnectCurrent) {
+            client.sendRequest(
+                action = "unpair_request",
+                data = mapOf(
+                    "device_id" to devId,
+                    "auth_token" to currentToken
+                )
+            ) { _ -> }
+        }
+
+        if (targetDevice != null) {
+            removeSavedDevice(targetDevice.deviceId)
+        } else {
+            clearSavedDevices()
+        }
+
+        if (shouldDisconnectCurrent) {
+            SnowForegroundService.setDisconnectedByUser(appContext, true)
+            serviceRef?.cancelAutoConnect()
+            tokenStorage.clearToken()
+            _connectedEndpoint.value = null
+            connectedHost = ""
+            _pcTelemetry.value = PcTelemetry.UNAVAILABLE
+            _authState.value = AuthState.Disconnected
+            client?.disconnect()
+            _connectionState.value = ConnectionState.DISCONNECTED
+            _uiConnectionState.value = ConnectionState.DISCONNECTED
+        }
     }
 
     fun resetTrust() {
         appendLog("INFO", TAG, "Resetting all cryptographic trust (clearing certificates and auth tokens).")
+        SnowForegroundService.setDisconnectedByUser(appContext, true)
+        serviceRef?.cancelAutoConnect()
         certPinStorage.clearPinnedFingerprint()
         tokenStorage.clearToken()
+        _connectedEndpoint.value = null
+        connectedHost = ""
         _authState.value = AuthState.Disconnected
         serviceRef?.client?.disconnect()
         _connectionState.value = ConnectionState.DISCONNECTED
+        _uiConnectionState.value = ConnectionState.DISCONNECTED
         clearSavedDevices()
     }
 
@@ -527,7 +686,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         if (!rawJson.isNullOrBlank()) {
             _savedDevices.value = deserializeSavedDevices(rawJson)
         } else {
-            // Safe migration from legacy snow_settings: discard placeholder 127.0.0.1
+            // Safe migration from legacy snow_settings: discard placeholder 127.0.0.1 and never key by token prefix
             val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             val savedHost = (prefs.getString("last_connected_host", "") ?: "").trim()
             val savedPort = prefs.getInt("last_connected_port", 8765)
@@ -536,15 +695,21 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             if (token != null) {
                 val validHost = if (savedHost.isNotBlank() && savedHost != "127.0.0.1") savedHost else ""
                 val endpoints = if (validHost.isNotBlank()) listOf(DeviceEndpoint(validHost, savedPort)) else emptyList()
+                val canonicalId = when {
+                    !pinnedFp.isNullOrBlank() -> deriveCanonicalSnowId("fp:${pinnedFp.replace(":", "").lowercase()}")
+                    validHost.isNotBlank() -> deriveCanonicalSnowId("host:$validHost:$savedPort")
+                    else -> "paired-desktop-legacy"
+                }
                 val migrated = SavedDevice(
-                    deviceId = token.take(8),
+                    deviceId = canonicalId,
                     deviceName = if (validHost.isNotBlank()) "Paired Desktop ($validHost)" else "Paired Desktop Core",
                     host = validHost,
                     port = savedPort,
                     lastSeen = "Active",
                     trustTier = "OWNER",
                     certFingerprint = pinnedFp,
-                    recentEndpoints = endpoints
+                    recentEndpoints = endpoints,
+                    snowId = canonicalId.takeIf { it.startsWith("SNW-") }
                 )
                 val list = listOf(migrated)
                 _savedDevices.value = list
@@ -561,15 +726,24 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         sessionId: String,
         tier: String = "PEER",
         peerDeviceName: String? = null,
-        peerDeviceType: String? = null
+        peerDeviceType: String? = null,
+        peerDeviceId: String? = null,
+        peerSnowId: String? = null
     ) {
         val cleanHost = host.trim()
-        val token = tokenStorage.getToken()
-        val deviceId = token?.take(8) ?: sessionId.take(8)
         val pinnedFp = certPinStorage.getPinnedFingerprint()
+        val cleanSnowId = peerSnowId?.trim()?.takeIf { it.isNotBlank() }
+        val cleanPeerId = peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+        val canonicalKey = cleanSnowId
+            ?: cleanPeerId
+            ?: pinnedFp?.takeIf { it.isNotBlank() }?.let { deriveCanonicalSnowId("fp:${it.replace(":", "").lowercase()}") }
+            ?: if (cleanHost.isNotBlank()) "peer-$cleanHost:$port" else "peer-$sessionId"
         val nowStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
 
         val matchedDiscovered = _discoveredPeers.value.find { it.ipAddress == cleanHost }
+        val resolvedSnowId = cleanSnowId
+            ?: matchedDiscovered?.snowId?.takeIf { it.isNotBlank() }
+            ?: (if (canonicalKey.startsWith("SNW-")) canonicalKey else null)
         val rawType = peerDeviceType?.takeIf { it.isNotBlank() }
             ?: matchedDiscovered?.deviceType?.takeIf { it.isNotBlank() }
         val resolvedType = when {
@@ -581,7 +755,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             ?: matchedDiscovered?.deviceName?.takeIf { it.isNotBlank() }
 
         val current = _savedDevices.value.toMutableList()
-        val existingIdx = current.indexOfFirst { it.deviceId == deviceId }
+        val existingIdx = current.indexOfFirst { dev ->
+            (cleanSnowId != null && dev.snowId == cleanSnowId) ||
+                (cleanPeerId != null && dev.deviceId == cleanPeerId) ||
+                dev.deviceId == canonicalKey ||
+                (cleanSnowId != null && dev.deviceId == cleanSnowId)
+        }
 
         val updatedEndpoints = mutableListOf<DeviceEndpoint>()
         if (cleanHost.isNotBlank() && cleanHost != "127.0.0.1") {
@@ -602,6 +781,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             val effectiveType = resolvedType ?: existing.deviceType
             val effectiveName = resolvedName ?: existing.deviceName
             current[existingIdx] = existing.copy(
+                deviceId = canonicalKey,
                 deviceName = effectiveName,
                 deviceType = effectiveType,
                 host = if (cleanHost != "127.0.0.1" || existing.host.isBlank()) cleanHost else existing.host,
@@ -609,7 +789,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 lastSeen = nowStr,
                 trustTier = effectiveTier,
                 certFingerprint = pinnedFp ?: existing.certFingerprint,
-                recentEndpoints = updatedEndpoints.take(5)
+                recentEndpoints = updatedEndpoints.take(5),
+                snowId = resolvedSnowId ?: existing.snowId
             )
         } else {
             val finalType = resolvedType ?: "pc"
@@ -618,7 +799,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             current.add(
                 0,
                 SavedDevice(
-                    deviceId = deviceId,
+                    deviceId = canonicalKey,
                     deviceName = finalName,
                     host = cleanHost,
                     port = port,
@@ -626,6 +807,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     trustTier = tier,
                     certFingerprint = pinnedFp,
                     recentEndpoints = updatedEndpoints.take(5),
+                    snowId = resolvedSnowId,
                     deviceType = finalType
                 )
             )
@@ -772,7 +954,16 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 val auth = _authState.value
                 if (state == ConnectionState.CONNECTED && auth is AuthState.Authenticated) {
                     appendLog("INFO", TAG, "Device already authenticated with desktop. Onboarding complete.")
-                    recordSuccessfulConnection(targetIp, port, auth.sessionId, auth.trustTier, auth.peerDeviceName, auth.peerDeviceType)
+                    recordSuccessfulConnection(
+                        host = targetIp,
+                        port = port,
+                        sessionId = auth.sessionId,
+                        tier = auth.trustTier,
+                        peerDeviceName = auth.peerDeviceName,
+                        peerDeviceType = auth.peerDeviceType,
+                        peerDeviceId = auth.peerDeviceId,
+                        peerSnowId = auth.peerSnowId
+                    )
                     onComplete(true, null)
                     return@launch
                 } else if (state == ConnectionState.CONNECTED && auth is AuthState.ConnectedUnauthenticated) {
@@ -3303,9 +3494,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             try {
                 val res = transferClient.getAppUpdateInfo(host, 8766)
                 if (res.isSuccess) {
-                    val info = res.getOrNull()
-                    appendLog("INFO", TAG, "App update check result: available=${info?.available}, code=${info?.versionCode}")
-                    onResult(info)
+                    val rawInfo = res.getOrNull()
+                    val strictlyNewer = isUpdateStrictlyNewer(
+                        rawInfo,
+                        org.snow.BuildConfig.VERSION_CODE,
+                        org.snow.BuildConfig.VERSION_NAME
+                    )
+                    val checkedInfo = rawInfo?.copy(available = strictlyNewer)
+                    appendLog("INFO", TAG, "App update check result: available=$strictlyNewer, remoteCode=${rawInfo?.versionCode}, localCode=${org.snow.BuildConfig.VERSION_CODE}")
+                    onResult(checkedInfo)
                 } else {
                     appendLog("WARN", TAG, "App update check failed on $host:8766: ${res.exceptionOrNull()?.message}")
                     onResult(null)

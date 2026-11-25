@@ -107,12 +107,18 @@ class AndroidCapabilityDispatcher(
                         flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                         putExtra("request_camera_capture", true)
                     }
-                    ActionNotificationHelper.postActionNotification(
-                        context = context,
-                        title = "Camera Photo Requested",
-                        content = "Tap to capture & send to PC",
-                        intent = reqIntent
-                    )
+                    if (ClipboardHandler.isAppInForeground) {
+                        try {
+                            context.startActivity(reqIntent)
+                        } catch (_: Exception) {}
+                    } else {
+                        ActionNotificationHelper.postActionNotification(
+                            context = context,
+                            title = "Camera Photo Requested",
+                            content = "Tap to grant camera permission and capture photo for PC",
+                            intent = reqIntent
+                        )
+                    }
                     return mapOf(
                         "success" to false,
                         "status" to "CAMERA_PERMISSION_REQUIRED",
@@ -127,18 +133,37 @@ class AndroidCapabilityDispatcher(
                         flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                         putExtra("request_camera_capture", true)
                     }
-                    ActionNotificationHelper.postActionNotification(
-                        context = context,
-                        title = "Camera Photo Requested",
-                        content = "Tap to capture & send to PC",
-                        intent = reqIntent
-                    )
-                    return mapOf(
-                        "success" to false,
-                        "status" to "FOREGROUND_USER_INTERACTION_REQUIRED",
-                        "error" to "Camera capture requires SNOW to be in the foreground with active visible user interaction. Action notification posted.",
-                        "remediation_hint" to "Tap 'Camera Photo Requested' on your phone to capture & send to PC."
-                    )
+                    if (ClipboardHandler.isAppInForeground) {
+                        try {
+                            context.startActivity(reqIntent)
+                        } catch (_: Exception) {
+                            ActionNotificationHelper.postActionNotification(
+                                context = context,
+                                title = "Camera Photo Requested",
+                                content = "Tap to capture & send to PC",
+                                intent = reqIntent
+                            )
+                        }
+                        return mapOf(
+                            "success" to false,
+                            "status" to "FOREGROUND_USER_INTERACTION_REQUIRED",
+                            "error" to "Camera shutter opened on phone; awaiting explicit user capture confirmation.",
+                            "remediation_hint" to "Capture and confirm the photo on your phone camera screen."
+                        )
+                    } else {
+                        ActionNotificationHelper.postActionNotification(
+                            context = context,
+                            title = "Camera Photo Requested",
+                            content = "Tap to capture & send to PC",
+                            intent = reqIntent
+                        )
+                        return mapOf(
+                            "success" to false,
+                            "status" to "FOREGROUND_USER_INTERACTION_REQUIRED",
+                            "error" to "Camera capture requires SNOW to be in the foreground with active visible user interaction. Action notification posted.",
+                            "remediation_hint" to "Tap 'Camera Photo Requested' on your phone to capture & send to PC."
+                        )
+                    }
                 }
             }
             "clipboard_pull" -> {

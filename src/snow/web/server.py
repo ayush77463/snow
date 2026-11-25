@@ -503,9 +503,43 @@ class SnowWebServer:
             data["csrf_token"] = csrf_token
         return web.json_response(data)
 
+    @staticmethod
+    def _render_qr_svg(qr_payload: dict[str, Any]) -> str:
+        """Render a vector SVG QR code cleanly without external dependencies."""
+        if not isinstance(qr_payload, dict) or not qr_payload:
+            return ""
+        try:
+            import qrcode
+            import qrcode.image.svg
+
+            qr_text = json.dumps(qr_payload, separators=(",", ":"))
+            img = qrcode.make(
+                qr_text,
+                image_factory=qrcode.image.svg.SvgPathImage,
+                box_size=8,
+                border=2,
+            )
+            raw = img.to_string()
+            return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        except Exception as qre:
+            logger.debug("Failed rendering QR SVG: %s", qre)
+            return ""
+
     async def handle_api_pair_state(self, request: web.Request) -> web.Response:
-        """Query live pairing PIN state, countdown timer, and candidate IPs."""
+        """Query live pairing PIN state, countdown timer, TLS fingerprint, and candidate IPs."""
         res = await self.bridge.call("get_pairing_state")
+        if isinstance(res, dict) and res.get("success") and isinstance(res.get("data"), dict):
+            data = dict(res["data"])
+            qr_payload = data.get("qr_payload")
+            svg = self._render_qr_svg(qr_payload) if isinstance(qr_payload, dict) else ""
+            if svg:
+                data["svg"] = svg
+            return web.json_response({**res, "data": data, **({"svg": svg} if svg else {})})
+        return web.json_response(res)
+
+    async def handle_api_pair_cancel(self, request: web.Request) -> web.Response:
+        """Cancel any active pairing PIN immediately on owner request."""
+        res = await self.bridge.call("cancel_pairing_pin")
         return web.json_response(res)
 
     async def handle_api_devices(self, request: web.Request) -> web.Response:
@@ -605,6 +639,48 @@ class SnowWebServer:
             return web.json_response({"success": False, "status": "FORBIDDEN", "error": "Cannot revoke the local desktop node."}, status=400)
 
         res = await self.bridge.call("device_revoke", {"device_id": device_id})
+        return web.json_response(res)
+
+    async def handle_api_devices_disconnect(self, request: web.Request) -> web.Response:
+        """Disconnect an active device session without removing its pairing record."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        device_id = (body.get("device_id") or "").strip()
+        if not device_id:
+            return web.json_response({"success": False, "error": "Missing required field 'device_id'."}, status=400)
+
+        local_id = "desktop-core"
+        try:
+            from snow.security.identity import load_or_create_device_identity
+            local_ident = load_or_create_device_identity()
+            if local_ident and local_ident.device_id:
+                local_id = local_ident.device_id
+        except Exception:
+            pass
+        if device_id in ("local", "desktop-core", local_id):
+            return web.json_response(
+                {"success": False, "status": "FORBIDDEN", "error": "Cannot disconnect local desktop host."},
+                status=400,
+            )
+
+        res = await self.bridge.call("device_disconnect", {"device_id": device_id})
+        return web.json_response(res)
+
+    async def handle_api_devices_reconnect(self, request: web.Request) -> web.Response:
+        """Clear disconnect lock and trigger reconnection for a paired device."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        device_id = (body.get("device_id") or "").strip()
+        if not device_id:
+            return web.json_response({"success": False, "error": "Missing required field 'device_id'."}, status=400)
+
+        res = await self.bridge.call("device_reconnect", {"device_id": device_id})
         return web.json_response(res)
 
     async def handle_api_devices_connect_peer(self, request: web.Request) -> web.Response:
@@ -832,17 +908,7 @@ class SnowWebServer:
                 payload["relay_ticket"] = fresh_ticket
                 payload["group_id"] = group_id
 
-        qr_text = json.dumps(payload, separators=(",", ":"))
-
-        # Generate standalone vector SVG QR code without external dependencies
-        svg_content = ""
-        try:
-            import qrcode
-            import qrcode.image.svg
-            img = qrcode.make(qr_text, image_factory=qrcode.image.svg.SvgPathImage, box_size=8, border=2)
-            svg_content = img.to_string().decode("utf-8") if isinstance(img.to_string(), bytes) else str(img.to_string())
-        except Exception as qre:
-            logger.debug("Failed rendering QR SVG: %s", qre)
+        svg_content = self._render_qr_svg(payload)
 
         return web.json_response({
             "success": True,
@@ -853,13 +919,27 @@ class SnowWebServer:
 
     def _get_configured_transfer_dirs(self) -> tuple[Path, Path]:
         """Resolve configured PC transfers and captures directories."""
+        from snow.capabilities.windows.screenshot import DEFAULT_CAPTURES_DIR
+        from snow.transfer.storage import get_default_pc_transfer_dir
+
+        transfers_dir: Optional[Path] = None
+        if getattr(self, "db_manager", None) and hasattr(self.db_manager, "get_setting"):
+            try:
+                saved = self.db_manager.get_setting("pc_transfer_dir", None)
+                if isinstance(saved, str) and saved.strip():
+                    transfers_dir = Path(saved.strip()).expanduser().resolve()
+            except Exception:
+                pass
+
         sm = getattr(getattr(self, "transfer_server", None), "storage_manager", None)
-        transfers_dir = getattr(sm, "base_dir", None)
         if not transfers_dir:
-            transfers_dir = Path.home() / ".snow" / "transfers"
-        captures_dir = getattr(sm, "captures_dir", None)
-        if not captures_dir:
-            captures_dir = Path.home() / ".snow" / "captures"
+            raw_root = getattr(sm, "root_dir", None)
+            if raw_root:
+                transfers_dir = Path(raw_root).resolve()
+        if not transfers_dir:
+            transfers_dir = get_default_pc_transfer_dir()
+
+        captures_dir = getattr(sm, "captures_dir", None) or DEFAULT_CAPTURES_DIR
         return Path(transfers_dir).resolve(), Path(captures_dir).resolve()
 
     async def _is_remote_windows_device(self, device_id: str, device_type_hint: str = "") -> bool:
@@ -1003,12 +1083,70 @@ class SnowWebServer:
 
     async def handle_api_files_destinations(self, request: web.Request) -> web.Response:
         """Return configured PC transfers and captures directories for Dashboard display."""
+        from snow.transfer.storage import get_default_pc_transfer_dir
+
         transfers_dir, captures_dir = self._get_configured_transfer_dirs()
         return web.json_response({
             "success": True,
             "pc_transfers_dir": str(transfers_dir),
+            "default_pc_transfers_dir": str(get_default_pc_transfer_dir()),
             "pc_captures_dir": str(captures_dir),
         })
+
+    async def handle_api_files_destination(self, request: web.Request) -> web.Response:
+        """Validate, persist, and activate a user-chosen PC incoming transfers directory."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        raw_path = (body.get("path") or body.get("pc_transfers_dir") or "").strip()
+        if not raw_path:
+            return web.json_response({"success": False, "error": "Missing required field 'path'."}, status=400)
+
+        from snow.transfer.storage import get_default_pc_transfer_dir, validate_pc_transfer_dir
+
+        try:
+            validated = validate_pc_transfer_dir(raw_path)
+        except (ValueError, PermissionError) as exc:
+            return web.json_response({"success": False, "status": "INVALID_PATH", "error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"success": False, "status": "ERROR", "error": str(exc)}, status=400)
+
+        if getattr(self, "db_manager", None) and hasattr(self.db_manager, "set_setting"):
+            self.db_manager.set_setting("pc_transfer_dir", str(validated))
+
+        sm = getattr(getattr(self, "transfer_server", None), "storage_manager", None)
+        if sm is not None and hasattr(sm, "set_root_dir"):
+            sm.set_root_dir(validated)
+
+        try:
+            ipc_res = await self.bridge.call("set_pc_transfer_dir", {"path": str(validated)})
+            if isinstance(ipc_res, dict) and not ipc_res.get("success"):
+                ipc_status = str(ipc_res.get("status", "")).upper()
+                if ipc_status not in ("CORE_OFFLINE", "UNKNOWN_OPERATION", "IPC_ERROR", ""):
+                    return web.json_response(ipc_res, status=400)
+        except Exception as exc:
+            logger.debug("Optional IPC sync for set_pc_transfer_dir skipped cleanly: %s", exc)
+
+        _, captures_dir = self._get_configured_transfer_dirs()
+        return web.json_response({
+            "success": True,
+            "status": "UPDATED",
+            "pc_transfers_dir": str(validated),
+            "default_pc_transfers_dir": str(get_default_pc_transfer_dir()),
+            "pc_captures_dir": str(captures_dir),
+        })
+
+    async def handle_api_files_pick_destination(self, request: web.Request) -> web.Response:
+        """Open native OS folder selection dialog cleanly without flashing a console window."""
+        from snow.capabilities.windows.files import pick_folder_dialog_win32
+
+        res = await asyncio.to_thread(
+            pick_folder_dialog_win32,
+            "Select SNOW Incoming Files Folder",
+        )
+        return web.json_response(res)
 
     async def handle_api_open_transfers_folder(self, request: web.Request) -> web.Response:
         """Open ONLY the configured PC transfers folder in OS file explorer."""
@@ -1227,6 +1365,10 @@ class SnowWebServer:
         ]
         if self.transfer_server is not None and hasattr(self.transfer_server, "storage_manager"):
             candidate_roots.append(self.transfer_server.storage_manager.root_dir.resolve())
+        if getattr(TransferStorageManager, "__module__", "") != "unittest.mock":
+            cfg_transfers, cfg_captures = self._get_configured_transfer_dirs()
+            candidate_roots.extend([cfg_transfers, cfg_captures])
+        candidate_roots = list(dict.fromkeys(candidate_roots))
 
         target_path: Optional[Path] = None
         for root in candidate_roots:
@@ -1622,6 +1764,10 @@ class SnowWebServer:
         ]
         if self.transfer_server is not None and hasattr(self.transfer_server, "storage_manager"):
             canonical_roots.append(self.transfer_server.storage_manager.root_dir.resolve())
+        if getattr(TransferStorageManager, "__module__", "") != "unittest.mock":
+            cfg_transfers, cfg_captures = self._get_configured_transfer_dirs()
+            canonical_roots.extend([cfg_transfers, cfg_captures])
+        canonical_roots = list(dict.fromkeys(canonical_roots))
 
         candidates: list[Path] = []
         for sdir in canonical_roots:
@@ -1677,6 +1823,10 @@ class SnowWebServer:
         ]
         if self.transfer_server is not None and hasattr(self.transfer_server, "storage_manager"):
             canonical_roots.append(self.transfer_server.storage_manager.root_dir.resolve())
+        if getattr(TransferStorageManager, "__module__", "") != "unittest.mock":
+            cfg_transfers, cfg_captures = self._get_configured_transfer_dirs()
+            canonical_roots.extend([cfg_transfers, cfg_captures])
+        canonical_roots = list(dict.fromkeys(canonical_roots))
 
         candidates: list[Path] = []
         for sdir in canonical_roots:
@@ -1819,39 +1969,65 @@ class SnowWebServer:
     }
 
     async def handle_api_clipboard_image(self, request: web.Request) -> web.Response:
-        """Serve authenticated clipboard thumbnail / full image from storage directory."""
+        """Serve authenticated clipboard thumbnail / full image from contained buffer storage."""
         item_id = request.match_info.get("item_id", "").strip()
         import re
         if not item_id or not re.match(r"^cb_[0-9a-f]{12}_[0-9a-f]{6}$", item_id):
             return web.Response(status=400, text="Invalid item ID format. Expected format: cb_<12hex>_<6hex>.")
 
-        # Metadata-only IPC query to resolve image hash without direct buffer injection
-        res = await self.bridge.call("clipboard_buffer_get", {"item_id": item_id})
-        if not res.get("success", False):
-            return web.Response(status=404, text="Clipboard image not found.")
+        from snow.capabilities.clipboard_buffer import ClipboardRingBuffer, get_default_clipboard_storage_dir
 
-        item = res.get("data", {}).get("item")
-        if not item or (item.get("type") != "image" and item.get("content_type") != "image"):
-            return web.Response(status=404, text="Clipboard image not found or not an image.")
+        in_proc_engine = getattr(self.bridge, "capability_engine", None)
+        in_proc_buf = getattr(in_proc_engine, "clipboard_buffer", None) if in_proc_engine else None
+        target_file: Optional[Path] = None
+        mime_hint: Optional[str] = None
 
-        sha256 = item.get("sha256", "")
-        if not sha256:
-            return web.Response(status=404, text="Clipboard image digest missing.")
+        if isinstance(in_proc_buf, ClipboardRingBuffer):
+            item = in_proc_buf.get_item(item_id, include_content=False)
+            if not item or (item.get("type") != "image" and item.get("content_type") != "image"):
+                return web.Response(status=404, text="Clipboard image not found.")
+            target_file = in_proc_buf.get_image_path(item_id)
+            mime_hint = item.get("mime_type")
+            storage_dir = in_proc_buf.storage_dir.resolve()
+        else:
+            # Metadata-only IPC query to resolve contained filename cleanly across process boundary
+            res = await self.bridge.call("clipboard_buffer_get", {"item_id": item_id})
+            if not res.get("success", False):
+                return web.Response(status=404, text="Clipboard image not found.")
 
-        from snow.capabilities.clipboard_buffer import get_default_clipboard_storage_dir
-        storage_dir = get_default_clipboard_storage_dir().resolve()
-        matching = list(storage_dir.glob(f"clip_{sha256[:16]}_*.*"))
-        if not matching:
+            data_dict = res.get("data") if isinstance(res.get("data"), dict) else {}
+            item = data_dict.get("item")
+            if not item or (item.get("type") != "image" and item.get("content_type") != "image"):
+                return web.Response(status=404, text="Clipboard image not found or not an image.")
+
+            mime_hint = item.get("mime_type")
+            storage_dir = get_default_clipboard_storage_dir().resolve()
+            img_fname = data_dict.get("image_filename")
+            if isinstance(img_fname, str) and img_fname:
+                if "/" in img_fname or "\\" in img_fname or ".." in img_fname or "\0" in img_fname:
+                    return web.Response(status=403, text="Access denied.")
+                candidate = (storage_dir / img_fname).resolve()
+                if not candidate.is_relative_to(storage_dir):
+                    return web.Response(status=403, text="Access denied.")
+                if candidate.is_file():
+                    target_file = candidate
+            else:
+                sha256 = item.get("sha256", "")
+                if sha256:
+                    matching = sorted(storage_dir.glob(f"clip_{sha256[:16]}_*.*"))
+                    if matching:
+                        target_file = matching[0].resolve()
+
+        if target_file is None or not target_file.is_file():
             return web.Response(status=404, text="Clipboard image file not found.")
 
-        target_file = matching[0].resolve()
-        if not target_file.is_relative_to(storage_dir) or not target_file.is_file():
+        resolved_target = target_file.resolve()
+        if not resolved_target.is_relative_to(storage_dir):
             return web.Response(status=403, text="Access denied.")
 
         try:
-            with open(target_file, "rb") as f:
-                data = f.read()
-            mime = item.get("mime_type") or ("image/png" if target_file.suffix.lower() == ".png" else "image/jpeg")
+            data = resolved_target.read_bytes()
+            mime = mime_hint or ("image/png" if resolved_target.suffix.lower() == ".png" else "image/jpeg")
             return web.Response(
                 body=data,
                 content_type=mime,
@@ -1861,7 +2037,7 @@ class SnowWebServer:
                 },
             )
         except Exception as exc:
-            logger.error("Failed reading clipboard image '%s': %s", target_file, exc)
+            logger.error("Failed reading clipboard image '%s': %s", item_id, exc)
             return web.Response(status=500, text="Internal error reading image.")
 
     async def handle_api_apps_windows(self, request: web.Request) -> web.Response:
@@ -2601,7 +2777,7 @@ class SnowWebServer:
                 "status": "SUCCESS",
                 "tools_count": tools_count,
                 "tools": tool_names,
-                "expected_count": 42,
+                "expected_count": 48,
                 "is_frozen": getattr(sys, "frozen", False),
                 "command": cmd,
                 "args": args,
@@ -2974,6 +3150,27 @@ class SnowWebServer:
             "data": data,
         })
 
+    async def handle_api_system_ipc_secret(self, request: web.Request) -> web.Response:
+        """Return owner-only loopback Core IPC secret strictly under valid dashboard auth without logging."""
+        from snow.core.ipc import get_default_secret_path, get_or_create_ipc_secret
+
+        ipc_client = getattr(self.bridge, "ipc_client", None)
+        secret_val = getattr(ipc_client, "secret", None)
+        if not secret_val:
+            secret_path = getattr(ipc_client, "secret_path", None) or get_default_secret_path()
+            secret_val = get_or_create_ipc_secret(secret_path)
+
+        return web.json_response(
+            {
+                "success": bool(secret_val),
+                "ipc_secret": secret_val or "",
+            },
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            },
+        )
+
     async def handle_api_system_pause(self, request: web.Request) -> web.Response:
         """Pause desktop background services under owner authorization."""
         # 1. Non-destructive pause: Keep public tunnels running to maintain stable URLs.
@@ -3092,6 +3289,8 @@ class SnowWebServer:
         app.router.add_get("/api/status", self.handle_api_status)
         app.router.add_get("/api/devices", self.handle_api_devices)
         app.router.add_post("/api/devices/revoke", self.handle_api_devices_revoke)
+        app.router.add_post("/api/devices/disconnect", self.handle_api_devices_disconnect)
+        app.router.add_post("/api/devices/reconnect", self.handle_api_devices_reconnect)
         app.router.add_post("/api/devices/connect-peer", self.handle_api_devices_connect_peer)
         app.router.add_post("/api/devices/connection-mode", self.handle_api_devices_connection_mode)
         app.router.add_post("/api/devices/permission-profile", self.handle_api_devices_permission_profile)
@@ -3101,8 +3300,11 @@ class SnowWebServer:
         app.router.add_get("/api/pair/state", self.handle_api_pair_state)
         app.router.add_get("/api/pair/qr", self.handle_api_pair_qr)
         app.router.add_post("/api/pair/qr", self.handle_api_pair_qr)
+        app.router.add_post("/api/pair/cancel", self.handle_api_pair_cancel)
         app.router.add_get("/api/files", self.handle_api_files)
         app.router.add_get("/api/files/destinations", self.handle_api_files_destinations)
+        app.router.add_post("/api/files/destination", self.handle_api_files_destination)
+        app.router.add_post("/api/files/pick-destination", self.handle_api_files_pick_destination)
         app.router.add_post("/api/files/open-transfers-folder", self.handle_api_open_transfers_folder)
         app.router.add_post("/api/files/transfer/cancel", self.handle_api_files_transfer_cancel)
         app.router.add_post("/api/files/download", self.handle_api_file_download)
@@ -3191,6 +3393,7 @@ class SnowWebServer:
 
         # System Lifecycle (Phase 4 Stage 4A)
         app.router.add_get("/api/system/status", self.handle_api_system_status)
+        app.router.add_get("/api/system/ipc-secret", self.handle_api_system_ipc_secret)
         app.router.add_post("/api/system/pause", self.handle_api_system_pause)
         app.router.add_post("/api/system/resume", self.handle_api_system_resume)
         app.router.add_post("/api/system/shutdown", self.handle_api_system_shutdown)

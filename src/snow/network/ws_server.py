@@ -169,7 +169,9 @@ class SnowWebSocketServer:
         self._clipboard_listener: Optional[WindowsClipboardListener] = None
         self._clipboard_watchdog_task: Optional[asyncio.Task] = None
         self._clipboard_debounce_task: Optional[asyncio.Task] = None
+        self._clipboard_update_lock: asyncio.Lock = asyncio.Lock()
         self._last_processed_clipboard_hash: str = ""
+        self._last_processed_canonical_hash: str = ""
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Phase 21: Live in-memory notification cache (strictly never persisted to disk)
         self.live_notifications: dict[str, list[dict[str, Any]]] = {}
@@ -177,6 +179,8 @@ class SnowWebSocketServer:
         self._screen_stream_sessions: dict[str, dict[str, Any]] = {}
         # Optional in-process RemoteMcpGateway reference for direct OAuth approval bridge
         self._oauth_approval_bridge: Any = None
+        # Devices manually disconnected by owner (hold auto-reconnect until Reconnect or re-pair)
+        self.manually_disconnected_devices: set[str] = set()
         # Phase 30 / Stage 4A: Cross-Network Federation Manager
         from snow.network.federation import FederationManager
         self.federation_manager = FederationManager(
@@ -1998,6 +2002,20 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
+        if device_id in self.manually_disconnected_devices:
+            logger.info("auth_request held for manually disconnected device [%s].", device_id)
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="MANUAL_DISCONNECT: Device manually disconnected by desktop owner.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            try:
+                await client.websocket.close(code=1000, reason="MANUAL_DISCONNECT")
+            except Exception:
+                pass
+            return
+
         # Verification successful: cancel handshake timeout
         timer = self._auth_timers.pop(client.connection_id, None)
         if timer and not timer.done():
@@ -2049,6 +2067,8 @@ class SnowWebSocketServer:
                 "action": "auth_request",
                 "data": {
                     "device_id": device_id,
+                    "server_device_id": self.device_identity.device_id,
+                    "snow_id": self.device_identity.snow_id,
                     "device_name": self.device_identity.device_name,
                     "session_id": session.session_id,
                     "trust_tier": device_record.trust_tier,
@@ -2079,6 +2099,7 @@ class SnowWebSocketServer:
                 )
 
                 if client_device_id:
+                    self.manually_disconnected_devices.discard(client_device_id)
                     # Clean up prior records / sessions if re-pairing
                     existing = self.db_manager.get_paired_device(client_device_id)
                     if existing:
@@ -2140,6 +2161,8 @@ class SnowWebSocketServer:
                         "action": action,
                         "data": {
                             "device_id": self.device_identity.device_id,
+                            "server_device_id": self.device_identity.device_id,
+                            "snow_id": self.device_identity.snow_id,
                             "device_name": self.device_identity.device_name,
                             "session_id": result.session_id,
                             "auth_token": auth_token,
@@ -3072,6 +3095,15 @@ class SnowWebSocketServer:
 
     async def _broadcast_clipboard_update(self) -> None:
         """Process desktop clipboard update, update shared ring buffer, and broadcast to clients."""
+        lock = getattr(self, "_clipboard_update_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._clipboard_update_lock = lock
+        async with lock:
+            await self._broadcast_clipboard_update_locked()
+
+    async def _broadcast_clipboard_update_locked(self) -> None:
+        """Serialized inner implementation of desktop clipboard synchronization."""
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -3081,22 +3113,35 @@ class SnowWebSocketServer:
             except Exception:
                 pass
 
-        content = await asyncio.to_thread(self.capability_engine.clipboard.get_content_sync)
-        if not content.get("success"):
+        from snow.capabilities.windows.clipboard import get_default_clipboard_temp_dir
+
+        clip_tmp_dir = get_default_clipboard_temp_dir()
+        try:
+            content = await asyncio.to_thread(
+                self.capability_engine.clipboard.get_content_sync, clip_tmp_dir
+            )
+        except TypeError:
+            content = await asyncio.to_thread(self.capability_engine.clipboard.get_content_sync)
+        if not isinstance(content, dict) or not content.get("success"):
             return
 
         c_type = content.get("type")
         c_hash = content.get("sha256")
-        if not c_hash or c_type == "empty":
-            return
-
-        # Echo suppression check: if hash is identical to last processed hash, skip
-        if c_hash == getattr(self, "_last_processed_clipboard_hash", ""):
-            return
-        self._last_processed_clipboard_hash = c_hash
-
+        c_canon = content.get("canonical_sha256") or c_hash
         temp_capture_file = content.get("file_path") if c_type == "image" else None
         try:
+            if not c_hash or c_type == "empty":
+                return
+
+            # Echo suppression check: match either encoded hash or canonical pixel digest
+            if c_hash == getattr(self, "_last_processed_clipboard_hash", "") or (
+                c_type == "image" and c_canon == getattr(self, "_last_processed_canonical_hash", "")
+            ):
+                return
+            self._last_processed_clipboard_hash = c_hash
+            if c_type == "image":
+                self._last_processed_canonical_hash = c_canon
+
             # Add to shared clipboard buffer
             buffer_item = None
             cb_buf = getattr(self, "clipboard_buffer", None) or getattr(self.capability_engine, "clipboard_buffer", None)
@@ -3121,6 +3166,8 @@ class SnowWebSocketServer:
                         )
                         if res.get("success") and res.get("item"):
                             buffer_item = res["item"]
+                            c_hash = buffer_item.get("sha256") or c_hash
+                            c_canon = buffer_item.get("canonical_sha256") or c_canon
 
             # Broadcast clipboard_buffer_updated event with lightweight metadata to all connected clients
             if buffer_item:
@@ -3139,10 +3186,10 @@ class SnowWebSocketServer:
                 if session is None:
                     continue
 
-                if self._last_synced_clipboard_hash.get(conn_id) == c_hash:
+                if self._last_synced_clipboard_hash.get(conn_id) in (c_hash, c_canon):
                     continue
 
-                self._last_synced_clipboard_hash[conn_id] = c_hash
+                self._last_synced_clipboard_hash[conn_id] = c_canon or c_hash
 
                 if c_type == "text":
                     text = content.get("text", "")
@@ -3180,6 +3227,8 @@ class SnowWebSocketServer:
                         persistent_path = cb_buf.get_image_path(buffer_item["item_id"])
                         if persistent_path and persistent_path.exists():
                             record.file_path = str(persistent_path)
+                            record.file_size = persistent_path.stat().st_size
+                            file_size = record.file_size
                         else:
                             record.file_path = file_path
                     else:
@@ -3205,13 +3254,19 @@ class SnowWebSocketServer:
                     except Exception as err:
                         logger.warning("Failed sending clipboard image push to [%s]: %s", conn_id, err, exc_info=True)
         finally:
-            if temp_capture_file and Path(temp_capture_file).is_file():
+            if temp_capture_file:
                 try:
                     import tempfile
                     temp_p = Path(temp_capture_file).resolve()
                     temp_dir = Path(tempfile.gettempdir()).resolve()
-                    # Only remove if strictly inside the system temp directory, never touch buffer directory
-                    if temp_dir in temp_p.parents or temp_p.parent == temp_dir:
+                    cb_dir = (
+                        Path(cb_buf.storage_dir).resolve()
+                        if locals().get("cb_buf") and getattr(cb_buf, "storage_dir", None)
+                        else None
+                    )
+                    in_system_temp = temp_dir in temp_p.parents or temp_p.parent == temp_dir
+                    is_buffer_file = bool(cb_dir and (cb_dir in temp_p.parents or temp_p.parent == cb_dir))
+                    if in_system_temp and not is_buffer_file:
                         temp_p.unlink(missing_ok=True)
                 except Exception:
                     pass

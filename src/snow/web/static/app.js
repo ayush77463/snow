@@ -111,6 +111,8 @@
     let currentDeviceFilter = "all";
     let currentFilesSegment = "files";
     let replyingNotificationKey = "";
+    const openNotificationReplyKeys = new Set();
+    const notificationReplyDrafts = new Map();
     let localHostIdentity = "This PC";
     let localHostDeviceId = "";
     let localHostTelemetry = {};
@@ -129,6 +131,19 @@
     let isCaptureStreamActive = false;
     let lastCaptureTitle = "Capture Preview";
     let lastFocusedBeforeLightbox = null;
+    let revealedIpcSecret = "";
+    let lastPairingSnapshotHasActivePin = false;
+
+    function clearRevealedIpcSecret() {
+        revealedIpcSecret = "";
+        const inp = document.getElementById("diag-ipc-secret-value");
+        const toggleBtn = document.getElementById("btn-ipc-secret-toggle");
+        if (inp) {
+            inp.type = "password";
+            inp.value = "••••••••••••••••";
+        }
+        if (toggleBtn) toggleBtn.textContent = "Reveal";
+    }
 
     // =========================================================================
     // API Helpers & Identity Classification
@@ -147,6 +162,9 @@
 
         try {
             const resp = await fetch(endpoint, options);
+            if (resp.status === 401 || resp.status === 403) {
+                clearRevealedIpcSecret();
+            }
             if (resp.status === 403) {
                 const errData = await resp.json().catch(() => ({}));
                 if (errData.status === "SESSION_EXPIRED" || errData.status === "INVALID_TOKEN") {
@@ -416,7 +434,6 @@
         const dot = document.getElementById("core-status-dot");
         const text = document.getElementById("core-status-text");
         const btnPause = document.getElementById("btn-desktop-pause");
-        const bridgeStatusEl = document.getElementById("home-bridge-status");
 
         if (btnPause) {
             const label = btnPause.querySelector("span");
@@ -427,24 +444,12 @@
         if (!isCoreOnline) {
             dot.className = "status-dot dot-offline";
             text.textContent = "Core Offline";
-            if (bridgeStatusEl) {
-                bridgeStatusEl.textContent = "Reconnecting to SNOW Core...";
-                bridgeStatusEl.className = "text-xs text-amber";
-            }
         } else if (isCorePaused) {
             dot.className = "status-dot dot-paused";
             text.textContent = "Core Paused";
-            if (bridgeStatusEl) {
-                bridgeStatusEl.textContent = "Daemon Paused by Owner";
-                bridgeStatusEl.className = "text-xs text-amber";
-            }
         } else {
             dot.className = "status-dot dot-active";
             text.textContent = "Core Online";
-            if (bridgeStatusEl) {
-                bridgeStatusEl.textContent = "Local Loopback Active";
-                bridgeStatusEl.className = "text-xs text-emerald";
-            }
         }
     }
 
@@ -478,6 +483,9 @@
     }
 
     function switchTab(tabId) {
+        if (currentTab !== tabId) {
+            clearRevealedIpcSecret();
+        }
         currentTab = tabId;
         if (TITLE_MAP[tabId]) {
             document.title = `SNOW — ${TITLE_MAP[tabId]}`;
@@ -808,8 +816,6 @@
         document.getElementById("btn-active-transfer-cancel")?.addEventListener("click", cancelActiveTransfer);
         document.getElementById("btn-files-transfer-cancel")?.addEventListener("click", cancelActiveTransfer);
 
-        document.getElementById("btn-capture-screen-trigger")?.addEventListener("click", triggerScreenCapture);
-        document.getElementById("btn-capture-camera-trigger")?.addEventListener("click", triggerCameraCapture);
         document.getElementById("btn-stop-screen-stream")?.addEventListener("click", stopRemoteScreenStream);
         document.getElementById("btn-enlarge-capture")?.addEventListener("click", () => {
             const latestImg = document.getElementById("latest-capture-img");
@@ -1456,6 +1462,16 @@
                             </button>
                         </div>
                     `;
+                    const homeThumb = row.querySelector("img.clipboard-thumb");
+                    if (homeThumb) {
+                        homeThumb.addEventListener("error", () => {
+                            const fallback = document.createElement("div");
+                            fallback.className = "island-icon-box";
+                            fallback.title = "Image preview unavailable";
+                            fallback.innerHTML = `<svg class="svg-icon svg-icon-sm text-muted" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>`;
+                            homeThumb.replaceWith(fallback);
+                        }, { once: true });
+                    }
 
                     row.querySelector(".btn-copy-clip").onclick = async () => {
                         if (navigator.clipboard && text) navigator.clipboard.writeText(text).catch(() => {});
@@ -1482,79 +1498,196 @@
         if (notifContainer) {
             activeNotifications = (notifRes && Array.isArray(notifRes.notifications)) ? notifRes.notifications : [];
             if (notifBadge) notifBadge.textContent = activeNotifications.length;
-            notifContainer.innerHTML = "";
+            const visibleList = activeNotifications.slice(0, 6);
 
-            if (activeNotifications.length === 0) {
+            if (visibleList.length === 0) {
+                notifContainer.replaceChildren();
+                openNotificationReplyKeys.clear();
+                notificationReplyDrafts.clear();
                 notifEmpty?.classList.remove("d-none");
             } else {
                 notifEmpty?.classList.add("d-none");
-                activeNotifications.slice(0, 6).forEach(n => {
-                    const key = n.key || n.id || "";
+                const desiredKeys = new Set();
+                const existingCards = new Map();
+                notifContainer.querySelectorAll(".notif-card[data-notif-key]").forEach(el => {
+                    const k = el.dataset.notifKey || "";
+                    if (k) existingCards.set(k, el);
+                });
+
+                const renderedEntries = visibleList.map((n, idx) => {
+                    const rawKey = n.key || n.id || "";
+                    const domKey = rawKey || `${n.app_name || "Android"}::${n.title || "Notification"}::${idx}`;
+                    desiredKeys.add(domKey);
+                    return { n, rawKey, domKey };
+                });
+
+                // Prune removed notifications without touching active reply composers
+                existingCards.forEach((el, k) => {
+                    if (!desiredKeys.has(k)) {
+                        el.remove();
+                        openNotificationReplyKeys.delete(k);
+                        notificationReplyDrafts.delete(k);
+                    }
+                });
+                Array.from(openNotificationReplyKeys).forEach(k => {
+                    if (!desiredKeys.has(k)) openNotificationReplyKeys.delete(k);
+                });
+                Array.from(notificationReplyDrafts.keys()).forEach(k => {
+                    if (!desiredKeys.has(k)) notificationReplyDrafts.delete(k);
+                });
+
+                const activeEl = document.activeElement;
+                const focusedKey = activeEl && notifContainer.contains(activeEl) && activeEl.classList.contains("notif-reply-inp")
+                    ? activeEl.closest(".notif-card[data-notif-key]")?.dataset?.notifKey
+                    : null;
+                const selStart = focusedKey ? activeEl.selectionStart : null;
+                const selEnd = focusedKey ? activeEl.selectionEnd : null;
+
+                renderedEntries.forEach(({ n, rawKey, domKey }, idx) => {
+                    const titleText = n.title || n.app_name || "Notification";
+                    const appLabel = n.app_name || "Android";
                     const bodyText = n.body || n.text || "";
-                    const card = document.createElement("div");
-                    card.className = "notif-card";
-                    card.innerHTML = `
-                        <div class="flex items-center justify-between gap-2">
-                            <span class="text-xs font-bold text-primary truncate">${escapeHtml(n.title || n.app_name || "Notification")}</span>
-                            <span class="chip chip-sm chip-cyan">${escapeHtml(n.app_name || "Android")}</span>
-                        </div>
-                        <span class="text-xs text-secondary">${escapeHtml(bodyText)}</span>
-                        <div class="flex items-center justify-between gap-2 mt-1">
-                            <div class="flex gap-2">
-                                ${n.can_reply !== false ? `<button class="btn btn-xs btn-primary btn-toggle-reply">Reply</button>` : ""}
-                                <button class="btn btn-xs btn-tonal btn-notif-dismiss">Dismiss</button>
-                            </div>
-                        </div>
-                        <div class="notif-inline-reply d-none">
-                            <span class="text-xs text-muted">Replying as PC Host</span>
-                            <div class="flex gap-2">
-                                <input type="text" class="form-input text-xs notif-reply-inp" placeholder="Type reply..." />
-                                <button class="btn btn-xs btn-tonal btn-reply-cancel">Cancel</button>
-                                <button class="btn btn-xs btn-primary btn-reply-send">Send</button>
-                            </div>
-                        </div>
-                    `;
+                    const canReply = n.can_reply !== false;
 
-                    const inlineBox = card.querySelector(".notif-inline-reply");
-                    const replyInp = card.querySelector(".notif-reply-inp");
-                    const toggleBtn = card.querySelector(".btn-toggle-reply");
+                    let card = existingCards.get(domKey);
+                    if (!card) {
+                        card = document.createElement("div");
+                        card.className = "notif-card";
+                        card.dataset.notifKey = domKey;
+                        card.dataset.notifActionKey = rawKey;
+                        card.innerHTML = `
+                            <div class="flex items-center justify-between gap-2">
+                                <span class="text-xs font-bold text-primary truncate notif-title-text"></span>
+                                <span class="chip chip-sm chip-cyan notif-app-chip"></span>
+                            </div>
+                            <span class="text-xs text-secondary notif-body-text"></span>
+                            <div class="flex items-center justify-between gap-2 mt-1">
+                                <div class="flex gap-2">
+                                    <button class="btn btn-xs btn-primary btn-toggle-reply">Reply</button>
+                                    <button class="btn btn-xs btn-tonal btn-notif-dismiss">Dismiss</button>
+                                </div>
+                            </div>
+                            <div class="notif-inline-reply d-none">
+                                <span class="text-xs text-muted">Replying as PC Host</span>
+                                <div class="flex gap-2">
+                                    <input type="text" class="form-input text-xs notif-reply-inp" placeholder="Type reply..." />
+                                    <button class="btn btn-xs btn-tonal btn-reply-cancel">Cancel</button>
+                                    <button class="btn btn-xs btn-primary btn-reply-send">Send</button>
+                                </div>
+                            </div>
+                        `;
 
-                    if (toggleBtn && inlineBox) {
-                        toggleBtn.onclick = () => {
-                            inlineBox.classList.toggle("d-none");
-                            if (!inlineBox.classList.contains("d-none") && replyInp) replyInp.focus();
+                        const inlineBox = card.querySelector(".notif-inline-reply");
+                        const replyInp = card.querySelector(".notif-reply-inp");
+                        const toggleBtn = card.querySelector(".btn-toggle-reply");
+
+                        if (toggleBtn && inlineBox) {
+                            toggleBtn.onclick = () => {
+                                const cKey = card.dataset.notifKey || "";
+                                const willShow = inlineBox.classList.contains("d-none");
+                                inlineBox.classList.toggle("d-none", !willShow);
+                                if (willShow) {
+                                    openNotificationReplyKeys.add(cKey);
+                                    replyingNotificationKey = cKey;
+                                    if (replyInp) replyInp.focus();
+                                } else {
+                                    openNotificationReplyKeys.delete(cKey);
+                                    if (replyingNotificationKey === cKey) replyingNotificationKey = "";
+                                }
+                            };
+                        }
+
+                        replyInp?.addEventListener("input", () => {
+                            const cKey = card.dataset.notifKey || "";
+                            notificationReplyDrafts.set(cKey, replyInp.value);
+                        });
+
+                        card.querySelector(".btn-reply-cancel")?.addEventListener("click", () => {
+                            const cKey = card.dataset.notifKey || "";
+                            inlineBox?.classList.add("d-none");
+                            openNotificationReplyKeys.delete(cKey);
+                            notificationReplyDrafts.delete(cKey);
+                            if (replyInp) replyInp.value = "";
+                            if (replyingNotificationKey === cKey) replyingNotificationKey = "";
+                        });
+
+                        const dispatchReply = async () => {
+                            const cKey = card.dataset.notifKey || "";
+                            const actKey = card.dataset.notifActionKey || cKey;
+                            const txt = replyInp ? replyInp.value.trim() : "";
+                            if (!txt || !actKey) return;
+                            const r = await apiRequest("/api/notifications/reply", "POST", { key: actKey, text: txt, device_id: resolveTargetDeviceId() });
+                            if (r && r.success) {
+                                openNotificationReplyKeys.delete(cKey);
+                                notificationReplyDrafts.delete(cKey);
+                                if (replyInp) replyInp.value = "";
+                                inlineBox?.classList.add("d-none");
+                                if (replyingNotificationKey === cKey) replyingNotificationKey = "";
+                                showNotificationToast("Reply sent to phone!", "success");
+                                loadHomeWidgets();
+                            } else {
+                                showNotificationToast(r?.error || "Failed sending reply", "error");
+                            }
+                        };
+                        card.querySelector(".btn-reply-send")?.addEventListener("click", dispatchReply);
+                        replyInp?.addEventListener("keydown", (e) => {
+                            if (e.key === "Enter") dispatchReply();
+                        });
+
+                        card.querySelector(".btn-notif-dismiss").onclick = async () => {
+                            const cKey = card.dataset.notifKey || "";
+                            const actKey = card.dataset.notifActionKey || cKey;
+                            if (!actKey) return;
+                            openNotificationReplyKeys.delete(cKey);
+                            notificationReplyDrafts.delete(cKey);
+                            await apiRequest("/api/notifications/dismiss", "POST", { key: actKey, device_id: resolveTargetDeviceId() });
+                            showNotificationToast("Notification dismissed.", "info");
+                            loadHomeWidgets();
                         };
                     }
 
-                    card.querySelector(".btn-reply-cancel")?.addEventListener("click", () => {
-                        inlineBox?.classList.add("d-none");
-                    });
+                    // Incremental field updates (never recreate active input)
+                    card.dataset.notifActionKey = rawKey;
+                    const titleEl = card.querySelector(".notif-title-text");
+                    const appEl = card.querySelector(".notif-app-chip");
+                    const bodyEl = card.querySelector(".notif-body-text");
+                    const toggleBtnEl = card.querySelector(".btn-toggle-reply");
+                    const inlineBoxEl = card.querySelector(".notif-inline-reply");
+                    const replyInpEl = card.querySelector(".notif-reply-inp");
 
-                    const dispatchReply = async () => {
-                        const txt = replyInp ? replyInp.value.trim() : "";
-                        if (!txt || !key) return;
-                        const r = await apiRequest("/api/notifications/reply", "POST", { key, text: txt, device_id: resolveTargetDeviceId() });
-                        if (r && r.success) {
-                            showNotificationToast("Reply sent to phone!", "success");
-                            loadHomeWidgets();
-                        } else {
-                            showNotificationToast(r?.error || "Failed sending reply", "error");
+                    if (titleEl && titleEl.textContent !== titleText) titleEl.textContent = titleText;
+                    if (appEl && appEl.textContent !== appLabel) appEl.textContent = appLabel;
+                    if (bodyEl && bodyEl.textContent !== bodyText) bodyEl.textContent = bodyText;
+                    if (toggleBtnEl) toggleBtnEl.classList.toggle("d-none", !canReply);
+
+                    const isOpen = openNotificationReplyKeys.has(domKey);
+                    if (inlineBoxEl) inlineBoxEl.classList.toggle("d-none", !isOpen);
+                    if (replyInpEl && document.activeElement !== replyInpEl) {
+                        const savedDraft = notificationReplyDrafts.get(domKey);
+                        if (typeof savedDraft === "string" && replyInpEl.value !== savedDraft) {
+                            replyInpEl.value = savedDraft;
                         }
-                    };
-                    card.querySelector(".btn-reply-send")?.addEventListener("click", dispatchReply);
-                    replyInp?.addEventListener("keydown", (e) => {
-                        if (e.key === "Enter") dispatchReply();
-                    });
+                    }
 
-                    card.querySelector(".btn-notif-dismiss").onclick = async () => {
-                        if (!key) return;
-                        await apiRequest("/api/notifications/dismiss", "POST", { key, device_id: resolveTargetDeviceId() });
-                        showNotificationToast("Notification dismissed.", "info");
-                        loadHomeWidgets();
-                    };
-
-                    notifContainer.appendChild(card);
+                    // Preserve exact DOM slot without moving unchanged elements (prevents focus blur)
+                    const currentAtIdx = notifContainer.children[idx];
+                    if (currentAtIdx !== card) {
+                        notifContainer.insertBefore(card, currentAtIdx || null);
+                    }
                 });
+
+                if (focusedKey) {
+                    const refCard = Array.from(notifContainer.querySelectorAll(".notif-card[data-notif-key]")).find(
+                        el => el.dataset.notifKey === focusedKey
+                    );
+                    const refInp = refCard?.querySelector(".notif-reply-inp");
+                    if (refInp && document.activeElement !== refInp) {
+                        refInp.focus();
+                        if (typeof selStart === "number" && typeof selEnd === "number") {
+                            try { refInp.setSelectionRange(selStart, selEnd); } catch (e) {}
+                        }
+                    }
+                }
             }
         }
     }
@@ -1580,7 +1713,7 @@
                 tabApk.classList.remove("active");
                 paneQr.classList.remove("d-none");
                 paneApk.classList.add("d-none");
-                loadPairingQR();
+                refreshPairingState();
             };
             tabApk.onclick = () => {
                 tabApk.classList.add("active");
@@ -1591,10 +1724,15 @@
             };
         }
 
-        document.getElementById("btn-pairing-refresh-qr")?.addEventListener("click", () => {
-            loadPairingQR();
-            showNotificationToast("Regenerated pairing QR & PIN.", "info");
+        document.getElementById("btn-pairing-refresh-qr")?.addEventListener("click", async () => {
+            await loadPairingQR();
+            showNotificationToast("Generated 60s pairing QR & PIN.", "info");
         });
+        document.getElementById("btn-modal-generate-pin")?.addEventListener("click", async () => {
+            await loadPairingQR();
+            showNotificationToast("Generated 60s pairing QR & PIN.", "info");
+        });
+        document.getElementById("btn-pairing-cancel-pin")?.addEventListener("click", cancelPairingPin);
 
         const btnPairConnect = document.getElementById("btn-pairing-connect");
         const inputPair = document.getElementById("pairing-input");
@@ -1661,7 +1799,8 @@
                     const res = await apiRequest("/api/relay/tunnel/start", "POST", { provider: "cloudflared" });
                     if (res && res.success) {
                         showNotificationToast("Remote Access tunnel active!", "success");
-                        loadPairingQR();
+                        if (lastPairingSnapshotHasActivePin) loadPairingQR();
+                        else refreshPairingState();
                     } else {
                         showNotificationToast(res?.error || "Failed starting relay tunnel", "error");
                         chkRelay.checked = false;
@@ -1669,7 +1808,8 @@
                 } else {
                     await apiRequest("/api/relay/tunnel/stop", "POST", {});
                     showNotificationToast("Remote Access tunnel stopped.", "info");
-                    loadPairingQR();
+                    if (lastPairingSnapshotHasActivePin) loadPairingQR();
+                    else refreshPairingState();
                 }
                 loadRelayTunnelStatus();
             });
@@ -1840,6 +1980,9 @@
                     </div>
                     <div class="flex items-center gap-2">
                         <button class="btn btn-xs ${isSelected ? "btn-primary" : "btn-tonal"} btn-dev-select">${isSelected ? "Active" : "Switch"}</button>
+                        ${isConn
+                            ? `<button class="btn btn-xs btn-tonal btn-dev-disconnect">Disconnect</button>`
+                            : `<button class="btn btn-xs btn-primary btn-dev-reconnect">Reconnect</button>`}
                         <button class="btn btn-xs btn-danger btn-dev-revoke">Revoke</button>
                     </div>
                 </div>
@@ -1862,6 +2005,41 @@
                 showNotificationToast(`Switched active target to ${dev.device_name || "device"}.`, "info");
             };
 
+            const disconnectBtn = card.querySelector(".btn-dev-disconnect");
+            if (disconnectBtn) {
+                disconnectBtn.onclick = async () => {
+                    disconnectBtn.disabled = true;
+                    const res = await apiRequest("/api/devices/disconnect", "POST", { device_id: dev.device_id });
+                    if (res && res.success) {
+                        showNotificationToast(`Disconnected ${dev.device_name || "device"}. Pairing preserved.`, "info");
+                        refreshAllData();
+                    } else {
+                        disconnectBtn.disabled = false;
+                        showNotificationToast(res?.error || "Could not disconnect device", "error");
+                    }
+                };
+            }
+
+            const reconnectBtn = card.querySelector(".btn-dev-reconnect");
+            if (reconnectBtn) {
+                reconnectBtn.onclick = async () => {
+                    reconnectBtn.disabled = true;
+                    const res = await apiRequest("/api/devices/reconnect", "POST", { device_id: dev.device_id });
+                    if (res && res.success) {
+                        showNotificationToast(
+                            res.is_connected
+                                ? `Reconnected ${dev.device_name || "device"}!`
+                                : `Reconnect authorized for ${dev.device_name || "device"}.`,
+                            res.is_connected ? "success" : "info"
+                        );
+                        refreshAllData();
+                    } else {
+                        reconnectBtn.disabled = false;
+                        showNotificationToast(res?.error || "Reconnect failed", "error");
+                    }
+                };
+            }
+
             card.querySelector(".btn-dev-revoke").onclick = async () => {
                 const res = await apiRequest("/api/devices/revoke", "POST", { device_id: dev.device_id });
                 if (res && res.success) {
@@ -1876,12 +2054,34 @@
             container.appendChild(card);
         });
 
-        loadPairingQR();
+        refreshPairingState();
         loadRelayTunnelStatus();
         loadFederationGrants();
     }
 
-    async function loadPairingQR() {
+    function renderIdlePairingState(label = "No active PIN", countdownText = "--") {
+        lastPairingSnapshotHasActivePin = false;
+        if (qrCountdownTimer) {
+            clearInterval(qrCountdownTimer);
+            qrCountdownTimer = null;
+        }
+        const qrBox = document.getElementById("pairing-qr-box");
+        const modalQrBox = document.getElementById("modal-qr-container");
+        const pinEl = document.getElementById("pairing-pin-display");
+        const modalPinEl = document.getElementById("modal-pairing-pin");
+        const countdownEl = document.getElementById("pairing-countdown-display");
+        const cancelBtn = document.getElementById("btn-pairing-cancel-pin");
+
+        const idleMsg = `<span class="text-xs text-muted text-center">Click Generate Pairing QR &amp; PIN when ready</span>`;
+        if (qrBox) qrBox.innerHTML = idleMsg;
+        if (modalQrBox) modalQrBox.innerHTML = idleMsg;
+        if (pinEl) pinEl.textContent = label;
+        if (modalPinEl) modalPinEl.textContent = label;
+        if (countdownEl) countdownEl.textContent = countdownText;
+        cancelBtn?.classList.add("d-none");
+    }
+
+    function applyPairingState(res, isActiveGeneration = false) {
         const qrBox = document.getElementById("pairing-qr-box");
         const modalQrBox = document.getElementById("modal-qr-container");
         const snowIdEl = document.getElementById("pairing-snow-id");
@@ -1890,38 +2090,97 @@
         const pinEl = document.getElementById("pairing-pin-display");
         const modalPinEl = document.getElementById("modal-pairing-pin");
         const countdownEl = document.getElementById("pairing-countdown-display");
+        const cancelBtn = document.getElementById("btn-pairing-cancel-pin");
 
-        if (snowIdEl) snowIdEl.textContent = canonicalSnowId;
-        if (modalNetEl) modalNetEl.textContent = canonicalSnowId;
+        const dataObj = res?.data || res || {};
+        const effectiveSnowId = dataObj?.snow_id || canonicalSnowId;
+        if (snowIdEl) snowIdEl.textContent = effectiveSnowId;
+        if (modalNetEl) modalNetEl.textContent = effectiveSnowId;
 
-        const res = await apiRequest("/api/pair/qr", "POST", { trust_tier: "owner" });
+        const fpVal = res?.data?.fp || res?.fp || res?.data?.cert_fingerprint || res?.cert_fingerprint || "";
+        if (fpEl) {
+            if (fpVal) {
+                fpEl.textContent = `${fpVal.slice(0, 16)}...`;
+                fpEl.title = fpVal;
+            } else {
+                fpEl.textContent = "--";
+                fpEl.removeAttribute("title");
+            }
+        }
+
+        const pinVal = res?.data?.pin || res?.pin || "";
+        const hasActivePin = Boolean(
+            pinVal && (isActiveGeneration || dataObj?.has_active_pin === true)
+        );
+
+        if (!hasActivePin) {
+            if (res && res.success === false && qrBox) {
+                qrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
+                if (pinEl) pinEl.textContent = "Unavailable";
+                if (countdownEl) countdownEl.textContent = "--";
+                cancelBtn?.classList.add("d-none");
+                return;
+            }
+            renderIdlePairingState("No active PIN", "--");
+            return;
+        }
+
+        lastPairingSnapshotHasActivePin = true;
         const svgMarkup = res?.svg || res?.qr_svg || res?.data?.svg;
-        const pinVal = res?.data?.pin || res?.pin;
-        const fpVal = res?.data?.cert_fingerprint || res?.cert_fingerprint;
-
         if (svgMarkup) {
             if (qrBox) qrBox.innerHTML = svgMarkup;
             if (modalQrBox) modalQrBox.innerHTML = svgMarkup;
-        } else if (qrBox && res && !res.success) {
-            qrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
         }
 
-        if (fpVal && fpEl) fpEl.textContent = `${fpVal.slice(0, 16)}...`;
-        if (pinVal) {
-            const fmtPin = pinVal.length === 6 ? `${pinVal.slice(0, 3)} ${pinVal.slice(3)}` : pinVal;
-            if (pinEl) pinEl.textContent = fmtPin;
-            if (modalPinEl) modalPinEl.textContent = fmtPin;
-        }
+        const fmtPin = pinVal.length === 6 ? `${pinVal.slice(0, 3)} ${pinVal.slice(3)}` : pinVal;
+        if (pinEl) pinEl.textContent = fmtPin;
+        if (modalPinEl) modalPinEl.textContent = fmtPin;
+        cancelBtn?.classList.remove("d-none");
 
-        let remaining = 60;
+        let remaining = Number.isFinite(Number(dataObj?.remaining_seconds))
+            ? Math.max(1, Math.round(Number(dataObj.remaining_seconds)))
+            : 60;
+        if (countdownEl) countdownEl.textContent = `${remaining}s`;
         if (qrCountdownTimer) clearInterval(qrCountdownTimer);
         qrCountdownTimer = setInterval(() => {
             remaining--;
             if (countdownEl) countdownEl.textContent = `${Math.max(0, remaining)}s`;
             if (remaining <= 0) {
                 clearInterval(qrCountdownTimer);
+                qrCountdownTimer = null;
+                renderIdlePairingState("Expired", "0s");
             }
         }, 1000);
+    }
+
+    async function refreshPairingState() {
+        const res = await apiRequest("/api/pair/state");
+        applyPairingState(res, false);
+    }
+
+    async function cancelPairingPin() {
+        const res = await apiRequest("/api/pair/cancel", "POST", {});
+        renderIdlePairingState("No active PIN", "--");
+        if (res && res.success) {
+            showNotificationToast("Pairing PIN cancelled.", "info");
+        }
+    }
+
+    async function loadPairingQR() {
+        const snowIdEl = document.getElementById("pairing-snow-id");
+        const modalNetEl = document.getElementById("modal-network-id");
+        if (snowIdEl) snowIdEl.textContent = canonicalSnowId;
+        if (modalNetEl) modalNetEl.textContent = canonicalSnowId;
+
+        const res = await apiRequest("/api/pair/qr", "POST", { trust_tier: "owner" });
+        const svgMarkup = res?.svg || res?.qr_svg || res?.data?.svg;
+        const pinVal = res?.data?.pin || res?.pin;
+        const fpVal = res?.data?.fp || res?.data?.cert_fingerprint || res?.fp || res?.cert_fingerprint;
+        if (res && res.success && (svgMarkup || pinVal || fpVal)) {
+            applyPairingState(res, true);
+        } else {
+            applyPairingState(res, false);
+        }
     }
 
     async function loadApkQr() {
@@ -2026,6 +2285,34 @@
         document.getElementById("files-search-input")?.addEventListener("input", filterFileRows);
         document.getElementById("apps-search-input")?.addEventListener("input", filterAppTiles);
         document.getElementById("chk-hide-hidden")?.addEventListener("change", () => loadFiles(currentSubpath));
+        document.getElementById("btn-change-transfers-folder")?.addEventListener("click", async () => {
+            const pickBtn = document.getElementById("btn-change-transfers-folder");
+            if (pickBtn) pickBtn.disabled = true;
+            try {
+                const pickRes = await apiRequest("/api/files/pick-destination", "POST", {});
+                if (!pickRes || !pickRes.success) {
+                    showNotificationToast(pickRes?.error || "Unable to open folder picker", "error");
+                    return;
+                }
+                if (pickRes.cancelled || !pickRes.selected || !pickRes.path) {
+                    return;
+                }
+                const setRes = await apiRequest("/api/files/destination", "POST", { path: pickRes.path });
+                if (setRes && setRes.success && setRes.pc_transfers_dir) {
+                    pcTransfersDestDir = setRes.pc_transfers_dir;
+                    const destEl = document.getElementById("files-destination-path");
+                    if (destEl) {
+                        destEl.textContent = setRes.pc_transfers_dir;
+                        destEl.title = setRes.pc_transfers_dir;
+                    }
+                    showNotificationToast(`Incoming folder updated to ${setRes.pc_transfers_dir}`, "success");
+                } else {
+                    showNotificationToast(setRes?.error || "Could not update destination folder", "error");
+                }
+            } finally {
+                if (pickBtn) pickBtn.disabled = false;
+            }
+        });
         document.getElementById("btn-open-transfers-folder")?.addEventListener("click", async () => {
             const res = await apiRequest("/api/files/open-transfers-folder", "POST", {});
             if (res && res.success) {
@@ -2053,7 +2340,6 @@
             }
         });
 
-        const dropzone = document.getElementById("file-upload-dropzone");
         const fileInput = document.getElementById("file-upload-input");
         document.getElementById("btn-trigger-upload")?.addEventListener("click", () => fileInput?.click());
 
@@ -2066,41 +2352,6 @@
             };
         }
 
-        if (dropzone) {
-            dropzone.onclick = () => {
-                if (dropzone.classList.contains("disabled")) {
-                    showNotificationToast("Switch the Files device selector to a connected phone/peer to upload files.", "info");
-                    return;
-                }
-                fileInput?.click();
-            };
-            dropzone.ondragover = (e) => {
-                e.preventDefault();
-                if (dropzone.classList.contains("disabled")) return;
-                dropzone.style.borderColor = "var(--snow-accent-cyan)";
-            };
-            dropzone.ondragleave = () => {
-                dropzone.style.borderColor = dropzone.classList.contains("disabled")
-                    ? "var(--snow-border)"
-                    : "var(--snow-accent-blue)";
-            };
-            dropzone.ondrop = (e) => {
-                e.preventDefault();
-                dropzone.style.borderColor = dropzone.classList.contains("disabled")
-                    ? "var(--snow-border)"
-                    : "var(--snow-accent-blue)";
-                if (dropzone.classList.contains("disabled")) {
-                    showNotificationToast("Switch the Files device selector to a connected phone/peer to upload files.", "info");
-                    return;
-                }
-                if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-                    uploadFiles(e.dataTransfer.files);
-                }
-            };
-        }
-
-        document.getElementById("btn-capture-screen-trigger")?.addEventListener("click", triggerScreenCapture);
-        document.getElementById("btn-capture-camera-trigger")?.addEventListener("click", triggerCameraCapture);
         document.getElementById("btn-stop-screen-stream")?.addEventListener("click", stopRemoteScreenStream);
         document.getElementById("btn-retry-screen-stream")?.addEventListener("click", () => {
             screenFrameErrorCount = 0;
@@ -2255,7 +2506,6 @@
         const emptyState = document.getElementById("file-empty-state");
         const emptyMsg = document.getElementById("file-empty-message");
         const uploadBtn = document.getElementById("btn-trigger-upload");
-        const dropzone = document.getElementById("file-upload-dropzone");
         const upBtn = document.getElementById("btn-file-up");
 
         if (breadcrumbEl) breadcrumbEl.textContent = subpath ? (subpath.startsWith("/") || subpath.includes(":\\") ? subpath : `/${subpath}`) : "/";
@@ -2266,7 +2516,6 @@
 
         if (uploadBtn) uploadBtn.disabled = isLocalTarget || !isTargetOnline || !isAndroid;
         if (upBtn) upBtn.disabled = isLocalTarget || !isTargetOnline || (!subpath && !currentRemoteParent);
-        if (dropzone) dropzone.classList.toggle("disabled", isLocalTarget || !isTargetOnline || !isAndroid);
 
         if (targetLabel) {
             if (isLocalTarget) {
@@ -2615,29 +2864,6 @@
         }
 
         document.getElementById("btn-clip-add-note")?.addEventListener("click", () => openTextModal("clipboard"));
-        document.getElementById("btn-clip-capture-pc")?.addEventListener("click", async () => {
-            const res = await apiRequest("/api/clipboard/buffer/capture_pc", "POST", {});
-            if (res && res.success) {
-                showNotificationToast("Captured Windows clipboard into buffer!", "success");
-                loadClipboardItems();
-            } else {
-                showNotificationToast(res?.error || "Windows clipboard empty or unavailable", "info");
-            }
-        });
-        document.getElementById("btn-clip-pull-phone")?.addEventListener("click", async () => {
-            const targetId = resolveTargetDeviceId();
-            if (!targetId) {
-                showNotificationToast("Select or connect an online phone first.", "warning");
-                return;
-            }
-            const res = await apiRequest("/api/clipboard/buffer/pull_phone", "POST", { device_id: targetId });
-            if (res && res.success) {
-                showNotificationToast("Pulled phone clipboard into buffer!", "success");
-                loadClipboardItems();
-            } else {
-                showNotificationToast(res?.error || "Could not pull phone clipboard", "error");
-            }
-        });
 
         document.getElementById("btn-clipboard-clear-unpinned")?.addEventListener("click", async () => {
             const res = await apiRequest("/api/clipboard/buffer/clear", "POST", { keep_pinned: true });
@@ -2686,8 +2912,8 @@
             card.className = "clipboard-card";
 
             const bodyHtml = isImg
-                ? `<div class="flex items-center justify-center p-2" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md);">
-                       <img src="/api/clipboard/image/${encodeURIComponent(id)}" alt="Clipboard Preview" style="max-height: 150px; border-radius: var(--snow-radius-sm);" />
+                ? `<div class="clipboard-image-wrap flex items-center justify-center p-2" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md); overflow: hidden; min-height: 96px;">
+                       <img class="clipboard-preview-img" src="/api/clipboard/image/${encodeURIComponent(id)}" alt="Clipboard Preview" style="max-height: 150px; max-width: 100%; object-fit: contain; border-radius: var(--snow-radius-sm);" />
                    </div>`
                 : `<p class="text-xs text-secondary mono" style="white-space: pre-wrap; word-break: break-word; max-height: 140px; overflow-y: auto;">${escapeHtml(text)}</p>`;
 
@@ -2713,6 +2939,15 @@
                     <button class="btn btn-xs btn-tonal btn-share-act">Send to Target</button>
                 </div>
             `;
+            const previewImg = card.querySelector("img.clipboard-preview-img");
+            if (previewImg) {
+                previewImg.addEventListener("error", () => {
+                    const wrap = card.querySelector(".clipboard-image-wrap");
+                    if (wrap) {
+                        wrap.innerHTML = `<div class="flex items-center gap-2 text-xs text-muted" style="padding: 12px;"><svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg><span>Image preview unavailable</span></div>`;
+                    }
+                }, { once: true });
+            }
 
             card.querySelector(".btn-copy-act").onclick = async () => {
                 if (navigator.clipboard && text) navigator.clipboard.writeText(text).catch(() => {});
@@ -2743,10 +2978,10 @@
 
     function initAiSettingsView() {
         document.getElementById("btn-mcp-test-local")?.addEventListener("click", async () => {
-            showNotificationToast("Testing 42 local FastMCP tools...", "info");
+            showNotificationToast("Testing 48 local FastMCP tools...", "info");
             const res = await apiRequest("/api/mcp/test-local", "POST", {});
             if (res && res.success) {
-                showNotificationToast(`All ${res.tools_count || 42} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
+                showNotificationToast(`All ${res.tools_count || 48} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
             } else {
                 showNotificationToast(res?.error || "MCP self-test failed", "error");
             }
@@ -2866,17 +3101,50 @@
             }
         });
 
-        // Diagnostics & Direct Product Updates
-        document.getElementById("btn-diag-copy-logs")?.addEventListener("click", async () => {
-            const box = document.getElementById("diag-log-box");
-            const text = box ? box.textContent : "No logs recorded.";
-            if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
-            showNotificationToast("Copied diagnostic logs!", "success");
+        // Diagnostics & Owner IPC Secret
+        document.getElementById("btn-ipc-secret-toggle")?.addEventListener("click", async () => {
+            const inp = document.getElementById("diag-ipc-secret-value");
+            const btn = document.getElementById("btn-ipc-secret-toggle");
+            if (revealedIpcSecret) {
+                clearRevealedIpcSecret();
+                return;
+            }
+            if (btn) btn.disabled = true;
+            try {
+                const res = await apiRequest("/api/system/ipc-secret");
+                if (res && res.success && res.ipc_secret) {
+                    revealedIpcSecret = res.ipc_secret;
+                    if (inp) {
+                        inp.type = "text";
+                        inp.value = revealedIpcSecret;
+                    }
+                    if (btn) btn.textContent = "Hide";
+                } else {
+                    showNotificationToast(res?.error || "Unable to fetch IPC secret", "error");
+                }
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         });
-        document.getElementById("btn-diag-clear-logs")?.addEventListener("click", () => {
-            const box = document.getElementById("diag-log-box");
-            if (box) box.textContent = "Diagnostics buffer cleared.";
+        document.getElementById("btn-ipc-secret-copy")?.addEventListener("click", async () => {
+            let secretToCopy = revealedIpcSecret;
+            if (!secretToCopy) {
+                const res = await apiRequest("/api/system/ipc-secret");
+                if (res && res.success && res.ipc_secret) {
+                    secretToCopy = res.ipc_secret;
+                } else {
+                    showNotificationToast(res?.error || "Unable to fetch IPC secret", "error");
+                    return;
+                }
+            }
+            if (navigator.clipboard && secretToCopy) {
+                navigator.clipboard.writeText(secretToCopy).catch(() => {});
+                showNotificationToast("Copied IPC Secret to clipboard!", "success");
+            }
+            secretToCopy = "";
         });
+        window.addEventListener("beforeunload", clearRevealedIpcSecret);
+
         document.getElementById("btn-diag-update-check")?.addEventListener("click", async () => {
             const banner = document.getElementById("update-status-banner");
             const applyBtn = document.getElementById("btn-diag-update-apply");
@@ -2977,7 +3245,7 @@
 
         if (statusRes && statusRes.active && statusRes.public_url) {
             if (statusBadge) {
-                statusBadge.textContent = "Active • 42 Tools Ready";
+                statusBadge.textContent = "Active • 48 Tools Ready";
                 statusBadge.className = "chip chip-emerald";
             }
             if (btnToggle) btnToggle.textContent = "Stop Tunnel";
@@ -3108,6 +3376,12 @@
             "windows_media_control": "Adjusted Windows media playback or volume",
             "share_link": "Shared link or note to device",
             "windows_share_link": "Opened shared link on Windows",
+            "youtube_play": "Opened YouTube playback or search",
+            "web_open": "Opened URL in browser",
+            "windows_list_windows": "Listed open Windows desktop windows",
+            "windows_focus_window": "Focused a Windows desktop window",
+            "system_volume_set": "Set system audio volume",
+            "federation_peers": "Listed federation peers and grants",
             "android_screenshot": "Captured Android screen",
             "android_camera_capture": "Captured Android camera photo",
             "android_ring": "Triggered Find My Phone ringer",
@@ -3142,20 +3416,8 @@
 
     async function loadActivityTimeline() {
         const container = document.getElementById("activity-timeline-container");
-        const diagBox = document.getElementById("diag-log-box");
         const res = await apiRequest("/api/activity?limit=25");
         const events = res?.events || res?.records || res?.activities || [];
-
-        if (diagBox) {
-            if (events.length > 0) {
-                diagBox.textContent = events.slice(0, 20).map(ev => {
-                    const fmt = formatActivityEvent(ev);
-                    return `[${formatTimestamp(ev.timestamp)}] ${fmt.title} (${fmt.subtitle})`;
-                }).join("\n");
-            } else {
-                diagBox.textContent = `SNOW Core Online • ${canonicalSnowId}\nWeb UI Loopback: 127.0.0.1:8769`;
-            }
-        }
 
         if (!container) return;
         container.innerHTML = "";
@@ -3370,7 +3632,7 @@
         const modal = document.getElementById("connect-modal");
         if (modal) {
             modal.classList.remove("d-none");
-            loadPairingQR();
+            refreshPairingState();
         }
     }
 

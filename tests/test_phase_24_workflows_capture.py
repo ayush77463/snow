@@ -89,10 +89,10 @@ class TestPhase24RegistryAndAnnotations(unittest.TestCase):
     """Verifies tool registry expansion and strict boolean ToolAnnotations (Points 1 & 2)."""
 
     def test_01_tool_registry_contains_exactly_34_capabilities(self):
-        """1. Registry contains exactly 42 capabilities including V5.0.0 additions."""
+        """1. Registry contains exactly 48 capabilities including Stage 6A additions."""
         all_caps = list_capabilities()
-        self.assertEqual(len(all_caps), 42)
-        self.assertEqual(len(CAPABILITY_REGISTRY), 42)
+        self.assertEqual(len(all_caps), 48)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 48)
 
         expected_new_tools = [
             "snow_windows_screenshot",

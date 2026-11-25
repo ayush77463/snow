@@ -233,7 +233,7 @@ class TestMcpHostingStage3B(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rej_res["status"], "REJECTED")
 
     async def test_05_web_server_test_local_mcp_handshake(self) -> None:
-        """Verify handle_api_mcp_test_local executes live stdio handshake and verifies 42 tools."""
+        """Verify handle_api_mcp_test_local executes live stdio handshake and verifies 48 tools."""
         req = MagicMock()
         resp = await self.web_server.handle_api_mcp_test_local(req)
         self.assertEqual(resp.status, 200)
@@ -241,8 +241,8 @@ class TestMcpHostingStage3B(unittest.IsolatedAsyncioTestCase):
         data = json.loads(resp.text)
         self.assertTrue(data["success"])
         self.assertEqual(data["status"], "SUCCESS")
-        self.assertEqual(data["tools_count"], 42)
-        self.assertEqual(data["expected_count"], 42)
+        self.assertEqual(data["tools_count"], 48)
+        self.assertEqual(data["expected_count"], 48)
         self.assertIn("snow_windows_system_info", data["tools"])
         self.assertIn("snow_android_battery", data["tools"])
         self.assertGreater(data["latency_ms"], 0.0)

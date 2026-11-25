@@ -9,6 +9,8 @@ and enforces bounded file read/write size limits.
 from __future__ import annotations
 
 import asyncio
+import ctypes
+from ctypes import wintypes
 from datetime import datetime, timezone
 import logging
 import os
@@ -213,6 +215,14 @@ class WindowsFileManager:
                         valid_roots.append(p)
 
         self.allowed_roots = valid_roots
+
+    def add_allowed_root(self, new_root: Path | str) -> None:
+        """Authorize an additional root directory cleanly without duplicating entries."""
+        if not new_root:
+            return
+        resolved = Path(new_root).expanduser().resolve()
+        if resolved not in self.allowed_roots:
+            self.allowed_roots.append(resolved)
 
     def _is_transfers_exemption(self, resolved: Path) -> bool:
         """Check whether a resolved path qualifies for the narrow ~/.snow/transfers exemption.
@@ -816,3 +826,96 @@ class WindowsFileManager:
     ) -> dict[str, Any]:
         """Asynchronously search files recursively on a worker thread."""
         return await asyncio.to_thread(self.search_files_sync, query, root_path, limit, ctx, hide_hidden)
+
+
+class _BROWSEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hwndOwner", wintypes.HWND),
+        ("pidlRoot", ctypes.c_void_p),
+        ("pszDisplayName", ctypes.c_wchar_p),
+        ("lpszTitle", ctypes.c_wchar_p),
+        ("ulFlags", wintypes.UINT),
+        ("lpfn", ctypes.c_void_p),
+        ("lParam", ctypes.c_ssize_t),
+        ("iImage", ctypes.c_int),
+    ]
+
+
+def pick_folder_dialog_win32(
+    title: str = "Select SNOW Incoming Transfers Folder",
+) -> dict[str, Any]:
+    """Open a native Win32 folder selection dialog with zero console flash."""
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "selected": False,
+            "cancelled": False,
+            "status": "UNSUPPORTED_PLATFORM",
+            "error": "Native Win32 folder picker requires Windows.",
+        }
+
+    ole32 = ctypes.windll.ole32
+    shell32 = ctypes.windll.shell32
+
+    ole32.CoInitializeEx.restype = ctypes.c_long
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoTaskMemFree.restype = None
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoUninitialize.restype = None
+    ole32.CoUninitialize.argtypes = []
+
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(_BROWSEINFOW)]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+
+    hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+    need_uninit = hr in (0, 1)  # S_OK or S_FALSE
+    pidl = None
+    try:
+        display_buf = ctypes.create_unicode_buffer(260)
+        bi = _BROWSEINFOW()
+        bi.hwndOwner = None
+        bi.pidlRoot = None
+        bi.pszDisplayName = ctypes.cast(display_buf, ctypes.c_wchar_p)
+        bi.lpszTitle = str(title)
+        bi.ulFlags = 0x00000041  # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+        bi.lpfn = None
+        bi.lParam = 0
+        bi.iImage = 0
+
+        pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+        if not pidl:
+            return {"success": True, "selected": False, "cancelled": True}
+
+        path_buf = ctypes.create_unicode_buffer(32768)
+        if not shell32.SHGetPathFromIDListW(pidl, path_buf) or not path_buf.value:
+            return {
+                "success": False,
+                "selected": False,
+                "cancelled": False,
+                "status": "PATH_RESOLVE_FAILED",
+                "error": "Could not resolve selected folder path.",
+            }
+        chosen = str(Path(path_buf.value).resolve())
+        return {"success": True, "selected": True, "cancelled": False, "path": chosen}
+    except Exception as exc:
+        logger.warning("Win32 folder picker failed: %s", exc)
+        return {
+            "success": False,
+            "selected": False,
+            "cancelled": False,
+            "status": "PICKER_FAILED",
+            "error": f"Failed opening folder picker: {exc}",
+        }
+    finally:
+        if pidl:
+            try:
+                ole32.CoTaskMemFree(pidl)
+            except Exception:
+                pass
+        if need_uninit:
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass

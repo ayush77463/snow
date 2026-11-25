@@ -24,6 +24,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -57,21 +58,45 @@ class SnowForegroundService : Service() {
         val identity = DeviceIdentity.getOrCreate(applicationContext)
         val tokenStorage = SharedPreferencesTokenStorage(applicationContext)
         val certPinStorage = EncryptedCertPinStorage(applicationContext)
+        val autoConnect = getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, true)
         SnowWebSocketClient(
             certPinStorage = certPinStorage,
             tokenStorage = tokenStorage,
             identity = identity,
             useTls = true,
             context = applicationContext
-        )
+        ).apply {
+            autoReconnectEnabled = autoConnect
+            onDeviceRevoked = { _ ->
+                userDisconnected = true
+                isUserDisconnected = true
+                setDisconnectedByUser(applicationContext, true)
+                cancelAutoConnect()
+                discoveryManager.stopListening()
+                ServiceCompat.stopForeground(this@SnowForegroundService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                manager?.cancel(NOTIFICATION_ID)
+            }
+        }
     }
 
     val discoveryManager: DiscoveryManager by lazy {
+        val identity = org.snow.security.DeviceIdentity.getOrCreate(applicationContext)
         val certPinStorage = EncryptedCertPinStorage(applicationContext)
         val tokenStorage = SharedPreferencesTokenStorage(applicationContext)
         DiscoveryManager(
             certPinStorage = certPinStorage,
-            tokenStorage = tokenStorage
+            tokenStorage = tokenStorage,
+            localDeviceId = identity.deviceId,
+            onWakeTargetMatched = { peer ->
+                if (!userDisconnected && client.autoReconnectEnabled &&
+                    client.connectionState.value == ConnectionState.DISCONNECTED
+                ) {
+                    SafeLog.i("SnowForegroundService", "Wake beacon matched for ${peer.ipAddress}:${peer.port}; reconnecting...")
+                    client.connect(peer.ipAddress, peer.port)
+                }
+            }
         )
     }
 
@@ -456,10 +481,11 @@ class SnowForegroundService : Service() {
     private fun startObservingState() {
         stateObserverJob?.cancel()
         stateObserverJob = serviceScope.launch {
-            client.connectionState.collectLatest { state ->
+            combine(client.connectionState, client.authState) { state, auth -> state to auth }
+                .collectLatest { (state, auth) ->
                 when (state) {
                     ConnectionState.DISCONNECTED -> {
-                        if (!userDisconnected) {
+                        if (!userDisconnected && client.autoReconnectEnabled) {
                             discoveryManager.startListening()
                         }
                         if (userDisconnected && !peerHostManager.isHostModeActive()) {
@@ -480,11 +506,19 @@ class SnowForegroundService : Service() {
                         updateNotification("Connecting...")
                     }
                     ConnectionState.CONNECTED -> {
-                        discoveryManager.stopListening()
-                        updateNotification("Connected to desktop")
+                        if (auth is AuthState.Authenticated) {
+                            discoveryManager.stopListening()
+                            updateNotification("Connected to desktop")
+                        } else if (auth is AuthState.ConnectedUnauthenticated) {
+                            updateNotification("Connected — awaiting pairing...")
+                        } else {
+                            updateNotification("Authenticating...")
+                        }
                     }
                     ConnectionState.RECONNECTING -> {
-                        discoveryManager.startListening()
+                        if (client.autoReconnectEnabled) {
+                            discoveryManager.startListening()
+                        }
                         updateNotification("Reconnecting...")
                     }
                 }

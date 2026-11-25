@@ -164,8 +164,8 @@ def validate_registry() -> tuple[bool, list[str]]:
         if not isinstance(meta.tier, str) or not meta.tier.strip():
             errors.append(f"Capability '{name}': tier must be non-empty string.")
 
-    if len(_CAPABILITY_REGISTRY) != 42:
-        errors.append(f"Expected exactly 42 registered capabilities (38 V4 baseline + 4 V5.0.0 additions), found {len(_CAPABILITY_REGISTRY)}.")
+    if len(_CAPABILITY_REGISTRY) != 48:
+        errors.append(f"Expected exactly 48 registered capabilities (42 V5.1.0 baseline + 6 V5.2 Stage 6A additions), found {len(_CAPABILITY_REGISTRY)}.")
 
     return (len(errors) == 0, errors)
 
@@ -276,7 +276,7 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         destructive_hint=False,
         requires_approval=False,
         os_classification="windows",
-        description="Get text content currently residing on the Windows system clipboard.",
+        description="Get text, OS image metadata, and up to 3 latest shared clipboard buffer entries from Windows clipboard.",
     ),
     CapabilityMetadata(
         name="snow_windows_clipboard_set",
@@ -605,6 +605,69 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         requires_approval=True,
         os_classification="windows",
         description="Lock the Windows workstation session cleanly (requires owner approval for AI callers).",
+    ),
+    # -------------------------------------------------------------------------
+    # V5.2.0 Stage 6A Additions (6 new tools -> 48 total)
+    # -------------------------------------------------------------------------
+    CapabilityMetadata(
+        name="snow_youtube_play",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Open a validated YouTube video/URL or YouTube search query on Windows or connected Android device.",
+    ),
+    CapabilityMetadata(
+        name="snow_web_open",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Safely open an HTTP/HTTPS URL in the browser on Windows or connected Android device.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_list_windows",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="List open visible top-level windows on the Windows desktop with hwnd, title, and process metadata.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_focus_window",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Focus an open Windows desktop window by hwnd, window title substring, or process name.",
+    ),
+    CapabilityMetadata(
+        name="snow_system_volume_set",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Set the master system volume percentage (0-100) on Windows or connected Android device.",
+    ),
+    CapabilityMetadata(
+        name="snow_federation_peers",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="List secret-redacted cross-network federation grants and peer reachability state.",
     ),
 ]
 

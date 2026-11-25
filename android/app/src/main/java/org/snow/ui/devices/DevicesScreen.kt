@@ -202,8 +202,11 @@ fun DevicesScreen(
                 }
             }
         } else {
-            items(filteredDevices, key = { it.deviceId.ifBlank { it.host } }) { dev ->
-                val isActive = dev.host == activeHost || (activeHost == "127.0.0.1" && dev.host == "127.0.0.1")
+            items(filteredDevices, key = { it.deviceId.ifBlank { it.snowId ?: it.host } }) { dev ->
+                val isActive = isConnected && (
+                    (!activeHost.isNullOrBlank() && dev.host == activeHost) ||
+                    (activeHost == "127.0.0.1" && dev.host == "127.0.0.1")
+                )
                 DeviceListItem(
                     device = dev,
                     isActive = isActive,
@@ -522,7 +525,7 @@ private fun DeviceListItem(
                         onDisconnect()
                     })
                 } else {
-                    SnowTonalButton(text = "Connect", onClick = {
+                    SnowTonalButton(text = "Reconnect", onClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onConnect()
                     })

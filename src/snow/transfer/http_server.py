@@ -857,10 +857,11 @@ class SnowHttpTransferServer:
         version_name = getattr(self.config, "version", "5.1.0") or "5.1.0"
         version_code = 3 if version_name.startswith("5.1") else 2
 
-        name_match = _re.search(r"SNOW-Mobile-(\d+\.\d+\.\d+)\.apk$", apk_path.name, _re.IGNORECASE)
+        name_match = _re.search(r"SNOW-Mobile-(\d+)\.(\d+)\.(\d+)\.apk$", apk_path.name, _re.IGNORECASE)
         if name_match:
-            version_name = name_match.group(1)
-            version_code = 3 if version_name.startswith("5.1") else (2 if version_name.startswith("5.0") else 1)
+            major, minor, patch = (int(name_match.group(1)), int(name_match.group(2)), int(name_match.group(3)))
+            version_name = f"{major}.{minor}.{patch}"
+            version_code = 4 if (major, minor) >= (5, 2) else (3 if (major, minor) == (5, 1) else (2 if (major, minor) == (5, 0) else 1))
 
         manifest_file = apk_path.parent / "update_manifest.json"
         if manifest_file.is_file():
@@ -870,10 +871,12 @@ class SnowHttpTransferServer:
                 if isinstance(android_meta, dict) and (
                     not android_meta.get("apk_name") or android_meta.get("apk_name") == apk_path.name
                 ):
-                    if isinstance(android_meta.get("version_code"), int):
-                        version_code = android_meta["version_code"]
-                    if isinstance(android_meta.get("version_name"), str) and android_meta["version_name"].strip():
-                        version_name = android_meta["version_name"].strip()
+                    vc = android_meta.get("version_code")
+                    if isinstance(vc, int) and vc > 0:
+                        version_code = vc
+                    vn = android_meta.get("version_name")
+                    if isinstance(vn, str) and _re.match(r"^\d+\.\d+\.\d+$", vn.strip()):
+                        version_name = vn.strip()
             except Exception:
                 pass
 

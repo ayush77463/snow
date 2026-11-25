@@ -29,6 +29,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
+import urllib.parse
 import uuid
 
 from snow.capabilities.engine import CapabilityEngine, CapabilityRequest, CapabilityResponse
@@ -1519,6 +1520,243 @@ class SnowMcpBridge:
         from snow.network.network_model import SnowNetworkManager
         network_mgr = SnowNetworkManager(db_manager=self.capability_engine.db_manager)
         return network_mgr.build_topology(principal=principal)
+
+    # =========================================================================
+    # V5.2.0 Stage 6A Capabilities (WS12 / WS13 -> 48 Total Tools)
+    # =========================================================================
+
+    @staticmethod
+    def _normalize_target_platform(target: str) -> Optional[str]:
+        clean = (target or "windows").strip().lower()
+        if clean in ("windows", "desktop", "local"):
+            return "windows"
+        if clean in ("android", "phone", "mobile"):
+            return "android"
+        return None
+
+    async def windows_list_windows(
+        self, include_empty_titles: bool = False, limit: int = 50
+    ) -> dict[str, Any]:
+        """List visible top-level windows on the Windows host."""
+        return await self._execute_local_or_ipc(
+            "windows_list_windows",
+            {"include_empty_titles": bool(include_empty_titles), "limit": int(limit)},
+        )
+
+    async def windows_focus_window(
+        self,
+        hwnd: Optional[int] = None,
+        title_contains: str = "",
+        process_name: str = "",
+    ) -> dict[str, Any]:
+        """Focus an existing visible Windows desktop window cleanly."""
+        if hwnd is not None and (isinstance(hwnd, bool) or not isinstance(hwnd, int) or hwnd <= 0):
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'hwnd' must be a positive integer window handle.",
+            }
+        if not hwnd and not str(title_contains or "").strip() and not str(process_name or "").strip():
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "Provide at least one selector: 'hwnd', 'title_contains', or 'process_name'.",
+            }
+        return await self._execute_local_or_ipc(
+            "windows_focus_window",
+            {
+                "hwnd": hwnd,
+                "title_contains": str(title_contains or ""),
+                "process_name": str(process_name or ""),
+            },
+        )
+
+    async def web_open(
+        self, url: str, target: str = "windows", device_id: str = ""
+    ) -> dict[str, Any]:
+        """Validate and open an HTTP/HTTPS URL on Windows or Android."""
+        platform = self._normalize_target_platform(target)
+        if not platform:
+            return {
+                "success": False,
+                "status": "INVALID_TARGET",
+                "error": f"Unsupported target '{target}'. Use 'windows' or 'android'.",
+            }
+        if not isinstance(url, str) or not url.strip():
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'url' must be a non-empty http:// or https:// URL.",
+            }
+        clean_url = url.strip()
+        if any(c in clean_url for c in ("\r", "\n", "\0")) or any(c.isspace() for c in clean_url):
+            return {
+                "success": False,
+                "status": "INVALID_URL_SCHEME",
+                "error": "URL contains invalid control or whitespace characters.",
+            }
+        parsed = urllib.parse.urlparse(clean_url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc or not parsed.hostname:
+            return {
+                "success": False,
+                "status": "INVALID_URL_SCHEME",
+                "error": "Only http:// and https:// URLs with a valid host are permitted.",
+            }
+        return await self.share_link(url=clean_url, target=platform, device_id=device_id)
+
+    async def youtube_play(
+        self, query: str = "", url: str = "", target: str = "windows", device_id: str = ""
+    ) -> dict[str, Any]:
+        """Open a validated YouTube URL or search query on Windows or Android."""
+        platform = self._normalize_target_platform(target)
+        if not platform:
+            return {
+                "success": False,
+                "status": "INVALID_TARGET",
+                "error": f"Unsupported target '{target}'. Use 'windows' or 'android'.",
+            }
+        allowed_hosts = {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+            "youtu.be",
+        }
+        clean_url = str(url or "").strip()
+        clean_query = str(query or "").strip()
+
+        if clean_url:
+            if any(c in clean_url for c in ("\r", "\n", "\0")) or any(c.isspace() for c in clean_url):
+                return {
+                    "success": False,
+                    "status": "INVALID_YOUTUBE_URL",
+                    "error": "YouTube URL contains illegal control or whitespace characters.",
+                }
+            parsed = urllib.parse.urlparse(clean_url)
+            host = (parsed.hostname or "").lower()
+            if parsed.scheme.lower() not in ("http", "https") or host not in allowed_hosts:
+                return {
+                    "success": False,
+                    "status": "INVALID_YOUTUBE_URL",
+                    "error": "Only http:// or https:// URLs on youtube.com or youtu.be are permitted.",
+                }
+            resolved_url = clean_url
+        elif clean_query:
+            if any(c in clean_query for c in ("\r", "\n", "\0")):
+                return {
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Search query contains illegal control characters.",
+                }
+            bounded_q = clean_query[:200]
+            resolved_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(bounded_q)}"
+            clean_query = bounded_q
+        else:
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "Either 'query' or 'url' must be provided.",
+            }
+
+        res = await self.share_link(url=resolved_url, target=platform, device_id=device_id)
+        if isinstance(res, dict) and res.get("success"):
+            data = dict(res.get("data") or {})
+            data.setdefault("url", resolved_url)
+            if clean_query:
+                data["query"] = clean_query
+            res = dict(res)
+            res["data"] = data
+        return res
+
+    async def system_volume_set(
+        self, level: int, target: str = "windows", device_id: str = ""
+    ) -> dict[str, Any]:
+        """Set master system volume percentage (0-100) on Windows or Android."""
+        platform = self._normalize_target_platform(target)
+        if not platform:
+            return {
+                "success": False,
+                "status": "INVALID_TARGET",
+                "error": f"Unsupported target '{target}'. Use 'windows' or 'android'.",
+            }
+        if isinstance(level, bool) or not isinstance(level, (int, float)):
+            return {
+                "success": False,
+                "status": "INVALID_VOLUME_LEVEL",
+                "error": "Volume 'level' must be an integer between 0 and 100.",
+            }
+        numeric = float(level)
+        if numeric != numeric or numeric < 0.0 or numeric > 100.0 or numeric in (float("inf"), float("-inf")):
+            return {
+                "success": False,
+                "status": "INVALID_VOLUME_LEVEL",
+                "error": "Volume 'level' must be between 0 and 100.",
+            }
+        bounded_level = int(round(numeric))
+        return await self.media_control(
+            action="volume_set",
+            target=platform,
+            device_id=device_id,
+            value=bounded_level,
+        )
+
+    async def federation_peers(
+        self, include_revoked: bool = False, ctx: Optional[ExecutionContext] = None
+    ) -> dict[str, Any]:
+        """Inspect secret-redacted federation grants and peer reachability."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.1):
+            res = await self.call(
+                "federation_peers",
+                payload={"include_revoked": bool(include_revoked)},
+                timeout=5.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+
+        from snow.network.network_model import SnowNetworkManager
+        from snow.network.federation import FederationManager
+
+        principal = ctx.principal if ctx else (
+            ExecutionPrincipal.OWNER_MANUAL if self.is_owner_channel else ExecutionPrincipal.AI_MCP
+        )
+        db_mgr = getattr(self.capability_engine, "db_manager", None)
+        node_reg = getattr(self.capability_engine, "node_registry", None)
+        network_mgr = SnowNetworkManager(db_manager=db_mgr, node_registry=node_reg)
+        topo = network_mgr.build_topology(principal=principal)
+        mesh_peers = [
+            n for n in (topo.get("nodes") or [])
+            if isinstance(n, dict) and n.get("federated")
+        ]
+
+        grants: list[dict[str, Any]] = []
+        local_network_id: Optional[str] = None
+        local_network_name: Optional[str] = None
+        if db_mgr and hasattr(db_mgr, "list_federation_grants"):
+            fed_mgr = FederationManager(db_manager=db_mgr, local_node_id="desktop-core")
+            local_network_id = getattr(fed_mgr, "local_network_id", None)
+            local_network_name = getattr(fed_mgr, "local_network_name", None)
+            forbidden = {"auth_token", "auth_token_hash", "token", "secret", "pairing_token", "ticket", "ipc_secret"}
+            for g in fed_mgr.list_grants(active_only=not include_revoked):
+                clean_g = {k: v for k, v in g.items() if k not in forbidden}
+                peer_id = clean_g.get("peer_node_id")
+                reg_node = node_reg.get_node(peer_id) if (node_reg and peer_id) else None
+                clean_g["is_connected"] = bool(getattr(reg_node, "is_connected", False)) if reg_node else False
+                clean_g["reachability_state"] = "active" if clean_g["is_connected"] else "offline"
+                grants.append(clean_g)
+
+        return {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {
+                "local_node_id": topo.get("local_node_id", "desktop-core"),
+                "local_network_id": local_network_id,
+                "local_network_name": local_network_name,
+                "grants": grants,
+                "mesh_peers": mesh_peers,
+                "active_count": sum(1 for g in grants if g.get("status") == "ACTIVE"),
+                "total_count": len(grants),
+            },
+        }
 
     # =========================================================================
     # Phase 28A: Connection Mode & Relay Management Methods

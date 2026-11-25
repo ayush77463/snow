@@ -171,6 +171,23 @@ class PairingManager:
                 state["peer_pin"] = self._peer_pin
             return state
 
+    def cancel_pin(self) -> dict[str, Any]:
+        """Immediately cancel and invalidate any currently active pairing PIN."""
+        with self._lock:
+            was_active = bool(self._active_pin or self._owner_pin or self._peer_pin)
+            self._active_pin = None
+            self._owner_pin = None
+            self._peer_pin = None
+            self._pin_generated_at = 0.0
+            self._pending_device_id = None
+            self._pending_device_name = None
+            logger.info("Cancelled active pairing PIN (was_active=%s).", was_active)
+            return {
+                "cancelled": was_active,
+                "has_active_pin": False,
+                "remaining_seconds": 0,
+            }
+
     def generate_pin(self, display_to_stderr: bool = True, trust_tier: str = "owner") -> str:
         """Generate cryptographically secure 6-digit decimal PINs for Owner and Peer pairing.
 

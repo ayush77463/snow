@@ -502,12 +502,13 @@ class TestDashboardScreenEndpoints(AioHTTPTestCase):
 
     @unittest_run_loop
     async def test_workflow_steps_details_collapsed(self):
-        """Test workflow execution steps are enclosed in collapsible details container."""
+        """Test Stage 6A diagnostics keeps Technical Ports collapsed while decluttering legacy workflow steps."""
         index_html_path = Path(__file__).resolve().parent.parent / "src" / "snow" / "web" / "static" / "index.html"
         content = index_html_path.read_text(encoding="utf-8")
-        self.assertIn('<details class="workflow-technical-details mt-3" id="workflow-steps-details">', content)
-        self.assertIn('<summary class="workflow-tech-summary">Execution Steps</summary>', content)
-        self.assertIn('<div id="workflow-steps-list"', content)
+        self.assertNotIn('id="workflow-steps-details"', content)
+        self.assertNotIn('id="workflow-steps-list"', content)
+        self.assertIn('<details class="advanced-accordion">', content)
+        self.assertIn("Technical Ports &amp; Loopback Architecture", content)
 
 
 class TestPhase26AMultiProcessIntegration(AioHTTPTestCase):

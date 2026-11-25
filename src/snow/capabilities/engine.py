@@ -69,6 +69,10 @@ ENGINE_ACTION_MAP: dict[str, str] = {
     "battery": CAPABILITY_DESKTOP_STATUS,
     "windows_active_window": CAPABILITY_DESKTOP_STATUS,
     "snow_windows_active_window": CAPABILITY_DESKTOP_STATUS,
+    "windows_list_windows": CAPABILITY_DESKTOP_STATUS,
+    "snow_windows_list_windows": CAPABILITY_DESKTOP_STATUS,
+    "windows_focus_window": CAPABILITY_DESKTOP_APP_LAUNCH,
+    "snow_windows_focus_window": CAPABILITY_DESKTOP_APP_LAUNCH,
     "windows_notify": CAPABILITY_DESKTOP_STATUS,
     "snow_windows_notify": CAPABILITY_DESKTOP_STATUS,
     "windows_lock_screen": CAPABILITY_DESKTOP_APP_LAUNCH,
@@ -494,6 +498,58 @@ class CapabilityEngine:
                 error=None if is_ok else res.get("error"),
             )
 
+        if action in ("windows_list_windows", "snow_windows_list_windows"):
+            include_empty = bool(params.get("include_empty_titles", False))
+            try:
+                limit = int(params.get("limit", 50) or 50)
+            except (TypeError, ValueError):
+                limit = 50
+            res = await self.system.list_windows(include_empty_titles=include_empty, limit=limit)
+            is_ok = bool(res.get("success", False))
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "LIST_WINDOWS_FAILED"),
+                data=res,
+                error=None if is_ok else res.get("error"),
+            )
+
+        if action in ("windows_focus_window", "snow_windows_focus_window"):
+            raw_hwnd = params.get("hwnd")
+            parsed_hwnd: Optional[int] = None
+            if raw_hwnd is not None and raw_hwnd != "":
+                if isinstance(raw_hwnd, bool):
+                    return CapabilityResponse(
+                        success=False,
+                        status="INVALID_ARGUMENT",
+                        error="'hwnd' must be a positive integer window handle.",
+                    )
+                try:
+                    parsed_hwnd = int(raw_hwnd)
+                except (TypeError, ValueError):
+                    return CapabilityResponse(
+                        success=False,
+                        status="INVALID_ARGUMENT",
+                        error="'hwnd' must be a positive integer window handle.",
+                    )
+            title_contains = params.get("title_contains", "")
+            process_name = params.get("process_name", "")
+            if title_contains is None:
+                title_contains = ""
+            if process_name is None:
+                process_name = ""
+            res = await self.system.focus_window(
+                hwnd=parsed_hwnd,
+                title_contains=title_contains,
+                process_name=process_name,
+            )
+            is_ok = bool(res.get("success", False))
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "FOCUS_FAILED"),
+                data=res,
+                error=None if is_ok else res.get("error"),
+            )
+
         # --- Files ---
         if action in ("windows_file_read", "desktop_file_read"):
             file_path = params.get("file_path", "")
@@ -610,10 +666,39 @@ class CapabilityEngine:
         if action in ("windows_clipboard_get", "desktop_clipboard_get"):
             res = await self.clipboard.get_clipboard()
             is_ok = res.get("success", False)
+            enriched: Optional[dict[str, Any]] = None
+            if is_ok and isinstance(res, dict):
+                os_text = str(res.get("text") or "")
+                has_image = bool(res.get("has_image", False))
+                raw_img = res.get("image") if isinstance(res.get("image"), dict) else None
+                forbidden_keys = ("file_path", "image_path", "storage_dir", "bytes", "raw_bytes", "image_bytes", "payload_bytes")
+                os_image = (
+                    {k: v for k, v in raw_img.items() if k not in forbidden_keys}
+                    if raw_img is not None
+                    else ({"has_image": True} if has_image else None)
+                )
+
+                recent_items: list[dict[str, Any]] = []
+                if not os_text and getattr(self, "clipboard_buffer", None):
+                    try:
+                        for entry in self.clipboard_buffer.list_items(limit=3):
+                            if isinstance(entry, dict):
+                                recent_items.append({k: v for k, v in entry.items() if k not in forbidden_keys})
+                    except Exception:
+                        recent_items = []
+
+                enriched = {k: v for k, v in res.items() if k not in forbidden_keys}
+                enriched["image"] = os_image
+                enriched["os_text"] = os_text
+                enriched["has_image"] = has_image
+                enriched["os_image"] = os_image
+                enriched["recent_buffer_items"] = recent_items
+                enriched["recent_buffer_count"] = len(recent_items)
+
             return CapabilityResponse(
                 success=is_ok,
                 status=res.get("status", "SUCCESS" if is_ok else "ERROR"),
-                data=res if is_ok else None,
+                data=enriched,
                 error=res.get("error"),
             )
 
@@ -964,11 +1049,16 @@ class CapabilityEngine:
             text = str(params.get("text", "")).strip()
             if url:
                 parsed = urllib.parse.urlparse(url)
-                if parsed.scheme.lower() not in ("http", "https") or any(c in url for c in ("\r", "\n", "\0")):
+                if (
+                    parsed.scheme.lower() not in ("http", "https")
+                    or not parsed.netloc
+                    or any(c in url for c in ("\r", "\n", "\0"))
+                    or any(c.isspace() for c in url)
+                ):
                     return CapabilityResponse(
                         success=False,
                         status="INVALID_URL_SCHEME",
-                        error="Only http:// and https:// URL schemes are permitted.",
+                        error="Only http:// and https:// URL schemes with a valid host are permitted.",
                     )
                 import webbrowser
                 opened = webbrowser.open(url)

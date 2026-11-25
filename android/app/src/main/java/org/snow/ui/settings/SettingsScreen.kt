@@ -567,6 +567,20 @@ fun SettingsScreen(
                             onClick = { showResetConfirm = true },
                             modifier = Modifier.fillMaxWidth()
                         )
+
+                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+
+                        Text(
+                            text = "OAuth Approvals",
+                            style = SnowTypography.labelSmall,
+                            color = colors.textMuted
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Review and approve AI OAuth authorization requests directly using the Pending Approvals bell in the top bar. Android never requires or receives the Windows local IPC secret.",
+                            style = SnowTypography.bodySmall,
+                            color = colors.textSecondary
+                        )
                     }
                 }
             }
@@ -577,13 +591,13 @@ fun SettingsScreen(
         }
     }
 
-    // Android 14+ Restricted Settings Guide Dialog
+    // Android 14–17 / ColorOS 17 Restricted Settings & Background Execution Guide Dialog
     if (showNotificationGuide) {
         AlertDialog(
             onDismissRequest = { showNotificationGuide = false },
             title = {
                 Text(
-                    text = "Notification Access Setup",
+                    text = "Android / ColorOS Setup Guide",
                     style = SnowTypography.titleMedium,
                     color = colors.textPrimary
                 )
@@ -591,15 +605,15 @@ fun SettingsScreen(
             text = {
                 Column {
                     Text(
-                        text = "On Android 13 and 14+, side-loaded apps require restricted settings authorization before notification access can be granted:",
+                        text = "Sideloaded apps on Android 14-17 and ColorOS 17 require explicit user approval in Android Settings before restricted features can run:",
                         style = SnowTypography.bodySmall,
                         color = colors.textSecondary
                     )
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text(text = "1. Open App Info for SNOW in Android Settings", style = SnowTypography.bodySmall, color = colors.textPrimary)
-                    Text(text = "2. Tap the 3 dots (⋮) in the top-right corner", style = SnowTypography.bodySmall, color = colors.textPrimary)
-                    Text(text = "3. Select 'Allow restricted settings' and confirm", style = SnowTypography.bodySmall, color = colors.textPrimary)
-                    Text(text = "4. Return here and tap 'Open Notification Settings'", style = SnowTypography.bodySmall, color = colors.textPrimary)
+                    Text(text = "1. Restricted Settings: Open App Info -> Menu (3 dots) -> Allow restricted settings.", style = SnowTypography.bodySmall, color = colors.textPrimary)
+                    Text(text = "2. Notifications: Grant Notification permission and enable SNOW in Notification Listener settings.", style = SnowTypography.bodySmall, color = colors.textPrimary)
+                    Text(text = "3. Battery Optimization: Set Battery usage to Unrestricted / Allow background activity.", style = SnowTypography.bodySmall, color = colors.textPrimary)
+                    Text(text = "4. Auto-Launch (ColorOS): Enable Allow auto-launch under App Info -> Battery usage.", style = SnowTypography.bodySmall, color = colors.textPrimary)
                 }
             },
             confirmButton = {

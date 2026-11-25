@@ -103,9 +103,11 @@ fun SnowApp(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
 
-    // State observation from SnowUiRepository
-    val connectionState by repository.connectionState.collectAsState()
+    // State observation from SnowUiRepository (UI connected ONLY when transport is CONNECTED AND Authenticated)
+    val connectionState by repository.uiConnectionState.collectAsState()
+    val authState by repository.authState.collectAsState()
     val connectedEndpoint by repository.connectedEndpoint.collectAsState()
+    val revocationNotice by repository.revocationNotice.collectAsState()
     val savedDevices by repository.savedDevices.collectAsState()
     val discoveredPeers by repository.discoveredPeers.collectAsState()
     val activeTransfer by repository.activeTransfer.collectAsState()
@@ -174,15 +176,39 @@ fun SnowApp(
         mutableStateOf(repository.isRemoteRelayEnabled())
     }
 
-    // Determine currently active connected device
-    val activeDevice = remember(savedDevices, repository.currentTargetHost) {
-        val target = repository.currentTargetHost
-        savedDevices.find { it.host == target || (target == "127.0.0.1" && it.host == "127.0.0.1") }
+    LaunchedEffect(revocationNotice) {
+        val msg = revocationNotice
+        if (!msg.isNullOrBlank()) {
+            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+            repository.clearRevocationNotice()
+        }
+    }
+
+    // Determine currently active authenticated device reactively
+    val activeAuth = authState as? org.snow.network.AuthState.Authenticated
+    val activeHostFromEndpoint = remember(connectedEndpoint, connectionState, authState) {
+        if (SnowUiRepository.isSessionTrulyConnected(connectionState, authState)) {
+            connectedEndpoint?.substringBeforeLast(":")?.trim().orEmpty()
+        } else {
+            ""
+        }
+    }
+    val activeDevice = remember(savedDevices, activeHostFromEndpoint, activeAuth, connectionState) {
+        if (!SnowUiRepository.isSessionTrulyConnected(connectionState, authState)) {
+            null
+        } else {
+            savedDevices.find { dev ->
+                (activeAuth?.peerSnowId != null && dev.snowId == activeAuth.peerSnowId) ||
+                    (activeAuth?.peerDeviceId != null && dev.deviceId == activeAuth.peerDeviceId) ||
+                    (activeHostFromEndpoint.isNotBlank() && (dev.host == activeHostFromEndpoint || (activeHostFromEndpoint == "127.0.0.1" && dev.host == "127.0.0.1")))
+            }
+        }
     }
 
     val activeDeviceName = activeDevice?.deviceName?.ifBlank { null }
+        ?: activeAuth?.peerDeviceName?.ifBlank { null }
         ?: pcTelemetry.hostname
-        ?: if (connectionState == ConnectionState.CONNECTED) "SNOW Core" else "No device"
+        ?: if (SnowUiRepository.isSessionTrulyConnected(connectionState, authState)) "SNOW Core" else "No device"
 
     val transport = remember(connectedEndpoint) {
         val ep = connectedEndpoint ?: ""
@@ -438,7 +464,7 @@ fun SnowApp(
                         DevicesScreen(
                             savedDevices = savedDevices,
                             discoveredPeers = discoveredPeers,
-                            activeHost = repository.currentTargetHost,
+                            activeHost = activeHostFromEndpoint,
                             federationGrants = federationGrantsList,
                             onConnectDevice = { dev: SavedDevice ->
                                 repository.connect(dev.host, dev.port)
@@ -447,17 +473,17 @@ fun SnowApp(
                                 repository.disconnect()
                             },
                             onUnpairDevice = { dev: SavedDevice ->
-                                repository.removeSavedDevice(dev.deviceId)
+                                repository.unpairDevice(dev)
+                                Toast.makeText(context, "Unpaired ${dev.deviceName}", Toast.LENGTH_SHORT).show()
                             },
                             onUpdateTrustTier = { deviceId, tier ->
                                 val canonical = SnowUiRepository.normalizeAccessProfile(tier)
                                 repository.updateDeviceTrustTier(deviceId, canonical)
                                 val targetDev = savedDevices.find { it.deviceId == deviceId }
-                                val activeHost = repository.currentTargetHost
-                                val isActiveDevice = targetDev != null && (
-                                    targetDev.host == activeHost ||
-                                        (activeHost == "127.0.0.1" && targetDev.host == "127.0.0.1") ||
-                                        (targetDev.host.isNotBlank() && targetDev.host == repository.connectedHost)
+                                val isActiveDevice = targetDev != null && SnowUiRepository.isSessionTrulyConnected(connectionState, authState) && (
+                                    (activeAuth?.peerSnowId != null && targetDev.snowId == activeAuth.peerSnowId) ||
+                                        (activeAuth?.peerDeviceId != null && targetDev.deviceId == activeAuth.peerDeviceId) ||
+                                        (activeHostFromEndpoint.isNotBlank() && targetDev.host == activeHostFromEndpoint)
                                     )
                                 if (isActiveDevice) {
                                     repository.setAccessProfile(canonical)
@@ -501,7 +527,7 @@ fun SnowApp(
                             onOpenConnectSheet = { showConnectSheet = true },
                             generatedFederationInvite = generatedFederationCode,
                             onDismissFederationInvite = { generatedFederationCode = null },
-                            isConnected = connectionState != ConnectionState.DISCONNECTED || peerHostState.isActive,
+                            isConnected = SnowUiRepository.isSessionTrulyConnected(connectionState, authState) || peerHostState.isActive,
                             autoConnectNearby = autoConnectNearby,
                             onToggleAutoConnect = { checked ->
                                 autoConnectNearby = checked
@@ -666,7 +692,7 @@ fun SnowApp(
                             autoConnectNearby = autoConnectNearby,
                             onToggleAutoConnectNearby = { checked ->
                                 autoConnectNearby = checked
-                                prefs.edit().putBoolean(SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, checked).apply()
+                                repository.setAutoReconnectEnabled(checked)
                             },
                             mySnowId = repository.canonicalSnowId,
                             myDeviceId = repository.identity.deviceId,

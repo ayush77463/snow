@@ -209,6 +209,176 @@ def _default_lock_workstation_win32() -> dict[str, Any]:
     }
 
 
+def _default_list_windows_win32(
+    include_empty_titles: bool = False,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Enumerate visible top-level desktop windows via Win32 EnumWindows."""
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_PLATFORM",
+            "windows": [],
+            "count": 0,
+            "error": "Window enumeration is only supported on Windows.",
+        }
+
+    try:
+        bounded_limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        bounded_limit = 50
+
+    user32 = ctypes.windll.user32
+    fg_hwnd = int(user32.GetForegroundWindow() or 0)
+    windows: list[dict[str, Any]] = []
+    proc_name_cache: dict[int, str] = {}
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _callback(hwnd_val: int, _lparam: int) -> bool:
+        try:
+            if not user32.IsWindowVisible(hwnd_val):
+                return True
+            title_len = int(user32.GetWindowTextLengthW(hwnd_val) or 0)
+            window_title = ""
+            if title_len > 0:
+                buf = ctypes.create_unicode_buffer(min(title_len, MAX_WINDOW_TITLE_CHARS) + 1)
+                user32.GetWindowTextW(hwnd_val, buf, len(buf))
+                window_title = _sanitize_text(buf.value, MAX_WINDOW_TITLE_CHARS)
+            if not include_empty_titles and not window_title:
+                return True
+
+            pid_val = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd_val, ctypes.byref(pid_val))
+            pid = int(pid_val.value) if pid_val.value else None
+            proc_name = ""
+            if pid:
+                if pid in proc_name_cache:
+                    proc_name = proc_name_cache[pid]
+                else:
+                    try:
+                        proc_name = psutil.Process(pid).name()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        proc_name = ""
+                    proc_name_cache[pid] = proc_name
+
+            hwnd_int = int(hwnd_val)
+            windows.append({
+                "hwnd": hwnd_int,
+                "window_title": window_title,
+                "process_id": pid,
+                "process_name": proc_name,
+                "is_foreground": hwnd_int == fg_hwnd and fg_hwnd != 0,
+                "is_minimized": bool(user32.IsIconic(hwnd_val)),
+            })
+            if len(windows) >= bounded_limit:
+                return False
+        except Exception:
+            return True
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_callback), 0)
+    return {
+        "success": True,
+        "status": "SUCCESS",
+        "count": len(windows),
+        "foreground_hwnd": fg_hwnd if fg_hwnd else None,
+        "windows": windows,
+    }
+
+
+def _default_focus_window_win32(
+    hwnd: Optional[int] = None,
+    title_contains: str = "",
+    process_name: str = "",
+) -> dict[str, Any]:
+    """Bring an existing visible desktop window to the foreground without shell calls."""
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_PLATFORM",
+            "error": "Window focusing is only supported on Windows.",
+        }
+
+    enum_res = _default_list_windows_win32(include_empty_titles=True, limit=200)
+    candidates: list[dict[str, Any]] = list(enum_res.get("windows") or [])
+    target_entry: Optional[dict[str, Any]] = None
+
+    title_needle = _sanitize_text(title_contains, MAX_WINDOW_TITLE_CHARS).lower() if title_contains else ""
+    proc_needle = _sanitize_text(process_name, 128).lower() if process_name else ""
+
+    for win in candidates:
+        if hwnd is not None and win.get("hwnd") == int(hwnd):
+            if title_needle and title_needle not in str(win.get("window_title") or "").lower():
+                continue
+            if proc_needle and proc_needle not in str(win.get("process_name") or "").lower():
+                continue
+            target_entry = win
+            break
+
+    if target_entry is None and hwnd is None:
+        for win in candidates:
+            win_title = str(win.get("window_title") or "").lower()
+            win_proc = str(win.get("process_name") or "").lower()
+            if title_needle and title_needle not in win_title:
+                continue
+            if proc_needle and proc_needle not in win_proc:
+                continue
+            if not win_title and not proc_needle:
+                continue
+            target_entry = win
+            break
+
+    if target_entry is None:
+        return {
+            "success": False,
+            "status": "WINDOW_NOT_FOUND",
+            "error": "No matching visible desktop window found for the specified selector.",
+        }
+
+    user32 = ctypes.windll.user32
+    target_hwnd = wintypes.HWND(int(target_entry["hwnd"]))
+    if not user32.IsWindow(target_hwnd):
+        return {
+            "success": False,
+            "status": "WINDOW_NOT_FOUND",
+            "error": "Target window handle is no longer valid.",
+        }
+
+    SW_RESTORE = 9
+    try:
+        if user32.IsIconic(target_hwnd):
+            user32.ShowWindow(target_hwnd, SW_RESTORE)
+        user32.BringWindowToTop(target_hwnd)
+        focused = bool(user32.SetForegroundWindow(target_hwnd))
+        now_fg = int(user32.GetForegroundWindow() or 0) == int(target_entry["hwnd"])
+        if not focused and not now_fg:
+            return {
+                "success": False,
+                "status": "FOCUS_DENIED",
+                "hwnd": target_entry["hwnd"],
+                "window_title": target_entry.get("window_title", ""),
+                "process_name": target_entry.get("process_name", ""),
+                "error": "Windows OS restricted SetForegroundWindow focus change for this window.",
+            }
+        return {
+            "success": True,
+            "status": "SUCCESS",
+            "hwnd": target_entry["hwnd"],
+            "window_title": target_entry.get("window_title", ""),
+            "process_id": target_entry.get("process_id"),
+            "process_name": target_entry.get("process_name", ""),
+            "focused": True,
+        }
+    except Exception as exc:
+        logger.error("Failed focusing window hwnd=%s: %s", target_entry.get("hwnd"), exc)
+        return {
+            "success": False,
+            "status": "FOCUS_FAILED",
+            "error": str(exc),
+        }
+
+
 class WindowsSystemControls:
     """Thread-safe, testable Windows workstation & shell notification capabilities."""
 
@@ -217,10 +387,14 @@ class WindowsSystemControls:
         active_window_fn: Optional[Callable[[], dict[str, Any]]] = None,
         notify_fn: Optional[Callable[[str, str], dict[str, Any]]] = None,
         lock_fn: Optional[Callable[[], dict[str, Any]]] = None,
+        list_windows_fn: Optional[Callable[[bool, int], dict[str, Any]]] = None,
+        focus_window_fn: Optional[Callable[[Optional[int], str, str], dict[str, Any]]] = None,
     ) -> None:
         self._active_window_fn = active_window_fn or _default_active_window_win32
         self._notify_fn = notify_fn or _default_notify_win32
         self._lock_fn = lock_fn or _default_lock_workstation_win32
+        self._list_windows_fn = list_windows_fn or _default_list_windows_win32
+        self._focus_window_fn = focus_window_fn or _default_focus_window_win32
 
     def get_active_window_sync(self) -> dict[str, Any]:
         """Synchronously inspect the active foreground window title and process."""
@@ -297,3 +471,92 @@ class WindowsSystemControls:
     async def lock_workstation(self) -> dict[str, Any]:
         """Asynchronously lock the Windows workstation."""
         return await asyncio.to_thread(self.lock_workstation_sync)
+
+    def list_windows_sync(
+        self,
+        include_empty_titles: bool = False,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Synchronously list open visible top-level windows on Windows."""
+        try:
+            bounded_limit = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            bounded_limit = 50
+        try:
+            res = self._list_windows_fn(bool(include_empty_titles), bounded_limit)
+            return dict(res) if isinstance(res, dict) else {"success": False, "status": "LIST_WINDOWS_FAILED", "windows": []}
+        except Exception as exc:
+            logger.error("Failed listing Windows desktop windows: %s", exc)
+            return {
+                "success": False,
+                "status": "LIST_WINDOWS_FAILED",
+                "windows": [],
+                "error": str(exc),
+            }
+
+    async def list_windows(
+        self,
+        include_empty_titles: bool = False,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Asynchronously list open visible top-level windows on Windows."""
+        return await asyncio.to_thread(self.list_windows_sync, include_empty_titles, limit)
+
+    def focus_window_sync(
+        self,
+        hwnd: Optional[int] = None,
+        title_contains: str = "",
+        process_name: str = "",
+    ) -> dict[str, Any]:
+        """Validate selector bounds and bring a matching window to the foreground."""
+        parsed_hwnd: Optional[int] = None
+        if hwnd is not None:
+            if isinstance(hwnd, bool) or not isinstance(hwnd, int) or hwnd <= 0:
+                return {
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "'hwnd' must be a positive integer window handle.",
+                }
+            parsed_hwnd = hwnd
+
+        if title_contains is not None and not isinstance(title_contains, str):
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'title_contains' must be a string.",
+            }
+        if process_name is not None and not isinstance(process_name, str):
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'process_name' must be a string.",
+            }
+
+        clean_title = _sanitize_text(title_contains or "", MAX_WINDOW_TITLE_CHARS)
+        clean_proc = _sanitize_text(process_name or "", 128)
+        if parsed_hwnd is None and not clean_title and not clean_proc:
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "Provide at least one selector: 'hwnd', 'title_contains', or 'process_name'.",
+            }
+
+        try:
+            res = self._focus_window_fn(parsed_hwnd, clean_title, clean_proc)
+            return dict(res) if isinstance(res, dict) else {"success": False, "status": "FOCUS_FAILED"}
+        except Exception as exc:
+            logger.error("Failed focusing Windows desktop window: %s", exc)
+            return {
+                "success": False,
+                "status": "FOCUS_FAILED",
+                "error": str(exc),
+            }
+
+    async def focus_window(
+        self,
+        hwnd: Optional[int] = None,
+        title_contains: str = "",
+        process_name: str = "",
+    ) -> dict[str, Any]:
+        """Asynchronously focus an open Windows desktop window."""
+        return await asyncio.to_thread(self.focus_window_sync, hwnd, title_contains, process_name)

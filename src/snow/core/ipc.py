@@ -635,6 +635,59 @@ class SnowIpcServer:
                 "error": res.get("error"),
             }, now_authed
 
+        if op in ("federation_peers", "federation_list_grants"):
+            include_revoked = bool(payload.get("include_revoked", False))
+            network_mgr = getattr(self.core_server, "network_manager", None)
+            db_mgr = getattr(self.core_server, "db_manager", None) or getattr(self, "db_manager", None)
+            if not db_mgr and self.capability_engine:
+                db_mgr = self.capability_engine.db_manager
+            node_reg = getattr(self.core_server, "node_registry", None) or getattr(self, "node_registry", None)
+            if not network_mgr:
+                from snow.network.network_model import SnowNetworkManager
+                network_mgr = SnowNetworkManager(db_manager=db_mgr, node_registry=node_reg)
+
+            topo = network_mgr.build_topology(principal=ctx.principal)
+            mesh_peers = [
+                n for n in (topo.get("nodes") or [])
+                if isinstance(n, dict) and n.get("federated")
+            ]
+
+            grants: list[dict[str, Any]] = []
+            local_network_id: Optional[str] = None
+            local_network_name: Optional[str] = None
+            if db_mgr and hasattr(db_mgr, "list_federation_grants"):
+                from snow.network.federation import FederationManager
+                fed_mgr = getattr(self.core_server, "federation_manager", None)
+                if not fed_mgr:
+                    fed_mgr = FederationManager(db_manager=db_mgr, local_node_id="desktop-core")
+                local_network_id = getattr(fed_mgr, "local_network_id", None)
+                local_network_name = getattr(fed_mgr, "local_network_name", None)
+                forbidden = {"auth_token", "auth_token_hash", "token", "secret", "pairing_token", "ticket", "ipc_secret"}
+                for g in fed_mgr.list_grants(active_only=not include_revoked):
+                    clean_g = {k: v for k, v in g.items() if k not in forbidden}
+                    peer_id = clean_g.get("peer_node_id")
+                    reg_node = node_reg.get_node(peer_id) if (node_reg and peer_id) else None
+                    clean_g["is_connected"] = bool(getattr(reg_node, "is_connected", False)) if reg_node else False
+                    clean_g["reachability_state"] = "active" if clean_g["is_connected"] else "offline"
+                    grants.append(clean_g)
+
+            active_count = sum(1 for g in grants if g.get("status") == "ACTIVE")
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SUCCESS",
+                "data": {
+                    "local_node_id": topo.get("local_node_id", "desktop-core"),
+                    "local_network_id": local_network_id,
+                    "local_network_name": local_network_name,
+                    "grants": grants,
+                    "mesh_peers": mesh_peers,
+                    "active_count": active_count,
+                    "total_count": len(grants),
+                },
+            }, now_authed
+
         if op == "system_pause":
             if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
                 return {
@@ -871,6 +924,10 @@ class SnowIpcServer:
             "windows_launch_app",
             "windows_active_window",
             "snow_windows_active_window",
+            "windows_list_windows",
+            "snow_windows_list_windows",
+            "windows_focus_window",
+            "snow_windows_focus_window",
             "windows_notify",
             "snow_windows_notify",
             "windows_lock_screen",
@@ -941,12 +998,16 @@ class SnowIpcServer:
                     "status": "NOT_FOUND",
                     "error": f"Item '{item_id}' not found in clipboard buffer.",
                 }, now_authed
+            data_out: dict[str, Any] = {"item": item}
+            img_path = buf.get_image_path(item_id)
+            if img_path is not None:
+                data_out["image_filename"] = img_path.name
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
                 "success": True,
                 "status": "SUCCESS",
-                "data": {"item": item},
+                "data": data_out,
             }, now_authed
 
         if op == "clipboard_capture_pc":
@@ -960,7 +1021,13 @@ class SnowIpcServer:
                     "status": "ENGINE_UNAVAILABLE",
                     "error": "Clipboard engine or buffer unavailable.",
                 }, now_authed
-            content = clip.get_content_sync(output_dir=buf.storage_dir)
+            from snow.capabilities.windows.clipboard import get_default_clipboard_temp_dir
+
+            clip_tmp = get_default_clipboard_temp_dir()
+            try:
+                content = clip.get_content_sync(output_dir=clip_tmp)
+            except TypeError:
+                content = clip.get_content_sync()
             if content.get("success"):
                 ctype = content.get("type")
                 if ctype == "image":
@@ -969,13 +1036,18 @@ class SnowIpcServer:
                         with open(fpath, "rb") as f:
                             ibytes = f.read()
                         res = buf.add_image(ibytes, mime_type="image/png", source_device="pc")
-                        if fpath and os.path.isfile(fpath):
-                            try:
-                                os.remove(fpath)
-                            except Exception:
-                                pass
                     except Exception as e:
                         res = {"success": False, "status": "ERROR", "error": str(e)}
+                    finally:
+                        if fpath and os.path.isfile(fpath):
+                            try:
+                                import tempfile
+                                f_resolved = Path(fpath).resolve()
+                                t_dir = Path(tempfile.gettempdir()).resolve()
+                                if (t_dir in f_resolved.parents or f_resolved.parent == t_dir) and not f_resolved.is_relative_to(buf.storage_dir):
+                                    f_resolved.unlink(missing_ok=True)
+                            except Exception:
+                                pass
                 elif ctype == "text" and content.get("text"):
                     res = buf.add_text(content["text"], source_device="pc")
                 else:
@@ -1515,14 +1587,33 @@ class SnowIpcServer:
                     "error": "Missing 'device_id'.",
                 }, now_authed
 
-            # 1. Terminate any active authenticated session and active transport for this device
+            # 1. Notify active client cleanly before terminating its session and socket
             session = self.core_server.session_manager.get_session_by_device(device_id)
             if session:
                 if session.connection_id and hasattr(self.core_server, "connection_manager"):
-                    client = self.core_server.connection_manager.unregister(session.connection_id)
-                    if client and hasattr(client, "websocket"):
+                    client = self.core_server.connection_manager.get(session.connection_id)
+                    if client and hasattr(client, "websocket") and client.websocket is not None:
                         try:
-                            await client.websocket.close(code=1000, reason="Device revoked")
+                            from snow.protocol.models import SnowMessage
+                            revoke_msg = SnowMessage.create_request(
+                                action="device_revoked",
+                                data={
+                                    "device_id": device_id,
+                                    "reason": "Revoked by desktop owner",
+                                },
+                            )
+                            send_res = client.websocket.send(revoke_msg.to_json())
+                            if inspect.isawaitable(send_res):
+                                await asyncio.wait_for(send_res, timeout=1.5)
+                        except Exception as notify_err:
+                            logger.debug("Best-effort device_revoked delivery failed: %s", notify_err)
+                    unreg_client = self.core_server.connection_manager.unregister(session.connection_id)
+                    close_target = unreg_client or client
+                    if close_target and hasattr(close_target, "websocket") and close_target.websocket is not None:
+                        try:
+                            close_res = close_target.websocket.close(code=1000, reason="Device revoked")
+                            if inspect.isawaitable(close_res):
+                                await close_res
                         except Exception as close_err:
                             logger.debug("Error closing revoked client websocket: %s", close_err)
                 self.core_server.session_manager.revoke_session(session.session_id)
@@ -1560,6 +1651,138 @@ class SnowIpcServer:
                 "error": None if deleted else f"Device [{device_id}] not found in paired database.",
             }, now_authed
 
+        if op == "device_disconnect":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            payload_data = payload if isinstance(payload, dict) else {}
+            device_id = (payload_data.get("device_id") or "").strip()
+            if not device_id:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing 'device_id' field in device_disconnect payload.",
+                }, now_authed
+
+            res = await self.core_server.disconnect_device(device_id)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": bool(res.get("success")),
+                "status": res.get("status", "ERROR"),
+                "data": res,
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "device_reconnect":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            payload_data = payload if isinstance(payload, dict) else {}
+            device_id = (payload_data.get("device_id") or "").strip()
+            if not device_id:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing 'device_id' field in device_reconnect payload.",
+                }, now_authed
+
+            res = await self.core_server.reconnect_device(device_id)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": bool(res.get("success")),
+                "status": res.get("status", "ERROR"),
+                "data": res,
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "get_pc_transfer_dir":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            from snow.transfer.storage import get_default_pc_transfer_dir
+            cs = self.core_server
+            cur_dir = str(cs.storage_manager.root_dir) if getattr(cs, "storage_manager", None) else str(get_default_pc_transfer_dir())
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SUCCESS",
+                "data": {
+                    "pc_transfers_dir": cur_dir,
+                    "default_pc_transfers_dir": str(get_default_pc_transfer_dir()),
+                },
+            }, now_authed
+
+        if op == "set_pc_transfer_dir":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            payload_data = payload if isinstance(payload, dict) else {}
+            raw_path = (payload_data.get("path") or payload_data.get("pc_transfers_dir") or "").strip()
+            if not raw_path:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Missing 'path' for set_pc_transfer_dir.",
+                }, now_authed
+            try:
+                res = self.core_server.set_pc_transfer_dir(raw_path)
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": res.get("status", "UPDATED"),
+                    "data": res,
+                }, now_authed
+            except (ValueError, PermissionError) as exc:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_PATH",
+                    "error": str(exc),
+                }, now_authed
+            except Exception as exc:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "ERROR",
+                    "error": str(exc),
+                }, now_authed
+
         if op == "get_pairing_state":
             cs = self.core_server
             ws = getattr(cs, "ws_server", None) if cs else None
@@ -1574,23 +1797,96 @@ class SnowIpcServer:
                 }, now_authed
 
             from snow.core.network import get_active_ip_addresses
+            from snow.security.identity import generate_snow_id
+            from snow.security.pairing import create_qr_pairing_payload
+
             candidate_ips = get_active_ip_addresses()
             cfg = getattr(cs, "config", None)
             node_id = getattr(cfg, "node_id", "desktop-core")
             port = getattr(cfg, "port", 8765)
 
+            cert_info = getattr(ws, "certificate_info", None)
+            if not cert_info:
+                from snow.security.tls import (
+                    DEFAULT_CERT_FILE,
+                    DEFAULT_KEY_FILE,
+                    DEFAULT_TLS_DIR,
+                    ensure_tls_certificate,
+                )
+                cert_info = ensure_tls_certificate(
+                    DEFAULT_TLS_DIR / DEFAULT_CERT_FILE,
+                    DEFAULT_TLS_DIR / DEFAULT_KEY_FILE,
+                    active_ips=candidate_ips,
+                )
+            fp = cert_info.fingerprint_sha256 if cert_info else ""
+            local_ident = getattr(cs, "device_identity", None)
+            snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=node_id)
+
             pin_state = pm.get_active_pin_state(include_pin=True)
+            qr_payload = None
+            if pin_state.get("has_active_pin") and pin_state.get("pin") and fp:
+                try:
+                    qr_payload = create_qr_pairing_payload(
+                        node_id=node_id,
+                        candidate_ips=candidate_ips,
+                        port=port,
+                        cert_fingerprint=fp,
+                        pin=pin_state["pin"],
+                        trust_tier=pin_state.get("trust_tier", "owner"),
+                        snow_id=snow_id,
+                    )
+                except Exception as exc:
+                    logger.debug("Non-fatal QR payload build skip in get_pairing_state: %s", exc)
+
+            state_data: dict[str, Any] = {
+                "ips": candidate_ips,
+                "port": port,
+                "node_id": node_id,
+                "snow_id": snow_id,
+                "fp": fp,
+                "cert_fingerprint": fp,
+                **pin_state,
+            }
+            if qr_payload is not None:
+                state_data["qr_payload"] = qr_payload
+
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
                 "success": True,
                 "status": "SUCCESS",
-                "data": {
-                    "ips": candidate_ips,
-                    "port": port,
-                    "node_id": node_id,
-                    **pin_state,
-                },
+                "data": state_data,
+            }, now_authed
+
+        if op == "cancel_pairing_pin":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            cs = self.core_server
+            ws = getattr(cs, "ws_server", None) if cs else None
+            pm = getattr(ws, "pairing_manager", None) if ws else None
+            if not ws or not pm:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "NOT_AVAILABLE",
+                    "error": "Core WebSocket server or pairing manager is not active.",
+                }, now_authed
+
+            cancel_res = pm.cancel_pin()
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "CANCELLED",
+                "data": cancel_res,
             }, now_authed
 
         if op == "generate_pairing_qr":

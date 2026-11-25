@@ -1,7 +1,7 @@
 """Unified static MCP tool registry for SNOW.
 
 Exposes standardized MCP tools for both Windows and Android capabilities to AI assistants.
-All 42 tools are statically discoverable via list_tools, even when the Core or Android
+All 48 tools are statically discoverable via list_tools, even when the Core or Android
 device is currently offline.
 
 In Phase 8:
@@ -25,7 +25,7 @@ ALL_TOOL_NAMES: List[str] = [meta.name for meta in list_capabilities()]
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 42 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 48 static MCP tools onto the provided FastMCP server instance."""
     # Wrap server.tool to automatically populate MCP ToolAnnotations (readOnlyHint, destructiveHint)
     _orig_tool = server.tool
 
@@ -264,10 +264,13 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
 
     @server.tool(
         name="snow_windows_clipboard_get",
-        description="Read the current text contents of the Windows laptop clipboard.",
+        description=(
+            "Read text from the Windows laptop clipboard, plus OS image metadata and up to "
+            "3 latest shared clipboard buffer entries when text is empty."
+        ),
     )
     async def snow_windows_clipboard_get() -> str:
-        """Read text from Windows clipboard."""
+        """Read text, image metadata, and recent buffer items from Windows clipboard."""
         result = await bridge.windows_clipboard_get()
         if not result.get("success", False):
             return json.dumps({
@@ -831,6 +834,139 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "success": False,
                 "status": result.get("status", "ERROR"),
                 "error": result.get("error", "Failed locking Windows workstation."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    # =========================================================================
+    # V5.2.0 Stage 6A Additions (43..48)
+    # =========================================================================
+
+    @server.tool(
+        name="snow_youtube_play",
+        description="Open a validated YouTube video/URL or YouTube search query on Windows or Android.",
+    )
+    async def snow_youtube_play(
+        query: str = "",
+        url: str = "",
+        target: str = "windows",
+        device_id: str = "",
+    ) -> str:
+        """Open a YouTube URL or search query safely on Windows or Android."""
+        result = await bridge.youtube_play(
+            query=query, url=url, target=target, device_id=device_id
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed opening YouTube."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_web_open",
+        description="Safely open an HTTP or HTTPS URL in the browser on Windows or Android.",
+    )
+    async def snow_web_open(
+        url: str,
+        target: str = "windows",
+        device_id: str = "",
+    ) -> str:
+        """Open a validated HTTP/HTTPS URL cleanly on Windows or Android."""
+        result = await bridge.web_open(url=url, target=target, device_id=device_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed opening web URL."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_windows_list_windows",
+        description="List open visible top-level desktop windows on Windows with hwnd, title, and process metadata.",
+    )
+    async def snow_windows_list_windows(
+        include_empty_titles: bool = False,
+        limit: int = 50,
+    ) -> str:
+        """Enumerate visible top-level windows on the Windows host."""
+        result = await bridge.windows_list_windows(
+            include_empty_titles=include_empty_titles,
+            limit=limit,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed listing Windows windows."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_windows_focus_window",
+        description="Bring an open Windows desktop window to focus by hwnd, title_contains, or process_name.",
+    )
+    async def snow_windows_focus_window(
+        hwnd: Optional[int] = None,
+        title_contains: str = "",
+        process_name: str = "",
+    ) -> str:
+        """Focus a matching visible window on the Windows host."""
+        result = await bridge.windows_focus_window(
+            hwnd=hwnd,
+            title_contains=title_contains,
+            process_name=process_name,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed focusing Windows window."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_system_volume_set",
+        description="Set the master system audio volume percentage (0-100) on Windows or Android.",
+    )
+    async def snow_system_volume_set(
+        level: int,
+        target: str = "windows",
+        device_id: str = "",
+    ) -> str:
+        """Set system volume level (0-100) on Windows or connected Android device."""
+        result = await bridge.system_volume_set(
+            level=level,
+            target=target,
+            device_id=device_id,
+        )
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed setting system volume."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_federation_peers",
+        description="List secret-redacted federation grants, trusted remote peers, and reachability state.",
+    )
+    async def snow_federation_peers(include_revoked: bool = False) -> str:
+        """Return redacted federation grants and peer reachability state."""
+        result = await bridge.federation_peers(include_revoked=include_revoked)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed querying federation peers."),
                 "data": result.get("data"),
             }, indent=2)
         return json.dumps(result.get("data", {}) or result, indent=2)

@@ -85,7 +85,7 @@ class TestStage4BMockupDataRegression(unittest.TestCase):
         self.assertIn("empty-state", self.html_content)
         self.assertIn("No clipboard items yet", self.html_content)
         self.assertIn("No active notifications", self.html_content)
-        self.assertIn("Scanning for devices...", self.html_content)
+        # "Scanning for devices..." was in diag-log-box, removed in Stage 6A declutter
 
 
 class TestStage4BRouteParity(unittest.TestCase):

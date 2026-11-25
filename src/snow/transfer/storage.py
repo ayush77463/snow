@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 import time
 from typing import Optional, Set, Tuple
 
@@ -15,6 +16,78 @@ logger = logging.getLogger(__name__)
 
 # Bounded chunk size for streaming I/O and digest computation (64 KiB)
 CHUNK_SIZE: int = 64 * 1024
+
+FORBIDDEN_TRANSFER_FILENAMES = {"con", "prn", "aux", "nul"}
+
+
+def get_default_pc_transfer_dir() -> Path:
+    """Return the default user-facing destination directory for incoming PC transfers."""
+    return (Path.home() / "Downloads" / "SNOW").resolve()
+
+
+def validate_pc_transfer_dir(path_value: Path | str) -> Path:
+    """Validate, create, and verify write access for a configurable PC transfer folder."""
+    if not path_value or not isinstance(path_value, (str, Path)):
+        raise ValueError("Transfer directory path must be a non-empty string or Path.")
+
+    raw_text = str(path_value).strip()
+    if not raw_text:
+        raise ValueError("Transfer directory path must not be blank.")
+
+    resolved = Path(raw_text).expanduser().resolve()
+    snow_state_dir = (Path.home() / ".snow").resolve()
+
+    # Forbid sensitive internal state directories (clipboard buffer, keys, SQLite DB)
+    if resolved == snow_state_dir or (
+        resolved.is_relative_to(snow_state_dir)
+        and resolved != (snow_state_dir / "transfers").resolve()
+    ):
+        raise ValueError(f"Cannot set PC transfers directory inside protected state folder '{snow_state_dir}'.")
+
+    # Forbid OS system locations on Windows and POSIX
+    forbidden_prefixes = [
+        Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve(),
+        Path(r"C:\Program Files").resolve(),
+        Path(r"C:\Program Files (x86)").resolve(),
+    ]
+    if sys.platform != "win32":
+        forbidden_prefixes.extend([Path("/bin"), Path("/sbin"), Path("/usr"), Path("/etc"), Path("/System")])
+
+    for prefix in forbidden_prefixes:
+        if resolved == prefix or resolved.is_relative_to(prefix):
+            raise ValueError(f"System directory '{resolved}' is not permitted as a transfer destination.")
+
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError(f"Path '{resolved}' exists and is not a directory.")
+
+    resolved.mkdir(parents=True, exist_ok=True)
+    probe = resolved / f".snow_write_probe_{os.getpid()}"
+    try:
+        probe.write_bytes(b"snow")
+        probe.unlink(missing_ok=True)
+    except Exception as exc:
+        raise PermissionError(f"Transfer directory '{resolved}' is not writable: {exc}") from exc
+
+    return resolved
+
+
+def resolve_configured_pc_transfer_dir(
+    db_manager: Optional[Any] = None,
+    explicit_root: Optional[Path | str] = None,
+) -> Path:
+    """Resolve the active PC transfers directory from config override, SQLite, or ~/Downloads/SNOW."""
+    if explicit_root is not None and str(explicit_root).strip():
+        return Path(explicit_root).expanduser().resolve()
+
+    if db_manager is not None and hasattr(db_manager, "get_setting"):
+        try:
+            saved = db_manager.get_setting("pc_transfer_dir", None)
+            if isinstance(saved, str) and saved.strip():
+                return Path(saved.strip()).expanduser().resolve()
+        except Exception as exc:
+            logger.debug("Failed reading pc_transfer_dir setting from SQLite: %s", exc)
+
+    return get_default_pc_transfer_dir()
 
 
 def sanitize_filename(filename: str) -> str:
@@ -72,6 +145,15 @@ class TransferStorageManager:
         """Ensure that the root and .parts directories exist with safe permissions."""
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.parts_dir.mkdir(parents=True, exist_ok=True)
+
+    def set_root_dir(self, new_root: Path | str) -> Path:
+        """Validate and switch the active transfer destination root cleanly."""
+        validated = validate_pc_transfer_dir(new_root)
+        self.root_dir = validated
+        self.parts_dir = (self.root_dir / ".parts").resolve()
+        self._ensure_directories()
+        logger.info("TransferStorageManager destination root updated to '%s'.", self.root_dir)
+        return self.root_dir
 
     def resolve_destination_path(self, filename: str) -> Path:
         """Resolve a safe destination path within the transfer root.

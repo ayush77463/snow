@@ -353,7 +353,7 @@ class TestStage5CFiveViewAndModalCoverage(unittest.TestCase):
         """Containers must feature semantic empty states."""
         self.assertIn("No clipboard items yet", self.html)
         self.assertIn("No active notifications", self.html)
-        self.assertIn("Scanning for devices...", self.html)
+        # "Scanning for devices..." was in diag-log-box, removed in Stage 6A declutter
 
 
 class TestStage5CThemeTokensAndResponsive(unittest.TestCase):

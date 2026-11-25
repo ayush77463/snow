@@ -63,10 +63,13 @@ class ClipboardItem:
     text_content: Optional[str] = None
     image_path: Optional[Path] = None
     mime_type: Optional[str] = None
+    canonical_sha256: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
 
     def to_metadata(self) -> Dict[str, Any]:
         """Return safe metadata omitting raw payloads and internal paths."""
-        return {
+        meta = {
             "item_id": self.item_id,
             "content_type": self.content_type,
             "type": self.content_type,
@@ -82,6 +85,13 @@ class ClipboardItem:
             "is_pinned": self.pinned,
             "mime_type": self.mime_type,
         }
+        if self.canonical_sha256:
+            meta["canonical_sha256"] = self.canonical_sha256
+        if self.width is not None:
+            meta["width"] = self.width
+        if self.height is not None:
+            meta["height"] = self.height
+        return meta
 
     def to_detail(self) -> Dict[str, Any]:
         """Return full item payload for explicit detail queries or apply actions."""
@@ -452,13 +462,29 @@ class ClipboardRingBuffer:
             }
 
         digest = hashlib.sha256(image_bytes).hexdigest()
+        from snow.capabilities.windows.clipboard import compute_canonical_image_digest
 
-        # Deduplication check
+        canonical_digest, img_w, img_h = compute_canonical_image_digest(image_bytes)
+
+        # Deduplication check: exact encoded bytes OR identical decoded RGBA pixels
         existing_idx: Optional[int] = None
         for idx, item in enumerate(self._items):
+            if item.content_type != "image":
+                continue
             if item.sha256 == digest:
                 existing_idx = idx
                 break
+            if canonical_digest:
+                item_canonical = item.canonical_sha256
+                if not item_canonical and item.image_path and item.image_path.is_file():
+                    try:
+                        item_canonical, _, _ = compute_canonical_image_digest(item.image_path.read_bytes())
+                        item.canonical_sha256 = item_canonical
+                    except Exception:
+                        item_canonical = None
+                if item_canonical and item_canonical == canonical_digest:
+                    existing_idx = idx
+                    break
 
         now = time.time()
         if existing_idx is not None:
@@ -541,6 +567,9 @@ class ClipboardRingBuffer:
             pinned=pin,
             image_path=target_path,
             mime_type=detected_mime,
+            canonical_sha256=canonical_digest,
+            width=img_w,
+            height=img_h,
         )
 
         self._items.insert(0, item)

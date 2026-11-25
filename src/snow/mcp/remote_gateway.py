@@ -554,39 +554,245 @@ class RemoteMcpGateway:
             safe_challenge = html.escape(code_challenge)
             safe_method = html.escape(code_challenge_method)
 
+            csp_nonce = secrets.token_urlsafe(16)
+            safe_req_id = html.escape(req_id)
+            safe_poll_tok = html.escape(poll_token)
+
             consent_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>SNOW MCP — Authorize Application</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }}
-    .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 2rem; max-width: 500px; width: 100%; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
-    h1 {{ font-size: 1.3rem; margin-top: 0; color: #38bdf8; display: flex; align-items: center; gap: 0.5rem; }}
-    .meta-box {{ background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 1rem; margin: 1rem 0; font-size: 0.9rem; line-height: 1.6; }}
-    .badge {{ background: #0284c7; color: #fff; padding: 0.15rem 0.45rem; border-radius: 4px; font-weight: bold; font-size: 0.8rem; }}
-    .secret-input {{ width: 100%; box-sizing: border-box; padding: 0.65rem; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; margin: 0.5rem 0 1rem; font-size: 0.95rem; }}
-    .actions {{ display: flex; gap: 1rem; margin-top: 1.5rem; }}
-    button {{ flex: 1; padding: 0.75rem; border-radius: 6px; border: none; font-weight: bold; cursor: pointer; font-size: 0.95rem; }}
-    .btn-approve {{ background: #10b981; color: #fff; }}
-    .btn-approve:hover {{ background: #059669; }}
-    .btn-deny {{ background: #ef4444; color: #fff; }}
-    .btn-deny:hover {{ background: #dc2626; }}
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SNOW MCP - Authorize Application</title>
+  <style nonce="{csp_nonce}">
+    :root {{
+      --bg-canvas: #f8fafc;
+      --bg-card: #ffffff;
+      --bg-nested: #f1f5f9;
+      --text-primary: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #64748b;
+      --border: #e2e8f0;
+      --accent: #0284c7;
+      --accent-soft: rgba(2, 132, 199, 0.10);
+      --accent-border: rgba(2, 132, 199, 0.28);
+      --danger: #dc2626;
+      --danger-soft: rgba(220, 38, 38, 0.08);
+      --shadow: 0 20px 45px rgba(15, 23, 42, 0.08);
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg-canvas: #0b1120;
+        --bg-card: #111a2e;
+        --bg-nested: #0d1526;
+        --text-primary: #f1f5f9;
+        --text-secondary: #cbd5e1;
+        --text-muted: #94a3b8;
+        --border: #1e293b;
+        --accent: #38bdf8;
+        --accent-soft: rgba(56, 189, 248, 0.12);
+        --accent-border: rgba(56, 189, 248, 0.30);
+        --danger: #f87171;
+        --danger-soft: rgba(248, 113, 113, 0.14);
+        --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+      }}
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }}
+    .card {{
+      width: 100%;
+      max-width: 520px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      box-shadow: var(--shadow);
+    }}
+    .brand-row {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 18px;
+    }}
+    .brand-logo {{
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      object-fit: contain;
+      flex-shrink: 0;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }}
+    .subtitle {{
+      margin: 2px 0 0;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }}
+    .one-click-banner {{
+      background: var(--accent-soft);
+      border: 1px solid var(--accent-border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 0.85rem;
+      line-height: 1.45;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+    }}
+    .one-click-banner strong {{
+      color: var(--accent);
+    }}
+    .meta-box {{
+      background: var(--bg-nested);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin: 14px 0 18px;
+      display: grid;
+      gap: 8px;
+      font-size: 0.88rem;
+    }}
+    .meta-row {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+    }}
+    .meta-label {{
+      color: var(--text-muted);
+      font-weight: 600;
+      flex-shrink: 0;
+    }}
+    .meta-val {{
+      color: var(--text-primary);
+      text-align: right;
+      word-break: break-all;
+    }}
+    .scope-chip {{
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      border: 1px solid var(--accent-border);
+      color: var(--accent);
+      font-weight: 600;
+      font-size: 0.78rem;
+    }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem;
+    }}
+    .field-label {{
+      display: block;
+      font-size: 0.84rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }}
+    .secret-input {{
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-nested);
+      color: var(--text-primary);
+      font-size: 0.92rem;
+      margin-bottom: 14px;
+    }}
+    .secret-input:focus {{
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+    }}
+    .status-note {{
+      display: none;
+      padding: 10px 12px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-size: 0.85rem;
+      border: 1px solid var(--border);
+      background: var(--bg-nested);
+      color: var(--text-secondary);
+    }}
+    .status-note.visible {{ display: block; }}
+    .status-note.rejected {{
+      border-color: var(--danger);
+      background: var(--danger-soft);
+      color: var(--danger);
+    }}
+    .actions {{
+      display: flex;
+      gap: 12px;
+      margin-top: 8px;
+    }}
+    button {{
+      flex: 1;
+      padding: 11px 16px;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.92rem;
+      cursor: pointer;
+    }}
+    .btn-deny {{
+      background: var(--bg-nested);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+    }}
+    .btn-approve {{
+      background: linear-gradient(135deg, #0ea5e9, #6366f1);
+      color: #ffffff;
+      border: none;
+    }}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>❄️ SNOW MCP Authorization</h1>
-    <div style="background: rgba(14, 165, 233, 0.15); border: 1px solid #0284c7; border-radius: 8px; padding: 0.8rem; margin-bottom: 1rem; font-size: 0.85rem; color: #38bdf8;">
-      ⚡ <strong>One-Click Approval:</strong> You can approve or reject this request with 1-click in the <a href="http://127.0.0.1:8769" target="_blank" style="color: #fff; text-decoration: underline;">SNOW Web Dashboard</a> without typing secrets. This screen updates automatically.
+  <main class="card">
+    <div class="brand-row">
+      <img src="/snow_logo.png" alt="SNOW Logo" class="brand-logo" width="40" height="40">
+      <div>
+        <h1>SNOW MCP Authorization</h1>
+        <p class="subtitle">OAuth 2.1 + PKCE Capability Bridge</p>
+      </div>
     </div>
-    <p style="font-size: 0.9rem; color: #cbd5e1;">An AI client is requesting authorization to connect to your local SNOW capability bridge:</p>
+
+    <div class="one-click-banner">
+      <strong>Approve with 1-Click in SNOW Web Dashboard or Android App</strong>
+      <div>No manual secret entry required when approving from your paired dashboard or phone. This page updates automatically.</div>
+    </div>
+
     <div class="meta-box">
-      <strong>Application:</strong> {safe_client_name}<br>
-      <strong>Client ID:</strong> <code>{safe_client_id}</code><br>
-      <strong>Requested Scopes:</strong> <span class="badge">{safe_scope}</span><br>
-      <strong>Redirect URI:</strong> <code>{safe_redirect}</code>
+      <div class="meta-row">
+        <span class="meta-label">Application</span>
+        <span class="meta-val">{safe_client_name}</span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Client ID</span>
+        <span class="meta-val"><code>{safe_client_id}</code></span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Requested Scopes</span>
+        <span class="meta-val"><span class="scope-chip">{safe_scope}</span></span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-label">Redirect URI</span>
+        <span class="meta-val"><code>{safe_redirect}</code></span>
+      </div>
     </div>
+
+    <div id="oauth-live-status" class="status-note" role="status" aria-live="polite"></div>
+
     <form method="POST" action="/oauth/authorize">
       <input type="hidden" name="client_id" value="{safe_client_id}">
       <input type="hidden" name="redirect_uri" value="{safe_redirect}">
@@ -596,39 +802,65 @@ class RemoteMcpGateway:
       <input type="hidden" name="scope" value="{safe_scope}">
       <input type="hidden" name="state" value="{safe_state}">
       <input type="hidden" name="csrf_token" value="{csrf_token}">
-      <input type="hidden" name="request_id" value="{req_id}">
-      <label for="ipc_secret" style="font-size:0.85rem;color:#94a3b8;font-weight:600;">Owner Authentication (IPC Secret or Dashboard Approval):</label>
-      <input type="password" id="ipc_secret" name="ipc_secret" class="secret-input" placeholder="Paste owner IPC secret (or approve in Dashboard)...">
+      <input type="hidden" name="request_id" value="{safe_req_id}">
+      <label for="ipc_secret" class="field-label">Owner Authentication (Optional IPC Secret or Dashboard Approval)</label>
+      <input type="password" id="ipc_secret" name="ipc_secret" class="secret-input" autocomplete="off" placeholder="Reveal in SNOW Dashboard -> AI & Settings -> Advanced & Diagnostics">
       <div class="actions">
-        <button type="submit" name="decision" value="deny" class="btn-deny">✕ Deny</button>
-        <button type="submit" name="decision" value="approve" class="btn-approve">✓ Authorize</button>
+        <button type="submit" name="decision" value="deny" class="btn-deny">Deny</button>
+        <button type="submit" name="decision" value="approve" class="btn-approve">Authorize</button>
       </div>
     </form>
-  </div>
-  <script>
-    const reqId = "{req_id}";
-    const pollTok = "{poll_token}";
-    if (reqId && pollTok) {{
-      const pollTimer = setInterval(async () => {{
+  </main>
+  <script nonce="{csp_nonce}">
+    (function () {{
+      var reqId = "{safe_req_id}";
+      var pollTok = "{safe_poll_tok}";
+      var statusEl = document.getElementById("oauth-live-status");
+      if (!reqId || !pollTok) return;
+      var pollTimer = setInterval(async function () {{
         try {{
-          const res = await fetch('/oauth/status?request_id=' + encodeURIComponent(reqId) + '&poll_token=' + encodeURIComponent(pollTok));
-          if (res.ok) {{
-            const data = await res.json();
-            if (data.status === 'APPROVED' && data.redirect_url) {{
-              clearInterval(pollTimer);
-              window.location.href = data.redirect_url;
-            }} else if (data.status === 'REJECTED') {{
-              clearInterval(pollTimer);
-              alert('Authorization request rejected by owner in Web Dashboard.');
+          var res = await fetch("/oauth/status?request_id=" + encodeURIComponent(reqId) + "&poll_token=" + encodeURIComponent(pollTok));
+          if (!res.ok) return;
+          var data = await res.json();
+          if (data.status === "APPROVED" && data.redirect_url) {{
+            clearInterval(pollTimer);
+            window.location.href = data.redirect_url;
+          }} else if (data.status === "REJECTED" || data.status === "EXPIRED") {{
+            clearInterval(pollTimer);
+            if (statusEl) {{
+              statusEl.textContent = data.status === "REJECTED"
+                ? "Authorization request was denied by owner."
+                : "Authorization request expired. Please restart sign-in.";
+              statusEl.className = "status-note visible rejected";
             }}
           }}
         }} catch (e) {{}}
       }}, 1000);
-    }}
+    }})();
   </script>
 </body>
 </html>"""
-            return web.Response(text=consent_html, content_type="text/html")
+            csp_header = (
+                "default-src 'self'; "
+                f"script-src 'self' 'nonce-{csp_nonce}'; "
+                f"style-src 'self' 'nonce-{csp_nonce}'; "
+                "img-src 'self' data:; "
+                "connect-src 'self'; "
+                "object-src 'none'; "
+                "frame-ancestors 'none';"
+            )
+            return web.Response(
+                text=consent_html,
+                content_type="text/html",
+                headers={
+                    "Content-Security-Policy": csp_header,
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Pragma": "no-cache",
+                    "X-Content-Type-Options": "nosniff",
+                    "Referrer-Policy": "no-referrer",
+                    "X-Frame-Options": "DENY",
+                },
+            )
 
         # POST Request Handling — Rate limit consent submissions
         client_ip = get_client_ip(request, self.trusted_proxies)

@@ -52,6 +52,8 @@ class MainActivity : AppCompatActivity() {
 
     private var currentThemeMode by mutableIntStateOf(SettingsViewModel.THEME_SYSTEM)
     private var pendingCameraCaptureFile: File? = null
+    @Volatile
+    private var isCameraCaptureLaunchInFlight: Boolean = false
     private var pendingScreenshotPermissionCallback: ((Boolean) -> Unit)? = null
 
     private val takePictureLauncher = registerForActivityResult(
@@ -59,6 +61,7 @@ class MainActivity : AppCompatActivity() {
     ) { success ->
         val capturedFile = pendingCameraCaptureFile
         pendingCameraCaptureFile = null
+        isCameraCaptureLaunchInFlight = false
         if (success && capturedFile != null && capturedFile.exists() && capturedFile.length() > 0) {
             CameraCaptureHandler.stagedPhotoFile = capturedFile
             CameraCaptureHandler.isUserInteractionActive = true
@@ -86,6 +89,7 @@ class MainActivity : AppCompatActivity() {
         if (granted) {
             launchRealCameraCapture()
         } else {
+            isCameraCaptureLaunchInFlight = false
             repository.dismissCameraDelivery()
             Toast.makeText(this, "Camera permission is required to capture photos", Toast.LENGTH_LONG).show()
         }
@@ -289,6 +293,10 @@ class MainActivity : AppCompatActivity() {
         }
         if (intent?.getBooleanExtra("request_camera_capture", false) == true) {
             intent.removeExtra("request_camera_capture")
+            if (isCameraCaptureLaunchInFlight || pendingCameraCaptureFile != null) {
+                SafeLog.i(TAG, "Ignoring repeated request_camera_capture intent while camera flow is active.")
+                return
+            }
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                 launchRealCameraCapture()
             } else {
@@ -349,6 +357,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun launchRealCameraCapture() {
+        if (isCameraCaptureLaunchInFlight || pendingCameraCaptureFile != null) {
+            SafeLog.i(TAG, "Ignoring duplicate camera capture launch while sheet is active.")
+            return
+        }
+        isCameraCaptureLaunchInFlight = true
         try {
             repository.setCameraCapturing()
             val cacheDir = File(cacheDir, "camera_captures").apply { mkdirs() }
@@ -362,6 +375,7 @@ class MainActivity : AppCompatActivity() {
                 pendingCameraCaptureFile?.delete()
             } catch (_: Exception) {}
             pendingCameraCaptureFile = null
+            isCameraCaptureLaunchInFlight = false
             repository.setCameraFailed(e.message ?: "Unable to launch camera")
             Toast.makeText(this, "Unable to launch camera: ${e.message}", Toast.LENGTH_LONG).show()
         }

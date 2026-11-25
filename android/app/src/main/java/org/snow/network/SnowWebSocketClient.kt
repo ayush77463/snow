@@ -42,6 +42,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -55,7 +56,9 @@ sealed class AuthState {
         val sessionId: String,
         val trustTier: String = "peer",
         val peerDeviceName: String? = null,
-        val peerDeviceType: String? = null
+        val peerDeviceType: String? = null,
+        val peerDeviceId: String? = null,
+        val peerSnowId: String? = null
     ) : AuthState()
     data class AuthFailed(val reason: String) : AuthState()
     data class FingerprintConfirmationRequired(val fingerprint: String) : AuthState()
@@ -98,7 +101,15 @@ class SnowWebSocketClient(
     private var targetPort: Int = Constants.DEFAULT_PORT
 
     private val userInitiatedDisconnect = AtomicBoolean(false)
+    private val missedHeartbeatAcks = AtomicInteger(0)
+    @Volatile
+    var autoReconnectEnabled: Boolean = true
+    var heartbeatIntervalMs: Long = Constants.HEARTBEAT_INTERVAL_MS
+    var heartbeatTimeoutMs: Long = Constants.HEARTBEAT_TIMEOUT_MS
+    var onDeviceRevoked: ((String?) -> Unit)? = null
+    @Volatile
     private var pendingHeartbeatId: String? = null
+    @Volatile
     private var lastAckTimestamp: Long = 0L
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
@@ -111,9 +122,18 @@ class SnowWebSocketClient(
         sessionId: String,
         trustTier: String = "peer",
         peerDeviceName: String? = null,
-        peerDeviceType: String? = null
+        peerDeviceType: String? = null,
+        peerDeviceId: String? = null,
+        peerSnowId: String? = null
     ) {
-        _authState.value = AuthState.Authenticated(sessionId, trustTier, peerDeviceName, peerDeviceType)
+        _authState.value = AuthState.Authenticated(
+            sessionId,
+            trustTier,
+            peerDeviceName,
+            peerDeviceType,
+            peerDeviceId,
+            peerSnowId
+        )
     }
 
     private val _logs = MutableSharedFlow<String>(replay = 50, extraBufferCapacity = 100)
@@ -444,7 +464,13 @@ class SnowWebSocketClient(
     }
 
     private fun scheduleReconnection() {
-        if (userInitiatedDisconnect.get()) return
+        if (userInitiatedDisconnect.get() || !autoReconnectEnabled) {
+            if (!autoReconnectEnabled) {
+                log("Auto-reconnect disabled; staying disconnected.")
+                _connectionState.value = ConnectionState.DISCONNECTED
+            }
+            return
+        }
 
         // If the failure was due to an unconfirmed certificate or fingerprint mismatch,
         // do not hammer the server with rapid auto-reconnects until user acts
@@ -472,36 +498,60 @@ class SnowWebSocketClient(
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             delay(delayMs)
-            if (!userInitiatedDisconnect.get() && isActive) {
+            if (!userInitiatedDisconnect.get() && autoReconnectEnabled && isActive) {
                 initiateConnection()
             }
         }
     }
 
-    private fun startHeartbeatLoop() {
+    internal fun handleHeartbeatFailure(reason: String = "Missed consecutive heartbeat acknowledgements") {
+        val prevWs = webSocket
+        webSocket = null
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        pendingHeartbeatId = null
+        missedHeartbeatAcks.set(0)
+        try {
+            prevWs?.cancel()
+        } catch (_: Exception) {}
+        failPendingRequests("Heartbeat timeout: $reason")
+        _authState.value = AuthState.Disconnected
+        _connectionState.value = ConnectionState.DISCONNECTED
+        log("Heartbeat timeout! $reason. Stale session cleared.")
+        if (autoReconnectEnabled && !userInitiatedDisconnect.get()) {
+            scheduleReconnection()
+        }
+    }
+
+    internal fun startHeartbeatLoop(socketRef: WebSocket? = webSocket) {
         heartbeatJob?.cancel()
         lastAckTimestamp = System.currentTimeMillis()
         pendingHeartbeatId = null
+        missedHeartbeatAcks.set(0)
 
         heartbeatJob = scope.launch {
             while (isActive && _connectionState.value == ConnectionState.CONNECTED) {
-                delay(Constants.HEARTBEAT_INTERVAL_MS)
-                if (!isActive) break
+                delay(heartbeatIntervalMs)
+                if (!isActive || _connectionState.value != ConnectionState.CONNECTED) break
 
-                val now = System.currentTimeMillis()
-                if (now - lastAckTimestamp > Constants.HEARTBEAT_TIMEOUT_MS) {
-                    log("Heartbeat timeout! Server did not acknowledge within ${Constants.HEARTBEAT_TIMEOUT_MS}ms.")
-                    webSocket?.cancel()
-                    scheduleReconnection()
-                    break
+                if (pendingHeartbeatId != null) {
+                    val missed = missedHeartbeatAcks.incrementAndGet()
+                    val now = System.currentTimeMillis()
+                    if (missed >= 2 || (now - lastAckTimestamp) > heartbeatTimeoutMs) {
+                        handleHeartbeatFailure("Missed $missed consecutive heartbeat_ack frames.")
+                        break
+                    }
+                    log("Heartbeat ack missed ($missed/2); sending follow-up heartbeat.")
                 }
 
                 val heartbeat = SnowMessage.createHeartbeat()
-                pendingHeartbeatId = heartbeat.id
                 val json = JsonSerialization.toJson(heartbeat)
-                val sent = webSocket?.send(json) == true
+                pendingHeartbeatId = heartbeat.id
+                val sent = (socketRef ?: webSocket)?.send(json) == true
                 if (sent) {
                     log("Heartbeat sent id=${heartbeat.id}")
+                } else {
+                    log("Failed sending heartbeat id=${heartbeat.id}")
                 }
             }
         }
@@ -649,15 +699,36 @@ class SnowWebSocketClient(
                         ?: (data?.get("platform") as? String)
                         ?: (manifest?.get("platform") as? String)
                         ?: (manifest?.get("device_type") as? String)
-                    _authState.value = AuthState.Authenticated(sessionId, trustTier, peerName, peerType)
+                    val peerDeviceId = (data?.get("server_device_id") as? String)
+                        ?: (manifest?.get("device_id") as? String)
+                    val peerSnowId = (data?.get("snow_id") as? String)
+                        ?: (manifest?.get("snow_id") as? String)
+                    _authState.value = AuthState.Authenticated(
+                        sessionId = sessionId,
+                        trustTier = trustTier,
+                        peerDeviceName = peerName,
+                        peerDeviceType = peerType,
+                        peerDeviceId = peerDeviceId,
+                        peerSnowId = peerSnowId
+                    )
                     log("Authenticated successfully with peer core [session=$sessionId, tier=$trustTier, type=${peerType ?: "unknown"}]")
                 } else {
                     val errCode = response.error?.code ?: ErrorCode.UNAUTHORIZED
                     val errMsg = response.error?.message ?: "Authentication rejected."
                     log("Authentication failed: $errMsg (code=$errCode)")
 
-                    if (errCode == ErrorCode.UNAUTHORIZED || errCode == ErrorCode.DEVICE_NOT_FOUND) {
-                        log("Stored token is invalid or revoked. Clearing stale token and prompting PIN pairing...")
+                    if (errCode == ErrorCode.DEVICE_NOT_FOUND) {
+                        log("Server reported device not paired (revoked). Clearing token and disabling auto-reconnect.")
+                        handleRemoteRevocation("Device pairing revoked on desktop host.")
+                    } else if (errCode == ErrorCode.UNAUTHORIZED && errMsg.startsWith("MANUAL_DISCONNECT", ignoreCase = true)) {
+                        log("Host manually disconnected session; keeping pairing token intact and pausing auto-reconnect.")
+                        userInitiatedDisconnect.set(true)
+                        disconnectInternal()
+                        backoffPolicy.reset()
+                        _authState.value = AuthState.Disconnected
+                        _connectionState.value = ConnectionState.DISCONNECTED
+                    } else if (errCode == ErrorCode.UNAUTHORIZED) {
+                        log("Stored token is invalid. Clearing stale token and awaiting user pairing...")
                         tokenStorage?.clearToken()
                         _authState.value = AuthState.ConnectedUnauthenticated
 
@@ -704,7 +775,17 @@ class SnowWebSocketClient(
         }
     }
 
-    private fun handleIncomingMessage(incomingSocket: WebSocket, rawText: String) {
+    internal fun handleRemoteRevocation(reason: String? = null) {
+        tokenStorage?.clearToken()
+        userInitiatedDisconnect.set(true)
+        disconnectInternal()
+        backoffPolicy.reset()
+        _authState.value = AuthState.AuthFailed(reason ?: "Device access revoked by host.")
+        _connectionState.value = ConnectionState.DISCONNECTED
+        onDeviceRevoked?.invoke(reason)
+    }
+
+    internal fun handleIncomingMessage(incomingSocket: WebSocket, rawText: String) {
         val message = try {
             ProtocolValidator.validateRawMessage(rawText)
         } catch (e: ProtocolValidationError) {
@@ -731,6 +812,7 @@ class SnowWebSocketClient(
                 if (message.correlationId == pendingHeartbeatId) {
                     lastAckTimestamp = System.currentTimeMillis()
                     pendingHeartbeatId = null
+                    missedHeartbeatAcks.set(0)
                     backoffPolicy.reset()
                     log("Received heartbeat_ack for ${message.correlationId}. Connection healthy.")
                 } else {
@@ -758,7 +840,33 @@ class SnowWebSocketClient(
                 val action = message.payload?.get("action") as? String
                 val data = message.payload?.get("data") as? Map<String, Any?>
                 log("Received request from server action='$action' id=${message.id}")
-                if (action == "ping") {
+                if (action == "device_revoked") {
+                    val reason = (data?.get("reason") as? String) ?: "Device revoked by desktop host."
+                    log("Received device_revoked from server: $reason")
+                    val ackResp = SnowMessage.createResponse(
+                        correlationId = message.id,
+                        payload = mapOf("status" to "success", "action" to "device_revoked", "acknowledged" to true)
+                    )
+                    try {
+                        incomingSocket.send(JsonSerialization.toJson(ackResp))
+                    } catch (_: Exception) {}
+                    handleRemoteRevocation(reason)
+                } else if (action == "session_disconnect") {
+                    val reason = (data?.get("reason") as? String) ?: "Disconnected by desktop host."
+                    log("Received session_disconnect from server: $reason")
+                    val ackResp = SnowMessage.createResponse(
+                        correlationId = message.id,
+                        payload = mapOf("status" to "success", "action" to "session_disconnect", "acknowledged" to true)
+                    )
+                    try {
+                        incomingSocket.send(JsonSerialization.toJson(ackResp))
+                    } catch (_: Exception) {}
+                    userInitiatedDisconnect.set(true)
+                    disconnectInternal()
+                    backoffPolicy.reset()
+                    _authState.value = AuthState.Disconnected
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                } else if (action == "ping") {
                     val respPayload = mapOf<String, Any?>(
                         "status" to "success",
                         "action" to "pong"

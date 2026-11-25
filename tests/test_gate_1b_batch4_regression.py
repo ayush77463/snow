@@ -302,17 +302,17 @@ class TestBatch4CleanAuditAndWorkflows(unittest.TestCase):
 
 
 class TestBatch4McpParityAndDoctor(unittest.TestCase):
-    """Test F28: 42-tool exact parity and doctor check."""
+    """Test F28: 48-tool exact parity and doctor check."""
 
     def test_mcp_exact_38_tool_parity(self) -> None:
-        self.assertEqual(len(CAPABILITY_REGISTRY), 42)
-        self.assertEqual(len(ALL_TOOL_NAMES), 42)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 48)
+        self.assertEqual(len(ALL_TOOL_NAMES), 48)
 
         server = create_snow_mcp_server()
         server_tools = {t.name for t in server._tool_manager.list_tools()}
         registry_tools = set(CAPABILITY_REGISTRY.keys())
 
-        self.assertEqual(len(server_tools), 42)
+        self.assertEqual(len(server_tools), 48)
         self.assertEqual(server_tools, registry_tools)
 
     def test_run_doctor_reports_ok_for_mcp_catalog(self) -> None:
@@ -325,7 +325,7 @@ class TestBatch4McpParityAndDoctor(unittest.TestCase):
         mcp_check = next((c for c in results["checks"] if c["component"] == "mcp_tool_catalog"), None)
         self.assertIsNotNone(mcp_check)
         self.assertEqual(mcp_check["status"], "OK")
-        self.assertIn("42 MCP tools verified", mcp_check["message"])
+        self.assertIn("48 MCP tools verified", mcp_check["message"])
 
 
 class TestBatch4WebAndTray(unittest.TestCase):

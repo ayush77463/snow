@@ -31,7 +31,11 @@ from snow.security.identity import DeviceIdentity
 from snow.security.policy import PeerCapabilityPolicy
 from snow.transfer.http_server import SnowHttpTransferServer
 from snow.transfer.manager import TransferManager
-from snow.transfer.storage import TransferStorageManager
+from snow.transfer.storage import (
+    TransferStorageManager,
+    get_default_pc_transfer_dir,
+    resolve_configured_pc_transfer_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,22 @@ class SnowCoreServer:
         self.capability_engine.storage_manager = self.storage_manager
         self.capability_engine.http_transfer_server = self.http_transfer_server
         self.capability_engine.core_server = self
+
+        configured_root = resolve_configured_pc_transfer_dir(
+            db_manager=self.db_manager,
+            explicit_root=self.config.transfer_root,
+        )
+        try:
+            self.storage_manager.set_root_dir(configured_root)
+        except Exception as exc:
+            logger.warning(
+                "Invalid configured PC transfer directory '%s'; falling back to default: %s",
+                configured_root,
+                exc,
+            )
+            self.storage_manager.set_root_dir(get_default_pc_transfer_dir())
+        if hasattr(self.windows_files, "add_allowed_root"):
+            self.windows_files.add_allowed_root(self.storage_manager.root_dir)
 
         from snow.network.router import SessionRouter
 
@@ -277,6 +297,178 @@ class SnowCoreServer:
             self.node_registry.on_session_disconnected(device_id)
             return {"success": True, "status": "DISCONNECTED", "device_id": device_id}
         return {"success": False, "status": "NOT_CONNECTED", "error": f"Peer '{device_id}' is not connected."}
+
+    def set_pc_transfer_dir(self, path_str: str) -> dict[str, Any]:
+        """Validate, persist in SQLite app_settings, and activate a new PC transfers destination."""
+        resolved = self.storage_manager.set_root_dir(path_str)
+        if self.db_manager is not None and hasattr(self.db_manager, "set_setting"):
+            self.db_manager.set_setting("pc_transfer_dir", str(resolved))
+        if hasattr(self.windows_files, "add_allowed_root"):
+            self.windows_files.add_allowed_root(resolved)
+        return {
+            "success": True,
+            "status": "UPDATED",
+            "pc_transfers_dir": str(resolved),
+            "default_pc_transfers_dir": str(get_default_pc_transfer_dir()),
+        }
+
+    async def disconnect_device(self, device_id: str) -> dict[str, Any]:
+        """Disconnect any active session for device_id while preserving its SQLite pairing."""
+        target_id = (device_id or "").strip()
+        if not target_id:
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "Missing 'device_id'."}
+
+        local_id = getattr(self.device_identity, "device_id", "") if hasattr(self, "device_identity") and self.device_identity else ""
+        if target_id in ("local", "desktop-core", local_id):
+            return {"success": False, "status": "FORBIDDEN", "error": "Cannot disconnect local desktop host."}
+
+        paired = self.db_manager.get_paired_device(target_id) if self.db_manager else None
+        ws_manual_set = getattr(self.ws_server, "manually_disconnected_devices", None)
+        if isinstance(ws_manual_set, set):
+            ws_manual_set.add(target_id)
+
+        closed_inbound = False
+        session_mgr = getattr(self, "session_manager", None) or getattr(self.ws_server, "session_manager", None)
+        conn_mgr = getattr(self, "connection_manager", None) or getattr(self.ws_server, "connection_manager", None)
+
+        matching_conn_ids: list[str] = []
+        if session_mgr and hasattr(session_mgr, "_sessions"):
+            for sess in list(session_mgr._sessions.values()):
+                if getattr(sess, "device_id", None) == target_id and getattr(sess, "connection_id", None):
+                    matching_conn_ids.append(sess.connection_id)
+
+        for conn_id in matching_conn_ids:
+            client = conn_mgr.get(conn_id) if conn_mgr else None
+            if client and getattr(client, "websocket", None) is not None:
+                try:
+                    disconnect_msg = SnowMessage.create_request(
+                        action="session_disconnect",
+                        data={"device_id": target_id, "reason": "Disconnected by desktop owner"},
+                    )
+                    send_res = client.websocket.send(disconnect_msg.to_json())
+                    if asyncio.iscoroutine(send_res) or hasattr(send_res, "__await__"):
+                        await asyncio.wait_for(send_res, timeout=1.0)
+                except Exception as exc:
+                    logger.debug("Best-effort session_disconnect send failed for %s: %s", target_id, exc)
+            unreg_client = conn_mgr.unregister(conn_id) if conn_mgr else None
+            close_target = unreg_client or client
+            if close_target and getattr(close_target, "websocket", None) is not None:
+                try:
+                    close_res = close_target.websocket.close(code=1000, reason="Disconnected by desktop owner")
+                    if asyncio.iscoroutine(close_res) or hasattr(close_res, "__await__"):
+                        await close_res
+                    closed_inbound = True
+                except Exception as exc:
+                    logger.debug("Error closing socket for %s: %s", target_id, exc)
+
+        if session_mgr and hasattr(session_mgr, "revoke_device_sessions"):
+            session_mgr.revoke_device_sessions(target_id)
+
+        if getattr(self, "node_registry", None):
+            self.node_registry.on_session_disconnected(target_id)
+
+        closed_peer = False
+        if target_id in self.peer_clients:
+            peer_res = await self.disconnect_peer(target_id)
+            closed_peer = bool(peer_res.get("success"))
+
+        if not paired and not closed_inbound and not closed_peer:
+            if isinstance(ws_manual_set, set):
+                ws_manual_set.discard(target_id)
+            return {
+                "success": False,
+                "status": "DEVICE_NOT_FOUND",
+                "error": f"Device '{target_id}' is neither paired nor currently connected.",
+            }
+
+        try:
+            if self.db_manager:
+                self.db_manager.log_audit_event(
+                    event_type="DEVICE_DISCONNECTED",
+                    device_id=target_id,
+                    details={"inbound": closed_inbound, "peer": closed_peer, "paired_preserved": bool(paired)},
+                )
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "status": "DISCONNECTED",
+            "device_id": target_id,
+            "paired": bool(paired),
+            "was_connected": bool(closed_inbound or closed_peer),
+        }
+
+    async def reconnect_device(self, device_id: str) -> dict[str, Any]:
+        """Clear manual disconnect hold and trigger clean reconnection for a paired device."""
+        target_id = (device_id or "").strip()
+        if not target_id:
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "Missing 'device_id'."}
+
+        ws_manual_set = getattr(self.ws_server, "manually_disconnected_devices", None)
+        if isinstance(ws_manual_set, set):
+            ws_manual_set.discard(target_id)
+
+        paired = self.db_manager.get_paired_device(target_id) if self.db_manager else None
+        if not paired:
+            return {
+                "success": False,
+                "status": "DEVICE_NOT_PAIRED",
+                "error": f"Device '{target_id}' is not paired.",
+            }
+
+        session_mgr = getattr(self, "session_manager", None) or getattr(self.ws_server, "session_manager", None)
+        conn_mgr = getattr(self, "connection_manager", None) or getattr(self.ws_server, "connection_manager", None)
+        existing_sess = session_mgr.get_session_by_device(target_id) if session_mgr else None
+        if existing_sess and existing_sess.connection_id and conn_mgr:
+            conn = conn_mgr.get(existing_sess.connection_id)
+            if conn and conn.is_active:
+                return {"success": True, "status": "CONNECTED", "device_id": target_id, "is_connected": True}
+
+        if target_id in self.peer_clients:
+            return {"success": True, "status": "CONNECTED", "device_id": target_id, "is_connected": True}
+
+        # Send targeted UDP discovery wake burst if discovery is active
+        disc = getattr(self, "discovery_service", None)
+        if disc and getattr(disc, "is_running", False):
+            try:
+                await disc.send_wake_burst(target_id, count=3, interval=0.1)
+            except Exception as exc:
+                logger.debug("Wake burst failed during reconnect for %s: %s", target_id, exc)
+
+        # If target is a federated/peer host with known endpoint, attempt direct peer connect
+        host = getattr(paired, "last_known_host", None)
+        port = getattr(paired, "last_known_port", None)
+        platform = str(getattr(paired, "platform", "") or "").lower()
+        trust_tier = str(getattr(paired, "trust_tier", "") or "").lower()
+        if host and port and (trust_tier == "peer" or platform == "windows" or int(port) == 8767):
+            try:
+                peer_res = await asyncio.wait_for(
+                    self.connect_peer(
+                        host=host,
+                        port=int(port),
+                        expected_fingerprint=getattr(paired, "cert_fingerprint", "") or "",
+                    ),
+                    timeout=5.0,
+                )
+                if peer_res.get("success"):
+                    return {
+                        "success": True,
+                        "status": "CONNECTED",
+                        "device_id": target_id,
+                        "is_connected": True,
+                        "data": peer_res.get("data"),
+                    }
+            except Exception as exc:
+                logger.debug("Direct peer reconnect failed for %s (%s:%s): %s", target_id, host, port, exc)
+
+        return {
+            "success": True,
+            "status": "RECONNECT_AUTHORIZED",
+            "device_id": target_id,
+            "is_connected": False,
+            "message": f"Disconnect hold cleared and reconnect signal sent to '{target_id}'.",
+        }
 
     def get_relay_status(self) -> dict[str, Any]:
         """Query live relay client connection state and active tunnels."""

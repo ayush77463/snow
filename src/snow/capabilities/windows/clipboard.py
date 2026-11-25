@@ -27,11 +27,13 @@ import logging
 import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+CF_BITMAP: int = 2
 CF_UNICODETEXT: int = 13
 CF_DIB: int = 8
 CF_DIBV5: int = 17
@@ -45,6 +47,46 @@ MAX_CLIPBOARD_IMAGE_PIXELS: int = 33_554_432
 MAX_CLIPBOARD_IMAGE_BYTES: int = 10 * 1024 * 1024  # 10 MiB PNG export cap
 MAX_OPEN_RETRIES: int = 5
 RETRY_DELAY_SECONDS: float = 0.04  # 40ms interval
+
+
+def get_default_clipboard_temp_dir() -> Path:
+    """Return dedicated OS temporary staging directory for transient clipboard captures."""
+    tmp_dir = (Path(tempfile.gettempdir()) / "snow_clip_tmp").resolve()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir
+
+
+def compute_canonical_image_digest(image_bytes: bytes) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    """Compute canonical SHA-256 digest over image dimensions and RGBA pixels."""
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        return None, None, None
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            width, height = img.size
+            if (
+                width <= 0
+                or height <= 0
+                or width > MAX_CLIPBOARD_IMAGE_DIMENSION
+                or height > MAX_CLIPBOARD_IMAGE_DIMENSION
+                or (width * height) > MAX_CLIPBOARD_IMAGE_PIXELS
+            ):
+                return None, width, height
+            rgba = img if img.mode == "RGBA" else img.convert("RGBA")
+            try:
+                header = f"{width}x{height}:".encode("ascii")
+                digest = hashlib.sha256(header + rgba.tobytes()).hexdigest()
+                return digest, width, height
+            finally:
+                if rgba is not img and hasattr(rgba, "close"):
+                    try:
+                        rgba.close()
+                    except Exception:
+                        pass
+    except Exception:
+        return None, None, None
 
 
 class GdiplusStartupInput(ctypes.Structure):
@@ -129,6 +171,9 @@ class WindowsClipboardManager:
         self._user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
         self._user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
 
+        self._user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        self._user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
         self._user32.GetDC.argtypes = [wintypes.HWND]
         self._user32.GetDC.restype = wintypes.HDC
 
@@ -137,6 +182,9 @@ class WindowsClipboardManager:
 
         self._kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
         self._kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+
+        self._kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+        self._kernel32.GlobalSize.restype = ctypes.c_size_t
 
         self._kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
         self._kernel32.GlobalLock.restype = wintypes.LPVOID
@@ -176,43 +224,67 @@ class WindowsClipboardManager:
                 "text": "",
             }
 
+        result: dict[str, Any]
         try:
             handle = self._user32.GetClipboardData(CF_UNICODETEXT)
             if not handle:
                 # Clipboard is empty or contains no CF_UNICODETEXT data
-                return {
+                result = {
                     "success": True,
                     "status": "EMPTY",
                     "text": "",
                     "message": "Clipboard is empty or does not contain text.",
                 }
+            else:
+                ptr = self._kernel32.GlobalLock(handle)
+                if not ptr:
+                    return {
+                        "success": False,
+                        "status": "LOCK_FAILED",
+                        "error": "Failed locking global clipboard memory handle.",
+                        "text": "",
+                    }
 
-            ptr = self._kernel32.GlobalLock(handle)
-            if not ptr:
-                return {
-                    "success": False,
-                    "status": "LOCK_FAILED",
-                    "error": "Failed locking global clipboard memory handle.",
-                    "text": "",
-                }
+                try:
+                    # Read null-terminated UTF-16LE string from pointer
+                    text_val = ctypes.wstring_at(ptr)
+                    # Cap maximum read length
+                    if len(text_val.encode("utf-8", errors="replace")) > MAX_CLIPBOARD_READ_BYTES:
+                        text_val = text_val[:MAX_CLIPBOARD_READ_BYTES]
 
-            try:
-                # Read null-terminated UTF-16LE string from pointer
-                text_val = ctypes.wstring_at(ptr)
-                # Cap maximum read length
-                if len(text_val.encode("utf-8", errors="replace")) > MAX_CLIPBOARD_READ_BYTES:
-                    text_val = text_val[:MAX_CLIPBOARD_READ_BYTES]
-
-                return {
-                    "success": True,
-                    "status": "SUCCESS",
-                    "text": text_val,
-                    "length": len(text_val),
-                }
-            finally:
-                self._kernel32.GlobalUnlock(handle)
+                    result = {
+                        "success": True,
+                        "status": "SUCCESS",
+                        "text": text_val,
+                        "length": len(text_val),
+                    }
+                finally:
+                    self._kernel32.GlobalUnlock(handle)
         finally:
             self._user32.CloseClipboard()
+
+        # Enrich cleanly with OS clipboard image metadata after closing handle
+        try:
+            img_meta = self.get_image_metadata_sync()
+        except Exception:
+            img_meta = {"has_image": False}
+        if isinstance(img_meta, dict) and img_meta.get("has_image"):
+            safe_img = {
+                k: v
+                for k, v in img_meta.items()
+                if k not in ("file_path", "image_path", "storage_dir", "bytes", "raw_bytes", "image_bytes")
+            }
+            result["has_image"] = True
+            result["image"] = safe_img
+            if result.get("status") == "EMPTY":
+                result["status"] = "IMAGE"
+                dims = f"{safe_img.get('width') or '?'}x{safe_img.get('height') or '?'}"
+                fmt = safe_img.get("format") or "PNG"
+                result["message"] = f"Clipboard currently contains an image ({dims} {fmt})."
+        else:
+            result["has_image"] = False
+            result["image"] = None
+        return result
 
     async def get_clipboard(self) -> dict[str, Any]:
         """Asynchronously read text from the Windows clipboard on a worker thread."""
@@ -331,6 +403,10 @@ class WindowsClipboardManager:
                 ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), wintypes.DWORD
             ]
             self._gdiplus.GdipCreateHBITMAPFromBitmap.restype = ctypes.c_int
+            self._gdiplus.GdipCreateBitmapFromHBITMAP.argtypes = [
+                wintypes.HBITMAP, wintypes.HPALETTE, ctypes.POINTER(ctypes.c_void_p)
+            ]
+            self._gdiplus.GdipCreateBitmapFromHBITMAP.restype = ctypes.c_int
             self._gdiplus.GdipSaveImageToFile.argtypes = [
                 ctypes.c_void_p, wintypes.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p
             ]
@@ -364,56 +440,66 @@ class WindowsClipboardManager:
                 pass
             self._gdiplus_token = None
 
+    def _get_png_clipboard_formats(self) -> list[int]:
+        """Return registered Win32 clipboard format IDs for modern PNG image formats."""
+        if not self._is_windows or not self._user32 or not hasattr(self._user32, "RegisterClipboardFormatW"):
+            return []
+        formats: list[int] = []
+        for fmt_name in ("PNG", "image/png"):
+            try:
+                fmt_id = int(self._user32.RegisterClipboardFormatW(fmt_name) or 0)
+                if fmt_id > 0 and fmt_id not in formats:
+                    formats.append(fmt_id)
+            except Exception:
+                continue
+        return formats
+
     def has_image_sync(self) -> bool:
-        """Check if image data (CF_DIB or CF_DIBV5) is available on the clipboard."""
+        """Check if supported image data (PNG, CF_DIBV5, CF_DIB, CF_BITMAP) is on the clipboard."""
         if not self._is_windows or not self._user32:
             return False
-        return bool(
-            self._user32.IsClipboardFormatAvailable(CF_DIB)
-            or self._user32.IsClipboardFormatAvailable(CF_DIBV5)
-        )
+        candidate_formats = [*self._get_png_clipboard_formats(), CF_DIBV5, CF_DIB, CF_BITMAP]
+        for fmt in candidate_formats:
+            try:
+                avail = self._user32.IsClipboardFormatAvailable(fmt)
+                if isinstance(avail, (int, bool)) and bool(avail):
+                    return True
+            except Exception:
+                continue
+        return False
 
-    def _grab_clipboard_image_via_pil(self, output_dir: Optional[Path] = None) -> dict[str, Any]:
-        """Fallback clipboard image capture using Pillow ImageGrab for CF_DIBV5/PNG formats."""
-        try:
-            from PIL import Image, ImageGrab  # type: ignore
-        except Exception as exc:
+    def _save_bounded_image(self, img_obj: Any, output_dir: Optional[Path] = None) -> dict[str, Any]:
+        """Validate dimensions/bounds, normalize mode, and write PNG atomically into temp dir."""
+        from PIL import Image  # type: ignore
+
+        if not isinstance(img_obj, Image.Image):
             return {
                 "success": False,
                 "status": "NO_IMAGE",
-                "error": f"Pillow ImageGrab unavailable: {exc}",
+                "error": "Clipboard object is not a valid image.",
             }
 
-        grabbed: Any = None
-        normalized: Any = None
+        width, height = img_obj.size
+        if (
+            width <= 0
+            or height <= 0
+            or width > MAX_CLIPBOARD_IMAGE_DIMENSION
+            or height > MAX_CLIPBOARD_IMAGE_DIMENSION
+            or (width * height) > MAX_CLIPBOARD_IMAGE_PIXELS
+        ):
+            return {
+                "success": False,
+                "status": "IMAGE_TOO_LARGE",
+                "error": f"Clipboard image dimensions ({width}x{height}) exceed safety bounds.",
+            }
+
+        normalized = None
         buf: Optional[io.BytesIO] = None
         try:
-            grabbed = ImageGrab.grabclipboard()
-            if not isinstance(grabbed, Image.Image):
-                return {
-                    "success": False,
-                    "status": "NO_IMAGE",
-                    "error": "No image object returned by Pillow ImageGrab.",
-                }
-
-            width, height = grabbed.size
-            if (
-                width <= 0
-                or height <= 0
-                or width > MAX_CLIPBOARD_IMAGE_DIMENSION
-                or height > MAX_CLIPBOARD_IMAGE_DIMENSION
-                or (width * height) > MAX_CLIPBOARD_IMAGE_PIXELS
-            ):
-                return {
-                    "success": False,
-                    "status": "IMAGE_TOO_LARGE",
-                    "error": f"Clipboard image dimensions ({width}x{height}) exceed safety bounds.",
-                }
-
-            has_alpha = "A" in (grabbed.mode or "") or "transparency" in getattr(grabbed, "info", {})
+            has_alpha = "A" in (img_obj.mode or "") or "transparency" in getattr(img_obj, "info", {})
             target_mode = "RGBA" if has_alpha else "RGB"
-            img_to_save = grabbed if grabbed.mode == target_mode else grabbed.convert(target_mode)
-            if img_to_save is not grabbed:
+            img_to_save = img_obj if img_obj.mode == target_mode else img_obj.convert(target_mode)
+            if img_to_save is not img_obj:
                 normalized = img_to_save
 
             buf = io.BytesIO()
@@ -426,9 +512,10 @@ class WindowsClipboardManager:
                     "error": f"Encoded clipboard image ({len(png_bytes)} bytes) exceeds 10 MiB limit.",
                 }
 
-            target_dir = output_dir or (Path.home() / ".snow" / "transfers")
+            target_dir = Path(output_dir).resolve() if output_dir else get_default_clipboard_temp_dir()
             target_dir.mkdir(parents=True, exist_ok=True)
             sha256 = hashlib.sha256(png_bytes).hexdigest()
+            canonical_sha, _, _ = compute_canonical_image_digest(png_bytes)
             final_path = target_dir / f"clip_{sha256[:16]}.png"
             if not final_path.exists():
                 tmp_path = target_dir / f"clip_{int(time.time() * 1000)}_{os.getpid()}.png.tmp"
@@ -444,17 +531,14 @@ class WindowsClipboardManager:
                 "status": "SUCCESS",
                 "type": "image",
                 "mime_type": "image/png",
+                "format": "PNG",
+                "width": width,
+                "height": height,
                 "file_path": str(final_path),
                 "file_name": final_path.name,
                 "sha256": sha256,
+                "canonical_sha256": canonical_sha or sha256,
                 "size": len(png_bytes),
-            }
-        except Exception as exc:
-            logger.debug("Pillow clipboard image fallback failed: %s", exc)
-            return {
-                "success": False,
-                "status": "DECODE_FAILED",
-                "error": f"Clipboard image fallback failed: {exc}",
             }
         finally:
             if buf is not None:
@@ -467,6 +551,36 @@ class WindowsClipboardManager:
                     normalized.close()
                 except Exception:
                     pass
+
+    def _grab_clipboard_image_via_pil(self, output_dir: Optional[Path] = None) -> dict[str, Any]:
+        """Fallback clipboard image capture using Pillow ImageGrab for CF_DIBV5/PNG/CF_BITMAP formats."""
+        try:
+            from PIL import Image, ImageGrab  # type: ignore
+        except Exception as exc:
+            return {
+                "success": False,
+                "status": "NO_IMAGE",
+                "error": f"Pillow ImageGrab unavailable: {exc}",
+            }
+
+        grabbed: Any = None
+        try:
+            grabbed = ImageGrab.grabclipboard()
+            if not isinstance(grabbed, Image.Image):
+                return {
+                    "success": False,
+                    "status": "NO_IMAGE",
+                    "error": "No image object returned by Pillow ImageGrab.",
+                }
+            return self._save_bounded_image(grabbed, output_dir=output_dir)
+        except Exception as exc:
+            logger.debug("Pillow clipboard image fallback failed: %s", exc)
+            return {
+                "success": False,
+                "status": "DECODE_FAILED",
+                "error": f"Clipboard image fallback failed: {exc}",
+            }
+        finally:
             if grabbed is not None and hasattr(grabbed, "close"):
                 try:
                     grabbed.close()
@@ -474,126 +588,221 @@ class WindowsClipboardManager:
                     pass
 
     def get_image_sync(self, output_dir: Optional[Path] = None) -> dict[str, Any]:
-        """Read image from clipboard, export to a PNG file, and return its metadata."""
+        """Read image from clipboard, export to a bounded PNG file in temp dir, and return metadata."""
         if not self._is_windows or not self._user32 or not self._kernel32:
             return {"success": False, "status": "UNSUPPORTED_PLATFORM", "error": "Windows only"}
 
+        target_dir = Path(output_dir).resolve() if output_dir else get_default_clipboard_temp_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
         self._init_gdiplus()
         gdi_failure: Optional[dict[str, Any]] = None
-        if not self._gdiplus or self._gdiplus_token is None:
-            gdi_failure = {"success": False, "status": "GDIPLUS_UNAVAILABLE", "error": "GDI+ not available"}
-        else:
-            if not self._open_clipboard_with_retry():
-                return {"success": False, "status": "CLIPBOARD_BUSY", "error": "Failed opening clipboard"}
+        raw_png_bytes: Optional[bytes] = None
 
-            try:
-                # Try CF_DIBV5 first, then fallback to standard CF_DIB
-                formats_to_try = [CF_DIBV5, CF_DIB]
-                h_data = None
-                fmt_chosen = None
-                for fmt in formats_to_try:
-                    h = self._user32.GetClipboardData(fmt)
-                    if h:
-                        h_data = h
-                        fmt_chosen = fmt
+        if not self._open_clipboard_with_retry():
+            return {"success": False, "status": "CLIPBOARD_BUSY", "error": "Failed opening clipboard"}
+
+        try:
+            # 1. Try modern Windows 11 registered PNG formats first
+            for png_fmt in self._get_png_clipboard_formats():
+                h_png = self._user32.GetClipboardData(png_fmt)
+                if h_png:
+                    png_size = int(self._kernel32.GlobalSize(h_png) or 0)
+                    if png_size > MAX_CLIPBOARD_IMAGE_BYTES:
+                        gdi_failure = {
+                            "success": False,
+                            "status": "IMAGE_TOO_LARGE",
+                            "error": f"Clipboard PNG ({png_size} bytes) exceeds 10 MiB limit.",
+                        }
                         break
+                    if png_size > 8:
+                        p_png = self._kernel32.GlobalLock(h_png)
+                        if p_png:
+                            try:
+                                raw_png_bytes = ctypes.string_at(p_png, png_size)
+                            finally:
+                                self._kernel32.GlobalUnlock(h_png)
+                    break
 
-                if not h_data:
-                    gdi_failure = {"success": False, "status": "NO_IMAGE", "error": "No DIB or DIBV5 image on clipboard"}
+            # 2. If no registered PNG blob extracted, try GDI+ CF_DIBV5 / CF_DIB / CF_BITMAP
+            if raw_png_bytes is None and gdi_failure is None:
+                if not self._gdiplus or self._gdiplus_token is None:
+                    gdi_failure = {"success": False, "status": "GDIPLUS_UNAVAILABLE", "error": "GDI+ not available"}
                 else:
-                    p_data = self._kernel32.GlobalLock(h_data)
-                    if not p_data:
-                        gdi_failure = {"success": False, "status": "LOCK_FAILED", "error": "GlobalLock failed"}
-                    else:
-                        try:
-                            bih = BITMAPINFOHEADER.from_address(p_data)
-                            header_size = bih.biSize
-                            if header_size < 40:
-                                gdi_failure = {
-                                    "success": False,
-                                    "status": "INVALID_IMAGE_HEADER",
-                                    "error": f"Invalid DIB header size: {header_size}",
-                                }
-                            else:
-                                clr_used = bih.biClrUsed
-                                bit_count = bih.biBitCount
-                                compression = bih.biCompression
-                                clr_size = 0
-                                if header_size == 40 and compression == 3:
-                                    # BI_BITFIELDS with BITMAPINFOHEADER appends 3 DWORD color masks (12 bytes)
-                                    clr_size = 12
-                                elif header_size >= 124:
-                                    # BITMAPV5HEADER has color masks embedded directly within its 124-byte structure
-                                    if clr_used > 0:
+                    h_data = None
+                    fmt_chosen = None
+                    for fmt in (CF_DIBV5, CF_DIB):
+                        h = self._user32.GetClipboardData(fmt)
+                        if h:
+                            h_data = h
+                            fmt_chosen = fmt
+                            break
+
+                    p_bmp = ctypes.c_void_p()
+                    if h_data:
+                        p_data = self._kernel32.GlobalLock(h_data)
+                        if not p_data:
+                            gdi_failure = {"success": False, "status": "LOCK_FAILED", "error": "GlobalLock failed"}
+                        else:
+                            try:
+                                bih = BITMAPINFOHEADER.from_address(p_data)
+                                header_size = bih.biSize
+                                width = abs(int(bih.biWidth))
+                                height = abs(int(bih.biHeight))
+                                if header_size < 40:
+                                    gdi_failure = {
+                                        "success": False,
+                                        "status": "INVALID_IMAGE_HEADER",
+                                        "error": f"Invalid DIB header size: {header_size}",
+                                    }
+                                elif (
+                                    width <= 0
+                                    or height <= 0
+                                    or width > MAX_CLIPBOARD_IMAGE_DIMENSION
+                                    or height > MAX_CLIPBOARD_IMAGE_DIMENSION
+                                    or (width * height) > MAX_CLIPBOARD_IMAGE_PIXELS
+                                ):
+                                    gdi_failure = {
+                                        "success": False,
+                                        "status": "IMAGE_TOO_LARGE",
+                                        "error": f"Clipboard DIB dimensions ({width}x{height}) exceed safety bounds.",
+                                    }
+                                else:
+                                    clr_used = bih.biClrUsed
+                                    bit_count = bih.biBitCount
+                                    compression = bih.biCompression
+                                    if header_size == 40 and compression == 3:
+                                        clr_size = 12
+                                    elif clr_used > 0:
                                         clr_size = clr_used * 4
                                     elif bit_count <= 8 and bit_count > 0:
                                         clr_size = (1 << bit_count) * 4
                                     else:
                                         clr_size = 0
-                                elif clr_used > 0:
-                                    clr_size = clr_used * 4
-                                elif bit_count <= 8 and bit_count > 0:
-                                    clr_size = (1 << bit_count) * 4
-                                p_bits = p_data + header_size + clr_size
+                                    p_bits = p_data + header_size + clr_size
+                                    st = self._gdiplus.GdipCreateBitmapFromGdiDib(
+                                        ctypes.c_void_p(p_data), ctypes.c_void_p(p_bits), ctypes.byref(p_bmp)
+                                    )
+                                    if st != 0:
+                                        gdi_failure = {
+                                            "success": False,
+                                            "status": "DECODE_FAILED",
+                                            "error": f"GDI+ decode failed (status {st}) for format {fmt_chosen}",
+                                        }
+                            finally:
+                                self._kernel32.GlobalUnlock(h_data)
+                    else:
+                        h_bm = self._user32.GetClipboardData(CF_BITMAP)
+                        if not h_bm:
+                            gdi_failure = {"success": False, "status": "NO_IMAGE", "error": "No DIB, DIBV5, PNG, or CF_BITMAP image on clipboard"}
+                        elif hasattr(self._gdiplus, "GdipCreateBitmapFromHBITMAP"):
+                            st = self._gdiplus.GdipCreateBitmapFromHBITMAP(
+                                ctypes.c_void_p(h_bm), None, ctypes.byref(p_bmp)
+                            )
+                            if st != 0:
+                                gdi_failure = {
+                                    "success": False,
+                                    "status": "DECODE_FAILED",
+                                    "error": f"GDI+ CF_BITMAP decode failed (status {st})",
+                                }
+                        else:
+                            gdi_failure = {"success": False, "status": "NO_IMAGE", "error": "GDI+ CF_BITMAP loader unavailable"}
 
-                                p_bmp = ctypes.c_void_p()
-                                st = self._gdiplus.GdipCreateBitmapFromGdiDib(
-                                    ctypes.c_void_p(p_data), ctypes.c_void_p(p_bits), ctypes.byref(p_bmp)
-                                )
-                                if st != 0:
+                    if p_bmp.value and gdi_failure is None:
+                        temp_name = f"clip_{int(time.time() * 1000)}_{os.getpid()}.png"
+                        out_path = target_dir / temp_name
+                        try:
+                            save_st = self._gdiplus.GdipSaveImageToFile(
+                                p_bmp, str(out_path), ctypes.byref(PNG_CLSID), None
+                            )
+                            if save_st != 0 or not out_path.exists():
+                                gdi_failure = {
+                                    "success": False,
+                                    "status": "SAVE_FAILED",
+                                    "error": f"Failed saving PNG (status {save_st})",
+                                }
+                            else:
+                                png_data = out_path.read_bytes()
+                                size = len(png_data)
+                                if size > MAX_CLIPBOARD_IMAGE_BYTES:
+                                    out_path.unlink(missing_ok=True)
                                     gdi_failure = {
                                         "success": False,
-                                        "status": "DECODE_FAILED",
-                                        "error": f"GDI+ decode failed (status {st}) for format {fmt_chosen}",
+                                        "status": "IMAGE_TOO_LARGE",
+                                        "error": f"Encoded clipboard image ({size} bytes) exceeds 10 MiB limit.",
                                     }
                                 else:
-                                    try:
-                                        target_dir = output_dir or (Path.home() / ".snow" / "transfers")
-                                        target_dir.mkdir(parents=True, exist_ok=True)
-                                        temp_name = f"clip_{int(time.time() * 1000)}.png"
-                                        out_path = target_dir / temp_name
-
-                                        save_st = self._gdiplus.GdipSaveImageToFile(
-                                            p_bmp, str(out_path), ctypes.byref(PNG_CLSID), None
-                                        )
-                                        if save_st != 0 or not out_path.exists():
-                                            gdi_failure = {
-                                                "success": False,
-                                                "status": "SAVE_FAILED",
-                                                "error": f"Failed saving PNG (status {save_st})",
-                                            }
+                                    sha256 = hashlib.sha256(png_data).hexdigest()
+                                    canonical_sha, img_w, img_h = compute_canonical_image_digest(png_data)
+                                    if img_w and img_h and (
+                                        img_w > MAX_CLIPBOARD_IMAGE_DIMENSION
+                                        or img_h > MAX_CLIPBOARD_IMAGE_DIMENSION
+                                        or (img_w * img_h) > MAX_CLIPBOARD_IMAGE_PIXELS
+                                    ):
+                                        out_path.unlink(missing_ok=True)
+                                        gdi_failure = {
+                                            "success": False,
+                                            "status": "IMAGE_TOO_LARGE",
+                                            "error": f"Clipboard image dimensions ({img_w}x{img_h}) exceed safety bounds.",
+                                        }
+                                    else:
+                                        final_path = target_dir / f"clip_{sha256[:16]}.png"
+                                        if final_path.exists():
+                                            out_path.unlink(missing_ok=True)
                                         else:
-                                            size = out_path.stat().st_size
-                                            sha256 = hashlib.sha256(out_path.read_bytes()).hexdigest()
-
-                                            final_path = target_dir / f"clip_{sha256[:16]}.png"
-                                            if final_path.exists():
-                                                try:
-                                                    out_path.unlink()
-                                                except Exception:
-                                                    pass
-                                            else:
-                                                out_path.rename(final_path)
-
-                                            return {
-                                                "success": True,
-                                                "status": "SUCCESS",
-                                                "type": "image",
-                                                "mime_type": "image/png",
-                                                "file_path": str(final_path),
-                                                "file_name": final_path.name,
-                                                "sha256": sha256,
-                                                "size": size,
-                                            }
-                                    finally:
-                                        self._gdiplus.GdipDisposeImage(p_bmp)
+                                            out_path.replace(final_path)
+                                        return {
+                                            "success": True,
+                                            "status": "SUCCESS",
+                                            "type": "image",
+                                            "mime_type": "image/png",
+                                            "format": "PNG",
+                                            "width": img_w,
+                                            "height": img_h,
+                                            "file_path": str(final_path),
+                                            "file_name": final_path.name,
+                                            "sha256": sha256,
+                                            "canonical_sha256": canonical_sha or sha256,
+                                            "size": size,
+                                        }
                         finally:
-                            self._kernel32.GlobalUnlock(h_data)
-            finally:
-                self._user32.CloseClipboard()
+                            out_path.unlink(missing_ok=True) if gdi_failure and out_path.exists() else None
+                            self._gdiplus.GdipDisposeImage(p_bmp)
+        finally:
+            self._user32.CloseClipboard()
 
-        # Fallback for modern Windows 11 PNG / CF_DIBV5 clipboard formats after Win32 clipboard is closed
-        pil_res = self._grab_clipboard_image_via_pil(output_dir=output_dir)
+        # Process registered PNG bytes safely outside Win32 clipboard lock
+        if raw_png_bytes is not None:
+            if raw_png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                try:
+                    from PIL import Image  # type: ignore
+
+                    with Image.open(io.BytesIO(raw_png_bytes)) as img:
+                        return self._save_bounded_image(img, output_dir=target_dir)
+                except Exception:
+                    # Handle environments without Pillow or unusual valid PNG chunks safely
+                    sha256 = hashlib.sha256(raw_png_bytes).hexdigest()
+                    final_path = target_dir / f"clip_{sha256[:16]}.png"
+                    if not final_path.exists():
+                        final_path.write_bytes(raw_png_bytes)
+                    return {
+                        "success": True,
+                        "status": "SUCCESS",
+                        "type": "image",
+                        "mime_type": "image/png",
+                        "format": "PNG",
+                        "file_path": str(final_path),
+                        "file_name": final_path.name,
+                        "sha256": sha256,
+                        "canonical_sha256": sha256,
+                        "size": len(raw_png_bytes),
+                    }
+            gdi_failure = {"success": False, "status": "DECODE_FAILED", "error": "Clipboard PNG data header invalid."}
+
+        if gdi_failure and gdi_failure.get("status") == "IMAGE_TOO_LARGE":
+            return gdi_failure
+
+        # Fallback for modern Windows 11 PNG / CF_DIBV5 / CF_BITMAP formats after Win32 clipboard is closed
+        pil_res = self._grab_clipboard_image_via_pil(output_dir=target_dir)
         if pil_res.get("success"):
             return pil_res
         return pil_res if pil_res.get("status") == "IMAGE_TOO_LARGE" else (gdi_failure or pil_res)
@@ -790,10 +999,44 @@ class WindowsClipboardManager:
         finally:
             self._gdiplus.GdipDisposeImage(p_img)
 
+    def get_image_metadata_sync(self) -> dict[str, Any]:
+        """Inspect current Windows clipboard image metadata without leaving temporary files behind."""
+        if not self._is_windows or not self._user32:
+            return {"has_image": False}
+        if not self.has_image_sync():
+            return {"has_image": False}
+
+        tmp_path: Optional[Path] = None
+        try:
+            res = self.get_image_sync(output_dir=get_default_clipboard_temp_dir())
+            if res.get("file_path"):
+                tmp_path = Path(res["file_path"])
+            if res.get("success"):
+                return {
+                    "has_image": True,
+                    "width": res.get("width"),
+                    "height": res.get("height"),
+                    "format": res.get("format") or "PNG",
+                    "mime_type": res.get("mime_type") or "image/png",
+                    "size_bytes": res.get("size"),
+                }
+            return {
+                "has_image": True,
+                "status": res.get("status"),
+                "error": res.get("error"),
+            }
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
     def get_content_sync(self, output_dir: Optional[Path] = None) -> dict[str, Any]:
         """Read clipboard content, detecting whether it is an image or text."""
+        effective_dir = Path(output_dir).resolve() if output_dir else get_default_clipboard_temp_dir()
         if self.has_image_sync():
-            img_res = self.get_image_sync(output_dir)
+            img_res = self.get_image_sync(effective_dir)
             if img_res.get("success"):
                 return img_res
         text_res = self.get_clipboard_sync()
@@ -801,4 +1044,9 @@ class WindowsClipboardManager:
             text = text_res["text"]
             sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
             return {"success": True, "type": "text", "text": text, "sha256": sha256}
+        # Re-check image if text is empty so modern PNG / CF_BITMAP formats never fall through as empty
+        if self.has_image_sync():
+            img_res = self.get_image_sync(effective_dir)
+            if img_res.get("success"):
+                return img_res
         return {"success": True, "type": "empty", "text": "", "sha256": ""}
