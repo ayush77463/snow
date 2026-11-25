@@ -122,23 +122,35 @@ class AndroidPeerHostManager {
         return pinVal
     }
 
+    @Synchronized
+    internal fun setHostStateForTesting(state: PeerHostState) {
+        _hostState.value = state
+        activePort = state.port
+    }
+
     /**
      * Generate standard SNOW Device Protocol v1 QR pairing payload for peer devices.
      */
     @Synchronized
-    fun generatePairingQrJson(localDeviceId: String): String? {
+    fun generatePairingQrJson(localDeviceId: String, snowId: String? = null): String? {
         val state = _hostState.value
+        val cleanFp = state.certFingerprint.replace(":", "").replace(" ", "").trim()
+        if (cleanFp.isBlank() || cleanFp == "--") return null
+
         val hostIp = if (state.ipAddress != "--" && state.ipAddress.isNotBlank()) state.ipAddress else getLocalIpv4Address()
         if (hostIp.isNullOrBlank()) return null
 
-        val pin = state.pairingPin ?: generatePairingPin()
+        val activePin = getCurrentEphemeralPinInfo()?.first ?: generatePairingPin()
         val json = org.json.JSONObject().apply {
             put("v", 1)
             put("id", localDeviceId)
+            if (!snowId.isNullOrBlank()) {
+                put("snow_id", snowId)
+            }
             put("ips", org.json.JSONArray().put(hostIp))
             put("port", activePort)
-            put("fp", state.certFingerprint.replace(":", "").replace(" ", "").trim())
-            put("pin", pin)
+            put("fp", cleanFp)
+            put("pin", activePin)
         }
         return json.toString()
     }

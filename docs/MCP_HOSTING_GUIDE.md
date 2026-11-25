@@ -1,6 +1,6 @@
 # SNOW AI Assistant Hosting & Integration Guide (v4.1.0)
 
-**SNOW** provides a standardized Model Context Protocol (MCP) bridge exposing exactly **38 static capabilities** across Windows desktop and Android mobile devices to compatible AI assistant platforms.
+**SNOW** provides a standardized Model Context Protocol (MCP) bridge exposing exactly **42 static capabilities** across Windows desktop and Android mobile devices to compatible AI assistant platforms.
 
 This document details local stdio integration, remote Streamable HTTP gateway deployment, tunnel configuration, OAuth 2.1 authentication, and an empirical host compatibility matrix.
 
@@ -104,7 +104,7 @@ To verify that stdio MCP integration works without manual configuration:
 1. Open the SNOW Web Dashboard at `http://127.0.0.1:8769`.
 2. Navigate to **Connect Your AI & Remote MCP Platform**.
 3. Click **⚡ Test Local MCP (stdio)**.
-4. The system executes a live JSON-RPC handshake (`initialize` -> `notifications/initialized` -> `tools/list`), verifying all 38 tools and reporting round-trip latency.
+4. The system executes a live JSON-RPC handshake (`initialize` -> `notifications/initialized` -> `tools/list`), verifying all 42 tools and reporting round-trip latency.
 
 ---
 
@@ -154,9 +154,9 @@ To protect the owner from complex manual secret copying, SNOW features a **1-Cli
 
 ---
 
-## 6. Static MCP Tool Inventory (38 Tools)
+## 6. Static MCP Tool Inventory (42 Tools)
 
-SNOW guarantees exactly 38 static FastMCP tools:
+SNOW guarantees exactly 42 static FastMCP tools (38 V4 baseline + 4 V5.0.0 additions):
 
 ### Windows Desktop Capabilities (19)
 1. `snow_windows_system_info` — Host telemetry, CPU, RAM, OS details.
@@ -199,3 +199,7 @@ SNOW guarantees exactly 38 static FastMCP tools:
 36. `snow_android_open_url` — Open URL on Android phone browser.
 37. `snow_android_clipboard_get` — Pull current Android clipboard content.
 38. `snow_android_clipboard_set` — Push content into Android clipboard and sync.
+39. `snow_mesh_health_summary` — Summarize SNOW mesh health, node counts, transports, and core reachability.
+40. `snow_windows_active_window` — Query the active foreground window title and owning process name on Windows.
+41. `snow_windows_notify` — Display a bounded native Windows desktop toast notification.
+42. `snow_windows_lock_screen` — Lock the Windows workstation (owner direct / AI approval-gated).

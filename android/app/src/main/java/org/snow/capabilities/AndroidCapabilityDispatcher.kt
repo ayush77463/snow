@@ -142,12 +142,18 @@ class AndroidCapabilityDispatcher(
                 }
             }
             "launch_app" -> {
-                if (!ClipboardHandler.isAppInForeground && !ActionNotificationHelper.canPostNotifications(context)) {
+                val hasOverlay = try {
+                    android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M &&
+                        android.provider.Settings.canDrawOverlays(context)
+                } catch (_: Throwable) {
+                    false
+                }
+                if (!ClipboardHandler.isAppInForeground && !hasOverlay && !ActionNotificationHelper.canPostNotifications(context)) {
                     return mapOf(
                         "success" to false,
                         "status" to "FOREGROUND_REQUIRED",
-                        "error" to "Background activity launch restricted by Android OS. Notification permission is required to deliver tap action.",
-                        "remediation_hint" to "Open SNOW on your phone or grant Notification permission in Android Settings to launch applications."
+                        "error" to "Background activity launch restricted by Android OS. Grant Background App Launch or Notification permission.",
+                        "remediation_hint" to "Enable Background App Launch (Display over other apps) or Notifications in SNOW Settings."
                     )
                 }
             }
@@ -441,7 +447,7 @@ class AndroidCapabilityDispatcher(
                     Pair(null, SnowError(code = code, message = "${res["status"]}: ${res["error"] ?: "Camera capture failed"}"))
                 }
             }
-            "screen_stream_stop" -> {
+            "screen_stream_stop", "android_screen_stream_stop" -> {
                 org.snow.service.SnowForegroundService.stopScreenShare(context)
                 Pair(mapOf("status" to "success", "action" to "screen_stream_stop"), null)
             }

@@ -164,8 +164,8 @@ def validate_registry() -> tuple[bool, list[str]]:
         if not isinstance(meta.tier, str) or not meta.tier.strip():
             errors.append(f"Capability '{name}': tier must be non-empty string.")
 
-    if len(_CAPABILITY_REGISTRY) != 38:
-        errors.append(f"Expected exactly 38 registered capabilities (24 V2 baseline + 6 P1 + 4 Phase 24 + 3 Phase 26B + 1 Phase 27), found {len(_CAPABILITY_REGISTRY)}.")
+    if len(_CAPABILITY_REGISTRY) != 42:
+        errors.append(f"Expected exactly 42 registered capabilities (38 V4 baseline + 4 V5.0.0 additions), found {len(_CAPABILITY_REGISTRY)}.")
 
     return (len(errors) == 0, errors)
 
@@ -565,6 +565,46 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         requires_approval=False,
         os_classification="cross_platform",
         description="Inspect reachable SNOW network nodes, transport status, and effective principal permissions.",
+    ),
+    CapabilityMetadata(
+        name="snow_mesh_health_summary",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="cross_platform",
+        description="Return a compact summary of SNOW mesh health, connected/offline nodes, active transports, and core reachability.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_active_window",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Query the currently active foreground window title and owning process name on the Windows desktop.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_notify",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Display a bounded Windows desktop toast notification with title and message.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_lock_screen",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="windows",
+        description="Lock the Windows workstation session cleanly (requires owner approval for AI callers).",
     ),
 ]
 

@@ -26,7 +26,7 @@ SNOW preserves a strict 4-layer architecture with non-negotiable security bounda
                                     |
 +-------------------------------------------------------------------------+
 | Layer 2: Capability Engine & Policy Authority                           |
-| - Dynamic 38-Tool Capability Catalog                                    |
+| - Dynamic 42-Tool Capability Catalog                                    |
 | - ApprovalPolicyEngine (Security Principals: AI_MCP vs OWNER_MANUAL)    |
 | - Cross-Network Federation Engine (9-Digit PINs, ACLs, Kill Switch)     |
 | - Cryptographic one-time approval tokens & timeout enforcement          |

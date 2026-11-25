@@ -8,6 +8,7 @@ from snow.capabilities.windows.apps import WindowsAppLauncher
 from snow.capabilities.windows.clipboard import WindowsClipboardManager
 from snow.capabilities.windows.files import WindowsFileManager
 from snow.capabilities.windows.processes import WindowsProcessMonitor
+from snow.capabilities.windows.system import WindowsSystemControls
 from snow.capabilities.windows.telemetry import WindowsTelemetry
 from snow.capabilities.windows.terminal import (
     TerminalSecurityPolicy,
@@ -20,6 +21,7 @@ __all__ = [
     "WindowsClipboardManager",
     "WindowsFileManager",
     "WindowsProcessMonitor",
+    "WindowsSystemControls",
     "WindowsTelemetry",
     "WindowsTerminalExecutor",
 ]

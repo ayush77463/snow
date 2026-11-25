@@ -62,7 +62,7 @@ fun SnowApprovalsSheet(
     visible: Boolean,
     onDismiss: () -> Unit,
     pendingApprovals: List<PendingApprovalItem>,
-    logs: List<UiLogEntry>,
+    logs: List<UiLogEntry> = emptyList(),
     onResolveApproval: (requestId: String, decision: String) -> Unit,
     initialTab: Int = 0
 ) {
@@ -70,7 +70,6 @@ fun SnowApprovalsSheet(
 
     val colors = LocalSnowColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var selectedTab by remember(visible, initialTab) { mutableStateOf(initialTab) } // 0: Approvals, 1: Activity
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -102,10 +101,24 @@ fun SnowApprovalsSheet(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Approvals & Activity",
+                        text = "Pending Approvals",
                         style = SnowTypography.titleLarge,
                         color = colors.textPrimary
                     )
+                    if (pendingApprovals.isNotEmpty()) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(colors.accentCyan)
+                                .padding(horizontal = 7.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = pendingApprovals.size.toString(),
+                                style = SnowTypography.labelSmall.copy(fontSize = 10.sp, color = Color.Black)
+                            )
+                        }
+                    }
                 }
 
                 Text(
@@ -119,100 +132,23 @@ fun SnowApprovalsSheet(
                 )
             }
 
-            // Tab Switcher
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(9999.dp))
-                    .background(colors.surfaceElevated)
-                    .padding(4.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(9999.dp))
-                        .background(if (selectedTab == 0) (if (colors.isDark) Color(0xFF2A2A2A) else Color.White) else Color.Transparent)
-                        .clickable { selectedTab = 0 }
-                        .padding(vertical = 8.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = "Pending Approvals",
-                            style = SnowTypography.labelMedium,
-                            color = if (selectedTab == 0) colors.textPrimary else colors.textMuted
-                        )
-                        if (pendingApprovals.isNotEmpty()) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Box(
-                                modifier = Modifier
-                                    .clip(CircleShape)
-                                    .background(colors.accentCyan)
-                                    .padding(horizontal = 6.dp, vertical = 2.dp)
-                            ) {
-                                Text(
-                                    text = pendingApprovals.size.toString(),
-                                    style = SnowTypography.labelSmall.copy(fontSize = 10.sp, color = Color.Black)
-                                )
-                            }
-                        }
-                    }
-                }
-
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(9999.dp))
-                        .background(if (selectedTab == 1) (if (colors.isDark) Color(0xFF2A2A2A) else Color.White) else Color.Transparent)
-                        .clickable { selectedTab = 1 }
-                        .padding(vertical = 8.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Live Activity (${logs.size})",
-                        style = SnowTypography.labelMedium,
-                        color = if (selectedTab == 1) colors.textPrimary else colors.textMuted
-                    )
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Tab Content
-            if (selectedTab == 0) {
-                if (pendingApprovals.isEmpty()) {
-                    SnowEmptyState(
-                        title = "No Pending Approvals",
-                        description = "All incoming capability executions and agent operations are currently authorized or idle.",
-                        icon = Icons.Default.Security
-                    )
-                } else {
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        items(pendingApprovals, key = { it.requestId }) { item ->
-                            SnowApprovalCard(
-                                item = item,
-                                onApprove = { onResolveApproval(item.requestId, "APPROVE") },
-                                onDeny = { onResolveApproval(item.requestId, "DENY") }
-                            )
-                        }
-                    }
-                }
+            // Approvals List
+            if (pendingApprovals.isEmpty()) {
+                SnowEmptyState(
+                    title = "No Pending Approvals",
+                    description = "All incoming capability executions and agent operations are currently authorized or idle.",
+                    icon = Icons.Default.Security
+                )
             } else {
-                if (logs.isEmpty()) {
-                    SnowEmptyState(
-                        title = "No Activity Logs",
-                        description = "Operational telemetry and audit events will appear here in real time.",
-                        icon = Icons.Default.History
-                    )
-                } else {
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(logs.reversed()) { log ->
-                            SnowLogCard(log = log)
-                        }
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    items(pendingApprovals, key = { it.requestId }) { item ->
+                        SnowApprovalCard(
+                            item = item,
+                            onApprove = { onResolveApproval(item.requestId, "APPROVE") },
+                            onDeny = { onResolveApproval(item.requestId, "DENY") }
+                        )
                     }
                 }
             }

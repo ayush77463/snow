@@ -1,7 +1,7 @@
 """Unified static MCP tool registry for SNOW.
 
 Exposes standardized MCP tools for both Windows and Android capabilities to AI assistants.
-All 38 tools are statically discoverable via list_tools, even when the Core or Android
+All 42 tools are statically discoverable via list_tools, even when the Core or Android
 device is currently offline.
 
 In Phase 8:
@@ -25,7 +25,7 @@ ALL_TOOL_NAMES: List[str] = [meta.name for meta in list_capabilities()]
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 38 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 42 static MCP tools onto the provided FastMCP server instance."""
     # Wrap server.tool to automatically populate MCP ToolAnnotations (readOnlyHint, destructiveHint)
     _orig_tool = server.tool
 
@@ -783,6 +783,57 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
         ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="fastmcp_stdio")
         result = await bridge.snow_mesh_topology(ctx=ctx)
         return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_mesh_health_summary",
+        description="Return a compact summary of SNOW mesh health, connected/offline nodes, active transports, and core status.",
+    )
+    async def snow_mesh_health_summary() -> str:
+        """Summarize SNOW mesh health and node connectivity without exposing credentials."""
+        from snow.security.context import ExecutionContext, ExecutionPrincipal
+        ctx = ExecutionContext(principal=ExecutionPrincipal.AI_MCP, origin="fastmcp_stdio")
+        result = await bridge.snow_mesh_health_summary(ctx=ctx)
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_windows_active_window",
+        description="Query the active foreground window title and process name on the Windows host.",
+    )
+    async def snow_windows_active_window() -> str:
+        """Return currently focused foreground window title and process metadata."""
+        result = await bridge.windows_active_window()
+        return json.dumps(result.get("data") if isinstance(result.get("data"), dict) else result, indent=2)
+
+    @server.tool(
+        name="snow_windows_notify",
+        description="Display a bounded Windows desktop toast notification with title and message.",
+    )
+    async def snow_windows_notify(title: str, message: str) -> str:
+        """Show a native Windows desktop notification."""
+        result = await bridge.windows_notify(title=title, message=message)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "NOTIFICATION_FAILED"),
+                "error": result.get("error", "Failed displaying Windows notification."),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
+
+    @server.tool(
+        name="snow_windows_lock_screen",
+        description="Lock the Windows workstation session cleanly (requires explicit owner approval for AI calls).",
+    )
+    async def snow_windows_lock_screen(approval_id: str = "") -> str:
+        """Lock the Windows host screen via LockWorkStation (approval-gated for AI)."""
+        result = await bridge.windows_lock_screen(approval_id=approval_id)
+        if not result.get("success", False):
+            return json.dumps({
+                "success": False,
+                "status": result.get("status", "ERROR"),
+                "error": result.get("error", "Failed locking Windows workstation."),
+                "data": result.get("data"),
+            }, indent=2)
+        return json.dumps(result.get("data", {}) or result, indent=2)
 
 
 def register_clipboard_buffer_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:

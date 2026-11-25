@@ -98,15 +98,15 @@ class TestPillar1DynamicCapabilityRegistry(unittest.IsolatedAsyncioTestCase):
 
     def test_tool_registry_backward_compatibility_dict(self) -> None:
         """TOOL_REGISTRY proxy dict provides backward compatible access."""
-        self.assertEqual(len(TOOL_REGISTRY), 38)
+        self.assertEqual(len(TOOL_REGISTRY), 42)
         self.assertEqual(TOOL_REGISTRY["snow_windows_battery"], ToolCategory.LOCAL_WINDOWS)
         self.assertEqual(TOOL_REGISTRY["snow_android_file_list"], ToolCategory.CROSS_DEVICE)
         self.assertTrue("snow_activity_history" in TOOL_REGISTRY)
 
     def test_exact_30_tools_and_prohibited_names_absent(self) -> None:
-        """Catalog has exactly 38 tools (24 baseline + 6 P1 + 4 Phase 24 + 3 Phase 26B + 1 Phase 27) with zero fabricated names."""
-        self.assertEqual(len(ALL_TOOL_NAMES), 38)
-        self.assertEqual(len(list_capabilities()), 38)
+        """Catalog has exactly 42 tools (38 V4 baseline + 4 V5.0.0 additions) with zero fabricated names."""
+        self.assertEqual(len(ALL_TOOL_NAMES), 42)
+        self.assertEqual(len(list_capabilities()), 42)
         prohibited = [
             "snow_android_send_sms",
             "snow_android_take_photo",
@@ -136,7 +136,7 @@ class TestPillar1DynamicCapabilityRegistry(unittest.IsolatedAsyncioTestCase):
         register_all_tools(server, bridge)
 
         tools = await server.list_tools()
-        self.assertEqual(len(tools), 38)
+        self.assertEqual(len(tools), 42)
         for t in tools:
             self.assertIsNotNone(t.annotations, f"Tool '{t.name}' is missing MCP ToolAnnotations")
             self.assertIs(type(t.annotations.readOnlyHint), bool, f"Tool '{t.name}': readOnlyHint not bool")

@@ -630,18 +630,23 @@
                             <div id="subpanel-captures" class="card flex flex-col gap-4">
                                 <div class="card-header-row" style="margin-bottom: 4px;">
                                     <h3 class="card-title">Screen &amp; Camera</h3>
-                                    <span class="chip chip-sm chip-cyan">HTTPS Plane</span>
+                                    <span id="screen-stream-badge" class="chip chip-sm chip-neutral">Standby</span>
                                 </div>
                                 <div class="flex flex-col gap-2">
-                                    <button id="btn-capture-screen-trigger" class="btn btn-sm btn-primary w-full">Capture Phone Screen</button>
+                                    <div class="flex gap-2">
+                                        <button id="btn-capture-screen-trigger" class="btn btn-sm btn-primary w-full">Capture Phone Screen</button>
+                                        <button id="btn-stop-screen-stream" class="btn btn-sm btn-danger d-none" style="flex-shrink:0;">Stop Stream</button>
+                                    </div>
                                     <button id="btn-capture-camera-trigger" class="btn btn-sm btn-tonal w-full">Take Camera Photo</button>
                                 </div>
-                                <div class="flex items-center justify-center p-3" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md); min-height: 160px;">
-                                    <img id="latest-capture-img" src="" alt="Capture Preview" style="max-height: 260px; max-width: 100%; border-radius: var(--snow-radius-sm); display: none;">
+                                <div class="flex flex-col items-center justify-center p-3 gap-2" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md); min-height: 160px;">
+                                    <img id="latest-capture-img" src="" alt="Capture Preview" style="max-height: 260px; max-width: 100%; border-radius: var(--snow-radius-sm); display: none; cursor: pointer;">
                                     <div id="latest-capture-placeholder" class="empty-state" style="padding: 16px;">
                                         <svg class="svg-icon svg-icon-lg text-muted" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
-                                        <span class="text-xs">No recent capture preview</span>
+                                        <span id="latest-capture-status-text" class="text-xs">No active stream or capture</span>
+                                        <button id="btn-retry-screen-stream" class="btn btn-xs btn-tonal d-none">Retry Viewer</button>
                                     </div>
+                                    <span id="screen-stream-meta" class="text-xs text-muted d-none"></span>
                                 </div>
                             </div>
                         </div>
@@ -697,7 +702,7 @@
                         <div class="card-header-row">
                             <div class="flex items-center gap-2">
                                 <h3 class="card-title">Connect AI Assistants</h3>
-                                <span class="chip chip-sm chip-emerald">FastMCP 38 Tools</span>
+                                <span class="chip chip-sm chip-emerald">FastMCP 42 Tools</span>
                             </div>
                             <button id="btn-mcp-test-local" class="btn btn-sm btn-tonal">Test Local MCP</button>
                         </div>
@@ -753,7 +758,7 @@
                             </div>
                             <button id="btn-mcp-tunnel-toggle" class="btn btn-sm btn-primary">Start Tunnel</button>
                         </div>
-                        <p class="text-xs text-muted">Exposes the 38-tool MCP gateway via Cloudflare Tunnel with OAuth 2.1 human-in-the-loop approval.</p>
+                        <p class="text-xs text-muted">Exposes the 42-tool MCP gateway via Cloudflare Tunnel with OAuth 2.1 human-in-the-loop approval.</p>
                         <div class="flex gap-2">
                             <input type="text" id="mcp-tunnel-url-display" class="form-input text-xs mono" readonly value="http://127.0.0.1:8771/mcp">
                             <button id="btn-mcp-copy-url" class="btn btn-sm btn-tonal">Copy Link</button>
@@ -856,7 +861,7 @@
                             </div>
                         </div>
 
-                        <!-- Right Column: Approvals & Activity Timeline -->
+                        <!-- Right Column: Pending Approvals -->
                         <div class="flex flex-col gap-4 approvals-activity-card">
                             <div class="card">
                                 <div class="card-header-row">
@@ -868,14 +873,6 @@
                                     <svg class="svg-icon svg-icon-md text-muted" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
                                     <span class="text-sm">No pending security or OAuth approvals</span>
                                 </div>
-                            </div>
-
-                            <div class="card">
-                                <div class="card-header-row">
-                                    <h3 class="card-title">Activity Timeline</h3>
-                                    <span class="text-xs text-muted">Secret-Redacted Audit</span>
-                                </div>
-                                <div id="activity-timeline-container" class="flex flex-col gap-2" style="max-height: 360px; overflow-y: auto;"></div>
                             </div>
                         </div>
                     </div>

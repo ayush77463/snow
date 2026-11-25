@@ -414,19 +414,37 @@ class SnowForegroundService : Service() {
                 handleDisconnect()
             }
             else -> {
-                // Defensive fallback: if invoked via startForegroundService with null or unexpected action,
-                // fulfill the OS contract immediately then cleanly stop.
-                ServiceCompat.startForeground(
-                    this,
-                    NOTIFICATION_ID,
-                    buildNotification("SNOW Capability Bridge"),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                )
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (intent == null && !isDisconnectedByUser(this)) {
+                    // Sticky OS restart after process/memory reclaim: re-elevate foreground and resume auto-connect
+                    ServiceCompat.startForeground(
+                        this,
+                        NOTIFICATION_ID,
+                        buildNotification("Standing by for SNOW desktop..."),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                    discoveryManager.startListening()
+                    startObservingState()
+                    startObservingDiscovery()
+                    startObservingAuth()
+                    executeAutoConnectCascade()
+                } else {
+                    // Defensive fallback: fulfill OS foreground contract immediately then cleanly stop.
+                    ServiceCompat.startForeground(
+                        this,
+                        NOTIFICATION_ID,
+                        buildNotification("SNOW Capability Bridge"),
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
-        return START_NOT_STICKY
+        return if (isDisconnectedByUser(this) && !peerHostManager.isHostModeActive()) {
+            START_NOT_STICKY
+        } else {
+            START_STICKY
+        }
     }
 
     private fun startObservingState() {
@@ -438,10 +456,19 @@ class SnowForegroundService : Service() {
                         if (!userDisconnected) {
                             discoveryManager.startListening()
                         }
-                        // When disconnected, remove the ongoing foreground notification completely.
-                        ServiceCompat.stopForeground(this@SnowForegroundService, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                        manager.cancel(NOTIFICATION_ID)
+                        if (userDisconnected && !peerHostManager.isHostModeActive()) {
+                            // Only remove the foreground notification when the user explicitly disconnected
+                            ServiceCompat.stopForeground(this@SnowForegroundService, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                            manager.cancel(NOTIFICATION_ID)
+                        } else {
+                            val label = if (peerHostManager.isHostModeActive()) {
+                                "Peer Host Active on Port ${peerHostManager.activePort}"
+                            } else {
+                                "Waiting for SNOW desktop..."
+                            }
+                            updateNotification(label)
+                        }
                     }
                     ConnectionState.CONNECTING -> {
                         updateNotification("Connecting...")
@@ -745,6 +772,18 @@ class SnowForegroundService : Service() {
                 this,
                 NOTIFICATION_ID,
                 buildNotification("Connected to desktop"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else if (!userDisconnected || peerHostManager.isHostModeActive()) {
+            val label = if (peerHostManager.isHostModeActive()) {
+                "Peer Host Active on Port ${peerHostManager.activePort}"
+            } else {
+                "Waiting for SNOW desktop..."
+            }
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                buildNotification(label),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             )
         }

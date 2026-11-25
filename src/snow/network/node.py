@@ -77,6 +77,9 @@ WINDOWS_CAPABILITIES: set[str] = {
 ANDROID_CAPABILITIES: set[str] = {
     "android.telemetry.get",
     "android.notifications.push",
+    "android.notifications.list",
+    "android.notifications.reply",
+    "android.notifications.dismiss",
     "android.clipboard.set",
     "android.clipboard.get",
     "android.apps.list",
@@ -84,6 +87,11 @@ ANDROID_CAPABILITIES: set[str] = {
     "android.messaging.send_intent",
     "android.files.transfer",
     "android.ringer.ring",
+    "android.media.control",
+    "android.link.share",
+    "android.screen.capture",
+    "android.screen.stream",
+    "android.camera.capture",
 }
 
 
@@ -100,6 +108,8 @@ CAPABILITY_ALIASES: dict[str, str] = {
     "android.ringer.ring": "android.ring_phone",
     "android.battery.get": "android.telemetry.get",
     "android.telemetry.get": "android.battery.get",
+    "android.media.projection": "android.screen.capture",
+    "android.screen.capture": "android.media.projection",
 }
 
 
@@ -222,6 +232,9 @@ def build_android_manifest() -> CapabilityManifest:
     classifications = {
         "android.telemetry.get": CapabilityExecutionClassification.BACKGROUND_SAFE,
         "android.notifications.push": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
+        "android.notifications.list": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
+        "android.notifications.reply": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
+        "android.notifications.dismiss": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
         "android.clipboard.set": CapabilityExecutionClassification.BACKGROUND_SAFE,
         "android.clipboard.get": CapabilityExecutionClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
         "android.apps.list": CapabilityExecutionClassification.BACKGROUND_SAFE,
@@ -229,6 +242,11 @@ def build_android_manifest() -> CapabilityManifest:
         "android.messaging.send_intent": CapabilityExecutionClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
         "android.files.transfer": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
         "android.ringer.ring": CapabilityExecutionClassification.BACKGROUND_SAFE,
+        "android.media.control": CapabilityExecutionClassification.BACKGROUND_SAFE,
+        "android.link.share": CapabilityExecutionClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
+        "android.screen.capture": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
+        "android.screen.stream": CapabilityExecutionClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
+        "android.camera.capture": CapabilityExecutionClassification.RUNTIME_PERMISSION_REQUIRED,
     }
     permission_states = {cap: "GRANTED" for cap in ANDROID_CAPABILITIES}
     return CapabilityManifest(
@@ -297,6 +315,7 @@ class DeviceNode:
             "trust_tier": self.trust_tier,
             "is_paired": self.is_paired,
             "is_authenticated": self.is_authenticated,
+            "is_local": self.transport == "local",
             "transport": self.transport,
             "connection_mode": self.connection_mode,
             "telemetry": self.telemetry,
@@ -329,6 +348,7 @@ class DeviceNode:
             "reachability_state": str(self.reachability_state),
             "is_connected": self.is_connected,
             "is_paired": self.is_paired,
+            "is_local": self.transport == "local",
             "transport": self.transport,
             "connection_mode": self.connection_mode,
             "telemetry": self.telemetry,

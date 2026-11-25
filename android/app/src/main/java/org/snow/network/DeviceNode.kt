@@ -1,9 +1,13 @@
 package org.snow.network
 
+import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import org.snow.capabilities.ScreenCaptureHandler
+import org.snow.service.SnowNotificationListenerService
 
 /**
  * Standard execution and availability profile for participating devices.
@@ -221,25 +225,41 @@ data class DeviceNode(
             val supported = listOf(
                 "android.telemetry.get",
                 "android.notifications.push",
+                "android.notifications.list",
+                "android.notifications.reply",
+                "android.notifications.dismiss",
                 "android.clipboard.set",
                 "android.clipboard.get",
                 "android.apps.list",
                 "android.apps.launch",
                 "android.messaging.send_intent",
                 "android.files.transfer",
-                "android.ringer.ring"
+                "android.ringer.ring",
+                "android.media.control",
+                "android.link.share",
+                "android.screen.capture",
+                "android.screen.stream",
+                "android.camera.capture"
             )
 
             val classifications = mapOf(
                 "android.telemetry.get" to CapabilityClassification.BACKGROUND_SAFE,
                 "android.notifications.push" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED,
+                "android.notifications.list" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED,
+                "android.notifications.reply" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED,
+                "android.notifications.dismiss" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED,
                 "android.clipboard.set" to CapabilityClassification.BACKGROUND_SAFE,
                 "android.clipboard.get" to CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
                 "android.apps.list" to CapabilityClassification.BACKGROUND_SAFE,
                 "android.apps.launch" to CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
                 "android.messaging.send_intent" to CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
                 "android.files.transfer" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED,
-                "android.ringer.ring" to CapabilityClassification.BACKGROUND_SAFE
+                "android.ringer.ring" to CapabilityClassification.BACKGROUND_SAFE,
+                "android.media.control" to CapabilityClassification.BACKGROUND_SAFE,
+                "android.link.share" to CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
+                "android.screen.capture" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED,
+                "android.screen.stream" to CapabilityClassification.FOREGROUND_USER_INTERACTION_REQUIRED,
+                "android.camera.capture" to CapabilityClassification.RUNTIME_PERMISSION_REQUIRED
             )
 
             val perms = mutableMapOf<String, String>()
@@ -251,14 +271,68 @@ data class DeviceNode(
             perms["android.files.transfer"] = "GRANTED"
             perms["android.apps.list"] = "GRANTED"
             perms["android.ringer.ring"] = "GRANTED"
+            perms["android.media.control"] = "GRANTED"
+            perms["android.link.share"] = "GRANTED"
+
+            // MediaProjection consent state for single capture and live streaming
+            val screenConsentState = if (
+                ScreenCaptureHandler.isConsentGranted && ScreenCaptureHandler.activeMediaProjection != null
+            ) {
+                "GRANTED"
+            } else {
+                "PROMPT_REQUIRED"
+            }
+            perms["android.screen.capture"] = screenConsentState
+            perms["android.screen.stream"] = screenConsentState
+
+            // Check runtime CAMERA permission safely
+            perms["android.camera.capture"] = if (context != null) {
+                try {
+                    val hasCamera = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.CAMERA
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (hasCamera) "GRANTED" else "DENIED"
+                } catch (_: Throwable) {
+                    "UNKNOWN"
+                }
+            } else {
+                "GRANTED"
+            }
+
+            // Check NotificationListenerService grant + in-app opt-in safely
+            val notifReadState = if (context != null) {
+                try {
+                    val enabled = NotificationManagerCompat
+                        .getEnabledListenerPackages(context)
+                        .contains(context.packageName)
+                    val optedIn = SnowNotificationListenerService.isOptedIn(context)
+                    when {
+                        !enabled -> "DENIED"
+                        !optedIn -> "OPT_OUT"
+                        else -> "GRANTED"
+                    }
+                } catch (_: Throwable) {
+                    "UNKNOWN"
+                }
+            } else {
+                "GRANTED"
+            }
+            perms["android.notifications.list"] = notifReadState
+            perms["android.notifications.reply"] = notifReadState
+            perms["android.notifications.dismiss"] = notifReadState
 
             // Check POST_NOTIFICATIONS permission for Android 13+ (API 33+) if context available
             if (context != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                val hasNotif = ContextCompat.checkSelfPermission(
-                    context,
-                    android.Manifest.permission.POST_NOTIFICATIONS
-                ) == PackageManager.PERMISSION_GRANTED
-                perms["android.notifications.push"] = if (hasNotif) "GRANTED" else "DENIED"
+                perms["android.notifications.push"] = try {
+                    val hasNotif = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (hasNotif) "GRANTED" else "DENIED"
+                } catch (_: Throwable) {
+                    "UNKNOWN"
+                }
             } else {
                 perms["android.notifications.push"] = "GRANTED"
             }

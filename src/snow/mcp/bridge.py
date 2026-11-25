@@ -468,6 +468,80 @@ class SnowMcpBridge:
         """Query host battery telemetry via Core IPC or in-process."""
         return await self._execute_local_or_ipc("windows_battery", {})
 
+    async def windows_active_window(self) -> dict[str, Any]:
+        """Query currently focused foreground window title and process on Windows."""
+        return await self._execute_local_or_ipc("windows_active_window", {})
+
+    async def windows_notify(self, title: str, message: str) -> dict[str, Any]:
+        """Display a bounded Windows desktop notification via Core IPC or in-process."""
+        return await self._execute_local_or_ipc("windows_notify", {"title": title, "message": message})
+
+    async def windows_lock_screen(self, approval_id: str = "") -> dict[str, Any]:
+        """Lock the Windows workstation (OWNER_MANUAL direct, AI_MCP approval-gated)."""
+        params: dict[str, Any] = {}
+        if approval_id:
+            params["approval_id"] = approval_id
+        return await self._execute_local_or_ipc("windows_lock_screen", params)
+
+    async def snow_mesh_health_summary(self, ctx: Optional[ExecutionContext] = None) -> dict[str, Any]:
+        """Compute compact secret-redacted SNOW mesh health and node reachability summary."""
+        topo, dev_res = await asyncio.gather(
+            self.snow_mesh_topology(ctx=ctx),
+            self.list_devices(),
+            return_exceptions=True,
+        )
+        topo_dict = topo if isinstance(topo, dict) else {}
+        devs_raw: list[dict[str, Any]] = []
+        if isinstance(dev_res, dict):
+            data = dev_res.get("data")
+            if isinstance(data, dict) and isinstance(data.get("devices"), list):
+                devs_raw = data["devices"]
+            elif isinstance(dev_res.get("devices"), list):
+                devs_raw = dev_res["devices"]
+
+        core_online = bool(
+            isinstance(dev_res, dict) and dev_res.get("success", False)
+        )
+        online_count = 0
+        offline_count = 0
+        transport_counts: dict[str, int] = {}
+        compact_nodes: list[dict[str, Any]] = []
+
+        for d in devs_raw:
+            is_conn = bool(d.get("is_connected"))
+            if is_conn:
+                online_count += 1
+            else:
+                offline_count += 1
+            tr = str(d.get("transport") or "unknown").lower()
+            transport_counts[tr] = transport_counts.get(tr, 0) + 1
+            compact_nodes.append({
+                "device_id": d.get("device_id"),
+                "device_name": d.get("device_name"),
+                "platform": d.get("platform", "unknown"),
+                "is_connected": is_conn,
+                "transport": tr,
+                "reachability_state": d.get("reachability_state", "UNKNOWN"),
+            })
+
+        remote_online = sum(
+            1 for d in devs_raw if bool(d.get("is_connected")) and not bool(d.get("is_local")) and d.get("transport") != "local"
+        )
+        health_status = "HEALTHY" if (core_online and remote_online > 0) else ("STANDBY" if core_online else "DEGRADED")
+
+        return {
+            "success": True,
+            "status": health_status,
+            "core_running": core_online,
+            "total_nodes": len(compact_nodes),
+            "online_nodes": online_count,
+            "offline_nodes": offline_count,
+            "remote_online_nodes": remote_online,
+            "transports": transport_counts,
+            "mesh_tier": topo_dict.get("network_name", "Local Mesh"),
+            "nodes": compact_nodes,
+        }
+
     async def windows_system_info(self) -> dict[str, Any]:
         """Query host system and hardware telemetry via Core IPC or in-process."""
         return await self._execute_local_or_ipc("windows_system_info", {})

@@ -48,10 +48,14 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.snow.network.ConnectionState
 import org.snow.network.DiscoveredPeer
@@ -96,6 +100,7 @@ fun SnowApp(
     onSyncSystemBars: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
 
     // State observation from SnowUiRepository
@@ -110,6 +115,7 @@ fun SnowApp(
     val terminalState by repository.terminalState.collectAsState()
     val logs by repository.logs.collectAsState()
     val clipboardItems by repository.clipboardBufferItems.collectAsState()
+    val clipboardThumbnailVersion by repository.clipboardThumbnailVersion.collectAsState()
     val peerHostState by repository.peerHostState.collectAsState()
     val desktopWallpaper by repository.desktopWallpaper.collectAsState()
     val activePermissionProfile by repository.permissionProfileState.collectAsState()
@@ -124,6 +130,12 @@ fun SnowApp(
     var showConnectSheet by remember { mutableStateOf(false) }
     var showPeerHostQrDialog by remember { mutableStateOf(false) }
     var peerHostQrJson by remember { mutableStateOf<String?>(null) }
+    var connectQrJson by remember { mutableStateOf<String?>(null) }
+    var connectQrError by remember { mutableStateOf<String?>(null) }
+    var isPreparingConnectQr by remember { mutableStateOf(false) }
+    var isHomeRefreshing by remember { mutableStateOf(false) }
+    var isDevicesRefreshing by remember { mutableStateOf(false) }
+    var isFilesRefreshing by remember { mutableStateOf(false) }
     var generatedFederationCode by remember { mutableStateOf<String?>(null) }
     var updateInfo by remember { mutableStateOf<org.snow.transfer.FileTransferClient.AppUpdateInfo?>(null) }
     var updateDownloadProgress by remember { mutableStateOf<Int?>(null) }
@@ -207,6 +219,25 @@ fun SnowApp(
                 if (success && grants != null) {
                     federationGrantsList = grants
                 }
+            }
+        }
+    }
+
+    // Lifecycle-aware 3s auto-refresh ticker when Activity is STARTED/resumed
+    LaunchedEffect(lifecycleOwner, connectionState, currentTab, currentToolSubTab, currentPcPath) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                repository.refreshPhoneTelemetry()
+                if (connectionState == ConnectionState.CONNECTED) {
+                    repository.queryPcStatus()
+                    repository.fetchClipboardBuffer()
+                    if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.FILES) {
+                        repository.listPcDirectory(currentPcPath) { files, _ ->
+                            if (files != null) pcFilesList = files
+                        }
+                    }
+                }
+                delay(3000L)
             }
         }
     }
@@ -333,8 +364,7 @@ fun SnowApp(
                                         repository.fetchClipboardBuffer()
                                     }
                                     "notifications" -> {
-                                        approvalsInitialTab = 1
-                                        showApprovalsSheet = true
+                                        currentTab = SnowTab.SETTINGS
                                     }
                                     "share" -> {
                                         shareInput = ""
@@ -385,7 +415,24 @@ fun SnowApp(
                             onClearClipboardBuffer = {
                                 repository.clearClipboardBuffer()
                             },
-                            scrollToClipboardTrigger = scrollToClipboardTrigger
+                            scrollToClipboardTrigger = scrollToClipboardTrigger,
+                            clipboardThumbnailVersion = clipboardThumbnailVersion,
+                            findCachedClipboardImage = { id -> repository.getCachedClipboardImageFile(id) },
+                            autoSyncScreenshots = autoSyncScreenshots,
+                            isRefreshing = isHomeRefreshing,
+                            onRefresh = {
+                                isHomeRefreshing = true
+                                repository.refreshPhoneTelemetry()
+                                if (connectionState == ConnectionState.CONNECTED) {
+                                    repository.queryPcStatus()
+                                    repository.refreshDesktopWallpaper()
+                                    repository.fetchClipboardBuffer()
+                                }
+                                scope.launch {
+                                    delay(500L)
+                                    isHomeRefreshing = false
+                                }
+                            }
                         )
                     }
                     SnowTab.DEVICES -> {
@@ -471,7 +518,21 @@ fun SnowApp(
                             },
                             onOpenConnectSheet = { showConnectSheet = true },
                             generatedFederationInvite = generatedFederationCode,
-                            onDismissFederationInvite = { generatedFederationCode = null }
+                            onDismissFederationInvite = { generatedFederationCode = null },
+                            isRefreshing = isDevicesRefreshing,
+                            onRefresh = {
+                                isDevicesRefreshing = true
+                                repository.refreshPhoneTelemetry()
+                                if (connectionState == ConnectionState.CONNECTED) {
+                                    repository.listFederationGrants { ok, grants, _ ->
+                                        if (ok && grants != null) federationGrantsList = grants
+                                    }
+                                }
+                                scope.launch {
+                                    delay(500L)
+                                    isDevicesRefreshing = false
+                                }
+                            }
                         )
                     }
                     SnowTab.TOOLS -> {
@@ -492,6 +553,14 @@ fun SnowApp(
                                 repository.startFileDownload(file) { _, _ -> }
                             },
                             onUploadFile = onPickFilesToUpload,
+                            isFilesRefreshing = isFilesRefreshing,
+                            onRefreshFiles = {
+                                isFilesRefreshing = true
+                                repository.listPcDirectory(currentPcPath) { files, _ ->
+                                    if (files != null) pcFilesList = files
+                                    isFilesRefreshing = false
+                                }
+                            },
                             allowlistedApps = AppLauncherBottomSheet.ALLOWLISTED_WINDOWS_APPS,
                             onLaunchApp = { target, friendlyName ->
                                 repository.launchWindowsApp(target) { success, err ->
@@ -678,7 +747,8 @@ fun SnowApp(
                     federationGrants = federationGrantsList,
                     onFederationGrantClick = {
                         currentTab = SnowTab.DEVICES
-                    }
+                    },
+                    localPhoneTelemetry = phoneTelemetry
                 )
 
                 SnowApprovalsSheet(
@@ -780,7 +850,24 @@ fun SnowApp(
                     mySnowId = repository.canonicalSnowId,
                     myDeviceId = repository.identity.deviceId,
                     isConnecting = isConnectingByInput,
-                    errorMessage = connectErrorMessage
+                    errorMessage = connectErrorMessage,
+                    peerHostState = peerHostState,
+                    pairingQrJson = connectQrJson,
+                    pairingQrError = connectQrError,
+                    isPreparingPairingQr = isPreparingConnectQr,
+                    onPreparePairingQr = {
+                        isPreparingConnectQr = true
+                        connectQrError = null
+                        repository.preparePeerHostPairingQr { qrJson, err ->
+                            isPreparingConnectQr = false
+                            connectQrJson = qrJson
+                            connectQrError = err
+                        }
+                    },
+                    onRegeneratePairingPin = {
+                        repository.generatePeerHostPin()
+                        connectQrJson = repository.generatePeerHostQrJson()
+                    }
                 )
 
                 // Phase 27 Peer Host Mode Pairing QR Dialog

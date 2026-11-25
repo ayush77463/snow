@@ -68,7 +68,7 @@ Every AI host evaluated in this document is classified under one of five strict 
   }
   ```
 - **Capabilities Verified:**
-  - Full tool discovery: 38 capabilities registered.
+  - Full tool discovery: 42 capabilities registered.
   - Desktop capture, system metrics, Android device resolution, clipboard synchronization, workflow trigger.
   - Tool annotations (`readOnlyHint`, `destructiveHint`) accurately rendered in Claude Desktop UI.
 
@@ -157,7 +157,7 @@ Every AI host evaluated in this document is classified under one of five strict 
 
 | Threat Vector | Local `stdio` Defense | Remote HTTP / OAuth 2.1 Defense |
 | :--- | :--- | :--- |
-| **Arbitrary Code Execution** | Frozen capability registry; zero shell execution capabilities. | Execution restricted to 38 authorized tools. |
+| **Arbitrary Code Execution** | Frozen capability registry; zero shell execution capabilities. | Execution restricted to 42 authorized tools. |
 | **SSRF / Internal Scan** | Not applicable (local process). | Strict IP blacklisting: private, loopback, link-local, cloud metadata (`169.254.169.254`), and IPv4-mapped IPv6 rejected. |
 | **DNS Rebinding** | Not applicable. | `PinnedIPHTTPSConnection` binds socket to pre-verified IP while preserving Host header. |
 | **Token Theft / Replay** | Process boundary isolation. | Refresh token family rotation with automatic revocation on reuse detection; PKCE S256 required. |

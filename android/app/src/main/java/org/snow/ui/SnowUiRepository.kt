@@ -221,6 +221,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private var discoveryJob: Job? = null
     private var screenShareJob: Job? = null
     private var _fileTransferClient: FileTransferClient? = null
+    private val _clipboardThumbnailVersion = MutableStateFlow(0)
+    val clipboardThumbnailVersion: StateFlow<Int> = _clipboardThumbnailVersion.asStateFlow()
+    private val inFlightThumbnails = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     var connectedHost: String = ""
         private set
 
@@ -2064,6 +2067,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     }
                 }
                 _clipboardBufferItems.value = parsed
+                prefetchClipboardThumbnails(parsed)
                 repoScope.launch(Dispatchers.Main) {
                     onComplete?.invoke(true, "Fetched ${parsed.size} items")
                 }
@@ -2786,9 +2790,94 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun isPeerHostActive(): Boolean = serviceRef?.peerHostManager?.isHostModeActive() ?: false
     fun getPeerHostManager(): org.snow.network.AndroidPeerHostManager? = serviceRef?.peerHostManager
 
+    fun getCachedClipboardImageFile(itemId: String): File? {
+        val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
+        return findCachedClipboardImageFile(cacheDir, itemId)
+    }
+
+    private fun prefetchClipboardThumbnails(items: List<ClipboardItemDto>) {
+        val client = serviceRef?.client ?: return
+        val transferClient = _fileTransferClient ?: return
+        val targetHost = client.currentTargetHost.takeIf { it.isNotBlank() } ?: connectedHost
+        if (targetHost.isBlank()) return
+
+        val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
+        items.filter { it.type == "image" && it.itemId.isNotBlank() && it.sizeBytes in 1L..(10L * 1024L * 1024L) }
+            .take(4)
+            .forEach { item ->
+                if (findCachedClipboardImageFile(cacheDir, item.itemId) != null) return@forEach
+                if (!inFlightThumbnails.add(item.itemId)) return@forEach
+
+                client.sendRequest(
+                    "clipboard_buffer_apply",
+                    mapOf("item_id" to item.itemId, "target" to identity.deviceId, "stage_only" to true)
+                ) { resp ->
+                    if (!resp.isSuccess) {
+                        inFlightThumbnails.remove(item.itemId)
+                        return@sendRequest
+                    }
+                    val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
+                    val transferId = data?.get("transfer_id") as? String
+                    val sha256 = (data?.get("sha256") as? String) ?: ""
+                    val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: 8766
+                    val mimeType = data?.get("mime_type") as? String
+                    if (transferId.isNullOrBlank()) {
+                        inFlightThumbnails.remove(item.itemId)
+                        return@sendRequest
+                    }
+                    repoScope.launch(Dispatchers.IO) {
+                        try {
+                            val ext = if (mimeType?.contains("jpeg") == true || mimeType?.contains("jpg") == true) "jpg" else "png"
+                            val localFile = clipboardImageCacheFile(cacheDir, item.itemId, ext)
+                            val dlRes = transferClient.downloadFile(
+                                serverHost = targetHost,
+                                transferPort = transferPort,
+                                transferId = transferId,
+                                destinationFile = localFile,
+                                expectedSha256 = sha256
+                            )
+                            if (dlRes is FileTransferClient.TransferResult.Success) {
+                                _clipboardThumbnailVersion.value = _clipboardThumbnailVersion.value + 1
+                            }
+                        } finally {
+                            inFlightThumbnails.remove(item.itemId)
+                        }
+                    }
+                }
+            }
+    }
+
     fun generatePeerHostQrJson(): String? {
         val service = serviceRef ?: return null
-        return service.peerHostManager.generatePairingQrJson(identity.deviceId)
+        return service.peerHostManager.generatePairingQrJson(identity.deviceId, canonicalSnowId)
+    }
+
+    fun preparePeerHostPairingQr(onReady: (qrJson: String?, error: String?) -> Unit) {
+        val service = serviceRef
+        if (service == null) {
+            onReady(null, "Background service starting; retry in a moment.")
+            return
+        }
+        val mgr = service.peerHostManager
+        val existing = mgr.generatePairingQrJson(identity.deviceId, canonicalSnowId)
+        if (!existing.isNullOrBlank()) {
+            onReady(existing, null)
+            return
+        }
+        repoScope.launch(Dispatchers.IO) {
+            mgr.setHostModeSettingEnabled(true)
+            service.startPeerHost()
+            val generated = mgr.generatePairingQrJson(identity.deviceId, canonicalSnowId)
+            repoScope.launch(Dispatchers.Main) {
+                if (!generated.isNullOrBlank()) {
+                    onReady(generated, null)
+                } else {
+                    val err = mgr.hostState.value.errorMessage
+                        ?: "Connect to Wi-Fi or local network to generate pairing QR."
+                    onReady(null, err)
+                }
+            }
+        }
     }
 
     fun startPeerHost() {

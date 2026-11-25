@@ -422,9 +422,54 @@ class SnowWebServer:
         if session_token and session_token in self._sessions:
             csrf_token = self._sessions[session_token].get("csrf_token")
 
-        daemon_online = await self.bridge.daemon_manager.is_ipc_ready(timeout=0.2)
-        telemetry_res = await self.bridge.windows_system_info()
-        
+        async def _safe_bridge_call(coro_or_val: Any) -> dict[str, Any]:
+            try:
+                res = await coro_or_val if inspect.isawaitable(coro_or_val) else coro_or_val
+                return res if isinstance(res, dict) else {}
+            except Exception:
+                return {}
+
+        daemon_raw = await _safe_bridge_call(self.bridge.daemon_manager.is_ipc_ready(timeout=0.2)) if hasattr(self.bridge, "daemon_manager") else True
+        daemon_online = bool(daemon_raw) if not isinstance(daemon_raw, dict) else True
+        telemetry_res = await _safe_bridge_call(self.bridge.windows_system_info())
+        battery_res = (
+            await _safe_bridge_call(self.bridge.windows_battery())
+            if hasattr(self.bridge, "windows_battery")
+            else {}
+        )
+
+        host_telemetry: dict[str, Any] = {}
+        if telemetry_res.get("success") and isinstance(telemetry_res.get("data"), dict):
+            sys_data = telemetry_res["data"]
+            host_telemetry = dict(sys_data)
+            cpu_info = sys_data.get("cpu") if isinstance(sys_data.get("cpu"), dict) else {}
+            mem_info = sys_data.get("memory") if isinstance(sys_data.get("memory"), dict) else {}
+            disk_info = sys_data.get("disk") if isinstance(sys_data.get("disk"), dict) else {}
+
+            if "utilization_percent" in cpu_info:
+                host_telemetry["cpu_percent"] = cpu_info["utilization_percent"]
+            if "total_mb" in mem_info and mem_info["total_mb"] is not None:
+                ram_tot = int(float(mem_info["total_mb"]) * 1024 * 1024)
+                ram_used = int(float(mem_info.get("used_mb") or 0) * 1024 * 1024)
+                host_telemetry["ram_total_bytes"] = ram_tot
+                host_telemetry["ram_used_bytes"] = ram_used
+                host_telemetry["ram_available_bytes"] = max(0, ram_tot - ram_used)
+                host_telemetry["ram_percent"] = mem_info.get("percent")
+            if disk_info.get("total_gb") is not None:
+                disk_tot = int(float(disk_info["total_gb"]) * (1024**3))
+                disk_used = int(float(disk_info.get("used_gb") or 0) * (1024**3))
+                host_telemetry["storage_total_bytes"] = disk_tot
+                host_telemetry["storage_used_bytes"] = disk_used
+                host_telemetry["storage_available_bytes"] = max(0, disk_tot - disk_used)
+                host_telemetry["storage_percent"] = disk_info.get("percent")
+
+        if battery_res.get("success") and isinstance(battery_res.get("data"), dict):
+            bdata = battery_res["data"]
+            host_telemetry["battery_status"] = bdata.get("status")
+            host_telemetry["battery_charging"] = bdata.get("power_plugged")
+            if bdata.get("available") and bdata.get("percent") is not None:
+                host_telemetry["battery_percent"] = bdata.get("percent")
+
         from snow.core.network import get_active_ip_addresses
         lan_ips = get_active_ip_addresses()
         lan_available = bool(lan_ips)
@@ -448,7 +493,7 @@ class SnowWebServer:
             "lan_ips": lan_ips,
             "lan_available": lan_available,
             "usb_connected": usb_connected,
-            "telemetry": telemetry_res.get("data") if telemetry_res.get("success") else {},
+            "telemetry": host_telemetry,
         }
         if csrf_token:
             data["csrf_token"] = csrf_token
@@ -468,26 +513,61 @@ class SnowWebServer:
         elif isinstance(res.get("devices"), list):
             devices = res["devices"]
 
-        # Populate live phone telemetry (battery, RAM, storage) and canonical snow_id
-        from snow.security.identity import generate_snow_id, is_valid_snow_id
-        for dev in devices:
-            if not dev.get("snow_id"):
-                dev_id = dev.get("device_id")
-                if dev_id:
-                    dev["snow_id"] = generate_snow_id(seed=dev_id)
+        # Deduplicate local host node & normalize live phone telemetry and canonical snow_id
+        from snow.security.identity import generate_snow_id, load_or_create_device_identity
+        local_ident = load_or_create_device_identity()
+        deduped: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_local = False
 
-            if dev.get("is_connected") and (dev.get("platform") == "android" or not dev.get("platform") or dev.get("platform") == "generic"):
-                dev_id = dev.get("device_id")
-                if not dev.get("telemetry") and dev_id:
+        for raw_dev in devices:
+            dev = dict(raw_dev)
+            dev_id = dev.get("device_id") or ""
+            is_local = bool(
+                dev.get("is_local")
+                or dev_id in ("local", "desktop-core", local_ident.device_id)
+                or dev.get("transport") == "local"
+                or (local_ident.snow_id and dev.get("snow_id") == local_ident.snow_id)
+            )
+            if is_local:
+                dev["is_local"] = True
+                dev["snow_id"] = local_ident.snow_id
+                if seen_local:
+                    continue
+                seen_local = True
+            else:
+                if dev_id and dev_id in seen_ids:
+                    continue
+                if dev_id:
+                    seen_ids.add(dev_id)
+
+            if not dev.get("snow_id") and dev_id:
+                dev["snow_id"] = generate_snow_id(seed=dev_id)
+
+            if not is_local and dev.get("is_connected") and (
+                dev.get("platform") == "android"
+                or dev.get("device_type") in ("phone", "android")
+                or not dev.get("platform")
+                or dev.get("platform") == "generic"
+            ):
+                if dev_id:
                     try:
-                        bat_res = await asyncio.wait_for(
-                            self.bridge.android_battery(device_id=dev_id),
-                            timeout=2.0,
+                        raw_bat = self.bridge.android_battery(device_id=dev_id)
+                        bat_res = (
+                            await asyncio.wait_for(raw_bat, timeout=2.0)
+                            if inspect.isawaitable(raw_bat)
+                            else raw_bat
                         )
-                        if bat_res.get("success") and isinstance(bat_res.get("data"), dict):
-                            dev["telemetry"] = bat_res["data"]
+                        if isinstance(bat_res, dict) and bat_res.get("success") and isinstance(bat_res.get("data"), dict):
+                            tel = dict(bat_res["data"])
+                            if "battery_level" not in tel and "level" in tel:
+                                tel["battery_level"] = tel["level"]
+                            dev["telemetry"] = tel
                     except Exception as ex:
                         logger.debug("Failed fetching live telemetry for device %s: %s", dev_id, ex)
+
+            deduped.append(dev)
+        devices = deduped
 
         return web.json_response({
             "success": res.get("success", False),
@@ -995,11 +1075,23 @@ class SnowWebServer:
             return web.Response(status=404, text="File not found.")
 
         from snow.capabilities.windows.screenshot import DEFAULT_CAPTURES_DIR
-        captures_dir = DEFAULT_CAPTURES_DIR.resolve()
-        target_path = (captures_dir / file_name).resolve()
+        from snow.transfer.storage import TransferStorageManager
 
-        # Canonical path containment verification
-        if not target_path.is_relative_to(captures_dir) or not target_path.is_file():
+        candidate_roots: list[Path] = [
+            DEFAULT_CAPTURES_DIR.resolve(),
+            TransferStorageManager().root_dir.resolve(),
+        ]
+        if self.transfer_server is not None and hasattr(self.transfer_server, "storage_manager"):
+            candidate_roots.append(self.transfer_server.storage_manager.root_dir.resolve())
+
+        target_path: Optional[Path] = None
+        for root in candidate_roots:
+            candidate = (root / file_name).resolve()
+            if candidate.is_relative_to(root) and candidate.is_file():
+                target_path = candidate
+                break
+
+        if target_path is None:
             return web.Response(status=404, text="File not found.")
 
         content_type = "image/png" if ext == ".png" else "image/jpeg"
@@ -1374,6 +1466,60 @@ class SnowWebServer:
         except Exception as e:
             logger.debug("Could not signal stop screen sharing via bridge: %s", e)
             return web.json_response({"success": False, "status": "ERROR", "error": str(e)}, status=500)
+
+    async def handle_api_screen_capture_latest(self, request: web.Request) -> web.Response:
+        """Serve latest delivered one-time Android screen capture PNG/JPEG with path containment."""
+        from snow.capabilities.windows.screenshot import DEFAULT_CAPTURES_DIR
+        from snow.transfer.storage import TransferStorageManager
+
+        canonical_roots: list[Path] = [
+            DEFAULT_CAPTURES_DIR.resolve(),
+            TransferStorageManager().root_dir.resolve(),
+        ]
+        if self.transfer_server is not None and hasattr(self.transfer_server, "storage_manager"):
+            canonical_roots.append(self.transfer_server.storage_manager.root_dir.resolve())
+
+        candidates: list[Path] = []
+        for sdir in canonical_roots:
+            if sdir.is_dir():
+                for pat in ("android_screen_*.png", "android_screen_*.jpg", "android_screen_*.jpeg"):
+                    for f in sdir.rglob(pat):
+                        try:
+                            resolved = f.resolve()
+                            if any(resolved.is_relative_to(root) for root in canonical_roots) and resolved.is_file():
+                                candidates.append(resolved)
+                        except (PermissionError, RuntimeError, OSError):
+                            pass
+
+        if not candidates:
+            return web.Response(status=204)
+
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        latest_file = candidates[0]
+        try:
+            import hashlib
+            st = latest_file.stat()
+            etag = f'"{hashlib.sha256(f"{latest_file.name}-{st.st_mtime}-{st.st_size}".encode("utf-8")).hexdigest()[:16]}"'
+            if_none_match = request.headers.get("If-None-Match", "").strip()
+            if if_none_match and if_none_match == etag:
+                return web.Response(status=304, headers={"ETag": etag, "Cache-Control": "no-cache, must-revalidate"})
+            with open(latest_file, "rb") as f:
+                data = f.read()
+            mime = "image/png" if latest_file.suffix.lower() == ".png" else "image/jpeg"
+            return web.Response(
+                body=data,
+                content_type=mime,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "no-cache, must-revalidate",
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Snow-Filename": latest_file.name,
+                    "X-Snow-Mtime": str(st.st_mtime),
+                },
+            )
+        except Exception as exc:
+            logger.error("Failed reading latest screen capture '%s': %s", latest_file, exc)
+            return web.Response(status=500, text="Internal error reading screen capture.")
 
     async def handle_api_camera_latest(self, request: web.Request) -> web.Response:
         """Serve latest delivered Android camera photo with strict path containment."""
@@ -2287,7 +2433,7 @@ class SnowWebServer:
                 "status": "SUCCESS",
                 "tools_count": tools_count,
                 "tools": tool_names,
-                "expected_count": 38,
+                "expected_count": 42,
                 "is_frozen": getattr(sys, "frozen", False),
                 "command": cmd,
                 "args": args,
@@ -2808,6 +2954,7 @@ class SnowWebServer:
 
         # Screen streaming & Camera delivery routes (Phase 26A)
         app.router.add_post("/api/screen/capture-phone", self.handle_api_screen_capture_phone)
+        app.router.add_get("/api/screen/capture-latest", self.handle_api_screen_capture_latest)
         app.router.add_get("/api/screen/status", self.handle_api_screen_status)
         app.router.add_get("/api/screen/frame", self.handle_api_screen_frame)
         app.router.add_post("/api/screen/stop", self.handle_api_screen_stop)

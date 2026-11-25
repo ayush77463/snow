@@ -193,14 +193,22 @@ class AppLauncherHandler(private val context: Context) {
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
         val inForeground = ClipboardHandler.isAppInForeground
-        if (inForeground) {
+        val hasOverlay = try {
+            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M &&
+                android.provider.Settings.canDrawOverlays(context)
+        } catch (_: Throwable) {
+            false
+        }
+
+        if (inForeground || hasOverlay) {
             try {
                 context.startActivity(launchIntent)
-                SafeLog.i(TAG, "Successfully launched application '$cleanPackage' directly in foreground.")
+                val deliveryMode = if (inForeground) "DIRECT_FOREGROUND" else "BACKGROUND_OVERLAY"
+                SafeLog.i(TAG, "Successfully launched application '$cleanPackage' ($deliveryMode).")
                 return@withContext mapOf(
                     "success" to true,
                     "status" to "success",
-                    "delivery_mode" to "DIRECT_FOREGROUND",
+                    "delivery_mode" to deliveryMode,
                     "package_name" to cleanPackage,
                     "message" to "Successfully launched application '$cleanPackage'."
                 )
@@ -213,55 +221,59 @@ class AppLauncherHandler(private val context: Context) {
                 )
             } catch (e: SecurityException) {
                 SafeLog.w(TAG, "SecurityException launching '$cleanPackage': ${e.message}")
-                return@withContext mapOf(
-                    "success" to false,
-                    "status" to "PERMISSION_DENIED",
-                    "error" to "Permission denied launching '$cleanPackage': ${e.message}",
-                    "remediation_hint" to "Check application permissions in Android Settings."
-                )
+                if (inForeground || !ActionNotificationHelper.canPostNotifications(context)) {
+                    return@withContext mapOf(
+                        "success" to false,
+                        "status" to "PERMISSION_DENIED",
+                        "error" to "Permission denied launching '$cleanPackage': ${e.message}",
+                        "remediation_hint" to "Enable Background App Launch or check application permissions in Android Settings."
+                    )
+                }
             } catch (e: Exception) {
                 SafeLog.e(TAG, "Unexpected error launching '$cleanPackage': ${e.message}", e)
-                return@withContext mapOf(
-                    "success" to false,
-                    "status" to "error",
-                    "error" to "Failed launching '$cleanPackage': ${e.message}"
-                )
-            }
-        } else {
-            // Android background activity launch restriction: require user tap via notification
-            if (ActionNotificationHelper.canPostNotifications(context)) {
-                val label = try {
-                    pm?.getApplicationLabel(pm.getApplicationInfo(cleanPackage, 0))?.toString() ?: cleanPackage
-                } catch (_: Exception) {
-                    cleanPackage
-                }
-
-                val posted = ActionNotificationHelper.postActionNotification(
-                    context = context,
-                    title = "SNOW: Tap to open $label",
-                    content = "Tap to open application on this device.",
-                    intent = launchIntent
-                )
-
-                if (posted) {
-                    SafeLog.i(TAG, "Posted action notification for background launch of '$cleanPackage'.")
+                if (inForeground || !ActionNotificationHelper.canPostNotifications(context)) {
                     return@withContext mapOf(
-                        "success" to true,
-                        "status" to "success",
-                        "delivery_mode" to "NOTIFICATION_TAP_REQUIRED",
-                        "package_name" to cleanPackage,
-                        "message" to "Application is in background. Tap the notification on your phone to open '$label'."
+                        "success" to false,
+                        "status" to "error",
+                        "error" to "Failed launching '$cleanPackage': ${e.message}"
                     )
                 }
             }
-
-            SafeLog.w(TAG, "Background launch rejected for '$cleanPackage': notifications disabled or unavailable.")
-            return@withContext mapOf(
-                "success" to false,
-                "status" to "FOREGROUND_REQUIRED",
-                "error" to "Background activity launch restricted by Android OS. Notification permission is required to deliver tap action.",
-                "remediation_hint" to "Open SNOW on your phone or grant Notification permission in Android Settings to launch applications."
-            )
         }
+
+        // Background activity launch fallback: require user tap via notification
+        if (ActionNotificationHelper.canPostNotifications(context)) {
+            val label = try {
+                pm?.getApplicationLabel(pm.getApplicationInfo(cleanPackage, 0))?.toString() ?: cleanPackage
+            } catch (_: Exception) {
+                cleanPackage
+            }
+
+            val posted = ActionNotificationHelper.postActionNotification(
+                context = context,
+                title = "SNOW: Tap to open $label",
+                content = "Tap to open application on this device.",
+                intent = launchIntent
+            )
+
+            if (posted) {
+                SafeLog.i(TAG, "Posted action notification for background launch of '$cleanPackage'.")
+                return@withContext mapOf(
+                    "success" to true,
+                    "status" to "success",
+                    "delivery_mode" to "NOTIFICATION_TAP_REQUIRED",
+                    "package_name" to cleanPackage,
+                    "message" to "Application is in background. Tap the notification on your phone to open '$label'."
+                )
+            }
+        }
+
+        SafeLog.w(TAG, "Background launch rejected for '$cleanPackage': overlay/notifications unavailable.")
+        return@withContext mapOf(
+            "success" to false,
+            "status" to "FOREGROUND_REQUIRED",
+            "error" to "Background activity launch blocked by Android OS. Notification or Background App Launch permission is required.",
+            "remediation_hint" to "Enable Background App Launch (Display over other apps) or Notifications in SNOW Settings."
+        )
     }
 }

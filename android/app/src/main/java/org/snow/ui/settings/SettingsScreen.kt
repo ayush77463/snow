@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.LockReset
 import androidx.compose.material.icons.filled.Notifications
@@ -145,9 +146,18 @@ fun SettingsScreen(
         return powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
     }
 
+    fun queryOverlayGranted(): Boolean {
+        return try {
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     var isNotificationAccessGranted by remember { mutableStateOf(queryNotificationAccess()) }
     var isAllFilesGranted by remember { mutableStateOf(queryAllFilesAccess()) }
     var isBatteryOptIgnored by remember { mutableStateOf(queryBatteryOptIgnored()) }
+    var isOverlayGranted by remember { mutableStateOf(queryOverlayGranted()) }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -155,6 +165,7 @@ fun SettingsScreen(
                 isNotificationAccessGranted = queryNotificationAccess()
                 isAllFilesGranted = queryAllFilesAccess()
                 isBatteryOptIgnored = queryBatteryOptIgnored()
+                isOverlayGranted = queryOverlayGranted()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -177,17 +188,11 @@ fun SettingsScreen(
             SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
                 Column {
                     Text(
-                        text = "Theme Preference",
+                        text = "Theme",
                         style = SnowTypography.titleSmall,
                         color = colors.textPrimary
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Choose light, dark, or sync with Android system theme.",
-                        style = SnowTypography.bodySmall,
-                        color = colors.textSecondary
-                    )
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -226,34 +231,30 @@ fun SettingsScreen(
                 Column {
                     SettingsSwitchRow(
                         title = "Always-On Remote Access",
-                        subtitle = "Keep foreground bridge service active for incoming connections",
                         checked = alwaysOnRemoteAccess,
                         onCheckedChange = onToggleAlwaysOnRemoteAccess
                     )
 
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
                     SettingsSwitchRow(
                         title = "Auto-Connect Nearby",
-                        subtitle = "Automatically connect to linked PC when detected on local Wi-Fi",
                         checked = autoConnectNearby,
                         onCheckedChange = onToggleAutoConnectNearby
                     )
 
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
                     SettingsSwitchRow(
                         title = "Instant Clipboard Sync",
-                        subtitle = "Mirror copied text in real time with linked PC or phone",
                         checked = instantClipboardSync,
                         onCheckedChange = onToggleInstantClipboardSync
                     )
 
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
                     SettingsSwitchRow(
                         title = "Auto-Sync Screenshots",
-                        subtitle = "Instantly stage phone screenshots to paired PC desktop",
                         checked = autoSyncScreenshots,
                         onCheckedChange = onToggleAutoSyncScreenshots
                     )
@@ -269,7 +270,6 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.Notifications,
                         title = "Notification Sync & Listener",
-                        subtitle = "Mirror incoming Android notifications to desktop",
                         statusText = if (isNotificationAccessGranted) "GRANTED" else "SETUP",
                         isGranted = isNotificationAccessGranted,
                         onClick = { showNotificationGuide = true }
@@ -280,7 +280,6 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.FolderShared,
                         title = "All Files Access",
-                        subtitle = "Required for bidirectional file transfers on Android 11+",
                         statusText = if (isAllFilesGranted) "GRANTED" else "SETUP",
                         isGranted = isAllFilesGranted,
                         onClick = {
@@ -302,7 +301,6 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.BatteryAlert,
                         title = "Battery Optimization Exemption",
-                        subtitle = "Prevent Android Doze mode from dropping background connections",
                         statusText = if (isBatteryOptIgnored) "GRANTED" else "ALLOW",
                         isGranted = isBatteryOptIgnored,
                         onClick = {
@@ -315,6 +313,29 @@ fun SettingsScreen(
                                 try {
                                     context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                                 } catch (_: Exception) { }
+                            }
+                        }
+                    )
+
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
+
+                    PermissionRowItem(
+                        icon = Icons.Default.Layers,
+                        title = "Background App Launch",
+                        statusText = if (isOverlayGranted) "GRANTED" else "ALLOW",
+                        isGranted = isOverlayGranted,
+                        onClick = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                try {
+                                    val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
+                                        data = Uri.parse("package:${context.packageName}")
+                                    }
+                                    context.startActivity(intent)
+                                } catch (_: Exception) {
+                                    try {
+                                        context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
+                                    } catch (_: Exception) { }
+                                }
                             }
                         }
                     )
@@ -350,7 +371,6 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.ViewQuilt,
                         title = "Quick Settings: SNOW Connect",
-                        subtitle = "One-tap bridge auto-connect toggle tile",
                         statusText = "ADD",
                         isGranted = false,
                         onClick = {
@@ -367,7 +387,6 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.ContentCopy,
                         title = "Quick Settings: SNOW Clip",
-                        subtitle = "Instant clipboard push and sync tile",
                         statusText = "ADD",
                         isGranted = false,
                         onClick = {
@@ -596,7 +615,7 @@ fun SettingsScreen(
         }
 
         item {
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(96.dp))
         }
     }
 
@@ -725,7 +744,7 @@ private fun ThemeOptionPill(
 @Composable
 private fun SettingsSwitchRow(
     title: String,
-    subtitle: String,
+    subtitle: String? = null,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
@@ -737,7 +756,9 @@ private fun SettingsSwitchRow(
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(text = title, style = SnowTypography.titleSmall, color = colors.textPrimary)
-            Text(text = subtitle, style = SnowTypography.bodySmall, color = colors.textSecondary)
+            if (!subtitle.isNullOrBlank()) {
+                Text(text = subtitle, style = SnowTypography.bodySmall, color = colors.textSecondary)
+            }
         }
         Switch(
             checked = checked,
@@ -757,7 +778,7 @@ private fun SettingsSwitchRow(
 private fun PermissionRowItem(
     icon: ImageVector,
     title: String,
-    subtitle: String,
+    subtitle: String? = null,
     statusText: String,
     isGranted: Boolean,
     onClick: () -> Unit
@@ -783,7 +804,9 @@ private fun PermissionRowItem(
             Spacer(modifier = Modifier.width(12.dp))
             Column {
                 Text(text = title, style = SnowTypography.titleSmall, color = colors.textPrimary)
-                Text(text = subtitle, style = SnowTypography.bodySmall, color = colors.textSecondary)
+                if (!subtitle.isNullOrBlank()) {
+                    Text(text = subtitle, style = SnowTypography.bodySmall, color = colors.textSecondary)
+                }
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically) {

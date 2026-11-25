@@ -32,7 +32,7 @@ SNOW continues to utilize `mcp.server.fastmcp` internally as an in-memory tool r
 
 | # | Evaluation Dimension | FastMCP (Standalone / Upstream) | SNOW Hardened Gateway (`remote_gateway.py`) | Evidence / Empirical Status |
 |---|---|---|---|---|
-| 1 | **Capability Catalog Registration** | Decorator-based registration (`@mcp.tool`) | Natively exposes all 38 capabilities via registry | **Verified Fact:** 38 capabilities registered |
+| 1 | **Capability Catalog Registration** | Decorator-based registration (`@mcp.tool`) | Natively exposes all 42 capabilities via registry | **Verified Fact:** 42 capabilities registered |
 | 2 | **ToolAnnotations Strict Booleans** | Pydantic model reflection | Enforces strict boolean `readOnlyHint` and `destructiveHint` | **Verified Fact:** 100% strict boolean typing |
 | 3 | **Input Schema Fidelity** | Pydantic v2 JSON Schema | Verified inputSchema with properties & required arrays | **Verified Fact:** Valid JSON Schema |
 | 4 | **Resource Registration** | Decorator-based `@mcp.resource` | Exposes `snow://mesh/topology` via resource manager | **Verified Fact:** Resource listed & readable |
@@ -56,7 +56,7 @@ SNOW continues to utilize `mcp.server.fastmcp` internally as an in-memory tool r
 - Python 3.13.15 with `mcp==1.30.0` is the active environment.
 - `fastmcp` (PyPI package) is not installed; no artificial dependencies are added to `.venv`.
 - `snow.mcp.remote_gateway` successfully negotiates `"2026-07-28"` and legacy protocol versions.
-- All 38 capabilities expose strict boolean annotations.
+- All 42 capabilities expose strict boolean annotations.
 
 ### Empirical Measurements
 - Hardware: Lenovo V15 G3 IAP, Windows 11.

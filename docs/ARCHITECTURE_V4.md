@@ -23,7 +23,7 @@ SNOW V4 expands the capability bridge into a multi-device local mesh and secure 
    - Secure remote app launcher restricted to explicit user-approved application whitelists on both Windows and Android.
 3. **Phase 27: Multi-Device Local SNOW Network**
    - Persistent `network_identity` and `network_endpoints` data model (Schema v5).
-   - 38-tool comprehensive MCP registry covering all capabilities.
+   - 42-tool comprehensive MCP registry covering all capabilities (expanded cleanly in V5.0.0 from 38).
    - Safe principal-scoped network topology resource (`snow://network/topology`), preventing `AI_MCP` from inspecting sensitive LAN infrastructure.
 4. **Phase 28A: Hybrid All-Pairs Remote Mesh**
    - TLS 1.3 MemoryBIO encrypted control & data tunnel for reliable out-of-LAN device presence.
@@ -67,7 +67,7 @@ SNOW V4 expands the capability bridge into a multi-device local mesh and secure 
                                          |
 +===================================================================================+
 |                         LAYER 2: CAPABILITY ENGINE                                |
-|  - Dynamic 38-Tool Capability Catalog (`CAPABILITY_REGISTRY`)                     |
+|  - Dynamic 42-Tool Capability Catalog (`CAPABILITY_REGISTRY`)                     |
 |  - CapabilityEngine: Centralized dispatch, execution, and validation              |
 |  - ApprovalPolicyEngine: Principle-based access control                           |
 |      * AI_MCP (Restricted, requires interactive confirmation for sensitive tools) |

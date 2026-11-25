@@ -557,11 +557,11 @@ class TestGroupEMcpTopologySecurityAnd38Tools(unittest.IsolatedAsyncioTestCase):
     """Test Group E: MCP Security, 38-Tool Dynamic Catalog & Secret Redaction."""
 
     def test_01_exact_38_capabilities_in_registry(self) -> None:
-        """Verify dynamic registry contains exactly 38 capabilities including snow_mesh_topology."""
+        """Verify dynamic registry contains exactly 42 capabilities including snow_mesh_topology and V5.0.0 tools."""
         caps = list_capabilities()
-        self.assertEqual(len(caps), 38)
-        self.assertEqual(len(ALL_TOOL_NAMES), 38)
-        self.assertEqual(len(CAPABILITY_REGISTRY), 38)
+        self.assertEqual(len(caps), 42)
+        self.assertEqual(len(ALL_TOOL_NAMES), 42)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 42)
 
         meta = get_capability_metadata("snow_mesh_topology")
         self.assertIsNotNone(meta)
@@ -619,7 +619,7 @@ class TestGroupEMcpTopologySecurityAnd38Tools(unittest.IsolatedAsyncioTestCase):
         """Verify create_snow_mcp_server exposes all 38 tools and the mesh topology resource."""
         server = create_snow_mcp_server()
         tools = await server.list_tools()
-        self.assertEqual(len(tools), 38)
+        self.assertEqual(len(tools), 42)
         tool_names = {t.name for t in tools}
         self.assertIn("snow_mesh_topology", tool_names)
 

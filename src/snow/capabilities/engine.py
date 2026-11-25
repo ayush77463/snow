@@ -35,6 +35,7 @@ from snow.capabilities.windows.clipboard import WindowsClipboardManager
 from snow.capabilities.windows.files import WindowsFileManager
 from snow.capabilities.windows.media import WindowsMediaController
 from snow.capabilities.windows.processes import WindowsProcessMonitor
+from snow.capabilities.windows.system import WindowsSystemControls
 from snow.capabilities.windows.telemetry import WindowsTelemetry
 from snow.capabilities.windows.terminal import (
     TerminalSecurityTier,
@@ -66,6 +67,12 @@ ENGINE_ACTION_MAP: dict[str, str] = {
     "windows_battery": CAPABILITY_DESKTOP_STATUS,
     "desktop_battery": CAPABILITY_DESKTOP_STATUS,
     "battery": CAPABILITY_DESKTOP_STATUS,
+    "windows_active_window": CAPABILITY_DESKTOP_STATUS,
+    "snow_windows_active_window": CAPABILITY_DESKTOP_STATUS,
+    "windows_notify": CAPABILITY_DESKTOP_STATUS,
+    "snow_windows_notify": CAPABILITY_DESKTOP_STATUS,
+    "windows_lock_screen": CAPABILITY_DESKTOP_APP_LAUNCH,
+    "snow_windows_lock_screen": CAPABILITY_DESKTOP_APP_LAUNCH,
     # Processes
     "windows_processes": CAPABILITY_DESKTOP_STATUS,
     "desktop_processes": CAPABILITY_DESKTOP_STATUS,
@@ -183,8 +190,10 @@ class CapabilityEngine:
         http_transfer_server: Optional[Any] = None,
         core_server: Optional[Any] = None,
         clipboard_buffer: Optional[ClipboardRingBuffer] = None,
+        system: Optional[WindowsSystemControls] = None,
     ) -> None:
         self.telemetry = telemetry or WindowsTelemetry()
+        self.system = system or WindowsSystemControls()
         self.processes = processes or WindowsProcessMonitor()
         self.files = files or WindowsFileManager(allowed_roots=allowed_roots)
         self.apps = apps or WindowsAppLauncher()
@@ -436,22 +445,13 @@ class CapabilityEngine:
 
             canonical = app_name.strip().lower()
             if canonical == "lock_screen":
-                success = True
-                msg = "Workstation locked successfully."
-                if sys.platform == "win32":
-                    try:
-                        res_val = ctypes.windll.user32.LockWorkStation()
-                        success = bool(res_val != 0)
-                        if not success:
-                            msg = "LockWorkStation returned 0."
-                    except Exception as exc:
-                        success = False
-                        msg = str(exc)
+                lock_res = await self.system.lock_workstation()
+                is_ok = bool(lock_res.get("success"))
                 return CapabilityResponse(
-                    success=success,
-                    status="SUCCESS" if success else "LOCK_FAILED",
-                    data={"app_name": "lock_screen", "message": msg},
-                    error=None if success else msg,
+                    success=is_ok,
+                    status=lock_res.get("status", "SUCCESS" if is_ok else "LOCK_FAILED"),
+                    data={"app_name": "lock_screen", **lock_res},
+                    error=None if is_ok else lock_res.get("error"),
                 )
 
             res = await self.apps.launch_app(app_name=app_name, ctx=ctx)
@@ -461,6 +461,37 @@ class CapabilityEngine:
                 status=res.get("status", "SUCCESS" if is_ok else "ERROR"),
                 data=res,
                 error=res.get("error"),
+            )
+
+        # --- Windows Active Window / Notification / Workstation Lock ---
+        if action in ("windows_active_window", "snow_windows_active_window"):
+            res = await self.system.get_active_window()
+            return CapabilityResponse(
+                success=True,
+                status=res.get("status", "SUCCESS"),
+                data=res,
+            )
+
+        if action in ("windows_notify", "snow_windows_notify"):
+            title = params.get("title", "")
+            message = params.get("message", "")
+            res = await self.system.send_notification(title=title, message=message)
+            is_ok = bool(res.get("success"))
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "ERROR"),
+                data=res,
+                error=res.get("error"),
+            )
+
+        if action in ("windows_lock_screen", "snow_windows_lock_screen"):
+            res = await self.system.lock_workstation()
+            is_ok = bool(res.get("success"))
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "LOCK_FAILED"),
+                data=res,
+                error=None if is_ok else res.get("error"),
             )
 
         # --- Files ---

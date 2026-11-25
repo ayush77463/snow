@@ -105,11 +105,18 @@
     let currentFilesSegment = "files";
     let replyingNotificationKey = "";
     let localHostIdentity = "This PC";
+    let localHostDeviceId = "";
     let localHostTelemetry = {};
     let canonicalSnowId = "SNW-LOCAL";
     let activeUploadXhr = null;
     let pendingUpdateMeta = null;
     let modalPurposeMode = "share"; // "share" | "clipboard"
+    let screenStreamTimer = null;
+    let isScreenStatusPolling = false;
+    let isScreenFrameInFlight = false;
+    let isPollStateInFlight = false;
+    let screenFrameErrorCount = 0;
+    let lastKnownStreamState = "IDLE";
 
     // =========================================================================
     // API Helpers & Identity Classification
@@ -144,7 +151,15 @@
 
     function isLocalNode(d) {
         if (!d) return false;
-        return Boolean(d.is_local || d.device_id === "local" || (d.device_name && d.device_name.includes("(This PC)")));
+        return Boolean(
+            d.is_local ||
+            d.device_id === "local" ||
+            d.device_id === "desktop-core" ||
+            (localHostDeviceId && d.device_id === localHostDeviceId) ||
+            (canonicalSnowId && canonicalSnowId !== "SNW-LOCAL" && d.snow_id === canonicalSnowId) ||
+            d.transport === "local" ||
+            (d.device_name && (d.device_name.includes("(This PC)") || d.device_name.includes("(Host)")))
+        );
     }
 
     function isAndroidDevice(d) {
@@ -820,31 +835,202 @@
             showNotificationToast("Select or connect an online phone for screen capture.", "warning");
             return;
         }
+        const statusText = document.getElementById("latest-capture-status-text");
+        if (statusText) statusText.textContent = "Awaiting phone consent for one-time screen capture...";
         showNotificationToast("Requesting phone screen capture (awaiting consent)...", "info");
+
+        let baselineFilename = "";
+        try {
+            const preResp = await fetch(`/api/screen/capture-latest?t=${Date.now()}`);
+            if (preResp.status === 200) baselineFilename = preResp.headers.get("X-Snow-Filename") || "";
+        } catch (e) {}
+
         const res = await apiRequest("/api/screen/capture-phone", "POST", { device_id: targetId });
         if (res && res.success) {
             const fileName = res.file_name || res.data?.file_name;
             if (fileName) {
-                const capUrl = `/api/captures/${encodeURIComponent(fileName)}`;
+                const capUrl = `/api/captures/${encodeURIComponent(fileName)}?t=${Date.now()}`;
                 showCapturePreview(capUrl, "Remote Screen Capture");
                 showNotificationToast("Screen capture received!", "success");
                 return;
             }
-            let attempts = 0;
-            const pollTimer = setInterval(async () => {
+        }
+
+        const errStr = String(res?.error || res?.status || "");
+        const awaitingConsent = res?.success || errStr.includes("SCREEN_CAPTURE_CONSENT_REQUIRED") || errStr.includes("consent");
+        if (!awaitingConsent && res && !res.success) {
+            if (statusText) statusText.textContent = errStr || "Screen capture failed";
+            showNotificationToast(errStr || "Failed initiating screen capture", "error");
+            return;
+        }
+
+        if (errStr.includes("SCREEN_CAPTURE_CONSENT_REQUIRED")) {
+            showNotificationToast("Tap the Screen Capture notification on your phone to capture.", "info");
+        }
+
+        let attempts = 0;
+        let inFlight = false;
+        const pollTimer = setInterval(async () => {
+            if (inFlight) return;
+            inFlight = true;
+            try {
                 attempts++;
-                const statusRes = await apiRequest("/api/screen/status");
-                if (statusRes && statusRes.success && (statusRes.has_frame || statusRes.state === "STREAMING")) {
+                const capResp = await fetch(`/api/screen/capture-latest?t=${Date.now()}`);
+                if (capResp.status === 200) {
+                    const fname = capResp.headers.get("X-Snow-Filename") || "";
+                    if (fname && fname !== baselineFilename) {
+                        clearInterval(pollTimer);
+                        showCapturePreview(`/api/captures/${encodeURIComponent(fname)}?t=${Date.now()}`, "Remote Screen Capture");
+                        showNotificationToast("Screen capture received!", "success");
+                        return;
+                    }
+                }
+                if (attempts >= 25) {
                     clearInterval(pollTimer);
-                    showCapturePreview(`/api/screen/frame?t=${Date.now()}`, "Live Screen Frame");
-                    showNotificationToast("Screen frame received!", "success");
-                } else if (attempts >= 20) {
-                    clearInterval(pollTimer);
+                    if (statusText) statusText.textContent = "Screen capture consent timed out or was cancelled.";
                     showNotificationToast("Screen capture consent timed out or was cancelled.", "warning");
                 }
-            }, 1000);
+            } finally {
+                inFlight = false;
+            }
+        }, 1000);
+    }
+
+    function setScreenViewerState(mode, subtitle = "") {
+        const badge = document.getElementById("screen-stream-badge");
+        const stopBtn = document.getElementById("btn-stop-screen-stream");
+        const img = document.getElementById("latest-capture-img");
+        const placeholder = document.getElementById("latest-capture-placeholder");
+        const statusText = document.getElementById("latest-capture-status-text");
+        const retryBtn = document.getElementById("btn-retry-screen-stream");
+        const metaEl = document.getElementById("screen-stream-meta");
+
+        if (mode === "STREAMING") {
+            if (badge) {
+                badge.textContent = "Live Stream";
+                badge.className = "chip chip-sm chip-emerald";
+            }
+            stopBtn?.classList.remove("d-none");
+            retryBtn?.classList.add("d-none");
+            if (metaEl) {
+                metaEl.textContent = subtitle || "Streaming live from Android";
+                metaEl.classList.remove("d-none");
+            }
+        } else if (mode === "ERROR") {
+            if (badge) {
+                badge.textContent = "Stream Error";
+                badge.className = "chip chip-sm chip-rose";
+            }
+            stopBtn?.classList.add("d-none");
+            if (img) img.style.display = "none";
+            placeholder?.classList.remove("d-none");
+            if (statusText) statusText.textContent = subtitle || "Failed loading live screen frame.";
+            retryBtn?.classList.remove("d-none");
+            metaEl?.classList.add("d-none");
+        } else if (mode === "STOPPED") {
+            if (badge) {
+                badge.textContent = "Stopped";
+                badge.className = "chip chip-sm chip-amber";
+            }
+            stopBtn?.classList.add("d-none");
+            retryBtn?.classList.add("d-none");
+            if (img && !img.getAttribute("src")) {
+                placeholder?.classList.remove("d-none");
+            }
+            if (statusText) statusText.textContent = subtitle || "Live screen stream stopped.";
+            if (metaEl) {
+                metaEl.textContent = subtitle || "Live stream ended";
+                metaEl.classList.remove("d-none");
+            }
         } else {
-            showNotificationToast(res?.error || "Failed initiating screen capture", "error");
+            if (badge) {
+                badge.textContent = "Standby";
+                badge.className = "chip chip-sm chip-neutral";
+            }
+            stopBtn?.classList.add("d-none");
+            retryBtn?.classList.add("d-none");
+            metaEl?.classList.add("d-none");
+        }
+    }
+
+    function stopScreenFramePolling() {
+        if (screenStreamTimer) {
+            clearInterval(screenStreamTimer);
+            screenStreamTimer = null;
+        }
+        isScreenFrameInFlight = false;
+    }
+
+    function fetchNextScreenFrame() {
+        if (isScreenFrameInFlight) return;
+        isScreenFrameInFlight = true;
+        const frameUrl = `/api/screen/frame?t=${Date.now()}`;
+        const preloader = new Image();
+        preloader.onload = () => {
+            isScreenFrameInFlight = false;
+            screenFrameErrorCount = 0;
+            const latestImg = document.getElementById("latest-capture-img");
+            const placeholder = document.getElementById("latest-capture-placeholder");
+            if (latestImg) {
+                latestImg.src = frameUrl;
+                latestImg.style.display = "block";
+                latestImg.onclick = () => openMediaPreview(frameUrl, "Live Android Screen");
+            }
+            placeholder?.classList.add("d-none");
+        };
+        preloader.onerror = () => {
+            isScreenFrameInFlight = false;
+            screenFrameErrorCount++;
+            if (screenFrameErrorCount >= 3) {
+                stopScreenFramePolling();
+                setScreenViewerState("ERROR", "Unable to fetch live frames. Check connection and retry.");
+            }
+        };
+        preloader.src = frameUrl;
+    }
+
+    async function pollScreenStreamStatus() {
+        if (isScreenStatusPolling) return;
+        isScreenStatusPolling = true;
+        try {
+            const st = await apiRequest("/api/screen/status");
+            const state = String(st?.state || "IDLE").toUpperCase();
+            if (state === "STREAMING") {
+                const fpsText = st?.fps ? `${Number(st.fps).toFixed(1)} FPS` : "Live";
+                const dimText = (st?.width && st?.height) ? `${st.width}x${st.height}` : "";
+                setScreenViewerState("STREAMING", [fpsText, dimText].filter(Boolean).join(" • "));
+                if (st?.has_frame && !screenStreamTimer) {
+                    screenFrameErrorCount = 0;
+                    fetchNextScreenFrame();
+                    screenStreamTimer = setInterval(fetchNextScreenFrame, 1000);
+                } else if (st?.has_frame) {
+                    fetchNextScreenFrame();
+                }
+            } else {
+                stopScreenFramePolling();
+                if (lastKnownStreamState === "STREAMING" && (state === "STOPPED" || state === "REVOKED" || state === "IDLE")) {
+                    setScreenViewerState("STOPPED", state === "REVOKED" ? "Screen share revoked on phone" : "Live stream stopped");
+                } else if (state === "ERROR") {
+                    setScreenViewerState("ERROR", st?.error || "Screen stream error");
+                } else if (screenFrameErrorCount === 0) {
+                    setScreenViewerState("IDLE");
+                }
+            }
+            lastKnownStreamState = state;
+        } finally {
+            isScreenStatusPolling = false;
+        }
+    }
+
+    async function stopRemoteScreenStream() {
+        stopScreenFramePolling();
+        const res = await apiRequest("/api/screen/stop", "POST", {});
+        lastKnownStreamState = "STOPPED";
+        setScreenViewerState("STOPPED", "Live stream stopped");
+        if (res && res.success) {
+            showNotificationToast("Live screen stream stopped.", "info");
+        } else {
+            showNotificationToast(res?.error || "Failed stopping live stream", "error");
         }
     }
 
@@ -962,30 +1148,46 @@
             }
 
             const tel = localHostTelemetry || {};
-            const ramTot = tel.ram_total_bytes || tel.total_memory_bytes;
-            const ramAvail = tel.ram_available_bytes || tel.available_memory_bytes;
-            const diskFree = tel.storage_available_bytes || tel.disk_free_bytes;
+            const cpuPct = tel.cpu_percent ?? tel.cpu?.utilization_percent;
+            const memInfo = tel.memory || {};
+            const diskInfo = tel.disk || {};
+            const ramTot = tel.ram_total_bytes || tel.total_memory_bytes || (memInfo.total_mb ? memInfo.total_mb * 1024 * 1024 : null);
+            const ramAvail = tel.ram_available_bytes || tel.available_memory_bytes ||
+                (ramTot && memInfo.used_mb !== undefined ? Math.max(0, ramTot - memInfo.used_mb * 1024 * 1024) : null);
+            const ramPct = tel.ram_percent ?? memInfo.percent;
+            const diskFree = tel.storage_available_bytes || tel.disk_free_bytes ||
+                (diskInfo.total_gb != null && diskInfo.used_gb != null ? Math.max(0, (diskInfo.total_gb - diskInfo.used_gb) * 1024 * 1024 * 1024) : null);
 
             if (batteryInd) {
                 const pct = tel.battery_percent;
                 if (typeof pct === "number") {
                     batteryInd.classList.remove("d-none");
-                    if (batteryText) batteryText.textContent = `${pct}%`;
+                    if (batteryText) batteryText.textContent = `${Math.round(pct)}%${tel.battery_charging ? " Charging" : ""}`;
+                } else if (tel.battery_status === "NO_BATTERY") {
+                    batteryInd.classList.remove("d-none");
+                    if (batteryText) batteryText.textContent = "AC Power";
                 } else {
                     batteryInd.classList.add("d-none");
                 }
             }
             if (ramText) {
-                ramText.textContent = (ramTot && ramAvail)
-                    ? `RAM ${formatBytes(ramTot - ramAvail)} / ${formatBytes(ramTot)}`
-                    : "Host CPU & RAM Ready";
+                const cpuPart = (typeof cpuPct === "number") ? `CPU ${Math.round(cpuPct)}% • ` : "";
+                if (ramTot && ramAvail != null) {
+                    ramText.textContent = `${cpuPart}RAM ${formatBytes(ramTot - ramAvail)} / ${formatBytes(ramTot)}`;
+                } else if (typeof ramPct === "number") {
+                    ramText.textContent = `${cpuPart}RAM ${Math.round(ramPct)}%`;
+                } else {
+                    ramText.textContent = "Host CPU & RAM Ready";
+                }
             }
             if (storageText) {
-                storageText.textContent = diskFree ? `${formatBytes(diskFree)} free` : "Local Storage Active";
+                storageText.textContent = diskFree != null ? `${formatBytes(diskFree)} free` : "Local Storage Active";
             }
             if (resProgress) {
-                const pct = (ramTot && ramAvail) ? Math.round(((ramTot - ramAvail) / ramTot) * 100) : 25;
-                resProgress.style.width = `${Math.min(100, Math.max(8, pct))}%`;
+                const pct = (ramTot && ramAvail != null)
+                    ? Math.round(((ramTot - ramAvail) / ramTot) * 100)
+                    : (typeof ramPct === "number" ? Math.round(ramPct) : 25);
+                resProgress.style.width = `${Math.min(100, Math.max(5, pct))}%`;
             }
 
             const hasOnlinePhone = registeredDevices.some(d => !isLocalNode(d) && Boolean(d.is_connected));
@@ -1048,12 +1250,14 @@
         }
 
         const tel = device.telemetry || {};
-        const batLevel = tel.battery_level ?? device.battery?.level ?? device.battery_level;
+        const batLevel = tel.battery_level ?? tel.level ?? tel.battery_percent ?? device.battery?.level ?? device.battery_level;
         const charging = tel.charging ?? device.battery?.charging;
+        const tempC = tel.temperature_celsius;
         if (batteryInd) {
             if (batLevel !== null && batLevel !== undefined) {
                 batteryInd.classList.remove("d-none");
-                if (batteryText) batteryText.textContent = `${batLevel}%${charging ? " Charging" : ""}`;
+                const tempPart = (typeof tempC === "number") ? ` • ${tempC.toFixed(1)}°C` : "";
+                if (batteryText) batteryText.textContent = `${batLevel}%${charging ? " Charging" : ""}${tempPart}`;
             } else {
                 batteryInd.classList.add("d-none");
             }
@@ -1447,8 +1651,8 @@
                             <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="12" rx="2" width="20" x="2" y="4"></rect><line x1="2" x2="22" y1="20" y2="20"></line></svg>
                         </div>
                         <div class="flex flex-col">
-                            <span class="text-sm font-bold text-primary">${escapeHtml(localHostIdentity)} (This PC)</span>
-                            <span class="text-xs text-muted">Host Controller • ${escapeHtml(canonicalSnowId)}</span>
+                            <span class="text-sm font-bold text-primary">${escapeHtml(localHostIdentity)} (Host)</span>
+                            <span class="text-xs text-muted">This PC • ${escapeHtml(canonicalSnowId)}</span>
                         </div>
                     </div>
                     <span class="chip chip-emerald">${isHostActive ? "Active Host" : "Host"}</span>
@@ -1750,6 +1954,11 @@
 
         document.getElementById("btn-capture-screen-trigger")?.addEventListener("click", triggerScreenCapture);
         document.getElementById("btn-capture-camera-trigger")?.addEventListener("click", triggerCameraCapture);
+        document.getElementById("btn-stop-screen-stream")?.addEventListener("click", stopRemoteScreenStream);
+        document.getElementById("btn-retry-screen-stream")?.addEventListener("click", () => {
+            screenFrameErrorCount = 0;
+            pollScreenStreamStatus();
+        });
     }
 
     function focusFilesSegment(seg) {
@@ -2217,10 +2426,10 @@
 
     function initAiSettingsView() {
         document.getElementById("btn-mcp-test-local")?.addEventListener("click", async () => {
-            showNotificationToast("Testing 38 local FastMCP tools...", "info");
+            showNotificationToast("Testing 42 local FastMCP tools...", "info");
             const res = await apiRequest("/api/mcp/test-local", "POST", {});
             if (res && res.success) {
-                showNotificationToast(`All ${res.tools_count || 38} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
+                showNotificationToast(`All ${res.tools_count || 42} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
             } else {
                 showNotificationToast(res?.error || "MCP self-test failed", "error");
             }
@@ -2442,7 +2651,7 @@
 
         if (statusRes && statusRes.active && statusRes.public_url) {
             if (statusBadge) {
-                statusBadge.textContent = "Active • 38 Tools Ready";
+                statusBadge.textContent = "Active • 42 Tools Ready";
                 statusBadge.className = "chip chip-emerald";
             }
             if (btnToggle) btnToggle.textContent = "Stop Tunnel";
@@ -2853,59 +3062,89 @@
     // =========================================================================
 
     async function pollStateUpdates() {
-        // 1. System status & Core health
-        const [statusRes, sysStatus, fedRes] = await Promise.all([
-            apiRequest("/api/status"),
-            apiRequest("/api/system/status"),
-            apiRequest("/api/federation/grants"),
-        ]);
+        if (isPollStateInFlight) return;
+        isPollStateInFlight = true;
+        try {
+            // 1. System status & Core health
+            const [statusRes, sysStatus, fedRes] = await Promise.all([
+                apiRequest("/api/status"),
+                apiRequest("/api/system/status"),
+                apiRequest("/api/federation/grants"),
+            ]);
 
-        if (statusRes && statusRes.success) {
-            isCoreOnline = Boolean(statusRes.daemon_online ?? true);
-            if (statusRes.snow_id) canonicalSnowId = statusRes.snow_id;
-            if (statusRes.device_name) localHostIdentity = statusRes.device_name;
-            localHostTelemetry = statusRes.telemetry || {};
-            document.getElementById("core-canonical-id").textContent = canonicalSnowId;
-        } else {
-            isCoreOnline = false;
-        }
+            if (statusRes && statusRes.success) {
+                isCoreOnline = Boolean(statusRes.daemon_online ?? true);
+                if (statusRes.snow_id) canonicalSnowId = statusRes.snow_id;
+                if (statusRes.device_id) localHostDeviceId = statusRes.device_id;
+                if (statusRes.device_name) localHostIdentity = statusRes.device_name;
+                if (statusRes.telemetry && Object.keys(statusRes.telemetry).length > 0) {
+                    localHostTelemetry = statusRes.telemetry;
+                }
+                const coreIdEl = document.getElementById("core-canonical-id");
+                if (coreIdEl) coreIdEl.textContent = canonicalSnowId;
+            } else {
+                isCoreOnline = false;
+            }
 
-        if (sysStatus && sysStatus.success) {
-            isCorePaused = Boolean(sysStatus.is_paused ?? sysStatus.data?.is_paused);
-        }
-        updateCoreStatusBadge();
+            if (sysStatus && sysStatus.success) {
+                isCorePaused = Boolean(sysStatus.is_paused ?? sysStatus.data?.is_paused);
+            }
+            updateCoreStatusBadge();
 
-        if (fedRes && Array.isArray(fedRes.grants)) {
-            federationGrants = fedRes.grants;
-        }
+            if (fedRes && Array.isArray(fedRes.grants)) {
+                federationGrants = fedRes.grants;
+            }
 
-        // 2. Registered & Connected Devices
-        const devRes = await apiRequest("/api/devices");
-        if (devRes && Array.isArray(devRes.devices)) {
-            registeredDevices = devRes.devices;
-            const connectedRemotes = registeredDevices.filter(d => !isLocalNode(d) && d.is_connected);
+            // 2. Registered & Connected Devices (preserve non-empty telemetry across transient misses)
+            const devRes = await apiRequest("/api/devices");
+            if (devRes && Array.isArray(devRes.devices)) {
+                const prevById = new Map(registeredDevices.map(d => [d.device_id, d]));
+                const normalized = [];
+                const seenIds = new Set();
+                let seenLocal = false;
 
-            if (!hasUserSelectedDevice && !activeDeviceId) {
-                activeDeviceId = connectedRemotes.length > 0 ? connectedRemotes[0].device_id : "local";
-            } else if (activeDeviceId && activeDeviceId !== "local") {
-                const stillExists = registeredDevices.some(d => d.device_id === activeDeviceId);
-                if (!stillExists) {
-                    activeDeviceId = "local";
+                devRes.devices.forEach(rawDev => {
+                    const isLocal = isLocalNode(rawDev);
+                    if (isLocal) {
+                        if (seenLocal) return;
+                        seenLocal = true;
+                    } else if (rawDev.device_id) {
+                        if (seenIds.has(rawDev.device_id)) return;
+                        seenIds.add(rawDev.device_id);
+                    }
+                    const prev = prevById.get(rawDev.device_id);
+                    const hasNewTel = rawDev.telemetry && Object.keys(rawDev.telemetry).length > 0;
+                    const mergedTel = hasNewTel ? rawDev.telemetry : (rawDev.is_connected && prev?.telemetry ? prev.telemetry : rawDev.telemetry);
+                    normalized.push({ ...rawDev, is_local: isLocal, telemetry: mergedTel });
+                });
+
+                registeredDevices = normalized;
+                const connectedRemotes = registeredDevices.filter(d => !isLocalNode(d) && d.is_connected);
+
+                if (!hasUserSelectedDevice && !activeDeviceId) {
+                    activeDeviceId = connectedRemotes.length > 0 ? connectedRemotes[0].device_id : "local";
+                } else if (activeDeviceId && activeDeviceId !== "local") {
+                    const stillExists = registeredDevices.some(d => d.device_id === activeDeviceId && !isLocalNode(d));
+                    if (!stillExists) {
+                        activeDeviceId = "local";
+                    }
                 }
             }
+
+            const currentDev = getSelectedDeviceObj();
+            updateTopbarCapsule(currentDev);
+            renderDeviceIsland();
+
+            if (currentTab === "overview") {
+                updateHeroCard(currentDev);
+                loadHomeWidgets();
+            }
+
+            // 3. Global pending approvals counter & live screen stream status
+            await Promise.all([loadApprovals(), pollScreenStreamStatus()]);
+        } finally {
+            isPollStateInFlight = false;
         }
-
-        const currentDev = getSelectedDeviceObj();
-        updateTopbarCapsule(currentDev);
-        renderDeviceIsland();
-
-        if (currentTab === "overview") {
-            updateHeroCard(currentDev);
-            loadHomeWidgets();
-        }
-
-        // 3. Global pending approvals counter (Capability + OAuth)
-        await loadApprovals();
     }
 
     async function refreshAllData() {

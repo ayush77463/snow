@@ -168,6 +168,14 @@ class ApprovalPolicyEngine:
             if ctx and ctx.device_id:
                 return False, None, "LOW"
 
+            # Workstation locking requires explicit owner approval for AI callers
+            if canonical_action in ("windows_lock_screen", "snow_windows_lock_screen"):
+                return (
+                    True,
+                    f"Workstation lock capability '{canonical_action}' locks the active Windows desktop and requires explicit owner approval.",
+                    "HIGH",
+                )
+
             # Visual capture operations ALWAYS require explicit owner approval for AI callers
             if canonical_action in (
                 "windows_screenshot",

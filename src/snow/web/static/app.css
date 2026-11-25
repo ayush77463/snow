@@ -122,16 +122,26 @@ html, body {
 .sidebar {
     width: var(--snow-sidebar-width-expanded);
     height: 100%;
+    max-height: 100vh;
     background-color: var(--snow-bg-sidebar);
     border-right: 1px solid var(--snow-border);
     display: flex;
     flex-direction: column;
     justify-content: space-between;
     flex-shrink: 0;
+    overflow: hidden;
     z-index: 30;
     user-select: none;
     transition: width var(--snow-transition-speed) var(--snow-transition-timing);
     position: relative;
+}
+
+.sidebar-top {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
 }
 
 .sidebar.collapsed {
@@ -268,11 +278,25 @@ html.theme-light .nav-item.active {
 }
 
 .sidebar-footer {
-    padding: 16px;
+    padding: 12px 14px;
     border-top: 1px solid var(--snow-border);
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+@media (max-height: 820px) {
+    .sidebar-header {
+        padding: 12px 14px;
+    }
+    .nav-item {
+        padding: 8px 12px;
+    }
+    .sidebar-footer {
+        padding: 10px 12px;
+        gap: 8px;
+    }
 }
 
 .sidebar.collapsed .sidebar-footer {
@@ -710,7 +734,9 @@ html.theme-light .nav-item.active {
 
 .hero-preview-container {
     width: 100%;
-    height: 220px;
+    aspect-ratio: 16 / 9;
+    min-height: 200px;
+    max-height: 300px;
     background: var(--snow-hero-fallback-gradient);
     position: relative;
     overflow: hidden;
@@ -720,9 +746,11 @@ html.theme-light .nav-item.active {
 }
 
 .hero-wallpaper-img {
+    display: block;
     width: 100%;
     height: 100%;
     object-fit: cover;
+    object-position: center;
 }
 
 .hero-glass-bar {
@@ -1270,14 +1298,27 @@ html.theme-light .file-dropzone {
 .hero-card.phone-mode .hero-preview-container {
     width: auto;
     height: auto;
+    aspect-ratio: auto;
+    min-height: 0;
+    max-height: none;
+    flex-shrink: 0;
     background: transparent;
     overflow: visible;
 }
 .hero-desktop-card.phone-mode .hero-meta,
 .hero-card.phone-mode .hero-meta {
     flex: 1;
+    min-width: 0;
     padding: 4px 0;
     justify-content: center;
+}
+.hero-desktop-card.phone-mode .hero-meta > div:first-child {
+    flex-wrap: wrap;
+    row-gap: 6px;
+}
+.hero-desktop-card.phone-mode .hero-meta .chip {
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 
 /* Custom Toggle Switch */

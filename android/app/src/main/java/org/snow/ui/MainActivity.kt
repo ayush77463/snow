@@ -98,15 +98,32 @@ class MainActivity : AppCompatActivity() {
         pendingScreenshotPermissionCallback = null
     }
 
-    private val screenCaptureLauncher = registerForActivityResult(
+    private val postNotificationsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        service?.updateManifest()
+    }
+
+    private val oneTimeScreenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
-            SafeLog.i(TAG, "MediaProjection screen capture consent granted by user; delegating to ForegroundService.")
+            SafeLog.i(TAG, "MediaProjection one-time screen capture consent granted; delegating to ForegroundService.")
             SnowForegroundService.startOneTimeScreenCapture(this, result.resultCode, result.data!!)
         } else {
             org.snow.capabilities.ScreenCaptureHandler.resetConsent()
-            SafeLog.w(TAG, "MediaProjection screen capture consent cancelled or denied.")
+            SafeLog.w(TAG, "MediaProjection one-time screen capture consent cancelled or denied.")
+        }
+    }
+
+    private val liveScreenShareLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            SafeLog.i(TAG, "MediaProjection live screen share consent granted; starting live stream.")
+            SnowForegroundService.startScreenShare(this, result.resultCode, result.data!!)
+        } else {
+            SafeLog.w(TAG, "MediaProjection live screen share consent cancelled or denied.")
         }
     }
 
@@ -183,6 +200,14 @@ class MainActivity : AppCompatActivity() {
 
         setupWindowInsets()
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !prefs.getBoolean("post_notifications_prompted", false)
+        ) {
+            prefs.edit().putBoolean("post_notifications_prompted", true).apply()
+            postNotificationsLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         setContent {
             SnowApp(
                 repository = repository,
@@ -207,7 +232,7 @@ class MainActivity : AppCompatActivity() {
                     val projMgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
                     val captureIntent = projMgr?.createScreenCaptureIntent()
                     if (captureIntent != null) {
-                        screenCaptureLauncher.launch(captureIntent)
+                        liveScreenShareLauncher.launch(captureIntent)
                     }
                 },
                 themeMode = currentThemeMode,
@@ -255,10 +280,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun checkScreenCaptureRequest(intent: Intent?) {
         if (intent?.getBooleanExtra("request_screen_capture", false) == true) {
+            intent.removeExtra("request_screen_capture")
             val projMgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? android.media.projection.MediaProjectionManager
             val captureIntent = projMgr?.createScreenCaptureIntent()
             if (captureIntent != null) {
-                screenCaptureLauncher.launch(captureIntent)
+                oneTimeScreenCaptureLauncher.launch(captureIntent)
             }
         }
     }
@@ -267,6 +293,7 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         org.snow.capabilities.ClipboardHandler.onActivityResumed("MainActivity")
         org.snow.capabilities.ClipboardHandler.isUserIntentGranted = true
+        service?.updateManifest()
         lifecycleScope.launch {
             delay(150)
             repository.checkAndSyncForegroundClipboard()

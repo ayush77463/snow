@@ -302,17 +302,17 @@ class TestBatch4CleanAuditAndWorkflows(unittest.TestCase):
 
 
 class TestBatch4McpParityAndDoctor(unittest.TestCase):
-    """Test F28: 38-tool exact parity and doctor check."""
+    """Test F28: 42-tool exact parity and doctor check."""
 
     def test_mcp_exact_38_tool_parity(self) -> None:
-        self.assertEqual(len(CAPABILITY_REGISTRY), 38)
-        self.assertEqual(len(ALL_TOOL_NAMES), 38)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 42)
+        self.assertEqual(len(ALL_TOOL_NAMES), 42)
 
         server = create_snow_mcp_server()
         server_tools = {t.name for t in server._tool_manager.list_tools()}
         registry_tools = set(CAPABILITY_REGISTRY.keys())
 
-        self.assertEqual(len(server_tools), 38)
+        self.assertEqual(len(server_tools), 42)
         self.assertEqual(server_tools, registry_tools)
 
     def test_run_doctor_reports_ok_for_mcp_catalog(self) -> None:
@@ -325,7 +325,7 @@ class TestBatch4McpParityAndDoctor(unittest.TestCase):
         mcp_check = next((c for c in results["checks"] if c["component"] == "mcp_tool_catalog"), None)
         self.assertIsNotNone(mcp_check)
         self.assertEqual(mcp_check["status"], "OK")
-        self.assertIn("38 MCP tools verified", mcp_check["message"])
+        self.assertIn("42 MCP tools verified", mcp_check["message"])
 
 
 class TestBatch4WebAndTray(unittest.TestCase):
@@ -391,7 +391,8 @@ class TestBatch4WebAndTray(unittest.TestCase):
         })
 
         with patch.object(tray.daemon_manager, "get_tracked_pid", return_value=12345), \
-             patch.object(tray.daemon_manager, "is_process_snow_core", return_value=True):
+             patch.object(tray.daemon_manager, "is_process_snow_core", return_value=True), \
+             patch.object(tray.db_manager, "list_paired_devices", return_value=[MagicMock(), MagicMock()]):
             status = tray.refresh_status()
             self.assertEqual(status["connected_count"], 1)
             self.assertEqual(status["device_count"], 2)

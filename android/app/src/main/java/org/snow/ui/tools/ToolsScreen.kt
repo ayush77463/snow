@@ -71,6 +71,7 @@ import org.snow.ui.components.SnowEmptyState
 import org.snow.ui.components.SnowFilterChip
 import org.snow.ui.components.SnowGradientButton
 import org.snow.ui.components.SnowOutlinedButton
+import org.snow.ui.components.SnowPullToRefreshBox
 import org.snow.ui.components.SnowSectionHeader
 import org.snow.ui.components.SnowStatusBadge
 import org.snow.ui.components.SnowTonalButton
@@ -100,6 +101,8 @@ fun ToolsScreen(
     onNavigatePath: (String) -> Unit,
     onDownloadFile: (PcFileItem) -> Unit,
     onUploadFile: () -> Unit,
+    isFilesRefreshing: Boolean = false,
+    onRefreshFiles: () -> Unit = {},
     // Apps parameters
     allowlistedApps: List<WindowsAppItem>,
     onLaunchApp: (target: String, friendlyName: String) -> Unit,
@@ -170,7 +173,9 @@ fun ToolsScreen(
                     onChangeSafFolder = onChangeSafFolder,
                     onNavigatePath = onNavigatePath,
                     onDownloadFile = onDownloadFile,
-                    onUploadFile = onUploadFile
+                    onUploadFile = onUploadFile,
+                    isRefreshing = isFilesRefreshing,
+                    onRefresh = onRefreshFiles
                 )
             }
             ToolSubTab.APPS -> {
@@ -215,7 +220,9 @@ private fun FilesToolView(
     onChangeSafFolder: () -> Unit,
     onNavigatePath: (String) -> Unit,
     onDownloadFile: (PcFileItem) -> Unit,
-    onUploadFile: () -> Unit
+    onUploadFile: () -> Unit,
+    isRefreshing: Boolean = false,
+    onRefresh: () -> Unit = {}
 ) {
     val colors = LocalSnowColors.current
     var hideHidden by remember { mutableStateOf(true) }
@@ -345,31 +352,46 @@ private fun FilesToolView(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // File List
-        if (displayFiles.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(
-                    text = "Directory empty or loading files from PC...",
-                    style = SnowTypography.bodyMedium,
-                    color = colors.textMuted
-                )
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                items(displayFiles) { file ->
-                    FileRowItem(
-                        item = file,
-                        onClick = {
-                            if (file.isDirectory) {
-                                onNavigatePath(file.path)
-                            } else {
-                                onDownloadFile(file)
+        // File List with Pull-to-Refresh & Bottom Bar Clearance
+        SnowPullToRefreshBox(
+            isRefreshing = isRefreshing,
+            onRefresh = onRefresh,
+            modifier = Modifier.weight(1f).fillMaxWidth()
+        ) {
+            if (displayFiles.isEmpty()) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    item {
+                        Text(
+                            text = "Directory empty or loading files from PC...",
+                            style = SnowTypography.bodyMedium,
+                            color = colors.textMuted
+                        )
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(displayFiles) { file ->
+                        FileRowItem(
+                            item = file,
+                            onClick = {
+                                if (file.isDirectory) {
+                                    onNavigatePath(file.path)
+                                } else {
+                                    onDownloadFile(file)
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
+                    item {
+                        Spacer(modifier = Modifier.height(96.dp))
+                    }
                 }
             }
         }

@@ -1,5 +1,6 @@
 package org.snow.ui.home
 
+import android.graphics.BitmapFactory
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Folder
@@ -62,6 +64,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -74,6 +77,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.snow.network.ConnectionState
@@ -85,12 +89,15 @@ import org.snow.ui.SavedDevice
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
 import org.snow.ui.components.SnowGradientButton
+import org.snow.ui.components.SnowPullToRefreshBox
 import org.snow.ui.components.SnowSectionHeader
 import org.snow.ui.components.SnowStatusBadge
 import org.snow.ui.components.SnowTonalButton
 import org.snow.ui.navigation.SnowTab
 import org.snow.ui.theme.LocalSnowColors
 import org.snow.ui.theme.SnowTypography
+import java.io.File
+import java.util.Locale
 
 /**
  * Flagship Home Screen handling:
@@ -126,6 +133,11 @@ fun HomeScreen(
     onPinClipboardItem: (String, Boolean) -> Unit = { _, _ -> },
     onClearClipboardBuffer: () -> Unit = {},
     scrollToClipboardTrigger: Int = 0,
+    clipboardThumbnailVersion: Int = 0,
+    findCachedClipboardImage: (String) -> File? = { null },
+    autoSyncScreenshots: Boolean = false,
+    isRefreshing: Boolean = false,
+    onRefresh: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
@@ -139,9 +151,14 @@ fun HomeScreen(
         }
     }
 
+    SnowPullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        modifier = modifier.fillMaxSize()
+    ) {
     LazyColumn(
         state = listState,
-        modifier = modifier
+        modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -204,73 +221,125 @@ fun HomeScreen(
             }
         }
 
-        // Shared Clipboard Buffer Section
+        // Local Phone Telemetry Strip (always available on-device)
+        if (!isPhonePeer && phoneTelemetry.isAvailable) {
+            item {
+                LocalPhoneTelemetryStrip(phoneTelemetry = phoneTelemetry)
+            }
+        }
+
+        // Unified Shared Clipboard Buffer Section (Single Card matching Stitch V5)
         item {
-            SnowSectionHeader(
-                title = "Shared Clipboard",
-                trailing = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (clipboardItems.isNotEmpty()) {
+            SnowCard(
+                modifier = Modifier.fillMaxWidth(),
+                cornerRadius = 20.dp
+            ) {
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                text = "Clear",
-                                style = SnowTypography.labelSmall,
-                                color = colors.textMuted,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .clickable(onClick = onClearClipboardBuffer)
-                                    .padding(4.dp)
+                                text = "Shared Clipboard",
+                                style = SnowTypography.titleMedium,
+                                color = colors.textPrimary
                             )
                             Spacer(modifier = Modifier.width(8.dp))
+                            Surface(
+                                shape = RoundedCornerShape(9999.dp),
+                                color = colors.surfaceElevated
+                            ) {
+                                Text(
+                                    text = clipboardItems.size.toString(),
+                                    style = SnowTypography.labelSmall,
+                                    color = colors.textSecondary,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                )
+                            }
                         }
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(
+                                checked = instantClipboardSync,
+                                onCheckedChange = onToggleInstantClipboardSync,
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = colors.accentBlue,
+                                    uncheckedThumbColor = colors.textMuted,
+                                    uncheckedTrackColor = colors.surfaceElevated
+                                ),
+                                modifier = Modifier.scale(0.8f)
+                            )
+                            if (clipboardItems.isNotEmpty()) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "Clear",
+                                    style = SnowTypography.labelSmall,
+                                    color = colors.textMuted,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable(onClick = onClearClipboardBuffer)
+                                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    if (autoSyncScreenshots) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Surface(
+                            shape = RoundedCornerShape(9999.dp),
+                            color = colors.accentEmerald.copy(alpha = 0.14f)
+                        ) {
+                            Text(
+                                text = "Auto-sync screenshots ON",
+                                style = SnowTypography.labelSmall.copy(fontSize = 11.sp),
+                                color = colors.accentEmerald,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Divider(color = colors.borderSubtle)
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    if (clipboardItems.isEmpty()) {
                         Text(
-                            text = "Sync",
-                            style = SnowTypography.labelSmall,
-                            color = colors.textSecondary
+                            text = "No clipboard entries yet. Copied text or screenshots appear here automatically.",
+                            style = SnowTypography.bodySmall,
+                            color = colors.textSecondary,
+                            modifier = Modifier.padding(vertical = 8.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Switch(
-                            checked = instantClipboardSync,
-                            onCheckedChange = onToggleInstantClipboardSync,
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = colors.accentBlue,
-                                uncheckedThumbColor = colors.textMuted,
-                                uncheckedTrackColor = colors.surfaceElevated
-                            ),
-                            modifier = Modifier.scale(0.8f)
-                        )
+                    } else {
+                        val visibleItems = clipboardItems.take(5)
+                        visibleItems.forEachIndexed { idx, item ->
+                            UnifiedClipboardItemRow(
+                                item = item,
+                                thumbnailVersion = clipboardThumbnailVersion,
+                                findCachedImageFile = findCachedClipboardImage,
+                                onCopy = { onApplyClipboardItem(item) },
+                                onShare = { onShareClipboardItem(item) },
+                                onTogglePin = { onPinClipboardItem(item.itemId, !item.isPinned) }
+                            )
+                            if (idx < visibleItems.lastIndex) {
+                                Divider(
+                                    color = colors.borderSubtle,
+                                    modifier = Modifier.padding(vertical = 10.dp)
+                                )
+                            }
+                        }
                     }
                 }
-            )
-        }
-
-        if (clipboardItems.isEmpty()) {
-            item {
-                SnowCard(
-                    modifier = Modifier.fillMaxWidth(),
-                    cornerRadius = 16.dp
-                ) {
-                    Text(
-                        text = "No clipboard entries yet. Copied text on linked devices will appear here automatically.",
-                        style = SnowTypography.bodySmall,
-                        color = colors.textSecondary
-                    )
-                }
-            }
-        } else {
-            items(clipboardItems.take(5)) { item ->
-                ClipboardItemCard(
-                    item = item,
-                    onCopy = { onApplyClipboardItem(item) },
-                    onShare = { onShareClipboardItem(item) },
-                    onTogglePin = { onPinClipboardItem(item.itemId, !item.isPinned) }
-                )
             }
         }
 
         item {
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(96.dp))
         }
+    }
     }
 }
 
@@ -376,11 +445,13 @@ private fun PcConnectedHeroCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = hostName,
                         style = SnowTypography.titleMedium,
-                        color = colors.textPrimary
+                        color = colors.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     Text(
                         text = "$transport • Active",
@@ -955,117 +1026,210 @@ private fun CircularToolButton(
 }
 
 @Composable
-private fun ClipboardItemCard(
+private fun LocalPhoneTelemetryStrip(phoneTelemetry: PhoneTelemetry) {
+    val colors = LocalSnowColors.current
+    val batVal = buildString {
+        append("${phoneTelemetry.batteryPercent}%")
+        if (phoneTelemetry.isCharging) append(" ⚡")
+        phoneTelemetry.temperatureCelsius?.let { append(" • ${String.format(Locale.US, "%.0f°C", it)}") }
+    }
+    val ramVal = phoneTelemetry.ramTotalBytes?.let { tot ->
+        val avail = phoneTelemetry.ramAvailableBytes ?: return@let null
+        if (tot > 0) "${((tot - avail) * 100 / tot).toInt()}%" else null
+    } ?: "--"
+    val storageVal = phoneTelemetry.storageAvailableBytes?.let { free ->
+        String.format(Locale.US, "%.1f GB", free.toDouble() / (1024.0 * 1024.0 * 1024.0))
+    } ?: "--"
+
+    SnowCard(
+        modifier = Modifier.fillMaxWidth(),
+        cornerRadius = 16.dp
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "THIS PHONE",
+                style = SnowTypography.labelSmall.copy(letterSpacing = 0.8.sp),
+                color = colors.textMuted
+            )
+            TelemetryMetric(label = "BATTERY", value = batVal)
+            TelemetryMetric(label = "RAM", value = ramVal)
+            TelemetryMetric(label = "FREE", value = storageVal)
+        }
+    }
+}
+
+private fun friendlySourceName(rawSource: String): String {
+    val clean = rawSource.trim()
+    return when {
+        clean.isBlank() -> "PC"
+        clean.equals("pc", ignoreCase = true) ||
+            clean.equals("windows", ignoreCase = true) ||
+            clean.equals("desktop", ignoreCase = true) ||
+            clean.equals("desktop-core", ignoreCase = true) -> "PC"
+        clean.equals("android", ignoreCase = true) ||
+            clean.equals("phone", ignoreCase = true) -> "Phone"
+        else -> clean.take(18)
+    }
+}
+
+private fun formatReadableClipboardSize(bytes: Long): String = when {
+    bytes <= 0L -> "Text"
+    bytes < 1024L -> "$bytes B"
+    bytes < 1024L * 1024L -> "${bytes / 1024L} KB"
+    else -> String.format(Locale.US, "%.1f MB", bytes.toDouble() / (1024.0 * 1024.0))
+}
+
+@Composable
+private fun UnifiedClipboardItemRow(
     item: ClipboardItemDto,
+    thumbnailVersion: Int,
+    findCachedImageFile: (String) -> File?,
     onCopy: () -> Unit,
     onShare: () -> Unit,
     onTogglePin: () -> Unit
 ) {
     val colors = LocalSnowColors.current
     val isImage = item.type == "image"
-
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .border(1.dp, if (item.isPinned) colors.accentCyan.copy(alpha = 0.5f) else colors.borderSubtle, RoundedCornerShape(14.dp)),
-        color = colors.surface
-    ) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            if (isImage) {
-                Surface(
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(RoundedCornerShape(8.dp)),
-                    color = colors.accentBlue.copy(alpha = 0.15f)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Default.Image,
-                            contentDescription = "Image Clipboard Item",
-                            tint = colors.accentBlue,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
+    val sourceLabel = friendlySourceName(item.sourceDevice)
+    val thumbBitmap = remember(item.itemId, thumbnailVersion, isImage) {
+        if (!isImage) null
+        else try {
+            val file = findCachedImageFile(item.itemId)
+            if (file != null && file.exists() && file.length() > 0) {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(file.absolutePath, bounds)
+                var sample = 1
+                while (bounds.outWidth / sample > 240 || bounds.outHeight / sample > 240) {
+                    sample *= 2
                 }
-                Spacer(modifier = Modifier.width(10.dp))
-            }
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = item.previewText.ifBlank { if (isImage) "[Image Clip]" else "[Empty]" },
-                    style = SnowTypography.bodyMedium,
-                    color = colors.textPrimary,
-                    maxLines = 2
+                BitmapFactory.decodeFile(
+                    file.absolutePath,
+                    BitmapFactory.Options().apply { inSampleSize = sample }
                 )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "${if (isImage) "Image" else "Text"} • ${item.sourceDevice.ifBlank { "Remote" }} • ${item.sizeBytes} B",
-                    style = SnowTypography.bodySmall,
-                    color = colors.textMuted
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    val titleText = if (isImage) {
+        val raw = item.previewText.trim()
+        if (raw.isBlank() || raw.startsWith("clip_", ignoreCase = true) || raw.startsWith("[image", ignoreCase = true)) {
+            "$sourceLabel Screenshot"
+        } else {
+            raw
+        }
+    } else {
+        item.previewText.ifBlank { "Snippet" }
+    }
+
+    val sizeLabel = if (isImage && item.sizeBytes > 0L) {
+        formatReadableClipboardSize(item.sizeBytes)
+    } else if (!isImage && item.sizeBytes > 0L) {
+        formatReadableClipboardSize(item.sizeBytes)
+    } else {
+        if (isImage) "Image" else "Text"
+    }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(colors.surfaceElevated)
+                .border(1.dp, colors.borderSubtle, RoundedCornerShape(10.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            if (thumbBitmap != null) {
+                Image(
+                    bitmap = thumbBitmap.asImageBitmap(),
+                    contentDescription = titleText,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Icon(
+                    imageVector = if (isImage) Icons.Default.Image else Icons.Default.Description,
+                    contentDescription = titleText,
+                    tint = colors.textSecondary,
+                    modifier = Modifier.size(20.dp)
                 )
             }
-            Spacer(modifier = Modifier.width(8.dp))
+        }
 
-            // Action: Toggle Pin
-            Surface(
+        Spacer(modifier = Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = titleText,
+                style = SnowTypography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                color = colors.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "$sourceLabel • $sizeLabel",
+                style = SnowTypography.bodySmall,
+                color = colors.textMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
                 modifier = Modifier
                     .size(32.dp)
                     .clip(CircleShape)
                     .clickable(onClick = onTogglePin),
-                color = colors.surfaceElevated
+                contentAlignment = Alignment.Center
             ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Default.PushPin,
-                        contentDescription = "Pin",
-                        tint = if (item.isPinned) colors.accentCyan else colors.textMuted,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.PushPin,
+                    contentDescription = "Pin",
+                    tint = if (item.isPinned) colors.accentCyan else colors.textMuted,
+                    modifier = Modifier.size(16.dp)
+                )
             }
-
-            Spacer(modifier = Modifier.width(6.dp))
-
-            // Action: Share
-            Surface(
+            Box(
                 modifier = Modifier
                     .size(32.dp)
                     .clip(CircleShape)
                     .clickable(onClick = onShare),
-                color = colors.surfaceElevated
+                contentAlignment = Alignment.Center
             ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Default.Share,
-                        contentDescription = "Share",
-                        tint = colors.textSecondary,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.Share,
+                    contentDescription = "Share",
+                    tint = colors.textSecondary,
+                    modifier = Modifier.size(16.dp)
+                )
             }
-
-            Spacer(modifier = Modifier.width(6.dp))
-
-            // Action: Copy
-            Surface(
+            Box(
                 modifier = Modifier
                     .size(32.dp)
                     .clip(CircleShape)
                     .clickable(onClick = onCopy),
-                color = colors.surfaceElevated
+                contentAlignment = Alignment.Center
             ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Default.ContentCopy,
-                        contentDescription = "Copy",
-                        tint = colors.accentCyan,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.ContentCopy,
+                    contentDescription = "Copy",
+                    tint = colors.textSecondary,
+                    modifier = Modifier.size(16.dp)
+                )
             }
         }
     }

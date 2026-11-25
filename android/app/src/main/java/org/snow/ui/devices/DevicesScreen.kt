@@ -49,6 +49,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.snow.network.DiscoveredPeer
@@ -61,6 +62,7 @@ import org.snow.ui.components.SnowEmptyState
 import org.snow.ui.components.SnowFilterChip
 import org.snow.ui.components.SnowGradientButton
 import org.snow.ui.components.SnowOutlinedButton
+import org.snow.ui.components.SnowPullToRefreshBox
 import org.snow.ui.components.SnowSectionHeader
 import org.snow.ui.components.SnowStatusBadge
 import org.snow.ui.components.SnowTonalButton
@@ -97,9 +99,11 @@ fun DevicesScreen(
     onAcceptFederationCode: (String) -> Unit,
     onRevokeFederationGrant: (String) -> Unit,
     onFederationKillSwitch: () -> Unit = {},
-    onOpenConnectSheet: () -> Unit,
+    onOpenConnectSheet: () -> Unit = {},
     generatedFederationInvite: String? = null,
     onDismissFederationInvite: () -> Unit = {},
+    isRefreshing: Boolean = false,
+    onRefresh: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
@@ -120,8 +124,13 @@ fun DevicesScreen(
         }
     }
 
+    SnowPullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        modifier = modifier.fillMaxSize()
+    ) {
     LazyColumn(
-        modifier = modifier
+        modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -238,8 +247,9 @@ fun DevicesScreen(
         }
 
         item {
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(96.dp))
         }
+    }
     }
 
     // Join Network Dialog
@@ -436,11 +446,13 @@ private fun DeviceListItem(
                         )
                     }
                     Spacer(modifier = Modifier.width(12.dp))
-                    Column {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = device.deviceName.ifBlank { device.host },
                             style = SnowTypography.titleSmall,
-                            color = colors.textPrimary
+                            color = colors.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                         Text(
                             text = "${if (isPhone) "Phone" else "PC"} • $transportLabel",
@@ -582,7 +594,7 @@ private fun PeerHostModeCard(
                             color = colors.textPrimary
                         )
                         Text(
-                            text = if (peerHostState.isActive) "Host ready • ${peerHostState.peerCount} linked" else "Standby (Accepts peer connections)",
+                            text = if (peerHostState.isActive) "Host ready • ${peerHostState.peerCount} linked" else "Accepts direct peer links",
                             style = SnowTypography.bodySmall,
                             color = colors.textSecondary
                         )
@@ -687,14 +699,6 @@ private fun CrossNetworkSharingCard(
         cornerRadius = 20.dp
     ) {
         Column {
-            Text(
-                text = "Relay federation lets you bridge across separate Wi-Fi networks using secure end-to-end encrypted session codes.",
-                style = SnowTypography.bodySmall,
-                color = colors.textSecondary
-            )
-
-            Spacer(modifier = Modifier.height(14.dp))
-
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)

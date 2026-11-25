@@ -67,10 +67,10 @@ class TestLocalMcpStdioProtocol(unittest.TestCase):
     """Verify local FastMCP stdio server protocol correctness."""
 
     def test_all_38_tools_registered(self) -> None:
-        """Verify create_snow_mcp_server registers exactly 38 static tools."""
+        """Verify create_snow_mcp_server registers exactly 42 static tools."""
         server = create_snow_mcp_server()
         tools = asyncio.run(server.list_tools())
-        self.assertEqual(len(tools), 38)
+        self.assertEqual(len(tools), 42)
         tool_names = {t.name for t in tools}
         self.assertIn("snow_get_device_status", tool_names)
         self.assertIn("snow_windows_system_info", tool_names)
@@ -119,7 +119,7 @@ class TestLocalMcpStdioProtocol(unittest.TestCase):
             list_line = proc.stdout.readline()
             list_resp = json.loads(list_line)
             tools = list_resp.get("result", {}).get("tools", [])
-            self.assertEqual(len(tools), 38)
+            self.assertEqual(len(tools), 42)
 
             # 4. Safe read-only call
             call_req = {

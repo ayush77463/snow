@@ -35,10 +35,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import org.snow.ui.PhoneTelemetry
 import org.snow.ui.SavedDevice
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowSectionHeader
@@ -46,6 +48,7 @@ import org.snow.ui.components.SnowStatusBadge
 import org.snow.ui.components.SnowTonalButton
 import org.snow.ui.theme.LocalSnowColors
 import org.snow.ui.theme.SnowTypography
+import java.util.Locale
 
 /**
  * Floating Network & Device Selector Island modal matching snow_network_device_selector_island.
@@ -62,7 +65,8 @@ fun SnowDeviceSelectorIsland(
     onSelectDevice: (SavedDevice) -> Unit,
     onJoinAnotherNetwork: () -> Unit,
     federationGrants: List<Map<String, Any?>> = emptyList(),
-    onFederationGrantClick: () -> Unit = {}
+    onFederationGrantClick: () -> Unit = {},
+    localPhoneTelemetry: PhoneTelemetry = PhoneTelemetry.UNAVAILABLE
 ) {
     if (!visible) return
 
@@ -155,7 +159,9 @@ fun SnowDeviceSelectorIsland(
                                 Text(
                                     text = localDeviceName.ifBlank { "This Phone" },
                                     style = SnowTypography.titleSmall,
-                                    color = colors.textPrimary
+                                    color = colors.textPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -181,6 +187,34 @@ fun SnowDeviceSelectorIsland(
                                             )
                                         }
                                     }
+                                }
+                                if (localPhoneTelemetry.isAvailable) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    val metrics = buildList {
+                                        val ch = if (localPhoneTelemetry.isCharging) " ⚡" else ""
+                                        add("${localPhoneTelemetry.batteryPercent}%$ch")
+                                        localPhoneTelemetry.temperatureCelsius?.let {
+                                            add(String.format(Locale.US, "%.1f°C", it))
+                                        }
+                                        val rTot = localPhoneTelemetry.ramTotalBytes
+                                        val rAvail = localPhoneTelemetry.ramAvailableBytes
+                                        if (rTot != null && rTot > 0 && rAvail != null) {
+                                            val ramPct = (((rTot - rAvail) * 100) / rTot).toInt()
+                                            add("RAM $ramPct%")
+                                        }
+                                        val sAvail = localPhoneTelemetry.storageAvailableBytes
+                                        if (sAvail != null && sAvail > 0) {
+                                            val freeGb = sAvail.toDouble() / (1024.0 * 1024.0 * 1024.0)
+                                            add(String.format(Locale.US, "%.1f GB free", freeGb))
+                                        }
+                                    }
+                                    Text(
+                                        text = metrics.joinToString(" • "),
+                                        style = SnowTypography.labelSmall.copy(fontSize = 11.sp),
+                                        color = colors.textMuted,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
                                 }
                             }
                             if (peerHostActive) {
@@ -245,7 +279,9 @@ fun SnowDeviceSelectorIsland(
                                             Text(
                                                 text = dev.deviceName.ifBlank { dev.host },
                                                 style = SnowTypography.bodyMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
-                                                color = colors.textPrimary
+                                                color = colors.textPrimary,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
                                             Text(
                                                 text = "${if (isPhone) "Phone" else "PC"} • $transportLabel",
@@ -345,7 +381,7 @@ fun SnowDeviceSelectorIsland(
                     }
 
                     SnowTonalButton(
-                        text = "+ Join Another Network",
+                        text = "Join Another Network",
                         icon = Icons.Default.Add,
                         onClick = {
                             onJoinAnotherNetwork()

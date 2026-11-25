@@ -212,11 +212,14 @@ class TestActionRoutingAndNotifications(unittest.TestCase):
         """ACTION_ROUTING must contain Phase 21 actions."""
         expected_mappings = {
             "file_list": "android.files.transfer",
-            "notifications_list": "android.notifications.push",
-            "notification_dismiss": "android.notifications.push",
-            "notification_reply": "android.notifications.push",
-            "media_control": "android.ringer.ring",
-            "share_link": "android.apps.launch",
+            "notifications_list": "android.notifications.list",
+            "notification_dismiss": "android.notifications.dismiss",
+            "notification_reply": "android.notifications.reply",
+            "media_control": "android.media.control",
+            "share_link": "android.link.share",
+            "android_screenshot": "android.screen.capture",
+            "screen_stream_stop": "android.screen.stream",
+            "android_camera_capture": "android.camera.capture",
         }
         for action, capability in expected_mappings.items():
             self.assertIn(action, ACTION_ROUTING, f"Missing mapping for action {action}")
