@@ -218,6 +218,14 @@ def run_pipeline(
         print(f"[!] Failed staging cloudflared.exe into distribution: {exc}", file=sys.stderr)
         return 1
 
+    # 5b. Stage release-signed Android APK into frozen bundle when available
+    staged_apk = output_dir / "SNOW-Mobile-5.0.0.apk"
+    if staged_apk.is_file():
+        dst_apk_dir = dist_dir / "snow" / "packaging" / "output"
+        dst_apk_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged_apk, dst_apk_dir / "SNOW-Mobile-5.0.0.apk")
+        print(f"[+] Staged {staged_apk.name} into {dst_apk_dir / staged_apk.name}")
+
     print(f"[+] Standalone bundle successfully built: {dist_dir / 'snow'}")
 
     # 6. Inno Setup installer compilation
