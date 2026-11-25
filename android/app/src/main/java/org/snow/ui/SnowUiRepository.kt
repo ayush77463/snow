@@ -59,6 +59,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         const val PREF_KEY_AUTO_CONNECT_ENABLED = "auto_connect_nearby"
         const val PREF_KEY_REMOTE_RELAY_ENABLED = "remote_relay_enabled"
         const val PREF_KEY_REMOTE_RELAY_ENDPOINT = "remote_relay_endpoint"
+        const val PREF_KEY_PERMISSION_PROFILE = "permission_profile"
+
+        fun normalizeAccessProfile(raw: String): String {
+            return when (raw.trim().lowercase()) {
+                "files_and_clipboard", "files & clipboard", "files_only", "files & clip" -> "files_and_clipboard"
+                "clipboard_only", "clipboard only", "read_only", "clip only" -> "clipboard_only"
+                else -> "full_control"
+            }
+        }
 
         @Volatile
         private var instance: SnowUiRepository? = null
@@ -200,6 +209,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     // Phase 27 Direct Phone-to-Phone Peer Host state
     private val _peerHostState = MutableStateFlow(org.snow.network.PeerHostState())
     val peerHostState: StateFlow<org.snow.network.PeerHostState> = _peerHostState.asStateFlow()
+    private val _permissionProfileState = MutableStateFlow("full_control")
+    val permissionProfileState: StateFlow<String> = _permissionProfileState.asStateFlow()
     private var peerHostJob: Job? = null
 
     // Bounded retries tracking
@@ -216,6 +227,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     init {
         loadSavedDevices()
         refreshPhoneTelemetry()
+        _permissionProfileState.value = activePermissionProfile
     }
 
     /**
@@ -308,7 +320,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     // Fetch latest shared clipboard buffer items
                     fetchClipboardBuffer()
                     // Update identity-first saved device history and endpoint ring buffer
-                    recordSuccessfulConnection(host = host, port = port, sessionId = auth.sessionId, tier = auth.trustTier)
+                    recordSuccessfulConnection(
+                        host = host,
+                        port = port,
+                        sessionId = auth.sessionId,
+                        tier = auth.trustTier,
+                        peerDeviceName = auth.peerDeviceName,
+                        peerDeviceType = auth.peerDeviceType
+                    )
                 } else {
                     _fileTransferClient = null
                     screenshotObserver.unregister()
@@ -413,8 +432,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         pairingFlow.submitPin(cleanPin, client) { state ->
             appendLog("INFO", TAG, "Pairing state changed: $state")
             if (state is PairingState.Paired) {
-                client.setAuthenticated(state.sessionId)
-                _authState.value = AuthState.Authenticated(state.sessionId)
+                client.setAuthenticated(state.sessionId, state.trustTier, state.desktopName, state.deviceType)
+                _authState.value = AuthState.Authenticated(
+                    state.sessionId,
+                    state.trustTier,
+                    state.desktopName,
+                    state.deviceType
+                )
             }
             onStateChanged?.invoke(state)
         }
@@ -474,12 +498,30 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
-    fun recordSuccessfulConnection(host: String, port: Int, sessionId: String, tier: String = "PEER") {
+    fun recordSuccessfulConnection(
+        host: String,
+        port: Int,
+        sessionId: String,
+        tier: String = "PEER",
+        peerDeviceName: String? = null,
+        peerDeviceType: String? = null
+    ) {
         val cleanHost = host.trim()
         val token = tokenStorage.getToken()
         val deviceId = token?.take(8) ?: sessionId.take(8)
         val pinnedFp = certPinStorage.getPinnedFingerprint()
         val nowStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+
+        val matchedDiscovered = _discoveredPeers.value.find { it.ipAddress == cleanHost }
+        val rawType = peerDeviceType?.takeIf { it.isNotBlank() }
+            ?: matchedDiscovered?.deviceType?.takeIf { it.isNotBlank() }
+        val resolvedType = when {
+            rawType != null && (rawType.equals("android", ignoreCase = true) || rawType.equals("phone", ignoreCase = true)) -> "phone"
+            rawType != null -> "pc"
+            else -> null
+        }
+        val resolvedName = peerDeviceName?.takeIf { it.isNotBlank() }
+            ?: matchedDiscovered?.deviceName?.takeIf { it.isNotBlank() }
 
         val current = _savedDevices.value.toMutableList()
         val existingIdx = current.indexOfFirst { it.deviceId == deviceId }
@@ -500,7 +542,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             } else {
                 tier.uppercase()
             }
+            val effectiveType = resolvedType ?: existing.deviceType
+            val effectiveName = resolvedName ?: existing.deviceName
             current[existingIdx] = existing.copy(
+                deviceName = effectiveName,
+                deviceType = effectiveType,
                 host = if (cleanHost != "127.0.0.1" || existing.host.isBlank()) cleanHost else existing.host,
                 port = port,
                 lastSeen = nowStr,
@@ -509,17 +555,21 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 recentEndpoints = updatedEndpoints.take(5)
             )
         } else {
+            val finalType = resolvedType ?: "pc"
+            val finalName = resolvedName
+                ?: if (finalType == "phone") "Android Peer ($cleanHost)" else "Desktop Core ($cleanHost)"
             current.add(
                 0,
                 SavedDevice(
                     deviceId = deviceId,
-                    deviceName = "Desktop Core ($cleanHost)",
+                    deviceName = finalName,
                     host = cleanHost,
                     port = port,
                     lastSeen = nowStr,
                     trustTier = tier,
                     certFingerprint = pinnedFp,
-                    recentEndpoints = updatedEndpoints.take(5)
+                    recentEndpoints = updatedEndpoints.take(5),
+                    deviceType = finalType
                 )
             )
         }
@@ -665,7 +715,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 val auth = _authState.value
                 if (state == ConnectionState.CONNECTED && auth is AuthState.Authenticated) {
                     appendLog("INFO", TAG, "Device already authenticated with desktop. Onboarding complete.")
-                    recordSuccessfulConnection(targetIp, port, auth.sessionId, auth.trustTier)
+                    recordSuccessfulConnection(targetIp, port, auth.sessionId, auth.trustTier, auth.peerDeviceName, auth.peerDeviceType)
                     onComplete(true, null)
                     return@launch
                 } else if (state == ConnectionState.CONNECTED && auth is AuthState.ConnectedUnauthenticated) {
@@ -674,7 +724,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         when (pState) {
                             is PairingState.Paired -> {
                                 appendLog("INFO", TAG, "QR pairing successful [tier=${pState.trustTier}]")
-                                recordSuccessfulConnection(targetIp, port, pState.sessionId, pState.trustTier)
+                                recordSuccessfulConnection(targetIp, port, pState.sessionId, pState.trustTier, null, pState.deviceType)
                                 onComplete(true, null)
                             }
                             is PairingState.WrongPin -> {
@@ -1062,24 +1112,24 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Quick Actions & Clipboard ---
 
-    private val _permissionProfileState = MutableStateFlow("full_control")
-    val permissionProfileState: StateFlow<String> = _permissionProfileState.asStateFlow()
-
     var activePermissionProfile: String
         get() {
             val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
             return serviceRef?.capabilityDispatcher?.activePermissionProfile
-                ?: prefs.getString("active_permission_profile", "full_control") ?: "full_control"
+                ?: prefs.getString(
+                    PREF_KEY_PERMISSION_PROFILE,
+                    prefs.getString("active_permission_profile", "full_control")
+                )
+                ?: "full_control"
         }
         set(value) {
-            val canonical = when (value.lowercase()) {
-                "files_and_clipboard" -> "files_and_clipboard"
-                "clipboard_only" -> "clipboard_only"
-                else -> "full_control"
-            }
+            val canonical = normalizeAccessProfile(value)
             serviceRef?.capabilityDispatcher?.activePermissionProfile = canonical
             val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-            prefs.edit().putString("active_permission_profile", canonical).apply()
+            prefs.edit()
+                .putString(PREF_KEY_PERMISSION_PROFILE, canonical)
+                .putString("active_permission_profile", canonical)
+                .apply()
             _permissionProfileState.value = canonical
             appendLog("INFO", TAG, "Active permission profile updated to $canonical")
         }
@@ -1129,7 +1179,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
-    fun sendMediaKey(action: String, onComplete: ((Boolean, String?) -> Unit)? = null) {
+    fun sendMediaKey(action: String, value: Int? = null, onComplete: ((Boolean, String?) -> Unit)? = null) {
         val client = serviceRef?.client
         if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
             appendLog("WARN", TAG, "Cannot send media key: not connected")
@@ -1142,15 +1192,20 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             "prev", "previous", "previous_track" -> "previous"
             "volume_up", "vol_up" -> "volume_up"
             "volume_down", "vol_down" -> "volume_down"
-            "mute", "unmute", "toggle_mute" -> "volume_mute"
+            "volume", "volume_set" -> "volume_set"
+            "mute", "unmute", "toggle_mute", "volume_mute" -> "volume_mute"
             "stop" -> "stop"
             else -> action.lowercase()
+        }
+        val dataPayload = mutableMapOf<String, Any>("action" to canonical)
+        if (canonical == "volume_set" && value != null) {
+            dataPayload["value"] = value.coerceIn(0, 100)
         }
         repoScope.launch {
             try {
                 client.sendRequest(
                     action = "media_control",
-                    data = mapOf("action" to canonical)
+                    data = dataPayload
                 ) { response ->
                     val success = response.isSuccess
                     val err = response.error?.message
@@ -1683,7 +1738,19 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     fun dismissCameraDelivery() {
+        CameraCaptureHandler.isUserInteractionActive = false
+        CameraCaptureHandler.stagedPhotoFile?.let { staged ->
+            try {
+                if (staged.exists()) staged.delete()
+            } catch (_: Exception) {}
+        }
+        CameraCaptureHandler.stagedPhotoFile = null
         _cameraDelivery.value = CameraDeliveryInfo(status = CameraDeliveryStatus.IDLE)
+    }
+
+    fun setCameraFailed(errorMessage: String) {
+        CameraCaptureHandler.isUserInteractionActive = false
+        _cameraDelivery.value = CameraDeliveryInfo(status = CameraDeliveryStatus.FAILED, error = errorMessage)
     }
 
     fun toggleInstantClipboardSync(enabled: Boolean, onComplete: ((Boolean) -> Unit)? = null) {
@@ -2032,10 +2099,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         repoScope.launch(Dispatchers.IO) {
                             val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
                             val ext = if (mimeType?.contains("jpeg") == true || mimeType?.contains("jpg") == true) "jpg" else "png"
-                            val prefix = if (sha256.isNotBlank()) sha256.take(16) else item.itemId.take(16)
-                            val fileName = "clip_$prefix.$ext"
-                            val localFile = File(cacheDir, fileName)
-                            org.snow.capabilities.ClipboardHandler.pruneImageCache(cacheDir, preserveFileName = fileName)
+                            val localFile = clipboardImageCacheFile(cacheDir, item.itemId, ext)
+                            org.snow.capabilities.ClipboardHandler.pruneImageCache(cacheDir, preserveFileName = localFile.name)
 
                             val dlRes = transferClient.downloadFile(
                                 serverHost = targetHost,
@@ -2165,15 +2230,40 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
+    fun clipboardImageCacheFile(cacheDir: File, itemId: String, ext: String = "png"): File {
+        val safeId = itemId.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        val cleanExt = if (ext.equals("jpg", ignoreCase = true) || ext.equals("jpeg", ignoreCase = true)) "jpg" else "png"
+        return File(cacheDir, "clip_item_${safeId}.$cleanExt")
+    }
+
+    fun findCachedClipboardImageFile(cacheDir: File, itemId: String): File? {
+        val safeId = itemId.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        for (ext in listOf("png", "jpg", "jpeg")) {
+            val exact = File(cacheDir, "clip_item_${safeId}.$ext")
+            if (exact.exists() && exact.length() > 0) return exact
+        }
+        val shortPrefix = itemId.take(8)
+        return cacheDir.listFiles { f ->
+            f.isFile && (f.name.contains(safeId) || (shortPrefix.isNotBlank() && f.name.contains(shortPrefix)))
+        }?.firstOrNull()
+    }
+
     fun createShareIntentForClipboardItem(item: ClipboardItemDto): Intent {
         val intent = Intent(Intent.ACTION_SEND)
         if (item.type == "image") {
             val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
-            val files = cacheDir.listFiles { f -> f.name.contains(item.itemId.take(8)) }
-            val file = files?.firstOrNull()
+            val file = findCachedClipboardImageFile(cacheDir, item.itemId)
             if (file != null && file.exists()) {
-                val uri = androidx.core.content.FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
-                intent.type = if (file.extension.equals("jpg", ignoreCase = true)) "image/jpeg" else "image/png"
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    appContext,
+                    "${appContext.packageName}.fileprovider",
+                    file
+                )
+                intent.type = if (file.extension.equals("jpg", ignoreCase = true) || file.extension.equals("jpeg", ignoreCase = true)) {
+                    "image/jpeg"
+                } else {
+                    "image/png"
+                }
                 intent.putExtra(Intent.EXTRA_STREAM, uri)
                 intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             } else {
@@ -2184,7 +2274,69 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             intent.type = "text/plain"
             intent.putExtra(Intent.EXTRA_TEXT, item.previewText)
         }
-        return Intent.createChooser(intent, "Share via SNOW").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return Intent.createChooser(intent, "Share via SNOW")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    fun shareClipboardItem(item: ClipboardItemDto, onComplete: ((Boolean, String?) -> Unit)? = null) {
+        if (item.type != "image") {
+            appContext.startActivity(createShareIntentForClipboardItem(item))
+            onComplete?.invoke(true, null)
+            return
+        }
+        val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
+        val cached = findCachedClipboardImageFile(cacheDir, item.itemId)
+        if (cached != null && cached.exists()) {
+            appContext.startActivity(createShareIntentForClipboardItem(item))
+            onComplete?.invoke(true, null)
+            return
+        }
+        val client = serviceRef?.client
+        val transferClient = _fileTransferClient
+        val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
+        if (client == null || transferClient == null || targetHost.isBlank()) {
+            onComplete?.invoke(false, "Connect to host to share uncached clipboard image.")
+            return
+        }
+        client.sendRequest("clipboard_buffer_apply", mapOf("item_id" to item.itemId, "target" to identity.deviceId, "stage_only" to true)) { resp ->
+            if (!resp.isSuccess) {
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete?.invoke(false, resp.error?.message ?: "Failed preparing clipboard image")
+                }
+                return@sendRequest
+            }
+            val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
+            val transferId = data?.get("transfer_id") as? String
+            val sha256 = (data?.get("sha256") as? String) ?: ""
+            val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: 8766
+            val mimeType = data?.get("mime_type") as? String
+            if (transferId.isNullOrBlank()) {
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete?.invoke(false, "Image transfer ID unavailable")
+                }
+                return@sendRequest
+            }
+            repoScope.launch(Dispatchers.IO) {
+                val ext = if (mimeType?.contains("jpeg") == true || mimeType?.contains("jpg") == true) "jpg" else "png"
+                val localFile = clipboardImageCacheFile(cacheDir, item.itemId, ext)
+                org.snow.capabilities.ClipboardHandler.pruneImageCache(cacheDir, preserveFileName = localFile.name)
+                val dlRes = transferClient.downloadFile(
+                    serverHost = targetHost,
+                    transferPort = transferPort,
+                    transferId = transferId,
+                    destinationFile = localFile,
+                    expectedSha256 = sha256
+                )
+                repoScope.launch(Dispatchers.Main) {
+                    if (dlRes is FileTransferClient.TransferResult.Success) {
+                        appContext.startActivity(createShareIntentForClipboardItem(item))
+                        onComplete?.invoke(true, null)
+                    } else {
+                        onComplete?.invoke(false, "Failed downloading image for sharing")
+                    }
+                }
+            }
+        }
     }
 
     // --- Terminal Console with Stage 19A Confirmation Tickets ---

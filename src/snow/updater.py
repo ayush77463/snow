@@ -30,9 +30,9 @@ ALLOWED_STATIC_EXTENSIONS = {
     ".html", ".css", ".js", ".svg", ".png",
     ".jpg", ".jpeg", ".ico", ".woff", ".woff2"
 }
-REQUIRED_UI_ASSETS = {"index.html", "app.js", "app.css"}
+REQUIRED_UI_ASSETS = ("index.html", "app.js", "app.css", "tokens.css", "theme-init.js")
 DEFAULT_OVERRIDE_DIR = Path.home() / ".snow" / "web_override"
-CURRENT_VERSION = "4.1.0"
+CURRENT_VERSION = "5.0.0"
 
 
 def parse_version(version_str: str) -> Tuple[int, ...]:
@@ -303,6 +303,8 @@ def verify_authenticode_or_pe(installer_path: Path) -> bool:
 
     if sys.platform == "win32":
         try:
+            from snow.core.subprocess_util import get_no_window_subprocess_kwargs
+
             ps_cmd = (
                 f"(Get-AuthenticodeSignature -LiteralPath '{installer_path}').Status.ToString()"
             )
@@ -311,6 +313,7 @@ def verify_authenticode_or_pe(installer_path: Path) -> bool:
                 capture_output=True,
                 text=True,
                 timeout=15,
+                **get_no_window_subprocess_kwargs(),
             )
             status = result.stdout.strip()
             # Valid signature statuses: Valid or UnknownError (self-signed/trusted enterprise)
@@ -355,12 +358,25 @@ def apply_desktop_installer_update(
     if daemon_manager is not None:
         try:
             logger.info("Stopping running Core daemon before launching installer upgrade...")
-            if hasattr(daemon_manager, "stop_daemon"):
+            stop_fn = getattr(daemon_manager, "stop_core", None) or getattr(
+                daemon_manager, "stop_daemon", None
+            )
+            if callable(stop_fn):
                 import asyncio
-                if asyncio.iscoroutinefunction(daemon_manager.stop_daemon):
-                    asyncio.create_task(daemon_manager.stop_daemon())
+                if asyncio.iscoroutinefunction(stop_fn):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(stop_fn())
+                    except RuntimeError:
+                        asyncio.run(stop_fn())
                 else:
-                    daemon_manager.stop_daemon()
+                    res = stop_fn()
+                    if asyncio.iscoroutine(res):
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(res)
+                        except RuntimeError:
+                            asyncio.run(res)
         except Exception as e:
             logger.warning("Error stopping daemon: %s", e)
 

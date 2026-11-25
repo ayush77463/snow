@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -59,6 +60,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -123,13 +125,22 @@ fun HomeScreen(
     onShareClipboardItem: (ClipboardItemDto) -> Unit = {},
     onPinClipboardItem: (String, Boolean) -> Unit = { _, _ -> },
     onClearClipboardBuffer: () -> Unit = {},
+    scrollToClipboardTrigger: Int = 0,
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
-
+    val listState = rememberLazyListState()
     val isPhonePeer = connectedDevice?.isPhone == true
 
+    LaunchedEffect(scrollToClipboardTrigger) {
+        if (scrollToClipboardTrigger > 0) {
+            val clipboardHeaderIdx = if (activeTransfer != null) 3 else 2
+            listState.animateScrollToItem(clipboardHeaderIdx)
+        }
+    }
+
     LazyColumn(
+        state = listState,
         modifier = modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp),

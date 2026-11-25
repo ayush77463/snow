@@ -803,20 +803,22 @@ class SnowHttpTransferServer:
 
         repo_root = Path(__file__).resolve().parent.parent.parent.parent
         expected_dir = (repo_root / "packaging" / "output").resolve()
-        candidate = (expected_dir / "SNOW-Mobile-4.1.0.apk").resolve()
-        try:
-            if candidate.is_relative_to(expected_dir) and candidate.is_file():
-                return candidate
-        except (ValueError, OSError):
-            pass
+        for apk_name in ("SNOW-Mobile-5.0.0.apk", "SNOW-Mobile-4.1.0.apk", "SNOW-Mobile.apk"):
+            candidate = (expected_dir / apk_name).resolve()
+            try:
+                if candidate.is_relative_to(expected_dir) and candidate.is_file():
+                    return candidate
+            except (ValueError, OSError):
+                pass
 
         cwd_expected = (Path.cwd() / "packaging" / "output").resolve()
-        cwd_candidate = (cwd_expected / "SNOW-Mobile-4.1.0.apk").resolve()
-        try:
-            if cwd_candidate.is_relative_to(cwd_expected) and cwd_candidate.is_file():
-                return cwd_candidate
-        except (ValueError, OSError):
-            pass
+        for apk_name in ("SNOW-Mobile-5.0.0.apk", "SNOW-Mobile-4.1.0.apk", "SNOW-Mobile.apk"):
+            cwd_candidate = (cwd_expected / apk_name).resolve()
+            try:
+                if cwd_candidate.is_relative_to(cwd_expected) and cwd_candidate.is_file():
+                    return cwd_candidate
+            except (ValueError, OSError):
+                pass
 
         return None
 
@@ -840,10 +842,11 @@ class SnowHttpTransferServer:
         sha256 = h.hexdigest()
         size_bytes = apk_path.stat().st_size
 
+        version_name = getattr(self.config, "version", "5.0.0") or "5.0.0"
         return web.json_response({
             "available": True,
-            "version_code": 1,
-            "version_name": "4.1.0",
+            "version_code": 2,
+            "version_name": version_name,
             "size_bytes": size_bytes,
             "sha256": sha256
         })

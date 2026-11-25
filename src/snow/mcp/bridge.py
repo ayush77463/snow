@@ -770,12 +770,15 @@ class SnowMcpBridge:
         )
 
     async def media_control(
-        self, action: str, target: str = "windows", device_id: str = ""
+        self, action: str, target: str = "windows", device_id: str = "", value: Optional[int] = None
     ) -> dict[str, Any]:
         """Send media playback and volume control commands."""
         clean_target = (target or "windows").strip().lower()
+        payload: dict[str, Any] = {"action": action}
+        if value is not None:
+            payload["value"] = value
         if clean_target in ("windows", "desktop", "local"):
-            return await self._execute_local_or_ipc("media_control", {"action": action})
+            return await self._execute_local_or_ipc("media_control", payload)
         else:
             target_id, err = await self._resolve_android_target(device_id)
             if not target_id:
@@ -783,7 +786,7 @@ class SnowMcpBridge:
             return await self.send_device_request(
                 device_id=target_id,
                 action="media_control",
-                data={"action": action},
+                data=payload,
                 timeout=15.0,
             )
 

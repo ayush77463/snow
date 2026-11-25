@@ -51,7 +51,12 @@ sealed class AuthState {
     object Disconnected : AuthState()
     object Connecting : AuthState()
     object ConnectedUnauthenticated : AuthState()
-    data class Authenticated(val sessionId: String, val trustTier: String = "peer") : AuthState()
+    data class Authenticated(
+        val sessionId: String,
+        val trustTier: String = "peer",
+        val peerDeviceName: String? = null,
+        val peerDeviceType: String? = null
+    ) : AuthState()
     data class AuthFailed(val reason: String) : AuthState()
     data class FingerprintConfirmationRequired(val fingerprint: String) : AuthState()
     data class FingerprintMismatch(val pinned: String, val presented: String) : AuthState()
@@ -102,8 +107,13 @@ class SnowWebSocketClient(
     private val _authState = MutableStateFlow<AuthState>(AuthState.Disconnected)
     val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
-    fun setAuthenticated(sessionId: String) {
-        _authState.value = AuthState.Authenticated(sessionId)
+    fun setAuthenticated(
+        sessionId: String,
+        trustTier: String = "peer",
+        peerDeviceName: String? = null,
+        peerDeviceType: String? = null
+    ) {
+        _authState.value = AuthState.Authenticated(sessionId, trustTier, peerDeviceName, peerDeviceType)
     }
 
     private val _logs = MutableSharedFlow<String>(replay = 50, extraBufferCapacity = 100)
@@ -629,11 +639,18 @@ class SnowWebSocketClient(
                 )
             ) { response ->
                 if (response.type == MessageType.RESPONSE && response.payload?.get("status") == "success") {
-                    val data = response.payload["data"] as? Map<*, *>
+                    val data = (response.payload["data"] as? Map<*, *>) ?: response.payload
                     val sessionId = data?.get("session_id") as? String ?: "active"
                     val trustTier = data?.get("trust_tier") as? String ?: "peer"
-                    _authState.value = AuthState.Authenticated(sessionId, trustTier)
-                    log("Authenticated successfully with desktop core [session=$sessionId, tier=$trustTier]")
+                    val manifest = data?.get("manifest") as? Map<*, *>
+                    val peerName = (data?.get("device_name") as? String)
+                        ?: (manifest?.get("device_name") as? String)
+                    val peerType = (data?.get("device_type") as? String)
+                        ?: (data?.get("platform") as? String)
+                        ?: (manifest?.get("platform") as? String)
+                        ?: (manifest?.get("device_type") as? String)
+                    _authState.value = AuthState.Authenticated(sessionId, trustTier, peerName, peerType)
+                    log("Authenticated successfully with peer core [session=$sessionId, tier=$trustTier, type=${peerType ?: "unknown"}]")
                 } else {
                     val errCode = response.error?.code ?: ErrorCode.UNAUTHORIZED
                     val errMsg = response.error?.message ?: "Authentication rejected."

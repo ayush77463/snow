@@ -1,16 +1,14 @@
 /**
- * SNOW V4.1 — Modern Web Dashboard Client
- * 
- * Secure, zero-dependency local dashboard interface for SNOW Core.
- * Communicates with http://127.0.0.1:8769 over authenticated REST endpoints.
- * Phase 4 Stage 4B Web UI Closure.
+ * SNOW V5 Flagship Web Client — Windows Web V5 Architecture
+ * Live Loopback REST / WebSocket Bridge Client for Headless SNOW Core.
+ * Strictly offline-first: Zero CDNs, zero inline handlers (CSP strict), 100% route parity.
  */
 
 (function () {
     "use strict";
 
     // =========================================================================
-    // Core Utility Functions
+    // Core Utilities & Constants
     // =========================================================================
 
     function escapeHtml(str) {
@@ -24,11 +22,29 @@
     }
 
     function formatBytes(bytes) {
-        if (bytes === null || bytes === undefined || isNaN(bytes) || bytes <= 0) return null;
+        if (bytes === null || bytes === undefined || isNaN(bytes) || bytes < 0) return "--";
+        if (bytes === 0) return "0 B";
         const gb = bytes / (1024 * 1024 * 1024);
-        if (gb >= 1) return `${gb.toFixed(1)} GB`;
+        if (gb >= 1) return gb.toFixed(1) + " GB";
         const mb = bytes / (1024 * 1024);
-        return `${Math.round(mb)} MB`;
+        if (mb >= 1) return mb.toFixed(1) + " MB";
+        const kb = bytes / 1024;
+        if (kb >= 1) return kb.toFixed(0) + " KB";
+        return bytes + " B";
+    }
+
+    function formatTimestamp(ts) {
+        if (!ts) return "";
+        try {
+            if (typeof ts === "number") {
+                return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            }
+            const d = new Date(ts);
+            if (!isNaN(d.getTime())) {
+                return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            }
+        } catch (e) {}
+        return String(ts);
     }
 
     function showNotificationToast(msg, type = "info") {
@@ -37,51 +53,32 @@
         if (!container) {
             container = document.createElement("div");
             container.id = "toast-container";
-            container.style.position = "fixed";
-            container.style.bottom = "24px";
-            container.style.right = "24px";
-            container.style.zIndex = "99999";
-            container.style.display = "flex";
-            container.style.flexDirection = "column";
-            container.style.gap = "8px";
-            container.style.pointerEvents = "none";
             document.body.appendChild(container);
         }
 
         const toast = document.createElement("div");
-        toast.className = `toast-pill toast-${type}`;
-        toast.style.pointerEvents = "auto";
-        toast.style.background = type === "error" ? "var(--danger-color, #ef4444)" :
-                                 type === "warning" ? "#f59e0b" :
-                                 type === "success" ? "var(--success-color, #10b981)" : "var(--accent-primary, #2563eb)";
-        toast.style.color = "#ffffff";
-        toast.style.padding = "10px 16px";
-        toast.style.borderRadius = "8px";
-        toast.style.boxShadow = "0 4px 12px rgba(0,0,0,0.3)";
-        toast.style.fontSize = "0.875rem";
-        toast.style.fontWeight = "600";
-        toast.style.opacity = "0";
-        toast.style.transition = "opacity 0.2s ease, transform 0.2s ease";
-        toast.style.transform = "translateY(10px)";
+        toast.className = `toast toast-${type}`;
+        if (type === "error") {
+            toast.style.borderColor = "var(--snow-accent-rose)";
+            toast.style.color = "var(--snow-status-rose-text)";
+        } else if (type === "success") {
+            toast.style.borderColor = "var(--snow-accent-emerald)";
+            toast.style.color = "var(--snow-status-emerald-text)";
+        } else if (type === "warning") {
+            toast.style.borderColor = "var(--snow-accent-amber)";
+            toast.style.color = "var(--snow-status-amber-text)";
+        }
         toast.textContent = msg;
-
         container.appendChild(toast);
-        requestAnimationFrame(() => {
-            toast.style.opacity = "1";
-            toast.style.transform = "translateY(0)";
-        });
 
         setTimeout(() => {
             toast.style.opacity = "0";
-            toast.style.transform = "translateY(-10px)";
-            setTimeout(() => {
-                if (toast.parentNode) toast.parentNode.removeChild(toast);
-            }, 300);
-        }, 4000);
+            toast.style.transition = "opacity 0.2s ease";
+            setTimeout(() => toast.remove(), 250);
+        }, 3500);
     }
     window.showNotificationToast = showNotificationToast;
 
-    // View Titles Mapping
     const TITLE_MAP = {
         overview: "Home",
         devices: "Devices & Network",
@@ -91,43 +88,31 @@
         settings: "AI & Settings",
     };
 
-    // Application State
+    // Global Application State
     let csrfToken = "";
     let currentTab = "overview";
     let activeDeviceId = "";
+    let hasUserSelectedDevice = false;
     let currentSubpath = "";
     let isCorePaused = false;
+    let isCoreOnline = true;
     let registeredDevices = [];
-    let qrCountdownTimer = null;
+    let federationGrants = [];
+    let activeNotifications = [];
     let pollIntervalTimer = null;
+    let qrCountdownTimer = null;
     let currentDeviceFilter = "all";
-    let pendingApprovalItem = null;
-    let pendingOAuthItem = null;
+    let currentFilesSegment = "files";
     let replyingNotificationKey = "";
     let localHostIdentity = "This PC";
-
-    // DOM Elements
-    const authOverlay = document.getElementById("auth-overlay");
-    const authStatusText = document.getElementById("auth-status-text");
-    const coreStatusDot = document.getElementById("core-status-dot");
-    const coreStatusText = document.getElementById("core-status-text");
-    const btnDesktopPause = document.getElementById("btn-desktop-pause");
-    const btnDesktopPoweroff = document.getElementById("btn-desktop-poweroff");
-    const poweroffModal = document.getElementById("poweroff-modal");
-    const btnPoweroffCancel = document.getElementById("btn-poweroff-cancel");
-    const btnPoweroffConfirm = document.getElementById("btn-poweroff-confirm");
-    const globalTargetSelect = document.getElementById("global-target-select");
-    const globalTargetTransportChip = document.getElementById("global-target-transport-chip");
-    const btnThemeToggle = document.getElementById("btn-theme-toggle");
-    const btnGlobalRefresh = document.getElementById("btn-global-refresh");
-    const btnTopbarCommandPalette = document.getElementById("btn-topbar-command-palette");
-    const commandPaletteOverlay = document.getElementById("command-palette-overlay");
-    const commandPaletteInput = document.getElementById("command-palette-input");
-    const btnTopbarApprovals = document.getElementById("btn-topbar-approvals");
-    const topbarApprovalsBadge = document.getElementById("topbar-approvals-badge");
+    let localHostTelemetry = {};
+    let canonicalSnowId = "SNW-LOCAL";
+    let activeUploadXhr = null;
+    let pendingUpdateMeta = null;
+    let modalPurposeMode = "share"; // "share" | "clipboard"
 
     // =========================================================================
-    // API Helper
+    // API Helpers & Identity Classification
     // =========================================================================
 
     async function apiRequest(endpoint, method = "GET", data = null) {
@@ -137,7 +122,7 @@
         }
 
         const options = { method, headers };
-        if (data && (method === "POST" || method === "PUT" || method === "DELETE")) {
+        if (data !== null && (method === "POST" || method === "PUT" || method === "DELETE")) {
             options.body = JSON.stringify(data);
         }
 
@@ -149,6 +134,7 @@
                     showNotificationToast("Session expired. Reconnecting...", "warning");
                     window.location.reload();
                 }
+                return errData;
             }
             return await resp.json();
         } catch (err) {
@@ -156,20 +142,43 @@
         }
     }
 
-    // Helper: isLocalNode
     function isLocalNode(d) {
         if (!d) return false;
         return Boolean(d.is_local || d.device_id === "local" || (d.device_name && d.device_name.includes("(This PC)")));
     }
 
-    // Helper: isAndroidDevice
     function isAndroidDevice(d) {
         if (!d) return false;
         return d.platform === "android" || d.device_type === "phone" || d.device_type === "android";
     }
 
+    function resolveTransportLabel(dev) {
+        if (!dev) return "Offline";
+        if (isLocalNode(dev)) return "Host";
+        const t = String(dev.transport || "").toLowerCase();
+        const ep = String(dev.endpoint || "");
+        if (t === "usb" || ep.includes("127.0.0.1")) return "USB";
+        if (t === "relay" || ep.includes("/v1/tunnel")) return "Remote";
+        if (t === "peer") return "Direct Peer";
+        return "Wi-Fi";
+    }
+
+    function parseHostAndPort(rawInput) {
+        const trimmed = String(rawInput || "").trim();
+        if (!trimmed) return null;
+        if (trimmed.includes(":")) {
+            const parts = trimmed.split(":");
+            const port = parseInt(parts[parts.length - 1], 10);
+            const host = parts.slice(0, -1).join(":").trim();
+            if (host && !isNaN(port) && port > 0 && port <= 65535) {
+                return { host, port };
+            }
+        }
+        return { host: trimmed, port: 8765 };
+    }
+
     // =========================================================================
-    // 1. Authentication & Bootstrap
+    // 1. Session Bootstrap & Lifecycle
     // =========================================================================
 
     async function initSession() {
@@ -181,9 +190,12 @@
             history.replaceState(null, "", window.location.pathname);
         }
 
+        const authStatus = document.getElementById("auth-status-text");
+        const authOverlay = document.getElementById("auth-overlay");
+
         try {
             if (bootstrapToken) {
-                if (authStatusText) authStatusText.textContent = "Verifying single-use bootstrap token...";
+                if (authStatus) authStatus.textContent = "Verifying single-use bootstrap token...";
                 const res = await fetch("/api/auth/session", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -199,150 +211,86 @@
             }
 
             // Probe existing session via /api/status
-            const statusResp = await fetch("/api/status");
-            const statusData = await statusResp.json();
-            if (statusData && statusData.csrf_token) {
-                csrfToken = statusData.csrf_token;
-                if (authOverlay) authOverlay.classList.add("d-none");
-                startDashboard();
-                return;
+            const statusRes = await fetch("/api/status");
+            if (statusRes.ok) {
+                const statusData = await statusRes.json();
+                if (statusData && statusData.csrf_token) {
+                    csrfToken = statusData.csrf_token;
+                    if (authOverlay) authOverlay.classList.add("d-none");
+                    startDashboard();
+                    return;
+                }
             }
 
-            // Fallback development session
-            const devAuth = await fetch("/api/auth/session", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ token: "dev-local-session" }),
-            });
-            const devData = await devAuth.json();
-            if (devData.csrf_token) {
-                csrfToken = devData.csrf_token;
-            }
             if (authOverlay) authOverlay.classList.add("d-none");
             startDashboard();
-        } catch (e) {
+        } catch (err) {
+            if (authStatus) authStatus.textContent = "SNOW Core unreachable on 127.0.0.1:8769.";
             if (authOverlay) authOverlay.classList.add("d-none");
             startDashboard();
         }
     }
 
     function startDashboard() {
-        initNavigation();
         initTheming();
+        initSidebar();
+        initNavigation();
+        initDeviceIsland();
         initCommandPalette();
-        initCoreControls();
-        initHeroActions();
-        initPairingView();
+        initHomeHub();
+        initDevicesView();
         initFilesView();
         initClipboardView();
         initAiSettingsView();
         initModals();
 
-        // Initial fetch & start polling
         refreshAllData();
         if (pollIntervalTimer) clearInterval(pollIntervalTimer);
-        pollIntervalTimer = setInterval(refreshAllData, 3000);
+        pollIntervalTimer = setInterval(pollStateUpdates, 3000);
     }
 
     // =========================================================================
-    // 2. Navigation & Tabs
+    // 2. Theming (System, Light Mode, Dark Mode)
     // =========================================================================
 
-    function initNavigation() {
-        const navButtons = document.querySelectorAll(".nav-menu .nav-item");
-        navButtons.forEach(btn => {
-            btn.addEventListener("click", () => {
-                const tab = btn.getAttribute("data-tab");
-                if (!tab) return;
-                switchTab(tab);
+    function initTheming() {
+        const savedTheme = localStorage.getItem("snow_theme") || "system";
+        applyTheme(savedTheme);
+
+        const btnThemeToggle = document.getElementById("btn-theme-toggle");
+        if (btnThemeToggle) {
+            btnThemeToggle.addEventListener("click", () => {
+                const isDarkNow = document.documentElement.classList.contains("theme-dark");
+                const next = isDarkNow ? "light" : "dark";
+                localStorage.setItem("snow_theme", next);
+                applyTheme(next);
             });
+        }
+
+        ["system", "light", "dark"].forEach(themeKey => {
+            const radio = document.getElementById(`theme-opt-${themeKey}`);
+            if (radio) {
+                radio.checked = (savedTheme === themeKey);
+                radio.addEventListener("change", () => {
+                    if (radio.checked) {
+                        localStorage.setItem("snow_theme", themeKey);
+                        applyTheme(themeKey);
+                    }
+                });
+            }
         });
 
-        // Topbar Bell navigates directly to AI & Settings Approvals section
-        if (btnTopbarApprovals) {
-            btnTopbarApprovals.addEventListener("click", () => {
-                switchTab("settings");
-                const approvCard = document.querySelector(".approvals-activity-card");
-                if (approvCard) {
-                    approvCard.scrollIntoView({ behavior: "smooth" });
+        if (window.matchMedia) {
+            window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+                const current = localStorage.getItem("snow_theme") || "system";
+                if (current === "system") {
+                    applyTheme("system");
                 }
             });
         }
     }
 
-    function switchTab(tabId) {
-        currentTab = tabId;
-        const navButtons = document.querySelectorAll(".nav-menu .nav-item");
-        navButtons.forEach(btn => {
-            if (btn.getAttribute("data-tab") === tabId) {
-                btn.classList.add("active");
-            } else {
-                btn.classList.remove("active");
-            }
-        });
-
-        const tabPanes = document.querySelectorAll(".tab-pane");
-        tabPanes.forEach(pane => {
-            if (pane.id === `section-${tabId}`) {
-                pane.classList.add("active");
-            } else {
-                pane.classList.remove("active");
-            }
-        });
-
-        if (tabId === "overview") {
-            loadHomeWidgets();
-        } else if (tabId === "devices") {
-            renderDevicesView();
-            loadPairingQR();
-            loadRelayTunnelStatus();
-            loadFederationGrants();
-        } else if (tabId === "files") {
-            loadFiles(currentSubpath);
-            loadQuickApps();
-        } else if (tabId === "clipboard") {
-            loadClipboardItems();
-        } else if (tabId === "settings") {
-            loadAiLinkStatus();
-            loadAiHostStatus();
-            loadPendingApprovals();
-            loadActivityTimeline();
-        }
-    }
-
-    // =========================================================================
-    // 3. Theming & Zero-Flash Sync
-    // =========================================================================
-
-    function initTheming() {
-        const radios = document.querySelectorAll('input[name="theme-radio"]');
-        const savedTheme = localStorage.getItem("snow_theme") || "system";
-
-        radios.forEach(radio => {
-            radio.checked = (radio.value === savedTheme);
-            const parentSeg = radio.closest(".seg-item");
-            if (parentSeg) {
-                if (radio.value === savedTheme) parentSeg.classList.add("active");
-                else parentSeg.classList.remove("active");
-            }
-
-            radio.addEventListener("change", () => {
-                applyTheme(radio.value);
-            });
-        });
-
-        if (btnThemeToggle) {
-            btnThemeToggle.addEventListener("click", () => {
-                const cur = document.documentElement.classList.contains("theme-dark") ? "dark" : "light";
-                const next = cur === "dark" ? "light" : "dark";
-                applyTheme(next);
-            });
-        }
-    }
-
     function applyTheme(themeChoice) {
-        localStorage.setItem("snow_theme", themeChoice);
-
         let isDark = false;
         if (themeChoice === "dark") {
             isDark = true;
@@ -353,972 +301,1312 @@
         }
 
         document.documentElement.className = isDark ? "theme-dark" : "theme-light";
-        document.body.className = isDark ? "theme-dark" : "theme-light";
 
-        const radios = document.querySelectorAll('input[name="theme-radio"]');
-        radios.forEach(r => {
-            r.checked = (r.value === themeChoice);
-            const parentSeg = r.closest(".seg-item");
-            if (parentSeg) {
-                if (r.value === themeChoice) parentSeg.classList.add("active");
-                else parentSeg.classList.remove("active");
-            }
+        const sunIcon = document.getElementById("theme-icon-sun");
+        const moonIcon = document.getElementById("theme-icon-moon");
+        if (sunIcon && moonIcon) {
+            sunIcon.classList.toggle("d-none", !isDark);
+            moonIcon.classList.toggle("d-none", isDark);
+        }
+
+        ["system", "light", "dark"].forEach(k => {
+            const radio = document.getElementById(`theme-opt-${k}`);
+            if (radio) radio.checked = (themeChoice === k);
         });
     }
 
     // =========================================================================
-    // 4. Core Lifecycle: Pause / Resume / Power-Off
+    // 3. Sidebar Rail & Core Controls
     // =========================================================================
 
-    function initCoreControls() {
-        if (btnDesktopPause) {
-            btnDesktopPause.addEventListener("click", async () => {
-                if (!isCorePaused) {
-                    const res = await apiRequest("/api/system/pause", "POST", { reason: "Owner requested via Web UI" });
-                    if (res && res.success) {
-                        isCorePaused = true;
-                        btnDesktopPause.textContent = "▶ Resume";
-                        if (coreStatusDot) coreStatusDot.className = "status-dot dot-offline";
-                        if (coreStatusText) coreStatusText.textContent = "Core Paused";
-                        showNotificationToast("SNOW Core paused. USB & sync listeners suspended.", "warning");
-                    } else {
-                        showNotificationToast(res?.error || "Failed to pause Core", "error");
-                    }
-                } else {
+    function initSidebar() {
+        const sidebar = document.getElementById("main-sidebar");
+        const toggleBtn = document.getElementById("btn-sidebar-toggle");
+        const isCollapsed = localStorage.getItem("snow_sidebar_collapsed") === "true";
+
+        if (sidebar && isCollapsed) {
+            sidebar.classList.add("collapsed");
+        }
+
+        if (toggleBtn && sidebar) {
+            toggleBtn.addEventListener("click", () => {
+                sidebar.classList.toggle("collapsed");
+                localStorage.setItem("snow_sidebar_collapsed", String(sidebar.classList.contains("collapsed")));
+            });
+        }
+
+        const btnPause = document.getElementById("btn-desktop-pause");
+        if (btnPause) {
+            btnPause.addEventListener("click", async () => {
+                if (isCorePaused) {
                     const res = await apiRequest("/api/system/resume", "POST", {});
                     if (res && res.success) {
                         isCorePaused = false;
-                        btnDesktopPause.textContent = "⏸ Pause";
-                        if (coreStatusDot) coreStatusDot.className = "status-dot dot-active";
-                        if (coreStatusText) coreStatusText.textContent = "Core Online";
                         showNotificationToast("SNOW Core resumed.", "success");
                     } else {
-                        showNotificationToast(res?.error || "Failed to resume Core", "error");
+                        showNotificationToast(res?.error || "Failed resuming Core", "error");
+                    }
+                } else {
+                    const res = await apiRequest("/api/system/pause", "POST", { reason: "Owner paused via Web Dashboard" });
+                    if (res && res.success) {
+                        isCorePaused = true;
+                        showNotificationToast("SNOW Core paused.", "warning");
+                    } else {
+                        showNotificationToast(res?.error || "Failed pausing Core", "error");
                     }
                 }
+                updateCoreStatusBadge();
             });
         }
 
-        if (btnDesktopPoweroff) {
-            btnDesktopPoweroff.addEventListener("click", () => {
-                if (poweroffModal) poweroffModal.classList.remove("d-none");
-            });
-        }
+        const btnPoweroff = document.getElementById("btn-desktop-poweroff");
+        const poweroffModal = document.getElementById("poweroff-modal");
+        const btnPoweroffCancel = document.getElementById("btn-poweroff-cancel");
+        const btnPoweroffConfirm = document.getElementById("btn-poweroff-confirm");
 
-        if (btnPoweroffCancel) {
-            btnPoweroffCancel.addEventListener("click", () => {
-                if (poweroffModal) poweroffModal.classList.add("d-none");
-            });
+        if (btnPoweroff && poweroffModal) {
+            btnPoweroff.addEventListener("click", () => poweroffModal.classList.remove("d-none"));
         }
-
+        if (btnPoweroffCancel && poweroffModal) {
+            btnPoweroffCancel.addEventListener("click", () => poweroffModal.classList.add("d-none"));
+        }
         if (btnPoweroffConfirm) {
             btnPoweroffConfirm.addEventListener("click", async () => {
-                if (poweroffModal) poweroffModal.classList.add("d-none");
-                showNotificationToast("Shutting down SNOW Desktop Core...", "warning");
+                showNotificationToast("Initiating SNOW Desktop shutdown...", "warning");
                 await apiRequest("/api/system/shutdown", "POST", { reason: "Owner initiated power-off" });
+                if (poweroffModal) poweroffModal.classList.add("d-none");
                 document.body.innerHTML = `
-                    <div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:var(--bg-app);color:var(--text-primary);text-align:center;">
-                        <span style="font-size:3rem;margin-bottom:1rem;">❄</span>
-                        <h2>SNOW Desktop Core Has Shut Down</h2>
-                        <p style="color:var(--text-muted);margin-top:0.5rem;">All background processes have terminated cleanly. You can close this tab.</p>
+                    <div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:var(--snow-bg-canvas);color:var(--snow-text-primary);text-align:center;gap:12px;">
+                        <h2 style="font-size:20px;font-weight:700;">SNOW Desktop Core Has Shut Down</h2>
+                        <p class="text-sm text-muted">All local background processes have terminated cleanly. You may close this tab.</p>
                     </div>
                 `;
             });
         }
+    }
 
-        if (btnGlobalRefresh) {
-            btnGlobalRefresh.addEventListener("click", () => {
-                refreshAllData();
-                showNotificationToast("Refreshed live state.", "info");
-            });
+    function updateCoreStatusBadge() {
+        const dot = document.getElementById("core-status-dot");
+        const text = document.getElementById("core-status-text");
+        const btnPause = document.getElementById("btn-desktop-pause");
+        const bridgeStatusEl = document.getElementById("home-bridge-status");
+
+        if (btnPause) {
+            const label = btnPause.querySelector("span");
+            if (label) label.textContent = isCorePaused ? "Resume" : "Pause";
+        }
+
+        if (!dot || !text) return;
+        if (!isCoreOnline) {
+            dot.className = "status-dot dot-offline";
+            text.textContent = "Core Offline";
+            if (bridgeStatusEl) {
+                bridgeStatusEl.textContent = "Reconnecting to SNOW Core...";
+                bridgeStatusEl.className = "text-xs text-amber";
+            }
+        } else if (isCorePaused) {
+            dot.className = "status-dot dot-paused";
+            text.textContent = "Core Paused";
+            if (bridgeStatusEl) {
+                bridgeStatusEl.textContent = "Daemon Paused by Owner";
+                bridgeStatusEl.className = "text-xs text-amber";
+            }
+        } else {
+            dot.className = "status-dot dot-active";
+            text.textContent = "Core Online";
+            if (bridgeStatusEl) {
+                bridgeStatusEl.textContent = "Local Loopback Active";
+                bridgeStatusEl.className = "text-xs text-emerald";
+            }
         }
     }
 
     // =========================================================================
-    // 5. Hero Card & Device Updates
+    // 4. Navigation & Views Switching
     // =========================================================================
 
-    function updateHeroCard(device) {
-        const nameEl = document.getElementById("hero-device-name");
-        const iconEl = document.getElementById("hero-device-icon");
-        const transportPill = document.getElementById("hero-transport-pill");
-        const batteryEl = document.getElementById("hero-battery-indicator");
-        const ramEl = document.getElementById("hero-ram-text");
-        const storageEl = document.getElementById("hero-storage-text");
-        const progressEl = document.getElementById("hero-resource-progress");
-        const btnLock = document.getElementById("btn-hero-lock-pc");
-        const btnSend = document.getElementById("btn-hero-send-file");
-        const btnRing = document.getElementById("btn-hero-ring-phone");
-        const btnCapture = document.getElementById("btn-hero-capture-screen");
-        const bezelWrapper = document.querySelector(".laptop-bezel");
+    function initNavigation() {
+        document.querySelectorAll(".nav-menu .nav-item").forEach(item => {
+            item.addEventListener("click", () => {
+                const tab = item.getAttribute("data-tab");
+                if (tab) switchTab(tab);
+            });
+        });
 
-        if (!device || isLocalNode(device)) {
-            // Local PC presentation
+        const btnBell = document.getElementById("btn-topbar-approvals");
+        if (btnBell) {
+            btnBell.addEventListener("click", () => {
+                switchTab("settings");
+                document.querySelector(".approvals-activity-card")?.scrollIntoView({ behavior: "smooth" });
+            });
+        }
+
+        const refreshBtn = document.getElementById("btn-global-refresh");
+        if (refreshBtn) {
+            refreshBtn.addEventListener("click", () => {
+                refreshAllData();
+                showNotificationToast("Refreshed live data.", "info");
+            });
+        }
+    }
+
+    function switchTab(tabId) {
+        currentTab = tabId;
+        if (TITLE_MAP[tabId]) {
+            document.title = `SNOW — ${TITLE_MAP[tabId]}`;
+        }
+
+        document.querySelectorAll(".nav-item").forEach(item => {
+            item.classList.toggle("active", item.getAttribute("data-tab") === tabId);
+        });
+
+        document.querySelectorAll(".tab-pane").forEach(pane => {
+            pane.classList.toggle("active", pane.id === `section-${tabId}`);
+        });
+
+        if (tabId === "overview") {
+            const dev = getSelectedDeviceObj();
+            updateHeroCard(dev);
+            loadHomeWidgets();
+        } else if (tabId === "devices") {
+            renderDevicesView();
+        } else if (tabId === "files") {
+            loadFiles(currentSubpath);
+            loadRemoteApps();
+        } else if (tabId === "clipboard") {
+            loadClipboardItems();
+        } else if (tabId === "settings") {
+            loadAiSettingsView();
+        }
+    }
+
+    // =========================================================================
+    // 5. Floating Device Selector Island
+    // =========================================================================
+
+    function getSelectedDeviceObj() {
+        if (!activeDeviceId || activeDeviceId === "local") return null;
+        return registeredDevices.find(d => d.device_id === activeDeviceId) || null;
+    }
+
+    function initDeviceIsland() {
+        const capsule = document.getElementById("topbar-device-capsule");
+        const container = document.getElementById("device-island-container");
+        const btnIslandConnect = document.getElementById("btn-island-connect");
+
+        if (capsule && container) {
+            capsule.addEventListener("click", (e) => {
+                e.stopPropagation();
+                container.classList.toggle("d-none");
+            });
+            container.addEventListener("click", (e) => {
+                if (e.target === container) container.classList.add("d-none");
+            });
+        }
+
+        if (btnIslandConnect) {
+            btnIslandConnect.addEventListener("click", () => {
+                container?.classList.add("d-none");
+                openConnectModal();
+            });
+        }
+
+        document.getElementById("btn-topbar-connect")?.addEventListener("click", openConnectModal);
+    }
+
+    function renderDeviceIsland() {
+        const pairedContainer = document.getElementById("island-paired-devices");
+        const networkIdBadge = document.getElementById("island-network-id");
+        const localNameEl = document.getElementById("island-local-name");
+        const localHostRow = document.getElementById("island-local-host");
+        const fedContainer = document.getElementById("island-federation-peers");
+        const fedEmpty = document.getElementById("island-federation-empty");
+
+        if (networkIdBadge) networkIdBadge.textContent = canonicalSnowId;
+        if (localNameEl) localNameEl.textContent = localHostIdentity;
+
+        if (localHostRow) {
+            const isLocalActive = !activeDeviceId || activeDeviceId === "local";
+            localHostRow.classList.toggle("active", isLocalActive);
+            localHostRow.onclick = () => {
+                selectActiveDevice("local", true);
+                document.getElementById("device-island-container")?.classList.add("d-none");
+            };
+        }
+
+        if (pairedContainer) {
+            pairedContainer.innerHTML = "";
+            const nonLocal = registeredDevices.filter(d => !isLocalNode(d));
+            if (nonLocal.length === 0) {
+                pairedContainer.innerHTML = `<span class="text-xs text-muted" style="padding: 4px;">No paired devices yet. Click Connect to pair.</span>`;
+            } else {
+                nonLocal.forEach(dev => {
+                    const isSelected = (dev.device_id === activeDeviceId);
+                    const isConn = Boolean(dev.is_connected);
+                    const row = document.createElement("div");
+                    row.className = `island-item ${isSelected ? "active" : ""}`;
+
+                    const transport = resolveTransportLabel(dev);
+                    const dotClass = isConn ? "dot-active" : "dot-paused";
+                    const batVal = dev.telemetry?.battery_level ?? dev.battery?.level ?? dev.battery_level;
+                    const batPart = (batVal !== null && batVal !== undefined) ? ` • ${batVal}%` : "";
+                    const iconSvg = isAndroidDevice(dev)
+                        ? `<svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="20" rx="2" ry="2" width="14" x="5" y="2"></rect><line x1="12" x2="12.01" y1="18" y2="18"></line></svg>`
+                        : `<svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="12" rx="2" width="20" x="2" y="4"></rect><line x1="2" x2="22" y1="20" y2="20"></line></svg>`;
+
+                    row.innerHTML = `
+                        <div class="island-device-info min-w-0">
+                            <div class="island-icon-box">${iconSvg}</div>
+                            <div class="flex flex-col min-w-0">
+                                <span class="text-sm font-semibold text-primary leading-tight truncate">${escapeHtml(dev.device_name || "Device")}</span>
+                                <span class="text-xs text-muted flex items-center gap-1">
+                                    <span class="status-dot ${dotClass}" style="width:6px;height:6px;"></span>
+                                    <span>${isConn ? transport : "Offline"}${batPart} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}</span>
+                                </span>
+                            </div>
+                        </div>
+                        ${isSelected ? `<svg class="svg-icon svg-icon-sm text-cyan" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>` : ""}
+                    `;
+
+                    row.addEventListener("click", () => {
+                        selectActiveDevice(dev.device_id, true);
+                        document.getElementById("device-island-container")?.classList.add("d-none");
+                    });
+                    pairedContainer.appendChild(row);
+                });
+            }
+        }
+
+        // Render Section 2: OTHER NETWORKS (Active Federated Grants)
+        if (fedContainer && fedEmpty) {
+            fedContainer.innerHTML = "";
+            const activeGrants = (federationGrants || []).filter(g => String(g.status || "ACTIVE").toUpperCase() === "ACTIVE");
+            if (activeGrants.length === 0) {
+                fedEmpty.classList.remove("d-none");
+            } else {
+                fedEmpty.classList.add("d-none");
+                activeGrants.forEach(g => {
+                    const row = document.createElement("div");
+                    row.className = "island-item";
+                    const peerLabel = g.network_name || g.peer_node_name || g.peer_node_id || g.grant_id;
+                    const caps = Array.isArray(g.allowed_capabilities) && g.allowed_capabilities.length > 0
+                        ? g.allowed_capabilities.slice(0, 2).join(", ")
+                        : "Scoped Access";
+                    row.innerHTML = `
+                        <div class="island-device-info min-w-0">
+                            <div class="island-icon-box">
+                                <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="2" x2="22" y1="12" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+                            </div>
+                            <div class="flex flex-col min-w-0">
+                                <span class="text-sm font-semibold text-primary truncate">${escapeHtml(peerLabel)}</span>
+                                <span class="text-xs text-muted truncate">${escapeHtml(g.direction || "INBOUND")} • ${escapeHtml(caps)}</span>
+                            </div>
+                        </div>
+                        <span class="chip chip-sm chip-cyan">Federated</span>
+                    `;
+                    row.addEventListener("click", () => {
+                        document.getElementById("device-island-container")?.classList.add("d-none");
+                        switchTab("devices");
+                    });
+                    fedContainer.appendChild(row);
+                });
+            }
+        }
+
+        // Sync hidden selects for Files & Topbar
+        syncDeviceSelectDropdowns();
+    }
+
+    function syncDeviceSelectDropdowns() {
+        const filesSel = document.getElementById("files-device-select");
+        if (filesSel) {
+            filesSel.innerHTML = `<option value="local">${escapeHtml(localHostIdentity)} (Host)</option>`;
+            registeredDevices.filter(d => !isLocalNode(d)).forEach(d => {
+                const opt = document.createElement("option");
+                opt.value = d.device_id;
+                const st = d.is_connected ? resolveTransportLabel(d) : "Offline";
+                opt.textContent = `${d.device_name || "Device"} (${st})`;
+                if (d.device_id === activeDeviceId) opt.selected = true;
+                filesSel.appendChild(opt);
+            });
+            if (!activeDeviceId || activeDeviceId === "local") {
+                filesSel.value = "local";
+            }
+        }
+    }
+
+    function updateTopbarCapsule(dev) {
+        const nameEl = document.getElementById("topbar-device-name");
+        const chipEl = document.getElementById("topbar-device-transport-chip");
+        const dotEl = document.getElementById("topbar-device-dot");
+
+        if (!dev || isLocalNode(dev)) {
             if (nameEl) nameEl.textContent = localHostIdentity;
-            if (iconEl) iconEl.classList.add("d-none");
-            if (bezelWrapper) bezelWrapper.classList.remove("phone-bezel");
+            if (chipEl) {
+                chipEl.textContent = "Host";
+                chipEl.className = "chip chip-sm chip-emerald";
+            }
+            if (dotEl) dotEl.className = isCoreOnline ? "status-dot dot-active" : "status-dot dot-offline";
+        } else {
+            const isConn = Boolean(dev.is_connected);
+            const transport = isConn ? resolveTransportLabel(dev) : "Disconnected";
+            if (nameEl) nameEl.textContent = dev.device_name || "Device";
+            if (chipEl) {
+                chipEl.textContent = transport;
+                chipEl.className = isConn ? "chip chip-sm chip-cyan" : "chip chip-sm chip-amber";
+            }
+            if (dotEl) dotEl.className = isConn ? "status-dot dot-active" : "status-dot dot-paused";
+        }
+    }
 
-            if (transportPill) {
-                transportPill.textContent = "Host Active • Auto USB & Wi-Fi";
-                transportPill.className = "badge-pill badge-pill-success";
-            }
-            if (batteryEl) {
-                batteryEl.textContent = "🔋 100% • AC Power";
-                batteryEl.classList.remove("d-none");
-            }
-            if (ramEl) ramEl.textContent = "Host CPU & RAM Monitored";
-            if (storageEl) storageEl.textContent = "Storage Active";
-            if (progressEl) progressEl.style.width = "25%";
+    function selectActiveDevice(deviceId, userExplicit = false) {
+        activeDeviceId = deviceId || "local";
+        if (userExplicit) hasUserSelectedDevice = true;
 
-            if (btnLock) {
-                btnLock.textContent = "🔒 Lock PC";
-                btnLock.classList.remove("d-none");
+        const dev = getSelectedDeviceObj();
+        updateTopbarCapsule(dev);
+        renderDeviceIsland();
+
+        if (currentTab === "overview") updateHeroCard(dev);
+        else if (currentTab === "devices") renderDevicesView();
+        else if (currentTab === "files") {
+            loadFiles(currentSubpath);
+            loadRemoteApps();
+        }
+    }
+
+    // =========================================================================
+    // 6. View 1: Home Hub (Hero, Transfers, Quick Actions, Media, Clip, Notifs)
+    // =========================================================================
+
+    function initHomeHub() {
+        const wallpaperImg = document.getElementById("desktop-wallpaper-img");
+        const wallpaperFallback = document.getElementById("wallpaper-fallback");
+        if (wallpaperImg) {
+            wallpaperImg.addEventListener("error", () => {
+                wallpaperImg.style.display = "none";
+                if (wallpaperFallback) wallpaperFallback.style.display = "flex";
+            });
+            wallpaperImg.addEventListener("load", () => {
+                wallpaperImg.style.display = "block";
+                if (wallpaperFallback) wallpaperFallback.style.display = "none";
+            });
+        }
+
+        const mediaPreviewImg = document.getElementById("media-preview-img");
+        if (mediaPreviewImg) {
+            mediaPreviewImg.addEventListener("error", () => {
+                mediaPreviewImg.alt = "Preview unavailable";
+            });
+        }
+
+        document.getElementById("btn-hero-lock-pc")?.addEventListener("click", async () => {
+            showNotificationToast("Locking Windows PC session...", "info");
+            const res = await apiRequest("/api/desktop/lock", "POST", {});
+            if (res && res.success) {
+                showNotificationToast("Windows workstation locked.", "success");
+            } else {
+                showNotificationToast(res?.error || "Failed locking workstation", "error");
             }
-            if (btnSend) btnSend.classList.remove("d-none");
-            if (btnRing) btnRing.classList.add("d-none");
-            if (btnCapture) btnCapture.classList.remove("d-none");
+        });
+
+        const fileInput = document.getElementById("file-upload-input");
+        document.getElementById("btn-hero-send-file")?.addEventListener("click", () => {
+            if (fileInput) fileInput.click();
+        });
+        document.getElementById("btn-hero-ring-phone")?.addEventListener("click", triggerRingPhone);
+        document.getElementById("btn-hero-capture-screen")?.addEventListener("click", triggerScreenCapture);
+        document.getElementById("btn-hero-retry-link")?.addEventListener("click", () => {
+            refreshAllData();
+            showNotificationToast("Checking device connection...", "info");
+        });
+        document.getElementById("btn-hero-switch-device")?.addEventListener("click", () => {
+            document.getElementById("device-island-container")?.classList.remove("d-none");
+        });
+
+        // Quick Actions 2x3 Grid
+        document.getElementById("btn-qa-ring")?.addEventListener("click", triggerRingPhone);
+        document.getElementById("btn-qa-screen")?.addEventListener("click", triggerScreenCapture);
+        document.getElementById("btn-qa-camera")?.addEventListener("click", triggerCameraCapture);
+        document.getElementById("btn-qa-media")?.addEventListener("click", () => triggerMediaAction("play_pause"));
+        document.getElementById("btn-qa-send-files")?.addEventListener("click", () => {
+            if (fileInput) fileInput.click();
+        });
+        document.getElementById("btn-qa-share-note")?.addEventListener("click", () => openTextModal("share"));
+
+        // Media Controls Bar (Prev, Play/Pause, Next, Mute, Volume)
+        document.getElementById("btn-media-prev")?.addEventListener("click", () => triggerMediaAction("prev"));
+        document.getElementById("btn-media-play")?.addEventListener("click", () => triggerMediaAction("play_pause"));
+        document.getElementById("btn-media-next")?.addEventListener("click", () => triggerMediaAction("next"));
+        document.getElementById("btn-media-mute")?.addEventListener("click", () => triggerMediaAction("mute"));
+
+        const volSlider = document.getElementById("now-playing-volume");
+        if (volSlider) {
+            volSlider.addEventListener("change", () => {
+                const level = Math.max(0, Math.min(100, parseInt(volSlider.value, 10) || 0));
+                triggerMediaAction("volume_set", { value: level });
+            });
+        }
+
+        // Clipboard Instant Sync toggle sync
+        const homeSyncToggle = document.getElementById("clipboard-instant-sync-toggle");
+        if (homeSyncToggle) {
+            homeSyncToggle.addEventListener("change", async () => {
+                const clipSyncToggle = document.getElementById("clipview-instant-sync-toggle");
+                if (clipSyncToggle) clipSyncToggle.checked = homeSyncToggle.checked;
+                await apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: resolveTargetDeviceId() });
+                showNotificationToast(`Instant clipboard sync ${homeSyncToggle.checked ? "triggered" : "paused"}.`, "info");
+            });
+        }
+
+        // Notifications Clear All (dismisses each active key using real /api/notifications/dismiss contract)
+        document.getElementById("btn-notifications-clear-all")?.addEventListener("click", async () => {
+            if (!activeNotifications || activeNotifications.length === 0) {
+                showNotificationToast("No active notifications to clear.", "info");
+                return;
+            }
+            for (const n of activeNotifications) {
+                const key = n.key || n.id;
+                if (key) {
+                    await apiRequest("/api/notifications/dismiss", "POST", { key, device_id: resolveTargetDeviceId() });
+                }
+            }
+            showNotificationToast("Cleared active notifications.", "info");
+            loadHomeWidgets();
+        });
+
+        // Active Transfer Cancel
+        document.getElementById("btn-active-transfer-cancel")?.addEventListener("click", () => {
+            if (activeUploadXhr) {
+                activeUploadXhr.abort();
+                activeUploadXhr = null;
+                showNotificationToast("File transfer cancelled.", "warning");
+            }
+            document.getElementById("active-transfer-container")?.classList.add("d-none");
+            document.getElementById("topbar-active-transfer-chip")?.classList.add("d-none");
+        });
+
+        document.getElementById("btn-hero-refresh-wallpaper")?.addEventListener("click", () => {
+            const img = document.getElementById("desktop-wallpaper-img");
+            if (img) img.src = `/api/desktop/wallpaper?t=${Date.now()}`;
+            showNotificationToast("Refreshing desktop wallpaper...", "info");
+        });
+    }
+
+    function resolveTargetDeviceId() {
+        if (activeDeviceId && activeDeviceId !== "local") return activeDeviceId;
+        const firstPhone = registeredDevices.find(d => !isLocalNode(d) && d.is_connected);
+        return firstPhone ? firstPhone.device_id : "";
+    }
+
+    async function triggerRingPhone() {
+        const targetId = resolveTargetDeviceId();
+        if (!targetId) {
+            showNotificationToast("Select or connect an online Android phone first.", "warning");
             return;
         }
-
-        // Remote Device Presentation
-        const isAndroid = isAndroidDevice(device);
-        if (nameEl) nameEl.textContent = device.device_name || (isAndroid ? "Android Phone" : "Remote Peer");
-        if (iconEl) {
-            iconEl.classList.remove("d-none");
-            iconEl.textContent = isAndroid ? "📱" : "💻";
-        }
-        if (bezelWrapper) {
-            if (isAndroid) bezelWrapper.classList.add("phone-bezel");
-            else bezelWrapper.classList.remove("phone-bezel");
-        }
-
-        if (transportPill) {
-            const isUsb = device.transport === "usb" || (device.endpoint && device.endpoint.includes("127.0.0.1"));
-            const isRelay = device.transport === "relay" || (device.endpoint && device.endpoint.includes("/v1/tunnel"));
-            const label = isUsb ? "● Connected • USB" : isRelay ? "● Connected • Remote" : "● Connected • Wi-Fi";
-            transportPill.textContent = label;
-            transportPill.className = "badge-pill badge-pill-success";
-        }
-
-        // Real Telemetry from Byte Fields
-        const tel = device.telemetry || {};
-        const ramTotalBytes = tel.ram_total_bytes;
-        const ramAvailBytes = tel.ram_available_bytes;
-        const storageAvailBytes = tel.storage_available_bytes;
-
-        if (batteryEl) {
-            if (device.battery && typeof device.battery.level === "number") {
-                batteryEl.textContent = `🔋 ${device.battery.level}% • ${device.battery.charging ? "Charging" : "Discharging"}`;
-                batteryEl.classList.remove("d-none");
-            } else if (device.battery_level) {
-                batteryEl.textContent = `🔋 ${device.battery_level}%`;
-                batteryEl.classList.remove("d-none");
-            } else {
-                batteryEl.classList.add("d-none");
-            }
-        }
-
-        if (ramEl) {
-            if (ramTotalBytes && ramAvailBytes) {
-                const used = ramTotalBytes - ramAvailBytes;
-                ramEl.textContent = `RAM ${formatBytes(used)} / ${formatBytes(ramTotalBytes)}`;
-                if (progressEl) {
-                    const pct = Math.round((used / ramTotalBytes) * 100);
-                    progressEl.style.width = `${Math.min(100, Math.max(5, pct))}%`;
-                }
-            } else {
-                ramEl.textContent = "RAM: Telemetry unavailable";
-            }
-        }
-
-        if (storageEl) {
-            if (storageAvailBytes) {
-                storageEl.textContent = `Storage ${formatBytes(storageAvailBytes)} free`;
-            } else {
-                storageEl.textContent = "Storage: Telemetry unavailable";
-            }
-        }
-
-        // Adjust Hero action buttons for phone vs PC
-        if (isAndroid) {
-            if (btnLock) btnLock.classList.add("d-none");
-            if (btnRing) btnRing.classList.remove("d-none");
-            if (btnSend) btnSend.classList.remove("d-none");
-            if (btnCapture) btnCapture.classList.remove("d-none");
+        showNotificationToast("Ringing connected phone...", "info");
+        const res = await apiRequest("/api/devices/ring", "POST", { device_id: targetId, duration_seconds: 5 });
+        if (res && res.success) {
+            showNotificationToast("Phone ringer triggered!", "success");
         } else {
-            if (btnLock) {
-                btnLock.textContent = "🔒 Lock PC";
-                btnLock.classList.remove("d-none");
+            showNotificationToast(res?.error || "Failed triggering ringer", "error");
+        }
+    }
+
+    async function triggerScreenCapture() {
+        const targetId = resolveTargetDeviceId();
+        if (!targetId) {
+            showNotificationToast("Select or connect an online phone for screen capture.", "warning");
+            return;
+        }
+        showNotificationToast("Requesting phone screen capture (awaiting consent)...", "info");
+        const res = await apiRequest("/api/screen/capture-phone", "POST", { device_id: targetId });
+        if (res && res.success) {
+            const fileName = res.file_name || res.data?.file_name;
+            if (fileName) {
+                const capUrl = `/api/captures/${encodeURIComponent(fileName)}`;
+                showCapturePreview(capUrl, "Remote Screen Capture");
+                showNotificationToast("Screen capture received!", "success");
+                return;
             }
-            if (btnRing) btnRing.classList.add("d-none");
-            if (btnSend) btnSend.classList.remove("d-none");
-            if (btnCapture) btnCapture.classList.remove("d-none");
+            let attempts = 0;
+            const pollTimer = setInterval(async () => {
+                attempts++;
+                const statusRes = await apiRequest("/api/screen/status");
+                if (statusRes && statusRes.success && (statusRes.has_frame || statusRes.state === "STREAMING")) {
+                    clearInterval(pollTimer);
+                    showCapturePreview(`/api/screen/frame?t=${Date.now()}`, "Live Screen Frame");
+                    showNotificationToast("Screen frame received!", "success");
+                } else if (attempts >= 20) {
+                    clearInterval(pollTimer);
+                    showNotificationToast("Screen capture consent timed out or was cancelled.", "warning");
+                }
+            }, 1000);
+        } else {
+            showNotificationToast(res?.error || "Failed initiating screen capture", "error");
+        }
+    }
+
+    async function triggerCameraCapture() {
+        const targetId = resolveTargetDeviceId();
+        if (!targetId) {
+            showNotificationToast("Select or connect an online phone for camera capture.", "warning");
+            return;
+        }
+        showNotificationToast("Capturing photo via phone camera...", "info");
+        const res = await apiRequest("/api/camera/capture", "POST", { device_id: targetId });
+        if (res && res.success) {
+            showNotificationToast("Camera photo captured!", "success");
+            setTimeout(() => {
+                showCapturePreview(`/api/camera/latest?t=${Date.now()}`, "Camera Photo");
+            }, 1200);
+        } else {
+            showNotificationToast(res?.error || "Failed capturing camera photo", "error");
+        }
+    }
+
+    function showCapturePreview(imgUrl, title) {
+        const latestImg = document.getElementById("latest-capture-img");
+        const placeholder = document.getElementById("latest-capture-placeholder");
+        if (latestImg && placeholder) {
+            latestImg.src = imgUrl;
+            latestImg.style.display = "block";
+            placeholder.classList.add("d-none");
+        }
+        openMediaPreview(imgUrl, title);
+    }
+
+    async function triggerMediaAction(action, extra = {}) {
+        const dev = getSelectedDeviceObj();
+        const target = (dev && isAndroidDevice(dev)) ? "phone" : "windows";
+        const payload = { action, target, device_id: resolveTargetDeviceId(), ...extra };
+        const res = await apiRequest("/api/media", "POST", payload);
+        if (res && res.success) {
+            const d = res.data || res;
+            const volSlider = document.getElementById("now-playing-volume");
+            const muteBtn = document.getElementById("btn-media-mute");
+            if (volSlider && typeof d.volume_percent === "number") {
+                volSlider.value = String(d.volume_percent);
+            }
+            if (muteBtn && typeof d.muted === "boolean") {
+                muteBtn.classList.toggle("text-rose", d.muted);
+                muteBtn.title = d.muted ? "Unmute Audio" : "Mute Audio";
+            }
+            if (action !== "volume_set" && action !== "volume") {
+                showNotificationToast(`Media: ${action}`, "info");
+            }
+        } else {
+            showNotificationToast(res?.error || "Media control failed", "error");
         }
     }
 
     function applyOfflineUsbDimming(isOffline) {
         const heroCard = document.querySelector(".hero-desktop-card");
+        const qaBadge = document.getElementById("qa-offline-badge");
         if (heroCard) {
-            if (isOffline) heroCard.classList.add("offline-dimmed");
-            else heroCard.classList.remove("offline-dimmed");
+            heroCard.classList.toggle("offline-dimmed", Boolean(isOffline));
+        }
+        if (qaBadge) {
+            qaBadge.classList.toggle("d-none", !isOffline);
         }
     }
 
-    // =========================================================================
-    // 6. View 1: Quick Actions & Media
-    // =========================================================================
+    function updateHeroCard(device) {
+        const heroCard = document.getElementById("hero-card");
+        const bezelFrame = document.getElementById("hero-bezel-frame");
+        const wallImg = document.getElementById("desktop-wallpaper-img");
+        const wallFallback = document.getElementById("wallpaper-fallback");
+        const glassBar = document.getElementById("hero-glass-bar");
+        const phoneContent = document.getElementById("phone-bezel-content");
+        const phoneIconEl = document.getElementById("hero-device-icon");
+        const phoneClock = document.getElementById("phone-bezel-clock");
+        const phoneSub = document.getElementById("phone-bezel-sub");
 
-    function initHeroActions() {
-        const btnLockPc = document.getElementById("btn-hero-lock-pc");
-        if (btnLockPc) {
-            btnLockPc.addEventListener("click", async () => {
-                const res = await apiRequest("/api/desktop/lock", "POST", {});
-                if (res && res.success) {
-                    showNotificationToast("Desktop locked.", "info");
+        const nameEl = document.getElementById("hero-device-name");
+        const transportEl = document.getElementById("hero-transport-pill");
+        const batteryInd = document.getElementById("hero-battery-indicator");
+        const batteryText = document.getElementById("hero-battery-text");
+        const ramText = document.getElementById("hero-ram-text");
+        const storageText = document.getElementById("hero-storage-text");
+        const resProgress = document.getElementById("hero-resource-progress");
+
+        const ringBtn = document.getElementById("btn-hero-ring-phone");
+        const lockBtn = document.getElementById("btn-hero-lock-pc");
+        const sendBtn = document.getElementById("btn-hero-send-file");
+        const capBtn = document.getElementById("btn-hero-capture-screen");
+        const badgeType = document.getElementById("hero-device-type-badge");
+        const primaryActions = document.getElementById("hero-primary-actions");
+        const offlineActions = document.getElementById("hero-offline-actions");
+
+        // 1. Local Windows PC Host presentation
+        if (!device || isLocalNode(device)) {
+            if (heroCard) heroCard.classList.remove("phone-mode");
+            if (bezelFrame) bezelFrame.classList.remove("phone-bezel");
+            if (wallImg) {
+                wallImg.classList.remove("d-none");
+                if (csrfToken && !wallImg.dataset.loaded) {
+                    wallImg.dataset.loaded = "1";
+                    wallImg.src = `/api/desktop/wallpaper?t=${Date.now()}`;
+                }
+            }
+            if (wallFallback && wallImg && wallImg.style.display === "none") wallFallback.style.display = "flex";
+            if (glassBar) glassBar.classList.remove("d-none");
+            if (phoneContent) phoneContent.classList.add("d-none");
+
+            if (nameEl) nameEl.textContent = localHostIdentity;
+            if (badgeType) badgeType.textContent = "Windows PC";
+            if (transportEl) {
+                transportEl.textContent = isCoreOnline ? "Host Active" : "Core Offline";
+                transportEl.className = isCoreOnline ? "chip chip-emerald" : "chip chip-rose";
+            }
+
+            const tel = localHostTelemetry || {};
+            const ramTot = tel.ram_total_bytes || tel.total_memory_bytes;
+            const ramAvail = tel.ram_available_bytes || tel.available_memory_bytes;
+            const diskFree = tel.storage_available_bytes || tel.disk_free_bytes;
+
+            if (batteryInd) {
+                const pct = tel.battery_percent;
+                if (typeof pct === "number") {
+                    batteryInd.classList.remove("d-none");
+                    if (batteryText) batteryText.textContent = `${pct}%`;
                 } else {
-                    showNotificationToast(res?.error || "Failed to lock desktop", "error");
-                }
-            });
-        }
-
-        const btnHeroSend = document.getElementById("btn-hero-send-file");
-        if (btnHeroSend) {
-            btnHeroSend.addEventListener("click", () => {
-                switchTab("files");
-                const hiddenInput = document.getElementById("file-input-hidden");
-                if (hiddenInput) hiddenInput.click();
-            });
-        }
-
-        const btnHeroRing = document.getElementById("btn-hero-ring-phone");
-        if (btnHeroRing) {
-            btnHeroRing.addEventListener("click", async () => {
-                showNotificationToast("Ringing phone...", "info");
-                const res = await apiRequest("/api/devices/ring", "POST", { device_id: activeDeviceId, duration_seconds: 5 });
-                if (res && res.success) {
-                    showNotificationToast("Phone ringing sent!", "success");
-                } else {
-                    showNotificationToast(res?.error || "Failed ringing phone", "error");
-                }
-            });
-        }
-
-        const btnHeroCapture = document.getElementById("btn-hero-capture-screen");
-        if (btnHeroCapture) {
-            btnHeroCapture.addEventListener("click", async () => {
-                triggerPhoneScreenCapture();
-            });
-        }
-
-        // Quick 2x3 Grid Actions
-        const btnQuickRing = document.getElementById("btn-quick-ring");
-        if (btnQuickRing) {
-            btnQuickRing.addEventListener("click", async () => {
-                showNotificationToast("Ringing phone...", "info");
-                const res = await apiRequest("/api/devices/ring", "POST", { device_id: activeDeviceId, duration_seconds: 5 });
-                if (res && res.success) {
-                    showNotificationToast("Phone ringing triggered!", "success");
-                } else {
-                    showNotificationToast(res?.error || "Ring failed", "error");
-                }
-            });
-        }
-
-        const btnQuickCapture = document.getElementById("btn-quick-capture-screen");
-        if (btnQuickCapture) {
-            btnQuickCapture.addEventListener("click", async () => {
-                triggerPhoneScreenCapture();
-            });
-        }
-
-        const btnQuickCamera = document.getElementById("btn-quick-camera");
-        if (btnQuickCamera) {
-            btnQuickCamera.addEventListener("click", async () => {
-                showNotificationToast("Taking camera photo...", "info");
-                const res = await apiRequest("/api/camera/capture", "POST", { device_id: activeDeviceId });
-                if (res && res.success) {
-                    showNotificationToast("Camera photo captured!", "success");
-                    loadHomeWidgets();
-                    openMediaPreview("/api/camera/latest", "Latest Camera Photo");
-                } else {
-                    showNotificationToast(res?.error || "Camera capture failed", "error");
-                }
-            });
-        }
-
-        const btnQuickMedia = document.getElementById("btn-quick-media");
-        if (btnQuickMedia) {
-            btnQuickMedia.addEventListener("click", async () => {
-                await apiRequest("/api/media", "POST", { action: "play_pause", target: "phone", device_id: activeDeviceId });
-                showNotificationToast("Toggled media play/pause", "info");
-            });
-        }
-
-        const btnQuickSend = document.getElementById("btn-quick-send-files");
-        if (btnQuickSend) {
-            btnQuickSend.addEventListener("click", () => {
-                switchTab("files");
-            });
-        }
-
-        const btnQuickShareNote = document.getElementById("btn-quick-share-note");
-        if (btnQuickShareNote) {
-            btnQuickShareNote.addEventListener("click", async () => {
-                const note = prompt("Enter text or link to share to device:");
-                if (note && note.trim()) {
-                    const isUrl = note.trim().startsWith("http://") || note.trim().startsWith("https://");
-                    const res = await apiRequest("/api/share", "POST", {
-                        target: "phone",
-                        device_id: activeDeviceId,
-                        text: isUrl ? undefined : note.trim(),
-                        url: isUrl ? note.trim() : undefined,
-                    });
-                    if (res && res.success) {
-                        showNotificationToast("Shared to phone!", "success");
-                    } else {
-                        showNotificationToast(res?.error || "Share failed", "error");
-                    }
-                }
-            });
-        }
-
-        // Media Controls Bar
-        const btnMediaPrev = document.getElementById("btn-media-prev");
-        const btnMediaPlay = document.getElementById("btn-media-play");
-        const btnMediaNext = document.getElementById("btn-media-next");
-        const volumeSlider = document.getElementById("media-volume-slider");
-
-        if (btnMediaPrev) {
-            btnMediaPrev.addEventListener("click", async () => {
-                await apiRequest("/api/media", "POST", { action: "prev", target: "phone", device_id: activeDeviceId });
-                showNotificationToast("Previous track", "info");
-            });
-        }
-        if (btnMediaPlay) {
-            btnMediaPlay.addEventListener("click", async () => {
-                await apiRequest("/api/media", "POST", { action: "play_pause", target: "phone", device_id: activeDeviceId });
-                showNotificationToast("Play/Pause toggled", "info");
-            });
-        }
-        if (btnMediaNext) {
-            btnMediaNext.addEventListener("click", async () => {
-                await apiRequest("/api/media", "POST", { action: "next", target: "phone", device_id: activeDeviceId });
-                showNotificationToast("Next track", "info");
-            });
-        }
-        if (volumeSlider) {
-            volumeSlider.addEventListener("change", async () => {
-                await apiRequest("/api/media", "POST", { action: "volume", value: parseInt(volumeSlider.value, 10), target: "phone", device_id: activeDeviceId });
-            });
-        }
-
-        // Home Shared Clipboard Instant Sync Switch
-        const chkHomeSync = document.getElementById("chk-home-instant-sync");
-        if (chkHomeSync) {
-            chkHomeSync.addEventListener("change", async () => {
-                await apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: activeDeviceId });
-                showNotificationToast("Clipboard synchronized.", "info");
-            });
-        }
-    }
-
-    async function triggerPhoneScreenCapture() {
-        showNotificationToast("Requesting phone screenshot (MediaProjection consent)...", "info");
-        const res = await apiRequest("/api/screen/capture-phone", "POST", { device_id: activeDeviceId });
-
-        if (res && res.success) {
-            // Check if immediate file returned
-            const fileName = res.file_name || res.data?.file_name;
-            if (fileName) {
-                showNotificationToast("Screenshot captured!", "success");
-                openMediaPreview(`/api/captures/${encodeURIComponent(fileName)}`, "Phone Screenshot");
-                loadHomeWidgets();
-                return;
-            }
-
-            // Otherwise, poll for consent up to 30 seconds
-            let attempts = 0;
-            const maxAttempts = 30;
-            const consentPoll = setInterval(async () => {
-                attempts++;
-                const statusRes = await apiRequest("/api/screen/status");
-                if (statusRes && statusRes.success && (statusRes.has_frame || statusRes.state === "STREAMING")) {
-                    clearInterval(consentPoll);
-                    showNotificationToast("Phone screenshot consent granted!", "success");
-                    openMediaPreview("/api/camera/latest", "Phone Screenshot");
-                    loadHomeWidgets();
-                } else if (attempts >= maxAttempts) {
-                    clearInterval(consentPoll);
-                    showNotificationToast("Screen capture consent timed out or was cancelled on phone.", "warning");
-                }
-            }, 1000);
-        } else {
-            showNotificationToast(res?.error || "Capture request failed", "error");
-        }
-    }
-
-    async function loadHomeWidgets() {
-        // 1. Home Clipboard Preview
-        const clipContainer = document.getElementById("home-clipboard-items");
-        const clipCountEl = document.getElementById("home-clipboard-count");
-        if (clipContainer) {
-            const clipRes = await apiRequest("/api/clipboard/buffer");
-            if (clipRes && clipRes.success && Array.isArray(clipRes.items) && clipRes.items.length > 0) {
-                if (clipCountEl) clipCountEl.textContent = clipRes.items.length;
-                clipContainer.innerHTML = "";
-                clipRes.items.slice(0, 3).forEach(item => {
-                    const row = document.createElement("div");
-                    row.className = "mini-clip-card";
-
-                    const id = item.item_id || item.id || "";
-                    const type = item.content_type || item.type || "text";
-                    const text = item.text || item.content || item.preview || "";
-                    const source = item.source_device_name || item.source_device || "Device";
-                    const isImg = type === "image";
-
-                    const previewHtml = isImg
-                        ? `<div class="mini-clip-thumb"><img src="/api/clipboard/image/${id}" alt="Preview" class="thumb-preview" onerror="this.src='/api/desktop/wallpaper';" /></div>`
-                        : `<div class="mini-clip-text-icon">📝</div>`;
-                    const titleText = isImg ? `Image • ${escapeHtml(source)}` : escapeHtml(text ? text.slice(0, 36) : "Text snippet");
-
-                    row.innerHTML = `
-                        ${previewHtml}
-                        <div class="mini-clip-info">
-                            <div class="mini-clip-title">${titleText}</div>
-                        </div>
-                        <div class="mini-clip-actions">
-                            <button class="btn-icon-clean btn-clip-copy" title="Copy">📋</button>
-                        </div>
-                    `;
-                    row.querySelector(".btn-clip-copy").addEventListener("click", async () => {
-                        if (navigator.clipboard && text) {
-                            navigator.clipboard.writeText(text).catch(() => {});
-                        }
-                        await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id });
-                        showNotificationToast("Copied to active clipboard!", "success");
-                    });
-                    clipContainer.appendChild(row);
-                });
-            } else {
-                if (clipCountEl) clipCountEl.textContent = "0";
-                clipContainer.innerHTML = `<div class="empty-state text-muted text-xs p-3">No clipboard items yet</div>`;
-            }
-        }
-
-        // 2. Home Phone Notifications
-        const notifContainer = document.getElementById("home-notifications-list");
-        const notifCountEl = document.getElementById("home-notif-count");
-        if (notifContainer) {
-            const notifRes = await apiRequest("/api/notifications");
-            if (notifRes && notifRes.success && Array.isArray(notifRes.notifications) && notifRes.notifications.length > 0) {
-                if (notifCountEl) notifCountEl.textContent = `(${notifRes.notifications.length})`;
-                notifContainer.innerHTML = "";
-                notifRes.notifications.forEach(n => {
-                    const card = document.createElement("div");
-                    card.className = "notif-card";
-                    card.innerHTML = `
-                        <div class="notif-meta">
-                            <strong class="notif-sender">${escapeHtml(n.app_name || n.title || "Notification")}</strong>
-                            <p class="notif-snippet">${escapeHtml(n.body || n.text || "")}</p>
-                        </div>
-                        <div class="notif-actions">
-                            ${n.can_reply ? `<button class="btn-pill-action btn-pill-reply btn-notif-reply">Reply</button>` : ""}
-                            <button class="btn-pill-action btn-pill-dismiss btn-notif-dismiss">Dismiss</button>
-                        </div>
-                    `;
-                    const btnReply = card.querySelector(".btn-notif-reply");
-                    if (btnReply) {
-                        btnReply.addEventListener("click", () => {
-                            openReplyModal(n.key || n.id, n.title || n.app_name, n.body || n.text);
-                        });
-                    }
-                    const btnDismiss = card.querySelector(".btn-notif-dismiss");
-                    if (btnDismiss) {
-                        btnDismiss.addEventListener("click", async () => {
-                            await apiRequest("/api/notifications/dismiss", "POST", { key: n.key || n.id });
-                            showNotificationToast("Dismissed notification", "info");
-                            loadHomeWidgets();
-                        });
-                    }
-                    notifContainer.appendChild(card);
-                });
-            } else {
-                if (notifCountEl) notifCountEl.textContent = "(0)";
-                notifContainer.innerHTML = `<div class="empty-state text-muted text-xs p-3">No active notifications</div>`;
-            }
-        }
-    }
-
-    // =========================================================================
-    // 7. Refresh Loop & Device Resolution
-    // =========================================================================
-
-    async function refreshAllData() {
-        try {
-            // 1. Fetch system status
-            const sysStatus = await apiRequest("/api/system/status");
-            if (sysStatus && sysStatus.success && sysStatus.data) {
-                const isPaused = sysStatus.data.is_paused;
-                isCorePaused = isPaused;
-                if (btnDesktopPause) {
-                    btnDesktopPause.textContent = isPaused ? "▶ Resume" : "⏸ Pause";
-                }
-                if (coreStatusDot) {
-                    coreStatusDot.className = isPaused ? "status-dot dot-offline" : "status-dot dot-active";
-                }
-                if (coreStatusText) {
-                    coreStatusText.textContent = isPaused ? "Core Paused" : "Core Online";
+                    batteryInd.classList.add("d-none");
                 }
             }
-
-            // 2. Fetch devices
-            const devData = await apiRequest("/api/devices");
-            if (devData && devData.success && Array.isArray(devData.devices)) {
-                registeredDevices = devData.devices;
-                renderDeviceOptions(registeredDevices);
-
-                const connectedRemotes = registeredDevices.filter(d => !isLocalNode(d) && d.is_connected);
-                if (connectedRemotes.length > 0) {
-                    const activeDev = connectedRemotes.find(d => d.device_id === activeDeviceId) || connectedRemotes[0];
-                    activeDeviceId = activeDev.device_id;
-                    updateHeroCard(activeDev);
-                    applyOfflineUsbDimming(false);
-                } else {
-                    updateHeroCard(null);
-                    applyOfflineUsbDimming(true);
-                }
-
-                if (currentTab === "devices") {
-                    renderDevicesView();
-                }
+            if (ramText) {
+                ramText.textContent = (ramTot && ramAvail)
+                    ? `RAM ${formatBytes(ramTot - ramAvail)} / ${formatBytes(ramTot)}`
+                    : "Host CPU & RAM Ready";
+            }
+            if (storageText) {
+                storageText.textContent = diskFree ? `${formatBytes(diskFree)} free` : "Local Storage Active";
+            }
+            if (resProgress) {
+                const pct = (ramTot && ramAvail) ? Math.round(((ramTot - ramAvail) / ramTot) * 100) : 25;
+                resProgress.style.width = `${Math.min(100, Math.max(8, pct))}%`;
             }
 
-            // 3. Global poll approvals (both capability and OAuth)
-            loadPendingApprovals();
-
-            // 4. Tab-specific live refresh
-            if (currentTab === "overview") {
-                loadHomeWidgets();
-            } else if (currentTab === "settings") {
-                loadAiLinkStatus();
-                loadAiHostStatus();
+            const hasOnlinePhone = registeredDevices.some(d => !isLocalNode(d) && Boolean(d.is_connected));
+            if (lockBtn) {
+                lockBtn.classList.remove("d-none");
+                lockBtn.disabled = !isCoreOnline;
             }
-        } catch (e) {
-            // Background polling error ignored
-        }
-    }
-
-    function renderDeviceOptions(devices) {
-        if (!globalTargetSelect) return;
-        const currentVal = globalTargetSelect.value;
-        globalTargetSelect.innerHTML = "";
-
-        const connectedDevs = devices.filter(d => !isLocalNode(d) && d.is_connected);
-        if (connectedDevs.length === 0) {
-            const opt = document.createElement("option");
-            opt.value = "";
-            opt.textContent = `${localHostIdentity} (Host)`;
-            globalTargetSelect.appendChild(opt);
-            if (globalTargetTransportChip) {
-                globalTargetTransportChip.textContent = "Host";
-                globalTargetTransportChip.className = "chip chip-sm chip-neutral";
+            if (ringBtn) {
+                ringBtn.classList.add("d-none");
+                ringBtn.disabled = true;
             }
+            if (sendBtn) {
+                sendBtn.classList.remove("d-none");
+                sendBtn.disabled = !isCoreOnline || !hasOnlinePhone;
+                sendBtn.title = hasOnlinePhone ? "Send files to connected phone" : "Connect a phone to send files";
+            }
+            if (capBtn) {
+                capBtn.classList.remove("d-none");
+                capBtn.disabled = !isCoreOnline || !hasOnlinePhone;
+                capBtn.title = hasOnlinePhone ? "Capture connected phone screen" : "Connect a phone to capture screen";
+            }
+            if (primaryActions) primaryActions.classList.remove("d-none");
+            if (offlineActions) offlineActions.classList.add("d-none");
+            applyOfflineUsbDimming(!isCoreOnline);
             return;
         }
 
-        connectedDevs.forEach(d => {
-            const opt = document.createElement("option");
-            opt.value = d.device_id;
-            opt.textContent = `${d.device_name || "Device"} • ${d.transport || "Wi-Fi"}`;
-            globalTargetSelect.appendChild(opt);
-        });
+        // 2. Remote Peer / Android Device Presentation
+        const isAndroid = isAndroidDevice(device);
+        const isConn = Boolean(device.is_connected);
 
-        if (currentVal && connectedDevs.some(d => d.device_id === currentVal)) {
-            globalTargetSelect.value = currentVal;
-        } else if (connectedDevs.length > 0) {
-            globalTargetSelect.value = connectedDevs[0].device_id;
-            activeDeviceId = connectedDevs[0].device_id;
+        if (heroCard) heroCard.classList.toggle("phone-mode", isAndroid);
+        if (bezelFrame) bezelFrame.classList.toggle("phone-bezel", isAndroid);
+
+        if (isAndroid) {
+            if (wallImg) wallImg.classList.add("d-none");
+            if (wallFallback) wallFallback.style.display = "none";
+            if (glassBar) glassBar.classList.add("d-none");
+            if (phoneContent) phoneContent.classList.remove("d-none");
+            if (phoneIconEl) phoneIconEl.classList.toggle("text-amber", !isConn);
+            if (phoneClock) phoneClock.textContent = isConn ? new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Offline";
+            if (phoneSub) phoneSub.textContent = isConn ? `${resolveTransportLabel(device)} Link` : "Unreachable";
+        } else {
+            if (wallImg) wallImg.classList.remove("d-none");
+            if (glassBar) glassBar.classList.remove("d-none");
+            if (phoneContent) phoneContent.classList.add("d-none");
         }
 
-        globalTargetSelect.onchange = () => {
-            activeDeviceId = globalTargetSelect.value;
-            const chosen = connectedDevs.find(d => d.device_id === activeDeviceId);
-            if (chosen) {
-                updateHeroCard(chosen);
-                if (globalTargetTransportChip) {
-                    globalTargetTransportChip.textContent = chosen.transport || "Connected";
-                    globalTargetTransportChip.className = "chip chip-sm chip-primary";
-                }
-            }
-        };
+        if (nameEl) nameEl.textContent = device.device_name || (isAndroid ? "Android Phone" : "Remote Peer");
+        if (badgeType) badgeType.textContent = isAndroid ? "Android Phone" : "Remote PC";
 
-        // Also populate Files device selector
-        const filesDevSelect = document.getElementById("files-device-select");
-        if (filesDevSelect) {
-            filesDevSelect.innerHTML = `<option value="">${localHostIdentity} (PC Files)</option>`;
-            connectedDevs.forEach(d => {
-                const opt = document.createElement("option");
-                opt.value = d.device_id;
-                opt.textContent = `${d.device_name || "Phone"} (${d.transport || "Remote"})`;
-                if (d.device_id === activeDeviceId) opt.selected = true;
-                filesDevSelect.appendChild(opt);
-            });
-            filesDevSelect.onchange = () => {
-                activeDeviceId = filesDevSelect.value;
-                loadFiles(currentSubpath);
-                loadQuickApps();
-            };
+        if (transportEl) {
+            if (isConn) {
+                transportEl.textContent = `Connected • ${resolveTransportLabel(device)}`;
+                transportEl.className = "chip chip-emerald";
+            } else {
+                transportEl.textContent = "Disconnected";
+                transportEl.className = "chip chip-amber";
+            }
+        }
+
+        const tel = device.telemetry || {};
+        const batLevel = tel.battery_level ?? device.battery?.level ?? device.battery_level;
+        const charging = tel.charging ?? device.battery?.charging;
+        if (batteryInd) {
+            if (batLevel !== null && batLevel !== undefined) {
+                batteryInd.classList.remove("d-none");
+                if (batteryText) batteryText.textContent = `${batLevel}%${charging ? " Charging" : ""}`;
+            } else {
+                batteryInd.classList.add("d-none");
+            }
+        }
+
+        const ramTot = tel.ram_total_bytes;
+        const ramAvail = tel.ram_available_bytes;
+        const diskAvail = tel.storage_available_bytes;
+
+        if (ramText) {
+            if (ramTot && ramAvail) {
+                const used = ramTot - ramAvail;
+                ramText.textContent = `RAM ${formatBytes(used)} / ${formatBytes(ramTot)}`;
+                if (resProgress) resProgress.style.width = `${Math.min(100, Math.max(5, Math.round((used / ramTot) * 100)))}%`;
+            } else {
+                ramText.textContent = isConn ? "RAM: Active" : "RAM: Last known state";
+                if (resProgress) resProgress.style.width = isConn ? "35%" : "0%";
+            }
+        }
+        if (storageText) {
+            storageText.textContent = diskAvail ? `Storage ${formatBytes(diskAvail)} free` : (isConn ? "Storage: Ready" : "Device Offline");
+        }
+
+        if (lockBtn) {
+            lockBtn.classList.toggle("d-none", isAndroid);
+            lockBtn.disabled = isAndroid || !isConn;
+        }
+        if (ringBtn) {
+            ringBtn.classList.toggle("d-none", !isAndroid);
+            ringBtn.disabled = !isAndroid || !isConn;
+        }
+        if (sendBtn) {
+            sendBtn.classList.remove("d-none");
+            sendBtn.disabled = !isConn;
+            sendBtn.title = isConn ? "Send files to device" : "Device is offline";
+        }
+        if (capBtn) {
+            capBtn.classList.toggle("d-none", !isAndroid);
+            capBtn.disabled = !isAndroid || !isConn;
+            capBtn.title = isConn ? "Capture phone screen" : "Device is offline";
+        }
+
+        if (offlineActions) offlineActions.classList.toggle("d-none", isConn);
+        applyOfflineUsbDimming(!isConn);
+    }
+
+    async function loadHomeWidgets() {
+        // 1. Shared Clipboard Preview
+        const clipRes = await apiRequest("/api/clipboard/buffer");
+        const clipContainer = document.getElementById("clipboard-items-container");
+        const clipBadge = document.getElementById("clipboard-count-badge");
+        const clipEmpty = document.getElementById("clipboard-empty-state");
+
+        if (clipContainer) {
+            const items = (clipRes && Array.isArray(clipRes.items)) ? clipRes.items : (clipRes?.data?.items || []);
+            if (clipBadge) clipBadge.textContent = items.length;
+            clipContainer.innerHTML = "";
+
+            if (items.length === 0) {
+                clipEmpty?.classList.remove("d-none");
+            } else {
+                clipEmpty?.classList.add("d-none");
+                items.slice(0, 4).forEach(item => {
+                    const id = item.item_id || item.id || "";
+                    const type = item.content_type || item.type || "text";
+                    const text = item.text_content || item.text || item.preview || item.preview_text || "";
+                    const source = item.source_device_name || item.source_device || "Device";
+                    const isImg = type === "image";
+
+                    const row = document.createElement("div");
+                    row.className = "clipboard-item-row";
+                    const thumbHtml = isImg
+                        ? `<img class="clipboard-thumb" src="/api/clipboard/image/${encodeURIComponent(id)}" alt="Clip" />`
+                        : `<div class="island-icon-box"><svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path></svg></div>`;
+
+                    row.innerHTML = `
+                        <div class="flex items-center gap-2 min-w-0">
+                            ${thumbHtml}
+                            <div class="flex flex-col min-w-0">
+                                <span class="text-xs font-semibold text-primary truncate">${escapeHtml(isImg ? `Image • ${source}` : (text || "Snippet"))}</span>
+                                <span class="text-xs text-muted">${escapeHtml(source)} • ${formatBytes(item.size_bytes)}</span>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-1">
+                            <button class="icon-btn btn-copy-clip" style="width: 28px; height: 28px;" title="Copy & Apply">
+                                <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="13" rx="2" ry="2" width="13" x="9" y="9"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                            </button>
+                            <button class="icon-btn btn-share-clip" style="width: 28px; height: 28px;" title="Share to Device">
+                                <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><line x1="8.59" x2="15.42" y1="13.51" y2="17.49"></line><line x1="15.41" x2="8.59" y1="6.51" y2="10.49"></line></svg>
+                            </button>
+                        </div>
+                    `;
+
+                    row.querySelector(".btn-copy-clip").onclick = async () => {
+                        if (navigator.clipboard && text) navigator.clipboard.writeText(text).catch(() => {});
+                        await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id });
+                        showNotificationToast("Copied to active clipboard!", "success");
+                    };
+                    row.querySelector(".btn-share-clip").onclick = async () => {
+                        await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: resolveTargetDeviceId() || "pc" });
+                        showNotificationToast("Pushed clipboard entry to target.", "info");
+                    };
+                    clipContainer.appendChild(row);
+                });
+            }
+        }
+
+        // 2. Phone Notifications
+        const targetId = resolveTargetDeviceId();
+        const notifUrl = targetId ? "/api/notifications?device_id=" + encodeURIComponent(targetId) : "/api/notifications";
+        const notifRes = await apiRequest(notifUrl);
+        const notifContainer = document.getElementById("notifications-container");
+        const notifBadge = document.getElementById("notifications-count-badge");
+        const notifEmpty = document.getElementById("notifications-empty-state");
+
+        if (notifContainer) {
+            activeNotifications = (notifRes && Array.isArray(notifRes.notifications)) ? notifRes.notifications : [];
+            if (notifBadge) notifBadge.textContent = activeNotifications.length;
+            notifContainer.innerHTML = "";
+
+            if (activeNotifications.length === 0) {
+                notifEmpty?.classList.remove("d-none");
+            } else {
+                notifEmpty?.classList.add("d-none");
+                activeNotifications.slice(0, 6).forEach(n => {
+                    const key = n.key || n.id || "";
+                    const bodyText = n.body || n.text || "";
+                    const card = document.createElement("div");
+                    card.className = "notif-card";
+                    card.innerHTML = `
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="text-xs font-bold text-primary truncate">${escapeHtml(n.title || n.app_name || "Notification")}</span>
+                            <span class="chip chip-sm chip-cyan">${escapeHtml(n.app_name || "Android")}</span>
+                        </div>
+                        <span class="text-xs text-secondary">${escapeHtml(bodyText)}</span>
+                        <div class="flex items-center justify-between gap-2 mt-1">
+                            <div class="flex gap-2">
+                                ${n.can_reply !== false ? `<button class="btn btn-xs btn-primary btn-toggle-reply">Reply</button>` : ""}
+                                <button class="btn btn-xs btn-tonal btn-notif-dismiss">Dismiss</button>
+                            </div>
+                        </div>
+                        <div class="notif-inline-reply d-none">
+                            <span class="text-xs text-muted">Replying as PC Host</span>
+                            <div class="flex gap-2">
+                                <input type="text" class="form-input text-xs notif-reply-inp" placeholder="Type reply..." />
+                                <button class="btn btn-xs btn-tonal btn-reply-cancel">Cancel</button>
+                                <button class="btn btn-xs btn-primary btn-reply-send">Send</button>
+                            </div>
+                        </div>
+                    `;
+
+                    const inlineBox = card.querySelector(".notif-inline-reply");
+                    const replyInp = card.querySelector(".notif-reply-inp");
+                    const toggleBtn = card.querySelector(".btn-toggle-reply");
+
+                    if (toggleBtn && inlineBox) {
+                        toggleBtn.onclick = () => {
+                            inlineBox.classList.toggle("d-none");
+                            if (!inlineBox.classList.contains("d-none") && replyInp) replyInp.focus();
+                        };
+                    }
+
+                    card.querySelector(".btn-reply-cancel")?.addEventListener("click", () => {
+                        inlineBox?.classList.add("d-none");
+                    });
+
+                    const dispatchReply = async () => {
+                        const txt = replyInp ? replyInp.value.trim() : "";
+                        if (!txt || !key) return;
+                        const r = await apiRequest("/api/notifications/reply", "POST", { key, text: txt, device_id: resolveTargetDeviceId() });
+                        if (r && r.success) {
+                            showNotificationToast("Reply sent to phone!", "success");
+                            loadHomeWidgets();
+                        } else {
+                            showNotificationToast(r?.error || "Failed sending reply", "error");
+                        }
+                    };
+                    card.querySelector(".btn-reply-send")?.addEventListener("click", dispatchReply);
+                    replyInp?.addEventListener("keydown", (e) => {
+                        if (e.key === "Enter") dispatchReply();
+                    });
+
+                    card.querySelector(".btn-notif-dismiss").onclick = async () => {
+                        if (!key) return;
+                        await apiRequest("/api/notifications/dismiss", "POST", { key, device_id: resolveTargetDeviceId() });
+                        showNotificationToast("Notification dismissed.", "info");
+                        loadHomeWidgets();
+                    };
+
+                    notifContainer.appendChild(card);
+                });
+            }
         }
     }
 
     // =========================================================================
-    // 8. View 2: Devices & Pairing
+    // 7. View 2: Devices & Network
     // =========================================================================
 
-    function initPairingView() {
-        const tabPair = document.getElementById("tab-pair-device");
-        const tabInstall = document.getElementById("tab-install-apk");
-        const panePair = document.getElementById("subpane-pair-device");
-        const paneInstall = document.getElementById("subpane-install-apk");
+    function initDevicesView() {
+        document.getElementById("btn-filter-all")?.addEventListener("click", () => setDeviceFilter("all"));
+        document.getElementById("btn-filter-pcs")?.addEventListener("click", () => setDeviceFilter("pcs"));
+        document.getElementById("btn-filter-phones")?.addEventListener("click", () => setDeviceFilter("phones"));
+        document.getElementById("btn-devices-connect-header")?.addEventListener("click", openConnectModal);
 
-        if (tabPair && tabInstall) {
-            tabPair.addEventListener("click", () => {
-                tabPair.classList.add("active");
-                tabInstall.classList.remove("active");
-                if (panePair) panePair.classList.remove("d-none");
-                if (paneInstall) paneInstall.classList.add("d-none");
-            });
+        const tabQr = document.getElementById("btn-pair-tab-qr");
+        const tabApk = document.getElementById("btn-pair-tab-apk");
+        const paneQr = document.getElementById("pair-pane-qr");
+        const paneApk = document.getElementById("pair-pane-apk");
 
-            tabInstall.addEventListener("click", () => {
-                tabInstall.classList.add("active");
-                tabPair.classList.remove("active");
-                if (paneInstall) paneInstall.classList.remove("d-none");
-                if (panePair) panePair.classList.add("d-none");
+        if (tabQr && tabApk && paneQr && paneApk) {
+            tabQr.onclick = () => {
+                tabQr.classList.add("active");
+                tabApk.classList.remove("active");
+                paneQr.classList.remove("d-none");
+                paneApk.classList.add("d-none");
+                loadPairingQR();
+            };
+            tabApk.onclick = () => {
+                tabApk.classList.add("active");
+                tabQr.classList.remove("active");
+                paneApk.classList.remove("d-none");
+                paneQr.classList.add("d-none");
                 loadApkQr();
-            });
+            };
         }
 
-        // Filter pills: All, PCs, Phones
-        const filterPills = document.querySelectorAll(".devices-title-group .filter-pill");
-        filterPills.forEach(pill => {
-            pill.addEventListener("click", () => {
-                filterPills.forEach(p => p.classList.remove("active"));
-                pill.classList.add("active");
-                currentDeviceFilter = pill.getAttribute("data-filter") || "all";
-                renderDevicesView();
-            });
+        document.getElementById("btn-pairing-refresh-qr")?.addEventListener("click", () => {
+            loadPairingQR();
+            showNotificationToast("Regenerated pairing QR & PIN.", "info");
         });
 
-        const btnPairNew = document.getElementById("btn-device-pair-qr");
-        if (btnPairNew) {
-            btnPairNew.addEventListener("click", () => {
-                loadPairingQR();
-                showNotificationToast("Refreshed pairing QR code.", "info");
-            });
+        const btnPairConnect = document.getElementById("btn-pairing-connect");
+        const inputPair = document.getElementById("pairing-input");
+        if (btnPairConnect && inputPair) {
+            btnPairConnect.onclick = async () => {
+                await handleUnifiedConnectInput(inputPair.value.trim());
+            };
         }
 
-        // 6-digit PIN input auto-advance
-        for (let i = 1; i <= 6; i++) {
-            const box = document.getElementById(`pin-box-${i}`);
-            if (box) {
-                box.addEventListener("input", () => {
-                    if (box.value.length === 1 && i < 6) {
-                        const nextBox = document.getElementById(`pin-box-${i + 1}`);
-                        if (nextBox) nextBox.focus();
-                    }
-                });
-                box.addEventListener("keydown", (e) => {
-                    if (e.key === "Backspace" && box.value.length === 0 && i > 1) {
-                        const prevBox = document.getElementById(`pin-box-${i - 1}`);
-                        if (prevBox) prevBox.focus();
-                    }
-                });
+        // Federation Controls
+        document.getElementById("btn-federation-gen-invite")?.addEventListener("click", async () => {
+            showNotificationToast("Generating 9-digit federation invite...", "info");
+            const res = await apiRequest("/api/federation/invite", "POST", { ttl_seconds: 600 });
+            const displayInvite = document.getElementById("federation-invite-display");
+            const code = res?.code || res?.invite_code;
+            if (res && res.success && code && displayInvite) {
+                displayInvite.textContent = code;
+                displayInvite.classList.remove("d-none");
+                showNotificationToast(`Generated 9-digit code: ${code}`, "success");
+            } else {
+                showNotificationToast(res?.error || "Could not generate federation invite", "error");
             }
-        }
+        });
 
-        const btnPinConnect = document.getElementById("btn-pin-connect");
-        if (btnPinConnect) {
-            btnPinConnect.addEventListener("click", async () => {
-                let enteredPin = "";
-                for (let i = 1; i <= 6; i++) {
-                    const b = document.getElementById(`pin-box-${i}`);
-                    if (b) enteredPin += b.value.trim();
-                }
-                if (enteredPin.length !== 6) {
-                    showNotificationToast("Please enter all 6 digits of the PIN.", "warning");
-                    return;
-                }
-                const res = await apiRequest("/api/devices/connect-peer", "POST", { pin: enteredPin });
-                if (res && res.success) {
-                    showNotificationToast("Device paired successfully!", "success");
-                    refreshAllData();
-                } else {
-                    showNotificationToast(res?.error || "Pairing PIN verification failed.", "error");
-                }
-            });
-        }
+        document.getElementById("btn-federation-join")?.addEventListener("click", async () => {
+            const inp = document.getElementById("federation-input-code");
+            const code = inp ? inp.value.trim() : "";
+            if (!code) {
+                showNotificationToast("Enter a 9-digit federation invite code.", "warning");
+                return;
+            }
+            showNotificationToast("Joining federated network...", "info");
+            const res = await apiRequest("/api/federation/accept", "POST", { code });
+            if (res && res.success) {
+                showNotificationToast("Joined federated network!", "success");
+                if (inp) inp.value = "";
+                refreshAllData();
+            } else {
+                showNotificationToast(res?.error || "Failed joining federation", "error");
+            }
+        });
 
-        // Remote Device Access (Relay Tunnel)
+        // Kill Switch Modal
+        const killModal = document.getElementById("killswitch-modal");
+        document.getElementById("btn-federation-kill-switch")?.addEventListener("click", () => {
+            killModal?.classList.remove("d-none");
+        });
+        document.getElementById("btn-killswitch-cancel")?.addEventListener("click", () => {
+            killModal?.classList.add("d-none");
+        });
+        document.getElementById("btn-killswitch-confirm")?.addEventListener("click", async () => {
+            await apiRequest("/api/federation/kill-switch", "POST", { reason: "Emergency Kill Switch via Web Dashboard" });
+            showNotificationToast("Emergency Kill Switch activated: All federation grants severed.", "warning");
+            killModal?.classList.add("d-none");
+            refreshAllData();
+        });
+
+        // Remote Access Relay Tunnel Toggle
         const chkRelay = document.getElementById("chk-relay-tunnel-toggle");
         if (chkRelay) {
             chkRelay.addEventListener("change", async () => {
                 if (chkRelay.checked) {
-                    showNotificationToast("Starting Cloudflare Relay tunnel on port 8770...", "info");
+                    showNotificationToast("Starting Remote Device Relay tunnel (port 8770)...", "info");
                     const res = await apiRequest("/api/relay/tunnel/start", "POST", { provider: "cloudflared" });
                     if (res && res.success) {
-                        showNotificationToast("Remote Relay tunnel active!", "success");
-                        loadPairingQR(); // Refresh Master QR with relay URL
+                        showNotificationToast("Remote Access tunnel active!", "success");
+                        loadPairingQR();
                     } else {
-                        showNotificationToast(res?.error || "Failed starting Relay tunnel", "error");
+                        showNotificationToast(res?.error || "Failed starting relay tunnel", "error");
                         chkRelay.checked = false;
                     }
                 } else {
                     await apiRequest("/api/relay/tunnel/stop", "POST", {});
-                    showNotificationToast("Remote Relay tunnel stopped.", "info");
+                    showNotificationToast("Remote Access tunnel stopped.", "info");
                     loadPairingQR();
                 }
                 loadRelayTunnelStatus();
             });
         }
 
-        const btnRelayCopy = document.getElementById("btn-relay-copy-link");
-        if (btnRelayCopy) {
-            btnRelayCopy.addEventListener("click", () => {
-                const inp = document.getElementById("relay-tunnel-url-pill");
-                if (inp && inp.value && !inp.value.includes("Local Network Only")) {
-                    navigator.clipboard.writeText(inp.value);
-                    showNotificationToast("Copied Relay tunnel URL!", "success");
-                }
-            });
+        document.getElementById("btn-relay-copy-link")?.addEventListener("click", () => {
+            const inp = document.getElementById("relay-tunnel-url-pill");
+            if (inp && inp.value && !inp.value.includes("Local Network Only")) {
+                navigator.clipboard?.writeText(inp.value).catch(() => {});
+                showNotificationToast("Copied Relay URL!", "success");
+            }
+        });
+    }
+
+    async function handleUnifiedConnectInput(rawVal) {
+        if (!rawVal) {
+            showNotificationToast("Enter a 9-digit invite code or peer IP:port.", "warning");
+            return;
+        }
+        const digitsOnly = rawVal.replace(/\D/g, "");
+        if (digitsOnly.length === 9 && /^[\d-\s]+$/.test(rawVal)) {
+            showNotificationToast("Accepting 9-digit federation invite...", "info");
+            const res = await apiRequest("/api/federation/accept", "POST", { code: rawVal });
+            if (res && res.success) {
+                showNotificationToast("Federation established!", "success");
+                refreshAllData();
+            } else {
+                showNotificationToast(res?.error || "Federation acceptance failed", "error");
+            }
+            return;
         }
 
-        // 9-digit federation code
-        const btnGen9 = document.getElementById("btn-gen-9digit-code");
-        if (btnGen9) {
-            btnGen9.addEventListener("click", async () => {
-                const res = await apiRequest("/api/federation/invite", "POST", { ttl_seconds: 600 });
-                const statusEl = document.getElementById("cross-network-status");
-                if (res && res.success && res.code) {
-                    if (statusEl) statusEl.textContent = `Generated Code: ${res.code} (Expires in 10m)`;
-                    showNotificationToast(`Generated 9-digit code: ${res.code}`, "success");
-                } else {
-                    if (statusEl) statusEl.textContent = "Code generation active.";
-                }
-            });
-        }
-
-        const btnConnect9 = document.getElementById("btn-connect-9digit-code");
-        if (btnConnect9) {
-            btnConnect9.addEventListener("click", async () => {
-                const inp = document.getElementById("input-9digit-code");
-                const code = inp ? inp.value.trim() : "";
-                if (!code) {
-                    showNotificationToast("Please enter a 9-digit code.", "warning");
-                    return;
-                }
-                const res = await apiRequest("/api/federation/accept", "POST", { invite_code: code });
-                if (res && res.success) {
-                    showNotificationToast("Connected to cross-network peer!", "success");
-                    refreshAllData();
-                    loadFederationGrants();
-                } else {
-                    showNotificationToast(res?.error || "Failed connecting to peer.", "error");
-                }
-            });
-        }
-
-        const btnKillSwitch = document.getElementById("btn-federation-kill-switch");
-        if (btnKillSwitch) {
-            btnKillSwitch.addEventListener("click", async () => {
-                if (confirm("EMERGENCY: Terminate all federation connections and revoke all active remote grants?")) {
-                    const res = await apiRequest("/api/federation/kill-switch", "POST", { reason: "Emergency kill switch from Web Dashboard" });
-                    if (res && res.success) {
-                        showNotificationToast("Terminated all federation connections.", "warning");
-                        loadFederationGrants();
-                        refreshAllData();
-                    } else {
-                        showNotificationToast(res?.error || "Kill switch failed", "error");
-                    }
-                }
-            });
-        }
-
-        // Legacy connect to peer host
-        const btnPeerSubmit = document.getElementById("btn-connect-peer-submit");
-        if (btnPeerSubmit) {
-            btnPeerSubmit.addEventListener("click", async () => {
-                const host = document.getElementById("connect-peer-host")?.value.trim();
-                const port = parseInt(document.getElementById("connect-peer-port")?.value || "8765", 10);
-                const pin = document.getElementById("connect-peer-pin")?.value.trim() || undefined;
-                const fp = document.getElementById("connect-peer-fp")?.value.trim() || undefined;
-                if (!host) {
-                    showNotificationToast("Peer host required.", "warning");
-                    return;
-                }
-                const res = await apiRequest("/api/devices/connect-peer", "POST", { host, port, pin, cert_fingerprint: fp });
-                if (res && res.success) {
-                    showNotificationToast("Connected to peer host!", "success");
-                    refreshAllData();
-                } else {
-                    showNotificationToast(res?.error || "Peer host connection failed.", "error");
-                }
-            });
+        const parsed = parseHostAndPort(rawVal);
+        if (!parsed) return;
+        showNotificationToast(`Connecting to ${parsed.host}:${parsed.port}...`, "info");
+        const res = await apiRequest("/api/devices/connect-peer", "POST", { host: parsed.host, port: parsed.port });
+        if (res && res.success) {
+            showNotificationToast("Connected to peer device!", "success");
+            refreshAllData();
+        } else {
+            showNotificationToast(res?.error || "Connection failed (use Manual IP section if PIN required)", "error");
         }
     }
 
+    function setDeviceFilter(filter) {
+        currentDeviceFilter = filter;
+        const btnAll = document.getElementById("btn-filter-all");
+        const btnPcs = document.getElementById("btn-filter-pcs");
+        const btnPhones = document.getElementById("btn-filter-phones");
+        if (btnAll) btnAll.className = `btn btn-sm ${filter === "all" ? "btn-primary" : "btn-tonal"}`;
+        if (btnPcs) btnPcs.className = `btn btn-sm ${filter === "pcs" ? "btn-primary" : "btn-tonal"}`;
+        if (btnPhones) btnPhones.className = `btn btn-sm ${filter === "phones" ? "btn-primary" : "btn-tonal"}`;
+        renderDevicesView();
+    }
+
     function renderDevicesView() {
-        const container = document.getElementById("devices-cards-container");
+        const container = document.getElementById("devices-list-container");
         if (!container) return;
-
-        let pcs = registeredDevices.filter(d => isLocalNode(d) || !isAndroidDevice(d));
-        let phones = registeredDevices.filter(d => !isLocalNode(d) && isAndroidDevice(d));
-
-        // Update counts in filter pills
-        const countAll = document.getElementById("devices-count-all");
-        const countPc = document.getElementById("devices-count-pc");
-        const countPhone = document.getElementById("devices-count-phone");
-        if (countAll) countAll.textContent = registeredDevices.length + (pcs.length === 0 ? 1 : 0);
-        if (countPc) countPc.textContent = Math.max(1, pcs.length);
-        if (countPhone) countPhone.textContent = phones.length;
-
         container.innerHTML = "";
 
-        // Always render Host PC card
-        if (currentDeviceFilter === "all" || currentDeviceFilter === "pc") {
+        const remoteDevs = registeredDevices.filter(d => !isLocalNode(d));
+        const remotePcs = remoteDevs.filter(d => !isAndroidDevice(d));
+        const remotePhones = remoteDevs.filter(d => isAndroidDevice(d));
+
+        const cAll = document.getElementById("filter-count-all");
+        const cPcs = document.getElementById("filter-count-pcs");
+        const cPhones = document.getElementById("filter-count-phones");
+        if (cAll) cAll.textContent = String(1 + remoteDevs.length);
+        if (cPcs) cPcs.textContent = String(1 + remotePcs.length);
+        if (cPhones) cPhones.textContent = String(remotePhones.length);
+
+        let filtered = remoteDevs;
+        if (currentDeviceFilter === "pcs") filtered = remotePcs;
+        else if (currentDeviceFilter === "phones") filtered = remotePhones;
+
+        // Render Local Host Card
+        if (currentDeviceFilter === "all" || currentDeviceFilter === "pcs") {
+            const isHostActive = !activeDeviceId || activeDeviceId === "local";
             const hostCard = document.createElement("div");
-            hostCard.className = "card device-entry-card host-pc-card mb-3";
+            hostCard.className = "device-card";
             hostCard.innerHTML = `
-                <div class="device-icon-box">💻</div>
-                <div class="device-info-meta">
-                    <h3 class="device-title">${escapeHtml(localHostIdentity)} (Host)</h3>
-                    <span class="badge-pill badge-pill-success">Host Active • Auto USB &amp; Wi-Fi</span>
-                    <div class="device-stats-bar mt-2">
-                        <div class="resource-progress-track">
-                            <div class="resource-progress-fill" style="width: 28%;"></div>
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <div class="island-icon-box">
+                            <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="12" rx="2" width="20" x="2" y="4"></rect><line x1="2" x2="22" y1="20" y2="20"></line></svg>
                         </div>
-                        <div class="device-stats-text">Core Active • Standalone Bridge</div>
+                        <div class="flex flex-col">
+                            <span class="text-sm font-bold text-primary">${escapeHtml(localHostIdentity)} (This PC)</span>
+                            <span class="text-xs text-muted">Host Controller • ${escapeHtml(canonicalSnowId)}</span>
+                        </div>
                     </div>
+                    <span class="chip chip-emerald">${isHostActive ? "Active Host" : "Host"}</span>
                 </div>
             `;
             container.appendChild(hostCard);
         }
 
-        // Render connected/paired devices
-        registeredDevices.forEach(d => {
-            if (isLocalNode(d)) return;
-            const isAndroid = isAndroidDevice(d);
-            if (currentDeviceFilter === "pc" && isAndroid) return;
-            if (currentDeviceFilter === "phone" && !isAndroid) return;
+        if (filtered.length === 0 && currentDeviceFilter === "phones") {
+            const emptyCard = document.createElement("div");
+            emptyCard.className = "device-card empty-state";
+            emptyCard.innerHTML = `<span class="text-sm text-muted">No paired phones found. Scan QR to pair your Android device.</span>`;
+            container.appendChild(emptyCard);
+        }
+
+        filtered.forEach(dev => {
+            const isConn = Boolean(dev.is_connected);
+            const isSelected = dev.device_id === activeDeviceId;
+            const transport = isConn ? resolveTransportLabel(dev) : "Offline";
+            const connMode = dev.connection_mode || "auto";
+            const permProf = dev.permission_profile || "full_control";
+            const batVal = dev.telemetry?.battery_level ?? dev.battery?.level ?? dev.battery_level;
+            const iconSvg = isAndroidDevice(dev)
+                ? `<svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="20" rx="2" ry="2" width="14" x="5" y="2"></rect><line x1="12" x2="12.01" y1="18" y2="18"></line></svg>`
+                : `<svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="12" rx="2" width="20" x="2" y="4"></rect><line x1="2" x2="22" y1="20" y2="20"></line></svg>`;
 
             const card = document.createElement("div");
-            card.className = "card device-entry-card mb-3";
-            const icon = isAndroid ? "📱" : "🖥️";
-            const isUsb = d.transport === "usb" || (d.endpoint && d.endpoint.includes("127.0.0.1"));
-            const transportLabel = isUsb ? "USB" : "Wi-Fi";
-            const isSelected = d.device_id === activeDeviceId;
-
+            card.className = "device-card";
             card.innerHTML = `
-                <div class="device-icon-box">${icon}</div>
-                <div class="device-info-meta">
-                    <h3 class="device-title">${escapeHtml(d.device_name || "Remote Device")}</h3>
-                    <span class="badge-pill badge-pill-success">● Connected • ${transportLabel}</span>
-                    <div class="device-control-row mt-2">
-                        <select class="clean-select-sm device-profile-select">
-                            <option value="full_control" ${d.permission_profile === "full_control" ? "selected" : ""}>👤 Full Control</option>
-                            <option value="files_and_clipboard" ${d.permission_profile === "files_and_clipboard" ? "selected" : ""}>Files &amp; Clipboard</option>
-                            <option value="clipboard_only" ${d.permission_profile === "clipboard_only" ? "selected" : ""}>Clipboard Only</option>
+                <div class="flex items-center justify-between gap-2">
+                    <div class="flex items-center gap-3 min-w-0">
+                        <div class="island-icon-box">${iconSvg}</div>
+                        <div class="flex flex-col min-w-0">
+                            <span class="text-sm font-bold text-primary truncate">${escapeHtml(dev.device_name || "Device")}</span>
+                            <span class="text-xs text-muted">${isConn ? `Connected • ${transport}` : "Disconnected"}${batVal != null ? ` • ${batVal}%` : ""} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}</span>
+                        </div>
+                    </div>
+                    <span class="chip ${isConn ? "chip-cyan" : "chip-amber"}">${transport}</span>
+                </div>
+
+                <div class="flex items-center justify-between gap-2 flex-wrap">
+                    <div class="flex items-center gap-2">
+                        <select class="form-input text-xs dev-profile-select" style="width: auto; padding: 5px 8px;" title="Permission Profile">
+                            <option value="full_control" ${permProf === "full_control" ? "selected" : ""}>Full Control</option>
+                            <option value="files_and_clipboard" ${permProf === "files_and_clipboard" ? "selected" : ""}>Files &amp; Clip</option>
+                            <option value="clipboard_only" ${permProf === "clipboard_only" ? "selected" : ""}>Clip Only</option>
+                        </select>
+                        <select class="form-input text-xs dev-connmode-select" style="width: auto; padding: 5px 8px;" title="Connection Mode">
+                            <option value="auto" ${connMode === "auto" ? "selected" : ""}>Auto</option>
+                            <option value="local_only" ${connMode === "local_only" ? "selected" : ""}>Local Only</option>
+                            <option value="remote_only" ${connMode === "remote_only" ? "selected" : ""}>Remote Only</option>
                         </select>
                     </div>
-                </div>
-                <div class="device-action-box">
-                    <button class="btn btn-sm btn-pill ${isSelected ? "btn-primary" : "btn-outline-secondary"} btn-device-switch">
-                        ${isSelected ? "Active" : "Switch"}
-                    </button>
-                    <button class="btn btn-sm btn-pill btn-outline-danger btn-device-revoke ml-2" title="Revoke Device">
-                        ✕
-                    </button>
+                    <div class="flex items-center gap-2">
+                        <button class="btn btn-xs ${isSelected ? "btn-primary" : "btn-tonal"} btn-dev-select">${isSelected ? "Active" : "Switch"}</button>
+                        <button class="btn btn-xs btn-danger btn-dev-revoke">Revoke</button>
+                    </div>
                 </div>
             `;
 
-            const profSelect = card.querySelector(".device-profile-select");
-            profSelect.addEventListener("change", async () => {
-                await apiRequest("/api/devices/permission-profile", "POST", { device_id: d.device_id, profile: profSelect.value });
-                showNotificationToast(`Updated profile for ${d.device_name}`, "success");
-            });
+            card.querySelector(".dev-profile-select").onchange = async (e) => {
+                const res = await apiRequest("/api/devices/permission-profile", "POST", { device_id: dev.device_id, profile: e.target.value });
+                if (res && res.success) showNotificationToast(`Updated profile for ${dev.device_name || "device"}.`, "success");
+                else showNotificationToast(res?.error || "Failed updating permission profile", "error");
+            };
 
-            card.querySelector(".btn-device-switch").addEventListener("click", () => {
-                activeDeviceId = d.device_id;
-                updateHeroCard(d);
-                renderDevicesView();
-                showNotificationToast(`Switched active device to ${d.device_name}`, "info");
-            });
+            card.querySelector(".dev-connmode-select").onchange = async (e) => {
+                const res = await apiRequest("/api/devices/connection-mode", "POST", { device_id: dev.device_id, connection_mode: e.target.value });
+                if (res && res.success) showNotificationToast(`Updated connection mode for ${dev.device_name || "device"}.`, "success");
+                else showNotificationToast(res?.error || "Failed updating connection mode", "error");
+            };
 
-            card.querySelector(".btn-device-revoke").addEventListener("click", async () => {
-                if (confirm(`Revoke authorization for ${d.device_name}?`)) {
-                    await apiRequest("/api/devices/revoke", "POST", { device_id: d.device_id });
-                    showNotificationToast(`Revoked ${d.device_name}`, "warning");
+            card.querySelector(".btn-dev-select").onclick = () => {
+                selectActiveDevice(dev.device_id, true);
+                showNotificationToast(`Switched active target to ${dev.device_name || "device"}.`, "info");
+            };
+
+            card.querySelector(".btn-dev-revoke").onclick = async () => {
+                const res = await apiRequest("/api/devices/revoke", "POST", { device_id: dev.device_id });
+                if (res && res.success) {
+                    showNotificationToast(`Revoked ${dev.device_name || "device"}.`, "warning");
+                    if (activeDeviceId === dev.device_id) activeDeviceId = "local";
                     refreshAllData();
+                } else {
+                    showNotificationToast(res?.error || "Could not revoke device", "error");
                 }
-            });
+            };
 
             container.appendChild(card);
         });
 
-        if (container.children.length === 0) {
-            container.innerHTML = `<div class="empty-state text-muted text-xs p-3">No devices found for this filter</div>`;
-        }
+        loadPairingQR();
+        loadRelayTunnelStatus();
+        loadFederationGrants();
     }
 
     async function loadPairingQR() {
-        const qrContainer = document.getElementById("qr-svg-container");
-        const pinText = document.getElementById("qr-pin-code");
-        const countdownEl = document.getElementById("qr-countdown");
+        const qrBox = document.getElementById("pairing-qr-box");
+        const modalQrBox = document.getElementById("modal-qr-container");
+        const snowIdEl = document.getElementById("pairing-snow-id");
+        const modalNetEl = document.getElementById("modal-network-id");
+        const fpEl = document.getElementById("pairing-device-fp");
+        const pinEl = document.getElementById("pairing-pin-display");
+        const modalPinEl = document.getElementById("modal-pairing-pin");
+        const countdownEl = document.getElementById("pairing-countdown-display");
+
+        if (snowIdEl) snowIdEl.textContent = canonicalSnowId;
+        if (modalNetEl) modalNetEl.textContent = canonicalSnowId;
 
         const res = await apiRequest("/api/pair/qr", "POST", { trust_tier: "owner" });
-        if (res && res.success) {
-            const svgData = res?.svg || res?.qr_svg || res?.data?.svg;
-            const pinVal = res?.data?.pin || res?.pin;
+        const svgMarkup = res?.svg || res?.qr_svg || res?.data?.svg;
+        const pinVal = res?.data?.pin || res?.pin;
+        const fpVal = res?.data?.cert_fingerprint || res?.cert_fingerprint;
 
-            if (qrContainer && svgData) {
-                qrContainer.innerHTML = svgData;
-            }
-            if (pinText && pinVal) {
-                pinText.textContent = `PIN: ${pinVal.slice(0, 3)} ${pinVal.slice(3)}`;
-            }
-
-            let remaining = 60;
-            if (qrCountdownTimer) clearInterval(qrCountdownTimer);
-            qrCountdownTimer = setInterval(() => {
-                remaining--;
-                if (countdownEl) countdownEl.textContent = `⏳ ${remaining}s remaining`;
-                if (remaining <= 0) {
-                    clearInterval(qrCountdownTimer);
-                    loadPairingQR();
-                }
-            }, 1000);
+        if (svgMarkup) {
+            if (qrBox) qrBox.innerHTML = svgMarkup;
+            if (modalQrBox) modalQrBox.innerHTML = svgMarkup;
+        } else if (qrBox && res && !res.success) {
+            qrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
         }
+
+        if (fpVal && fpEl) fpEl.textContent = `${fpVal.slice(0, 16)}...`;
+        if (pinVal) {
+            const fmtPin = pinVal.length === 6 ? `${pinVal.slice(0, 3)} ${pinVal.slice(3)}` : pinVal;
+            if (pinEl) pinEl.textContent = fmtPin;
+            if (modalPinEl) modalPinEl.textContent = fmtPin;
+        }
+
+        let remaining = 60;
+        if (qrCountdownTimer) clearInterval(qrCountdownTimer);
+        qrCountdownTimer = setInterval(() => {
+            remaining--;
+            if (countdownEl) countdownEl.textContent = `${Math.max(0, remaining)}s`;
+            if (remaining <= 0) {
+                clearInterval(qrCountdownTimer);
+            }
+        }, 1000);
     }
 
     async function loadApkQr() {
-        const apkQrContainer = document.getElementById("apk-qr-svg-container");
-        const downloadBtn = document.getElementById("btn-devices-download-apk");
-        if (!apkQrContainer) return;
+        const apkBox = document.getElementById("apk-qr-box");
+        const apkUrlEl = document.getElementById("apk-download-url");
+        const dlBtn = document.getElementById("btn-devices-download-apk");
+        const res = await apiRequest("/api/app/apk-info");
+        const svgMarkup = res?.svg || res?.qr_svg;
 
-        const res = await apiRequest("/api/app/apk-info", "GET");
-        if (res && res.success && res.apk_available) {
-            if (apkQrContainer && res.svg) {
-                apkQrContainer.innerHTML = res.svg;
-            }
-            if (downloadBtn) {
-                downloadBtn.href = res.local_download_url || res.download_url;
-                downloadBtn.textContent = `💾 Download ${res.file_name || "SNOW-Mobile-4.1.0.apk"} (${res.version || "4.1.0"})`;
-                downloadBtn.classList.remove("disabled");
-            }
-        } else {
-            apkQrContainer.innerHTML = `<div class="p-3 text-xs text-muted">APK build not located in packaging/output/</div>`;
-            if (downloadBtn) {
-                downloadBtn.classList.add("disabled");
-                downloadBtn.textContent = "APK Unavailable";
+        if (res && res.success) {
+            if (svgMarkup && apkBox) apkBox.innerHTML = svgMarkup;
+            if (res.apk_available) {
+                if (apkUrlEl) apkUrlEl.textContent = res.download_url || "Ready for LAN download";
+                if (dlBtn) {
+                    dlBtn.href = res.local_download_url || res.download_url || "#";
+                    dlBtn.textContent = `Download ${res.file_name || "SNOW-Mobile.apk"} (${res.version || "5.0.0"})`;
+                    dlBtn.classList.remove("d-none");
+                }
+            } else {
+                if (apkUrlEl) apkUrlEl.textContent = "APK binary not yet built (run gradlew assembleDebug)";
+                dlBtn?.classList.add("d-none");
             }
         }
     }
@@ -1327,19 +1615,19 @@
         const badge = document.getElementById("relay-tunnel-badge");
         const urlPill = document.getElementById("relay-tunnel-url-pill");
         const chkRelay = document.getElementById("chk-relay-tunnel-toggle");
-
         const res = await apiRequest("/api/relay/tunnel/status");
+
         if (res && res.active && res.public_url) {
             if (badge) {
                 badge.textContent = "Relay Active • Port 8770";
-                badge.className = "badge-pill badge-pill-success";
+                badge.className = "chip chip-sm chip-emerald";
             }
             if (urlPill) urlPill.value = res.public_url;
             if (chkRelay) chkRelay.checked = true;
         } else {
             if (badge) {
                 badge.textContent = "Relay Inactive";
-                badge.className = "badge-pill badge-pill-muted";
+                badge.className = "chip chip-sm chip-neutral";
             }
             if (urlPill) urlPill.value = "Local Network Only";
             if (chkRelay) chkRelay.checked = false;
@@ -1347,661 +1635,768 @@
     }
 
     async function loadFederationGrants() {
-        const listEl = document.getElementById("cross-network-grants-list");
-        if (!listEl) return;
+        const container = document.getElementById("federation-grants-container");
         const res = await apiRequest("/api/federation/grants");
-        if (res && res.success && Array.isArray(res.grants) && res.grants.length > 0) {
-            listEl.innerHTML = "";
-            res.grants.forEach(g => {
+        federationGrants = (res && Array.isArray(res.grants)) ? res.grants : [];
+        if (!container) return;
+        container.innerHTML = "";
+
+        if (federationGrants.length > 0) {
+            federationGrants.forEach(g => {
                 const row = document.createElement("div");
-                row.className = "grant-row-item mt-1 p-2 rounded";
-                row.style.background = "var(--bg-hover)";
+                row.className = "flex items-center justify-between text-xs p-2";
+                row.style.background = "var(--snow-bg-elevated)";
+                row.style.borderRadius = "var(--snow-radius-sm)";
+                row.style.border = "1px solid var(--snow-border)";
+                const label = g.network_name || g.peer_node_name || g.peer_node_id || g.grant_id;
+                const status = g.status || "ACTIVE";
                 row.innerHTML = `
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div>
-                            <strong>${escapeHtml(g.peer_name || g.grant_id || "Peer Grant")}</strong>
-                            <div class="text-xs text-muted">${escapeHtml(g.scope || "Files & Clipboard")}</div>
-                        </div>
-                        <button class="btn btn-xs btn-outline-danger btn-grant-revoke">Revoke</button>
+                    <div class="flex flex-col min-w-0">
+                        <strong class="truncate text-primary">${escapeHtml(label)}</strong>
+                        <span class="text-muted">${escapeHtml(g.direction || "INBOUND")} • ${escapeHtml(status)}</span>
                     </div>
+                    ${status === "ACTIVE" ? `<button class="btn btn-xs btn-danger btn-revoke-grant">Revoke</button>` : `<span class="chip chip-sm chip-neutral">${escapeHtml(status)}</span>`}
                 `;
-                row.querySelector(".btn-grant-revoke").addEventListener("click", async () => {
-                    await apiRequest("/api/federation/revoke", "POST", { grant_id: g.grant_id || g.id });
-                    showNotificationToast("Revoked federation grant", "warning");
-                    loadFederationGrants();
+                row.querySelector(".btn-revoke-grant")?.addEventListener("click", async () => {
+                    await apiRequest("/api/federation/revoke", "POST", { grant_id: g.grant_id });
+                    showNotificationToast("Federation grant revoked.", "info");
+                    refreshAllData();
                 });
-                listEl.appendChild(row);
+                container.appendChild(row);
             });
         } else {
-            listEl.innerHTML = `<span class="text-muted text-xs">No active federation grants</span>`;
+            container.innerHTML = `<span class="text-xs text-muted">No active federation grants.</span>`;
         }
     }
 
     // =========================================================================
-    // 9. View 3: Files & Apps
+    // 8. View 3: Files & Apps
     // =========================================================================
 
     function initFilesView() {
-        const dropzone = document.getElementById("file-dropzone");
-        const fileInput = document.getElementById("file-input-hidden");
-        const chkHidden = document.getElementById("chk-show-hidden");
-        const pillFiles = document.getElementById("pill-files-mode");
-        const pillApps = document.getElementById("pill-apps-mode");
-        const pillScreen = document.getElementById("pill-screen-cam-mode");
-        const searchInp = document.getElementById("files-search-input");
+        const tabFiles = document.getElementById("tab-seg-files");
+        const tabApps = document.getElementById("tab-seg-apps");
+        const tabCaptures = document.getElementById("tab-seg-captures");
 
-        if (dropzone && fileInput) {
-            dropzone.addEventListener("click", () => fileInput.click());
-            dropzone.addEventListener("dragover", (e) => {
-                e.preventDefault();
-                dropzone.style.borderColor = "var(--accent-primary)";
-            });
-            dropzone.addEventListener("dragleave", () => {
-                dropzone.style.borderColor = "var(--accent-secondary)";
-            });
-            dropzone.addEventListener("drop", async (e) => {
-                e.preventDefault();
-                dropzone.style.borderColor = "var(--accent-secondary)";
-                if (e.dataTransfer && e.dataTransfer.files.length > 0) {
-                    await uploadFiles(e.dataTransfer.files);
-                }
-            });
-
-            fileInput.addEventListener("change", async () => {
-                if (fileInput.files && fileInput.files.length > 0) {
-                    await uploadFiles(fileInput.files);
-                }
-            });
+        if (tabFiles && tabApps && tabCaptures) {
+            tabFiles.onclick = () => focusFilesSegment("files");
+            tabApps.onclick = () => focusFilesSegment("apps");
+            tabCaptures.onclick = () => focusFilesSegment("captures");
         }
 
-        if (chkHidden) {
-            chkHidden.addEventListener("change", () => {
+        const filesDevSelect = document.getElementById("files-device-select");
+        if (filesDevSelect) {
+            filesDevSelect.onchange = () => selectActiveDevice(filesDevSelect.value, true);
+        }
+
+        document.getElementById("files-search-input")?.addEventListener("input", filterFileRows);
+        document.getElementById("apps-search-input")?.addEventListener("input", filterAppTiles);
+        document.getElementById("chk-hide-hidden")?.addEventListener("change", () => loadFiles(currentSubpath));
+
+        document.getElementById("btn-file-up")?.addEventListener("click", () => {
+            if (currentSubpath) {
+                const parts = currentSubpath.replace(/\\/g, "/").split("/").filter(Boolean);
+                parts.pop();
+                currentSubpath = parts.join("/");
                 loadFiles(currentSubpath);
-            });
-        }
+            }
+        });
 
-        if (searchInp) {
-            searchInp.addEventListener("input", () => {
-                const query = searchInp.value.toLowerCase().trim();
-                const rows = document.querySelectorAll(".file-row-item");
-                rows.forEach(r => {
-                    const name = r.querySelector(".file-name")?.textContent.toLowerCase() || "";
-                    if (name.includes(query)) r.style.display = "flex";
-                    else r.style.display = "none";
-                });
-            });
-        }
+        const dropzone = document.getElementById("file-upload-dropzone");
+        const fileInput = document.getElementById("file-upload-input");
+        document.getElementById("btn-trigger-upload")?.addEventListener("click", () => fileInput?.click());
 
-        if (pillFiles && pillApps && pillScreen) {
-            pillFiles.addEventListener("click", () => {
-                pillFiles.classList.add("active");
-                pillApps.classList.remove("active");
-                pillScreen.classList.remove("active");
-                document.querySelector(".files-explorer-col")?.classList.remove("d-none");
-            });
-            pillApps.addEventListener("click", () => {
-                pillApps.classList.add("active");
-                pillFiles.classList.remove("active");
-                pillScreen.classList.remove("active");
-                loadQuickApps();
-            });
-            pillScreen.addEventListener("click", () => {
-                pillScreen.classList.add("active");
-                pillFiles.classList.remove("active");
-                pillApps.classList.remove("active");
-            });
-        }
-
-        // Screen & Camera trigger buttons
-        const btnCapScreen = document.getElementById("btn-files-capture-screen");
-        if (btnCapScreen) {
-            btnCapScreen.addEventListener("click", async () => {
-                triggerPhoneScreenCapture();
-            });
-        }
-
-        const btnCamPhoto = document.getElementById("btn-files-camera-photo");
-        if (btnCamPhoto) {
-            btnCamPhoto.addEventListener("click", async () => {
-                showNotificationToast("Requesting camera capture...", "info");
-                const res = await apiRequest("/api/camera/capture", "POST", { device_id: activeDeviceId });
-                if (res && res.success) {
-                    showNotificationToast("Camera photo captured!", "success");
-                    loadClipboardItems();
-                    openMediaPreview("/api/camera/latest", "Latest Camera Capture");
-                } else {
-                    showNotificationToast(res?.error || "Camera capture failed", "error");
+        if (fileInput) {
+            fileInput.onchange = (e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                    uploadFiles(e.target.files);
+                    e.target.value = "";
                 }
-            });
+            };
         }
+
+        if (dropzone) {
+            dropzone.onclick = () => {
+                if (dropzone.classList.contains("disabled")) {
+                    showNotificationToast("Switch the Files device selector to a connected phone/peer to upload files.", "info");
+                    return;
+                }
+                fileInput?.click();
+            };
+            dropzone.ondragover = (e) => {
+                e.preventDefault();
+                if (dropzone.classList.contains("disabled")) return;
+                dropzone.style.borderColor = "var(--snow-accent-cyan)";
+            };
+            dropzone.ondragleave = () => {
+                dropzone.style.borderColor = dropzone.classList.contains("disabled")
+                    ? "var(--snow-border)"
+                    : "var(--snow-accent-blue)";
+            };
+            dropzone.ondrop = (e) => {
+                e.preventDefault();
+                dropzone.style.borderColor = dropzone.classList.contains("disabled")
+                    ? "var(--snow-border)"
+                    : "var(--snow-accent-blue)";
+                if (dropzone.classList.contains("disabled")) {
+                    showNotificationToast("Switch the Files device selector to a connected phone/peer to upload files.", "info");
+                    return;
+                }
+                if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+                    uploadFiles(e.dataTransfer.files);
+                }
+            };
+        }
+
+        document.getElementById("btn-capture-screen-trigger")?.addEventListener("click", triggerScreenCapture);
+        document.getElementById("btn-capture-camera-trigger")?.addEventListener("click", triggerCameraCapture);
+    }
+
+    function focusFilesSegment(seg) {
+        currentFilesSegment = seg;
+        document.getElementById("tab-seg-files")?.classList.toggle("active", seg === "files");
+        document.getElementById("tab-seg-apps")?.classList.toggle("active", seg === "apps");
+        document.getElementById("tab-seg-captures")?.classList.toggle("active", seg === "captures");
+
+        const subFiles = document.getElementById("subpanel-files");
+        const subApps = document.getElementById("subpanel-apps");
+        const subCaptures = document.getElementById("subpanel-captures");
+        const layout = document.querySelector(".files-v5-layout");
+
+        if (window.innerWidth <= 1100) {
+            subFiles?.classList.toggle("d-none", seg !== "files");
+            subApps?.classList.toggle("d-none", seg !== "apps");
+            subCaptures?.classList.toggle("d-none", seg !== "captures");
+        } else {
+            subFiles?.classList.remove("d-none");
+            subApps?.classList.remove("d-none");
+            subCaptures?.classList.remove("d-none");
+            if (seg === "apps") {
+                subApps?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+            } else if (seg === "captures") {
+                subCaptures?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+            }
+        }
+        if (layout) layout.dataset.focus = seg;
+    }
+
+    function filterFileRows() {
+        const q = (document.getElementById("files-search-input")?.value || "").trim().toLowerCase();
+        document.querySelectorAll("#file-table-body tr[data-filename]").forEach(tr => {
+            const fname = tr.getAttribute("data-filename") || "";
+            tr.style.display = (!q || fname.includes(q)) ? "" : "none";
+        });
     }
 
     async function loadFiles(subpath = "") {
         currentSubpath = subpath;
-        const breadcrumbSub = document.getElementById("files-breadcrumb-sub");
-        if (breadcrumbSub) {
-            breadcrumbSub.textContent = subpath || "Root";
+        const breadcrumbEl = document.getElementById("file-breadcrumbs");
+        const targetLabel = document.getElementById("files-transfer-target-label");
+        const tbody = document.getElementById("file-table-body");
+        const emptyState = document.getElementById("file-empty-state");
+        const emptyMsg = document.getElementById("file-empty-message");
+        const uploadBtn = document.getElementById("btn-trigger-upload");
+        const dropzone = document.getElementById("file-upload-dropzone");
+        const upBtn = document.getElementById("btn-file-up");
+
+        if (breadcrumbEl) breadcrumbEl.textContent = subpath ? `/${subpath}` : "/";
+        const devObj = getSelectedDeviceObj();
+        const isLocalTarget = !devObj || isLocalNode(devObj);
+        const isAndroid = Boolean(devObj && isAndroidDevice(devObj));
+        const isTargetOnline = Boolean(devObj && devObj.is_connected);
+
+        if (uploadBtn) uploadBtn.disabled = isLocalTarget || !isTargetOnline;
+        if (upBtn) upBtn.disabled = isLocalTarget || !isTargetOnline || !subpath;
+        if (dropzone) dropzone.classList.toggle("disabled", isLocalTarget || !isTargetOnline);
+
+        if (targetLabel) {
+            if (isLocalTarget) {
+                targetLabel.textContent = "Local Windows Host active — select a connected Android phone above to browse mobile storage or transfer files.";
+            } else if (!isTargetOnline) {
+                targetLabel.textContent = `${devObj.device_name || "Device"} is offline — reconnect to transfer files over HTTPS (port 8766).`;
+            } else if (isAndroid) {
+                targetLabel.textContent = `Encrypted HTTPS transfer to ${devObj.device_name || "Phone"} (port 8766)`;
+            } else {
+                targetLabel.textContent = `Peer PC ${devObj.device_name || "Remote"} connected — select an Android device to browse mobile storage.`;
+            }
+        }
+        if (!tbody) return;
+
+        if (isLocalTarget) {
+            tbody.innerHTML = "";
+            if (emptyMsg) {
+                emptyMsg.textContent = "Local Windows PC mode: Use Quick Launch Apps on the right for desktop tools. Select a paired Android phone in the target selector above to browse phone files or send files.";
+            }
+            emptyState?.classList.remove("d-none");
+            return;
         }
 
-        const chkHidden = document.getElementById("chk-show-hidden");
-        const hideHidden = chkHidden ? chkHidden.checked : true;
+        if (!isAndroid) {
+            tbody.innerHTML = "";
+            if (emptyMsg) {
+                emptyMsg.textContent = "Remote file explorer supports paired Android phones. Select a phone target to browse storage.";
+            }
+            emptyState?.classList.remove("d-none");
+            return;
+        }
 
-        const res = await apiRequest(`/api/files?device_id=${encodeURIComponent(activeDeviceId)}&subpath=${encodeURIComponent(subpath)}&hide_hidden=${hideHidden}&show_hidden=${!hideHidden}`);
-        const filesContainer = document.getElementById("files-list-table");
-        if (!filesContainer) return;
+        if (!isTargetOnline) {
+            tbody.innerHTML = "";
+            if (emptyMsg) {
+                emptyMsg.textContent = `${devObj.device_name || "Phone"} is currently offline. Reconnect to browse remote files.`;
+            }
+            emptyState?.classList.remove("d-none");
+            return;
+        }
 
-        const filesList = res.items || res.files || (res.data && res.data.items) || [];
-        if (res && res.success && Array.isArray(filesList) && filesList.length > 0) {
-            filesContainer.innerHTML = "";
-            filesList.forEach(f => {
-                const row = document.createElement("div");
-                row.className = `file-row-item ${f.is_directory ? "folder-item" : "file-item"}`;
-                const icon = f.is_directory ? "📁" : f.name.endsWith(".pdf") ? "📄" : "🖼️";
-                const sizeTag = f.is_directory ? "" : `<span class="file-size-tag">• ${f.size_formatted || formatBytes(f.size) || "File"}</span>`;
-                row.innerHTML = `
-                    <div class="file-item-left" style="cursor: pointer;">
-                        <span class="file-type-icon">${icon}</span>
-                        <span class="file-name">${escapeHtml(f.name)}</span>
-                        ${sizeTag}
+        const targetId = devObj.device_id;
+        const hideHidden = document.getElementById("chk-hide-hidden")?.checked ?? true;
+        tbody.innerHTML = `<tr><td colspan="4" class="text-muted text-center" style="padding: 20px;">Loading files...</td></tr>`;
+        emptyState?.classList.add("d-none");
+
+        const res = await apiRequest(`/api/files?subpath=${encodeURIComponent(subpath)}&hide_hidden=${hideHidden}&device_id=${encodeURIComponent(targetId)}`);
+        const items = res?.items || res?.files || res?.data?.items || [];
+
+        if (!res || !res.success) {
+            tbody.innerHTML = "";
+            if (emptyMsg) emptyMsg.textContent = res?.error || "Unable to browse files on selected phone.";
+            emptyState?.classList.remove("d-none");
+            return;
+        }
+
+        tbody.innerHTML = "";
+        if (!Array.isArray(items) || items.length === 0) {
+            if (emptyMsg) emptyMsg.textContent = "Empty directory";
+            emptyState?.classList.remove("d-none");
+            return;
+        }
+
+        items.forEach(f => {
+            const isDir = Boolean(f.is_dir || f.is_directory);
+            const row = document.createElement("tr");
+            row.setAttribute("data-filename", String(f.name || "").toLowerCase());
+            const modTime = formatTimestamp(f.modified || f.modified_time) || "--";
+
+            row.innerHTML = `
+                <td>
+                    <div class="flex items-center gap-2 cursor-pointer file-row-open">
+                        <svg class="svg-icon svg-icon-sm ${isDir ? "text-cyan" : "text-muted"}" viewBox="0 0 24 24">
+                            ${isDir ? '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>' : '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>'}
+                        </svg>
+                        <span class="${isDir ? "text-primary font-semibold" : "text-secondary"}">${escapeHtml(f.name)}</span>
                     </div>
-                    <button class="btn-download-action">⤓ Download</button>
-                `;
-                if (f.is_directory) {
-                    row.querySelector(".file-item-left").addEventListener("click", () => {
-                        const nextSub = subpath ? `${subpath}/${f.name}` : f.name;
-                        loadFiles(nextSub);
-                    });
-                }
-                row.querySelector(".btn-download-action").addEventListener("click", async () => {
-                    showNotificationToast(`Downloading ${f.name}...`, "info");
+                </td>
+                <td class="text-xs text-muted mono">${isDir ? "--" : (f.size_formatted || formatBytes(f.size))}</td>
+                <td class="text-xs text-muted">${escapeHtml(modTime)}</td>
+                <td style="text-align: right;">
+                    ${isDir ? `<button class="btn btn-xs btn-tonal btn-open-dir">Open</button>` : `<button class="btn btn-xs btn-primary btn-dl-file">Download</button>`}
+                </td>
+            `;
+
+            if (isDir) {
+                const enterDir = () => loadFiles(subpath ? `${subpath}/${f.name}` : f.name);
+                row.querySelector(".btn-open-dir").onclick = enterDir;
+                row.querySelector(".file-row-open").onclick = enterDir;
+            } else {
+                row.querySelector(".btn-dl-file").onclick = async () => {
+                    showNotificationToast(`Receiving ${f.name} to PC transfers...`, "info");
                     const dlRes = await apiRequest("/api/files/download", "POST", {
                         file_name: f.name,
                         subpath: currentSubpath,
-                        device_id: activeDeviceId,
+                        device_id: targetId,
                     });
                     if (dlRes && dlRes.success) {
-                        showNotificationToast(`Downloaded ${f.name}`, "success");
+                        showNotificationToast(`Downloaded ${f.name}!`, "success");
                     } else {
-                        showNotificationToast(dlRes?.error || "Download initiated", "info");
+                        showNotificationToast(dlRes?.error || "Download failed", "error");
                     }
-                });
-                filesContainer.appendChild(row);
-            });
-        } else {
-            filesContainer.innerHTML = `<div class="empty-state text-muted text-xs p-3">Folder is empty</div>`;
-        }
+                };
+            }
+            tbody.appendChild(row);
+        });
+        filterFileRows();
     }
 
-    async function uploadFiles(files) {
+    function uploadFiles(files) {
         if (!files || files.length === 0) return;
-        const progressPill = document.getElementById("transfer-progress-pill");
-        const progressText = document.getElementById("transfer-progress-text");
-        if (progressPill) progressPill.classList.remove("d-none");
+        const targetId = resolveTargetDeviceId();
+        if (!targetId) {
+            showNotificationToast("Connect or select an Android phone to send files.", "warning");
+            return;
+        }
 
-        let fileIdx = 0;
-        function uploadNext() {
-            if (fileIdx >= files.length) {
-                if (progressPill) progressPill.classList.add("d-none");
+        const transferCard = document.getElementById("active-transfer-container");
+        const topbarChip = document.getElementById("topbar-active-transfer-chip");
+        const nameEl = document.getElementById("active-transfer-name");
+        const speedEl = document.getElementById("active-transfer-speed");
+        const barEl = document.getElementById("active-transfer-progress");
+        const bytesEl = document.getElementById("active-transfer-bytes");
+        const pctEl = document.getElementById("active-transfer-percent");
+
+        let idx = 0;
+        function sendNext() {
+            if (idx >= files.length) {
+                activeUploadXhr = null;
+                transferCard?.classList.add("d-none");
+                topbarChip?.classList.add("d-none");
                 loadFiles(currentSubpath);
                 return;
             }
 
-            const file = files[fileIdx];
+            const file = files[idx];
             const formData = new FormData();
+            formData.append("device_id", targetId);
             formData.append("file", file);
-            if (activeDeviceId) formData.append("device_id", activeDeviceId);
 
+            transferCard?.classList.remove("d-none");
+            topbarChip?.classList.remove("d-none");
+            if (nameEl) nameEl.textContent = `Sending ${file.name}`;
+            if (barEl) barEl.style.width = "0%";
+
+            const startTime = performance.now();
             const xhr = new XMLHttpRequest();
+            activeUploadXhr = xhr;
             xhr.open("POST", "/api/files/upload", true);
             if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
 
-            xhr.upload.onprogress = function (e) {
-                if (e.lengthComputable && progressText) {
-                    const percent = Math.round((e.loaded / e.total) * 100);
-                    progressText.textContent = `Sending ${escapeHtml(file.name)} • ${percent}%`;
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const pct = Math.round((e.loaded / e.total) * 100);
+                    const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
+                    const bps = e.loaded / elapsedSec;
+                    if (barEl) barEl.style.width = `${pct}%`;
+                    if (pctEl) pctEl.textContent = `${pct}%`;
+                    if (bytesEl) bytesEl.textContent = `${formatBytes(e.loaded)} / ${formatBytes(e.total)}`;
+                    if (speedEl) speedEl.textContent = `${formatBytes(bps)}/s`;
                 }
             };
 
-            xhr.onload = function () {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    showNotificationToast(`Uploaded ${file.name} successfully`, "success");
-                } else {
-                    showNotificationToast(`Upload failed for ${file.name}`, "error");
+            xhr.onload = () => {
+                try {
+                    const data = JSON.parse(xhr.responseText || "{}");
+                    if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+                        showNotificationToast(`Sent ${file.name}!`, "success");
+                    } else {
+                        showNotificationToast(data.error || `Failed sending ${file.name}`, "error");
+                    }
+                } catch (e) {
+                    showNotificationToast(`Failed sending ${file.name}`, "error");
                 }
-                fileIdx++;
-                uploadNext();
+                idx++;
+                sendNext();
             };
 
-            xhr.onerror = function () {
-                showNotificationToast(`Upload failed for ${file.name}`, "error");
-                fileIdx++;
-                uploadNext();
+            xhr.onerror = () => {
+                showNotificationToast(`Network error uploading ${file.name}`, "error");
+                idx++;
+                sendNext();
             };
 
             xhr.send(formData);
         }
-        uploadNext();
+        sendNext();
     }
 
-    async function loadQuickApps() {
-        const appsListEl = document.getElementById("quick-apps-list");
-        if (!appsListEl) return;
+    function filterAppTiles() {
+        const q = (document.getElementById("apps-search-input")?.value || "").trim().toLowerCase();
+        document.querySelectorAll("#apps-grid-container .app-tile").forEach(tile => {
+            const label = tile.getAttribute("data-appname") || "";
+            tile.style.display = (!q || label.includes(q)) ? "flex" : "none";
+        });
+    }
 
-        // Determine if target device is Windows or Android
-        const chosen = registeredDevices.find(d => d.device_id === activeDeviceId);
-        const isWindows = chosen ? !isAndroidDevice(chosen) : true;
-        const endpoint = isWindows ? "/api/apps/windows" : "/api/apps/android";
+    async function loadRemoteApps() {
+        const container = document.getElementById("apps-grid-container");
+        const emptyState = document.getElementById("apps-empty-state");
+        const appsTitle = document.getElementById("apps-panel-title");
+        const appsChip = document.getElementById("apps-panel-scope-chip");
+        if (!container) return;
+        container.innerHTML = "";
+
+        const chosen = getSelectedDeviceObj();
+        const isAndroid = chosen ? isAndroidDevice(chosen) : false;
+        if (appsTitle) appsTitle.textContent = isAndroid ? "Remote Phone Apps" : "Quick Launch Apps (Windows)";
+        if (appsChip) {
+            appsChip.textContent = isAndroid ? "Android Launcher" : "Windows Allowlist";
+            appsChip.className = isAndroid ? "chip chip-sm chip-cyan" : "chip chip-sm chip-emerald";
+        }
+        const endpoint = isAndroid
+            ? `/api/apps/android?device_id=${encodeURIComponent(chosen.device_id)}`
+            : "/api/apps/windows";
 
         const res = await apiRequest(endpoint);
-        const apps = res.apps || [];
+        const apps = res?.apps || res?.data?.apps || [];
 
         if (res && res.success && Array.isArray(apps) && apps.length > 0) {
-            appsListEl.innerHTML = "";
-            apps.slice(0, 8).forEach(app => {
-                const appLabel = app.label || app.app_name || app.name || app.package_name;
-                const row = document.createElement("div");
-                row.className = "app-row-item";
-                row.innerHTML = `
-                    <div class="app-left">
-                        <span class="app-badge-icon">${isWindows ? "💻" : "📱"}</span>
-                        <span class="app-name-label">${escapeHtml(appLabel)}</span>
+            emptyState?.classList.add("d-none");
+            apps.forEach(rawApp => {
+                const app = (typeof rawApp === "string") ? { name: rawApp, app_name: rawApp } : rawApp;
+                const displayName = app.label || app.app_name || app.name || app.package_name || "Application";
+                const tile = document.createElement("div");
+                tile.className = "app-tile";
+                tile.setAttribute("data-appname", displayName.toLowerCase());
+                tile.innerHTML = `
+                    <div class="island-icon-box" style="width:28px;height:28px;">
+                        <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="18" rx="2" ry="2" width="18" x="3" y="3"></rect></svg>
                     </div>
-                    <button class="btn-pill-action btn-pill-launch">Launch</button>
+                    <div class="flex flex-col min-w-0" style="flex:1;">
+                        <span class="text-sm font-semibold text-primary truncate">${escapeHtml(displayName)}</span>
+                        <span class="text-xs text-muted truncate">${escapeHtml(app.package_name || (isAndroid ? "Android App" : "Windows Allowlist"))}</span>
+                    </div>
+                    <button class="btn btn-xs btn-tonal btn-launch-app">Launch</button>
                 `;
-                row.querySelector(".btn-pill-launch").addEventListener("click", async () => {
-                    if (isWindows) {
-                        await apiRequest("/api/apps/windows/launch", "POST", { app_name: app.name || appLabel });
+
+                tile.querySelector(".btn-launch-app").onclick = async () => {
+                    showNotificationToast(`Launching ${displayName}...`, "info");
+                    let launchRes;
+                    if (isAndroid) {
+                        launchRes = await apiRequest("/api/apps/android/launch", "POST", {
+                            package_name: app.package_name || app.name,
+                            device_id: chosen.device_id,
+                        });
                     } else {
-                        await apiRequest("/api/apps/android/launch", "POST", { package_name: app.package_name || app.name });
+                        launchRes = await apiRequest("/api/apps/windows/launch", "POST", {
+                            app_name: app.name || app.app_name || displayName,
+                        });
                     }
-                    showNotificationToast(`Launched ${appLabel}`, "success");
-                });
-                appsListEl.appendChild(row);
+                    if (launchRes && launchRes.success) {
+                        showNotificationToast(`Launched ${displayName}!`, "success");
+                    } else {
+                        showNotificationToast(launchRes?.error || `Failed launching ${displayName}`, "error");
+                    }
+                };
+                container.appendChild(tile);
             });
+            filterAppTiles();
         } else {
-            appsListEl.innerHTML = `<div class="empty-state text-muted text-xs p-3">No applications found on target device</div>`;
+            emptyState?.classList.remove("d-none");
         }
     }
 
     // =========================================================================
-    // 10. View 4: Shared Clipboard
+    // 9. View 4: Shared Clipboard
     // =========================================================================
 
     function initClipboardView() {
-        const chkInstant = document.getElementById("chk-clipboard-instant-sync");
-        if (chkInstant) {
-            chkInstant.addEventListener("change", async () => {
-                await apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: activeDeviceId });
-                showNotificationToast(`Instant Sync ${chkInstant.checked ? "Enabled" : "Disabled"}`, "info");
+        const clipSyncToggle = document.getElementById("clipview-instant-sync-toggle");
+        if (clipSyncToggle) {
+            clipSyncToggle.addEventListener("change", async () => {
+                const homeToggle = document.getElementById("clipboard-instant-sync-toggle");
+                if (homeToggle) homeToggle.checked = clipSyncToggle.checked;
+                await apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: resolveTargetDeviceId() });
+                showNotificationToast("Clipboard synchronized.", "info");
             });
         }
 
-        const btnClear = document.getElementById("btn-clipboard-clear-unpinned");
-        if (btnClear) {
-            btnClear.addEventListener("click", async () => {
-                await apiRequest("/api/clipboard/buffer/clear", "POST", { keep_pinned: true });
-                showNotificationToast("Cleared unpinned clipboard entries", "info");
+        document.getElementById("btn-clip-add-note")?.addEventListener("click", () => openTextModal("clipboard"));
+        document.getElementById("btn-clip-capture-pc")?.addEventListener("click", async () => {
+            const res = await apiRequest("/api/clipboard/buffer/capture_pc", "POST", {});
+            if (res && res.success) {
+                showNotificationToast("Captured Windows clipboard into buffer!", "success");
                 loadClipboardItems();
-            });
-        }
-
-        const searchInp = document.getElementById("clipboard-search-input");
-        if (searchInp) {
-            searchInp.addEventListener("input", () => {
-                const query = searchInp.value.toLowerCase().trim();
-                const cards = document.querySelectorAll(".clipboard-card-item");
-                cards.forEach(c => {
-                    const text = c.textContent.toLowerCase();
-                    if (text.includes(query)) c.style.display = "block";
-                    else c.style.display = "none";
-                });
-            });
-        }
-    }
-
-    async function loadClipboardItems() {
-        const grid = document.getElementById("clipboard-grid-container");
-        if (!grid) return;
-        const res = await apiRequest("/api/clipboard/buffer");
-        if (res && res.success && Array.isArray(res.items) && res.items.length > 0) {
-            const countEl = document.getElementById("clipboard-total-count");
-            if (countEl) countEl.textContent = `${res.items.length} of ${res.items.length} items`;
-            grid.innerHTML = "";
-
-            res.items.forEach(item => {
-                const card = document.createElement("div");
-                card.className = "card clipboard-card-item";
-
-                // Safe normalized fields
-                const id = item.item_id || item.id || "";
-                const type = item.content_type || item.type || "text";
-                const text = item.text || item.content || item.preview || "";
-                const source = item.source_device_name || item.source_device || "Device";
-                const pinned = item.is_pinned !== undefined ? Boolean(item.is_pinned) : Boolean(item.pinned);
-                const isImg = type === "image";
-
-                const headerHtml = `
-                    <div class="clip-card-header">
-                        <span class="clip-meta">From ${escapeHtml(source)} • ${isImg ? "Image" : "Text"}</span>
-                        ${pinned ? `<span class="badge-pinned">📌 Pinned</span>` : ""}
-                    </div>
-                `;
-
-                const bodyHtml = isImg
-                    ? `
-                        <div class="clip-image-preview mt-2">
-                            <img src="/api/clipboard/image/${id}" alt="Preview" class="clip-thumb-img" onerror="this.src='/api/desktop/wallpaper';" />
-                        </div>
-                    `
-                    : `
-                        <div class="clip-text-body mt-2">
-                            <p>${escapeHtml(text)}</p>
-                        </div>
-                    `;
-
-                card.innerHTML = `
-                    ${headerHtml}
-                    ${bodyHtml}
-                    <div class="clip-card-footer mt-2">
-                        <button class="btn-icon-label btn-clip-copy">📋 Copy</button>
-                        <button class="btn-icon-label btn-clip-pin">${pinned ? "Unpin" : "📌 Pin"}</button>
-                        <button class="btn-icon-label btn-clip-delete text-danger" title="Delete">🗑️</button>
-                    </div>
-                `;
-
-                card.querySelector(".btn-clip-copy").addEventListener("click", async () => {
-                    if (navigator.clipboard && text) {
-                        navigator.clipboard.writeText(text).catch(() => {});
-                    }
-                    await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target_device_id: activeDeviceId });
-                    showNotificationToast("Copied to device clipboard!", "success");
-                });
-
-                card.querySelector(".btn-clip-pin").addEventListener("click", async () => {
-                    const endpoint = pinned ? "/api/clipboard/buffer/unpin" : "/api/clipboard/buffer/pin";
-                    await apiRequest(endpoint, "POST", { item_id: id });
-                    loadClipboardItems();
-                });
-
-                card.querySelector(".btn-clip-delete").addEventListener("click", async () => {
-                    await apiRequest("/api/clipboard/buffer/delete", "POST", { item_id: id });
-                    showNotificationToast("Deleted clipboard item.", "info");
-                    loadClipboardItems();
-                });
-
-                grid.appendChild(card);
-            });
-        } else {
-            const countEl = document.getElementById("clipboard-total-count");
-            if (countEl) countEl.textContent = "0 items";
-            grid.innerHTML = `<div class="empty-state text-muted text-xs p-3">No clipboard items captured yet</div>`;
-        }
-    }
-
-    // =========================================================================
-    // 11. View 5: AI & Settings
-    // =========================================================================
-
-    function initAiSettingsView() {
-        const aiHosts = ["claude", "cursor", "gemini", "antigravity", "chatgpt"];
-        aiHosts.forEach(host => {
-            const btn = document.getElementById(`btn-setup-${host}`);
-            if (btn) {
-                btn.addEventListener("click", async () => {
-                    if (host === "claude" || host === "antigravity") {
-                        // Test Tools Action
-                        showNotificationToast(`Testing 38 local MCP tools for ${host}...`, "info");
-                        const testRes = await apiRequest("/api/mcp/test-local", "POST", {});
-                        if (testRes && testRes.success) {
-                            showNotificationToast(`All ${testRes.tools_count || 38} tools verified active!`, "success");
-                        } else {
-                            showNotificationToast(testRes?.error || "MCP tool self-test completed.", "info");
-                        }
-                    } else {
-                        // Setup / Connect Action
-                        const res = await apiRequest("/api/mcp/setup", "POST", { host });
-                        if (res && res.success) {
-                            showNotificationToast(`Configured MCP tools for ${host}!`, "success");
-                        } else {
-                            showNotificationToast(res?.error || `Setup for ${host} ready.`, "info");
-                        }
-                    }
-                    loadAiHostStatus();
-                });
+            } else {
+                showNotificationToast(res?.error || "Windows clipboard empty or unavailable", "info");
+            }
+        });
+        document.getElementById("btn-clip-pull-phone")?.addEventListener("click", async () => {
+            const targetId = resolveTargetDeviceId();
+            if (!targetId) {
+                showNotificationToast("Select or connect an online phone first.", "warning");
+                return;
+            }
+            const res = await apiRequest("/api/clipboard/buffer/pull_phone", "POST", { device_id: targetId });
+            if (res && res.success) {
+                showNotificationToast("Pulled phone clipboard into buffer!", "success");
+                loadClipboardItems();
+            } else {
+                showNotificationToast(res?.error || "Could not pull phone clipboard", "error");
             }
         });
 
-        // Remote Tunnel Controls (Cloudflared provider)
-        const chkTunnel = document.getElementById("chk-mcp-tunnel-toggle");
-        if (chkTunnel) {
-            chkTunnel.addEventListener("change", async () => {
-                if (chkTunnel.checked) {
-                    showNotificationToast("Starting Cloudflare MCP tunnel...", "info");
-                    const res = await apiRequest("/api/mcp/tunnel/start", "POST", { provider: "cloudflared" });
-                    if (res && res.success) {
-                        showNotificationToast("Remote MCP tunnel active!", "success");
-                    } else {
-                        showNotificationToast(res?.error || "Failed starting tunnel", "error");
-                        chkTunnel.checked = false;
-                    }
-                } else {
-                    await apiRequest("/api/mcp/tunnel/stop", "POST", {});
-                    showNotificationToast("Remote MCP tunnel stopped.", "info");
-                }
-                loadAiLinkStatus();
+        document.getElementById("btn-clipboard-clear-unpinned")?.addEventListener("click", async () => {
+            const res = await apiRequest("/api/clipboard/buffer/clear", "POST", { keep_pinned: true });
+            if (res && res.success) showNotificationToast("Cleared unpinned clipboard entries.", "info");
+            loadClipboardItems();
+        });
+
+        document.getElementById("clipview-search-input")?.addEventListener("input", () => loadClipboardItems());
+    }
+
+    async function loadClipboardItems() {
+        const container = document.getElementById("clipview-grid-container");
+        const emptyState = document.getElementById("clipview-empty-state");
+        const badge = document.getElementById("clipview-count-badge");
+        if (!container) return;
+
+        const res = await apiRequest("/api/clipboard/buffer");
+        const rawItems = (res && Array.isArray(res.items)) ? res.items : (res?.data?.items || []);
+        container.innerHTML = "";
+
+        let items = rawItems;
+        const q = document.getElementById("clipview-search-input")?.value?.trim().toLowerCase();
+        if (q) {
+            items = items.filter(it => {
+                const t = `${it.text_content || ""} ${it.text || ""} ${it.preview || ""} ${it.preview_text || ""} ${it.source_device_name || ""}`;
+                return t.toLowerCase().includes(q);
             });
         }
 
-        const btnMcpCopy = document.getElementById("btn-mcp-copy-link");
-        if (btnMcpCopy) {
-            btnMcpCopy.addEventListener("click", () => {
-                const inp = document.getElementById("mcp-tunnel-url-pill");
-                if (inp && inp.value && !inp.value.includes("Idle")) {
-                    navigator.clipboard.writeText(inp.value);
-                    showNotificationToast("Copied MCP Gateway link!", "success");
-                }
-            });
+        if (badge) badge.textContent = `${items.length} Items`;
+        if (items.length === 0) {
+            emptyState?.classList.remove("d-none");
+            return;
         }
+        emptyState?.classList.add("d-none");
 
-        const btnMcpShowQr = document.getElementById("btn-mcp-show-qr");
-        const mcpQrModal = document.getElementById("mcp-qr-modal");
-        const btnCloseMcpQr = document.getElementById("btn-close-mcp-qr");
-        const btnMcpModalCopy = document.getElementById("btn-mcp-modal-copy");
+        items.forEach(it => {
+            const id = it.item_id || it.id || "";
+            const type = it.content_type || it.type || "text";
+            const text = it.text_content || it.text || it.preview || it.preview_text || "";
+            const source = it.source_device_name || it.source_device || "Device";
+            const pinned = it.is_pinned !== undefined ? Boolean(it.is_pinned) : Boolean(it.pinned);
+            const isImg = type === "image";
 
-        if (btnMcpShowQr && mcpQrModal) {
-            btnMcpShowQr.addEventListener("click", async () => {
-                mcpQrModal.classList.remove("d-none");
-                const res = await apiRequest("/api/mcp/tunnel/qr", "GET");
-                const svgBox = document.getElementById("mcp-qr-svg-container");
-                const linkInp = document.getElementById("mcp-qr-link-input");
+            const card = document.createElement("div");
+            card.className = "clipboard-card";
+
+            const bodyHtml = isImg
+                ? `<div class="flex items-center justify-center p-2" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md);">
+                       <img src="/api/clipboard/image/${encodeURIComponent(id)}" alt="Clipboard Preview" style="max-height: 150px; border-radius: var(--snow-radius-sm);" />
+                   </div>`
+                : `<p class="text-xs text-secondary mono" style="white-space: pre-wrap; word-break: break-word; max-height: 140px; overflow-y: auto;">${escapeHtml(text)}</p>`;
+
+            card.innerHTML = `
+                <div class="flex items-center justify-between gap-2">
+                    <div class="flex items-center gap-2 min-w-0">
+                        <span class="chip chip-sm chip-cyan">${isImg ? "Image" : "Text"}</span>
+                        <span class="text-xs text-muted truncate">${escapeHtml(source)} • ${formatTimestamp(it.timestamp)}</span>
+                    </div>
+                    <div class="flex items-center gap-1">
+                        ${pinned ? `<span class="chip chip-sm chip-emerald">Pinned</span>` : ""}
+                        <button class="icon-btn btn-pin-clip" style="width: 26px; height: 26px;" title="${pinned ? "Unpin" : "Pin"}">
+                            <svg class="svg-icon svg-icon-sm ${pinned ? "text-cyan" : ""}" viewBox="0 0 24 24"><line x1="12" x2="12" y1="17" y2="22"></line><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"></path></svg>
+                        </button>
+                        <button class="icon-btn btn-del-clip text-rose" style="width: 26px; height: 26px;" title="Delete">
+                            <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                        </button>
+                    </div>
+                </div>
+                ${bodyHtml}
+                <div class="flex items-center justify-between gap-2 pt-2" style="border-top: 1px solid var(--snow-border);">
+                    <button class="btn btn-xs btn-primary btn-copy-act">Copy</button>
+                    <button class="btn btn-xs btn-tonal btn-share-act">Send to Target</button>
+                </div>
+            `;
+
+            card.querySelector(".btn-copy-act").onclick = async () => {
+                if (navigator.clipboard && text) navigator.clipboard.writeText(text).catch(() => {});
+                await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: "pc" });
+                showNotificationToast("Applied to clipboard!", "success");
+            };
+            card.querySelector(".btn-share-act").onclick = async () => {
+                await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: resolveTargetDeviceId() || "pc" });
+                showNotificationToast("Sent clipboard entry to active device.", "info");
+            };
+            card.querySelector(".btn-pin-clip").onclick = async () => {
+                const action = pinned ? "/api/clipboard/buffer/unpin" : "/api/clipboard/buffer/pin";
+                await apiRequest(action, "POST", { item_id: id });
+                loadClipboardItems();
+            };
+            card.querySelector(".btn-del-clip").onclick = async () => {
+                await apiRequest("/api/clipboard/buffer/delete", "POST", { item_id: id });
+                loadClipboardItems();
+            };
+
+            container.appendChild(card);
+        });
+    }
+
+    // =========================================================================
+    // 10. View 5: AI & Settings
+    // =========================================================================
+
+    function initAiSettingsView() {
+        document.getElementById("btn-mcp-test-local")?.addEventListener("click", async () => {
+            showNotificationToast("Testing 38 local FastMCP tools...", "info");
+            const res = await apiRequest("/api/mcp/test-local", "POST", {});
+            if (res && res.success) {
+                showNotificationToast(`All ${res.tools_count || 38} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
+            } else {
+                showNotificationToast(res?.error || "MCP self-test failed", "error");
+            }
+        });
+
+        const hostMappings = [
+            { id: "btn-setup-claude", host: "claude" },
+            { id: "btn-setup-chatgpt", host: "chatgpt" },
+            { id: "btn-setup-gemini", host: "gemini" },
+            { id: "btn-setup-antigravity", host: "antigravity" },
+            { id: "btn-setup-cursor", host: "cursor" },
+        ];
+        hostMappings.forEach(({ id, host }) => {
+            document.getElementById(id)?.addEventListener("click", async () => {
+                showNotificationToast(`Configuring MCP host: ${host}...`, "info");
+                const res = await apiRequest("/api/mcp/setup", "POST", { host });
                 if (res && res.success) {
-                    if (svgBox && res.svg) svgBox.innerHTML = res.svg;
-                    if (linkInp && res.url) linkInp.value = res.url;
+                    showNotificationToast(`Configured ${host} successfully!`, "success");
+                } else {
+                    showNotificationToast(res?.error || `Setup completed for ${host}.`, "info");
                 }
+                loadAiHostStatus();
             });
-        }
+        });
 
-        if (btnCloseMcpQr && mcpQrModal) {
-            btnCloseMcpQr.addEventListener("click", () => {
-                mcpQrModal.classList.add("d-none");
-            });
-        }
-
-        if (btnMcpModalCopy) {
-            btnMcpModalCopy.addEventListener("click", () => {
-                const inp = document.getElementById("mcp-qr-link-input");
-                if (inp && inp.value) {
-                    navigator.clipboard.writeText(inp.value);
-                    showNotificationToast("Copied MCP Gateway URL!", "success");
+        // Cloudflare MCP Tunnel Controls
+        document.getElementById("btn-mcp-tunnel-toggle")?.addEventListener("click", async () => {
+            const badge = document.getElementById("mcp-tunnel-status");
+            const isOnline = badge && badge.textContent.includes("Active");
+            if (isOnline) {
+                await apiRequest("/api/mcp/tunnel/stop", "POST", {});
+                showNotificationToast("Remote MCP tunnel stopped.", "info");
+            } else {
+                showNotificationToast("Starting Cloudflare MCP tunnel...", "info");
+                const res = await apiRequest("/api/mcp/tunnel/start", "POST", { provider: "cloudflared" });
+                if (res && res.success) {
+                    showNotificationToast("Cloudflare Remote MCP tunnel online!", "success");
+                } else {
+                    showNotificationToast(res?.error || "Failed starting MCP tunnel", "error");
                 }
-            });
-        }
+            }
+            loadAiSettingsView();
+        });
 
-        // Capability Approvals Resolve Buttons
-        const btnApprove = document.getElementById("btn-approval-approve");
-        const btnDeny = document.getElementById("btn-approval-deny");
-        if (btnApprove) {
-            btnApprove.addEventListener("click", async () => {
-                if (pendingApprovalItem) {
-                    await apiRequest("/api/approvals/resolve", "POST", { request_id: pendingApprovalItem.id, decision: "approve", status: "APPROVED" });
-                    showNotificationToast("Operation approved.", "success");
-                    loadPendingApprovals();
-                }
-            });
-        }
-        if (btnDeny) {
-            btnDeny.addEventListener("click", async () => {
-                if (pendingApprovalItem) {
-                    await apiRequest("/api/approvals/resolve", "POST", { request_id: pendingApprovalItem.id, decision: "deny", status: "REJECTED" });
-                    showNotificationToast("Operation denied.", "warning");
-                    loadPendingApprovals();
-                }
-            });
-        }
+        document.getElementById("btn-mcp-copy-url")?.addEventListener("click", () => {
+            const inp = document.getElementById("mcp-tunnel-url-display");
+            if (inp && inp.value) {
+                navigator.clipboard?.writeText(inp.value).catch(() => {});
+                showNotificationToast("Copied MCP URL to clipboard!", "success");
+            }
+        });
 
-        // OAuth 2.1 Approvals Resolve Buttons
-        const btnOAuthApprove = document.getElementById("btn-oauth-approve");
-        const btnOAuthDeny = document.getElementById("btn-oauth-deny");
-        if (btnOAuthApprove) {
-            btnOAuthApprove.addEventListener("click", async () => {
-                if (pendingOAuthItem) {
-                    await apiRequest("/api/mcp/oauth/approve", "POST", { request_id: pendingOAuthItem.request_id });
-                    showNotificationToast(`Authorized OAuth 2.1 client: ${pendingOAuthItem.client_name || pendingOAuthItem.client_id}`, "success");
-                    loadPendingApprovals();
-                }
-            });
-        }
-        if (btnOAuthDeny) {
-            btnOAuthDeny.addEventListener("click", async () => {
-                if (pendingOAuthItem) {
-                    await apiRequest("/api/mcp/oauth/reject", "POST", { request_id: pendingOAuthItem.request_id });
-                    showNotificationToast("Rejected OAuth 2.1 authorization request.", "warning");
-                    loadPendingApprovals();
-                }
-            });
-        }
+        document.getElementById("btn-mcp-tunnel-save")?.addEventListener("click", async () => {
+            const provider = document.getElementById("mcp-tunnel-provider")?.value || "cloudflared";
+            const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || "";
+            const tokenInp = document.getElementById("mcp-tunnel-token-input");
+            const rawToken = tokenInp ? tokenInp.value.trim() : "";
 
-        // Diagnostics Buttons
-        const btnCopyLogs = document.getElementById("btn-diag-copy-logs");
-        if (btnCopyLogs) {
-            btnCopyLogs.addEventListener("click", async () => {
-                const res = await apiRequest("/api/activity?limit=100");
-                const acts = res.events || res.activities || res.items || res.records || [];
-                const lines = acts.map(a => `[${new Date((a.timestamp || 0) * 1000).toISOString()}] ${a.principal || "SYSTEM"} - ${a.event_type || a.action || "EVENT"}: ${a.message || a.details || ""}`);
-                const logText = lines.join("\n") || "No activity events recorded.";
-                if (navigator.clipboard) {
-                    navigator.clipboard.writeText(logText).catch(() => {});
-                }
-                showNotificationToast("Copied sanitized debug logs to clipboard!", "success");
+            const payload = {
+                provider,
+                mcp_public_url: domain || null,
+            };
+            if (rawToken && !rawToken.includes("***") && rawToken !== "[REDACTED]") {
+                payload.mcp_cloudflare_token = rawToken;
+            }
+            const res = await apiRequest("/api/mcp/tunnel/config", "POST", payload);
+            if (res && res.success) {
+                if (tokenInp) tokenInp.value = "";
+                showNotificationToast("Saved permanent tunnel configuration.", "success");
+                loadAiTunnelStatus();
+            } else {
+                showNotificationToast(res?.error || "Failed saving tunnel configuration", "error");
+            }
+        });
+
+        document.getElementById("btn-mcp-tunnel-token-clear")?.addEventListener("click", async () => {
+            const res = await apiRequest("/api/mcp/tunnel/config", "POST", {
+                mcp_cloudflare_token: null,
+                cloudflare_token: null,
             });
-        }
+            if (res && res.success) {
+                const tokenInp = document.getElementById("mcp-tunnel-token-input");
+                if (tokenInp) tokenInp.value = "";
+                showNotificationToast("Cleared persisted Cloudflare tunnel token.", "info");
+                loadAiTunnelStatus();
+            } else {
+                showNotificationToast(res?.error || "Failed clearing tunnel token", "error");
+            }
+        });
 
-        const btnResetTokens = document.getElementById("btn-diag-reset-tokens");
-        if (btnResetTokens) {
-            btnResetTokens.addEventListener("click", async () => {
-                if (confirm("Reset active pairing tokens and refresh credentials?")) {
-                    await apiRequest("/api/pair/qr", "POST", { trust_tier: "owner" });
-                    loadPairingQR();
-                    showNotificationToast("Pairing tokens reset and regenerated.", "warning");
+        const qrModal = document.getElementById("mcp-qr-modal");
+        document.getElementById("btn-mcp-tunnel-show-qr")?.addEventListener("click", async () => {
+            const res = await apiRequest("/api/mcp/tunnel/qr");
+            if (res && res.success && res.svg && qrModal) {
+                document.getElementById("mcp-qr-svg-container").innerHTML = res.svg;
+                document.getElementById("mcp-qr-link-input").value = res.url || "";
+                qrModal.classList.remove("d-none");
+            } else {
+                showNotificationToast("QR code unavailable.", "warning");
+            }
+        });
+        document.getElementById("btn-close-mcp-qr")?.addEventListener("click", () => qrModal?.classList.add("d-none"));
+        document.getElementById("btn-mcp-modal-copy")?.addEventListener("click", () => {
+            const inp = document.getElementById("mcp-qr-link-input");
+            if (inp && inp.value) {
+                navigator.clipboard?.writeText(inp.value).catch(() => {});
+                showNotificationToast("Copied MCP link!", "success");
+            }
+        });
+
+        // Diagnostics & Direct Product Updates
+        document.getElementById("btn-diag-copy-logs")?.addEventListener("click", async () => {
+            const box = document.getElementById("diag-log-box");
+            const text = box ? box.textContent : "No logs recorded.";
+            if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+            showNotificationToast("Copied diagnostic logs!", "success");
+        });
+        document.getElementById("btn-diag-clear-logs")?.addEventListener("click", () => {
+            const box = document.getElementById("diag-log-box");
+            if (box) box.textContent = "Diagnostics buffer cleared.";
+        });
+        document.getElementById("btn-diag-update-check")?.addEventListener("click", async () => {
+            const banner = document.getElementById("update-status-banner");
+            const applyBtn = document.getElementById("btn-diag-update-apply");
+            showNotificationToast("Checking release manifest...", "info");
+            const res = await apiRequest("/api/system/update-check");
+            if (res && res.success && (res.available || res.update_available)) {
+                pendingUpdateMeta = res;
+                if (banner) {
+                    banner.textContent = `Update v${res.latest_version} available (${res.update_type})`;
+                    banner.classList.remove("d-none");
                 }
-            });
-        }
-
-        // Direct Product Updates & Hot-Swap UI
-        let pendingUpdate = null;
-        const btnCheckUpdates = document.getElementById("btn-check-updates");
-        const btnApplyUpdate = document.getElementById("btn-apply-update");
-        const btnResetUiOverride = document.getElementById("btn-reset-ui-override");
-        const updateStatusBadge = document.getElementById("update-status-badge");
-        const updateNotesContainer = document.getElementById("update-notes-container");
-
-        if (btnCheckUpdates) {
-            btnCheckUpdates.addEventListener("click", async () => {
-                if (updateStatusBadge) updateStatusBadge.textContent = "Checking...";
-                try {
-                    const res = await apiRequest("/api/system/update-check");
-                    if (res && res.success) {
-                        if (res.available) {
-                            pendingUpdate = res;
-                            if (updateStatusBadge) {
-                                updateStatusBadge.textContent = `v${res.latest_version} available (${res.update_type})`;
-                                updateStatusBadge.className = "badge text-xs bg-primary text-white";
-                            }
-                            if (btnApplyUpdate) btnApplyUpdate.classList.remove("d-none");
-                            if (updateNotesContainer && res.release_notes) {
-                                updateNotesContainer.textContent = res.release_notes;
-                                updateNotesContainer.classList.remove("d-none");
-                            }
-                            showNotificationToast(`Update available: v${res.latest_version}`, "info");
-                        } else {
-                            pendingUpdate = null;
-                            if (updateStatusBadge) {
-                                updateStatusBadge.textContent = `v${res.current_version} • Up to date`;
-                                updateStatusBadge.className = "badge text-xs";
-                            }
-                            if (btnApplyUpdate) btnApplyUpdate.classList.add("d-none");
-                            if (updateNotesContainer) updateNotesContainer.classList.add("d-none");
-                            showNotificationToast("SNOW is up to date.", "success");
-                        }
-                    } else {
-                        if (updateStatusBadge) updateStatusBadge.textContent = "Check failed";
-                        showNotificationToast(res.error || "Update check failed", "danger");
-                    }
-                } catch (e) {
-                    if (updateStatusBadge) updateStatusBadge.textContent = "Check error";
-                    showNotificationToast(`Error: ${e.message}`, "danger");
+                applyBtn?.classList.remove("d-none");
+                showNotificationToast(`Update v${res.latest_version} available!`, "success");
+            } else {
+                pendingUpdateMeta = null;
+                applyBtn?.classList.add("d-none");
+                if (banner) {
+                    banner.textContent = `Current version ${res?.current_version || "5.0.0"} is up to date.`;
+                    banner.classList.remove("d-none");
                 }
+                showNotificationToast("SNOW is up to date.", "info");
+            }
+        });
+        document.getElementById("btn-diag-update-apply")?.addEventListener("click", async () => {
+            if (!pendingUpdateMeta) return;
+            const res = await apiRequest("/api/system/update-apply", "POST", {
+                update_type: pendingUpdateMeta.update_type,
+                url: pendingUpdateMeta.url,
+                sha256: pendingUpdateMeta.sha256,
             });
-        }
+            if (res && res.success) {
+                showNotificationToast(res.message || "Update applied!", "success");
+                setTimeout(() => window.location.reload(), 1200);
+            } else {
+                showNotificationToast(res?.error || "Update failed", "error");
+            }
+        });
+        document.getElementById("btn-diag-reset-override")?.addEventListener("click", async () => {
+            const res = await apiRequest("/api/web-ui/reset-override", "POST", {});
+            if (res && res.success) {
+                showNotificationToast("Reset to bundled Web UI. Reloading...", "info");
+                setTimeout(() => window.location.reload(), 900);
+            } else {
+                showNotificationToast(res?.error || "Reset failed", "error");
+            }
+        });
+    }
 
-        if (btnApplyUpdate) {
-            btnApplyUpdate.addEventListener("click", async () => {
-                if (!pendingUpdate) return;
-                const msg = pendingUpdate.update_type === "desktop"
-                    ? `Apply full desktop update to v${pendingUpdate.latest_version}? The Core daemon will restart.`
-                    : `Apply Web UI hot-swap update to v${pendingUpdate.latest_version}?`;
-                if (!confirm(msg)) return;
-
-                btnApplyUpdate.disabled = true;
-                btnApplyUpdate.textContent = "Applying...";
-                try {
-                    const res = await apiRequest("/api/system/update-apply", "POST", {
-                        update_type: pendingUpdate.update_type,
-                        url: pendingUpdate.url,
-                        sha256: pendingUpdate.sha256
-                    });
-                    if (res && res.success) {
-                        showNotificationToast(res.message || "Update applied!", "success");
-                        setTimeout(() => window.location.reload(), 1500);
-                    } else {
-                        btnApplyUpdate.disabled = false;
-                        btnApplyUpdate.textContent = "Apply Update";
-                        showNotificationToast(res.error || "Update application failed.", "danger");
-                    }
-                } catch (e) {
-                    btnApplyUpdate.disabled = false;
-                    btnApplyUpdate.textContent = "Apply Update";
-                    showNotificationToast(`Error: ${e.message}`, "danger");
-                }
-            });
-        }
-
-        if (btnResetUiOverride) {
-            btnResetUiOverride.addEventListener("click", async () => {
-                if (!confirm("Reset to bundled Web UI assets and discard local overrides?")) return;
-                try {
-                    const res = await apiRequest("/api/web-ui/reset-override", "POST", {});
-                    if (res && res.success) {
-                        showNotificationToast("Reset complete. Reloading...", "success");
-                        setTimeout(() => window.location.reload(), 1000);
-                    } else {
-                        showNotificationToast(res.error || "Failed resetting Web UI override.", "danger");
-                    }
-                } catch (e) {
-                    showNotificationToast(`Error: ${e.message}`, "danger");
-                }
-            });
-        }
+    async function loadAiSettingsView() {
+        await Promise.all([
+            loadAiHostStatus(),
+            loadAiTunnelStatus(),
+            loadApprovals(),
+            loadActivityTimeline(),
+        ]);
     }
 
     async function loadAiHostStatus() {
@@ -2010,282 +2405,523 @@
             res.data.ai_hosts.forEach(h => {
                 const badge = document.getElementById(`badge-status-${h.host}`);
                 if (badge) {
-                    if (h.is_configured) {
-                        badge.textContent = "Connected";
-                        badge.className = "badge-pill badge-pill-success";
-                    } else {
-                        badge.textContent = "Ready";
-                        badge.className = "badge-pill badge-pill-muted";
-                    }
+                    badge.textContent = h.is_configured ? "Configured" : "Ready";
+                    badge.className = h.is_configured ? "chip chip-sm chip-emerald" : "chip chip-sm chip-neutral";
                 }
             });
         }
     }
 
-    async function loadAiLinkStatus() {
-        const badge = document.getElementById("mcp-tunnel-badge");
-        const linkInp = document.getElementById("mcp-tunnel-url-pill");
-        const chkTunnel = document.getElementById("chk-mcp-tunnel-toggle");
+    async function loadAiTunnelStatus() {
+        const [statusRes, cfgRes] = await Promise.all([
+            apiRequest("/api/mcp/tunnel/status"),
+            apiRequest("/api/mcp/tunnel/config"),
+        ]);
+        const statusBadge = document.getElementById("mcp-tunnel-status");
+        const btnToggle = document.getElementById("btn-mcp-tunnel-toggle");
+        const urlInput = document.getElementById("mcp-tunnel-url-display");
+        const providerSel = document.getElementById("mcp-tunnel-provider");
+        const permUrlInput = document.getElementById("mcp-tunnel-permanent-input");
+        const tokenStatusBadge = document.getElementById("mcp-tunnel-token-status");
 
-        const res = await apiRequest("/api/mcp/tunnel/status");
-        if (res && res.active && res.public_url) {
-            if (badge) {
-                badge.textContent = "Tunnel Active • 38 Tools Ready";
-                badge.className = "badge-pill badge-pill-success";
+        const cfg = cfgRes?.config || {};
+        if (providerSel && cfg.provider) providerSel.value = cfg.provider;
+        if (permUrlInput && document.activeElement !== permUrlInput) {
+            permUrlInput.value = cfg.mcp_public_url || cfg.public_url || "";
+        }
+        if (tokenStatusBadge) {
+            const maskedToken = cfg.mcp_cloudflare_token || cfg.cloudflare_token || "";
+            if (maskedToken) {
+                tokenStatusBadge.textContent = `Configured: ${maskedToken}`;
+                tokenStatusBadge.className = "chip chip-sm chip-emerald mono";
+            } else {
+                tokenStatusBadge.textContent = "No Token Saved";
+                tokenStatusBadge.className = "chip chip-sm chip-neutral";
             }
-            if (linkInp) linkInp.value = `${res.public_url}/mcp`;
-            if (chkTunnel) chkTunnel.checked = true;
+        }
+
+        if (statusRes && statusRes.active && statusRes.public_url) {
+            if (statusBadge) {
+                statusBadge.textContent = "Active • 38 Tools Ready";
+                statusBadge.className = "chip chip-emerald";
+            }
+            if (btnToggle) btnToggle.textContent = "Stop Tunnel";
+            if (urlInput) urlInput.value = `${statusRes.public_url.replace(/\/$/, "")}/mcp`;
         } else {
-            if (badge) {
-                badge.textContent = "Tunnel Inactive";
-                badge.className = "badge-pill badge-pill-muted";
+            if (statusBadge) {
+                statusBadge.textContent = "Offline";
+                statusBadge.className = "chip chip-neutral";
             }
-            if (linkInp) linkInp.value = "http://127.0.0.1:8771/mcp";
-            if (chkTunnel) chkTunnel.checked = false;
+            if (btnToggle) btnToggle.textContent = "Start Tunnel";
+            if (urlInput) urlInput.value = "http://127.0.0.1:8771/mcp";
         }
     }
 
-    async function loadPendingApprovals() {
-        const badge = document.getElementById("topbar-approvals-badge");
+    async function loadApprovals() {
+        const container = document.getElementById("approvals-list-container");
+        const emptyState = document.getElementById("approvals-empty-state");
+        const badge = document.getElementById("approvals-count-badge");
+        const topbarBadge = document.getElementById("topbar-approvals-badge");
 
-        // 1. Capability approvals
-        const capRes = await apiRequest("/api/approvals");
-        const capApprovals = capRes.approvals || capRes.pending || capRes.requests || [];
-        const approvalBox = document.getElementById("settings-pending-approval-item");
-        const approvalText = document.getElementById("settings-pending-approval-text");
+        const [capRes, oauthRes] = await Promise.all([
+            apiRequest("/api/approvals"),
+            apiRequest("/api/mcp/oauth/pending"),
+        ]);
 
-        if (capRes && capRes.success && Array.isArray(capApprovals) && capApprovals.length > 0) {
-            pendingApprovalItem = capApprovals[0];
-            if (approvalBox && approvalText) {
-                approvalText.textContent = `${pendingApprovalItem.client_name || "AI Client"} requested ${pendingApprovalItem.tool_name || "Operation"}`;
-                approvalBox.classList.remove("d-none");
-            }
-        } else {
-            pendingApprovalItem = null;
-            if (approvalBox) approvalBox.classList.add("d-none");
-        }
-
-        // 2. OAuth 2.1 pending requests
-        const oauthRes = await apiRequest("/api/mcp/oauth/pending");
+        const capApprovals = capRes?.requests || capRes?.approvals || capRes?.pending || [];
         const oauthPending = (oauthRes && Array.isArray(oauthRes.pending)) ? oauthRes.pending : [];
-        const oauthBox = document.getElementById("settings-pending-oauth-item");
-        const oauthText = document.getElementById("settings-pending-oauth-text");
+        const total = capApprovals.length + oauthPending.length;
 
-        if (oauthRes && oauthRes.success && oauthPending.length > 0) {
-            pendingOAuthItem = oauthPending[0];
-            if (oauthBox && oauthText) {
-                oauthText.textContent = `${pendingOAuthItem.client_name || pendingOAuthItem.client_id || "OAuth Client"} requested OAuth 2.1 authorization`;
-                oauthBox.classList.remove("d-none");
-            }
-        } else {
-            pendingOAuthItem = null;
-            if (oauthBox) oauthBox.classList.add("d-none");
+        if (badge) badge.textContent = `${total} Pending`;
+        if (topbarBadge) {
+            topbarBadge.textContent = String(total);
+            topbarBadge.classList.toggle("d-none", total === 0);
         }
 
-        // Total count on topbar bell badge
-        const totalPending = capApprovals.length + oauthPending.length;
-        if (badge) {
-            badge.textContent = totalPending;
-            if (totalPending > 0) badge.classList.remove("d-none");
-            else badge.classList.add("d-none");
+        if (!container) return;
+        container.innerHTML = "";
+        if (total === 0) {
+            emptyState?.classList.remove("d-none");
+            return;
         }
+        emptyState?.classList.add("d-none");
+
+        // Render Capability Approvals
+        capApprovals.forEach(appr => {
+            const reqId = appr.request_id || appr.id;
+            const remSec = appr.time_remaining_seconds !== undefined ? Math.max(0, Math.round(Number(appr.time_remaining_seconds))) : null;
+            const card = document.createElement("div");
+            card.className = "notif-card";
+            card.innerHTML = `
+                <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs font-bold text-primary truncate">${escapeHtml(appr.principal || appr.client_name || "AI Assistant")}</span>
+                    <span class="chip chip-sm chip-amber">${escapeHtml(appr.risk_level || "CONFIRM")}${remSec !== null ? ` • ${remSec}s` : ""}</span>
+                </div>
+                <span class="text-xs text-secondary">${escapeHtml(appr.action || appr.tool_name || "Execute capability")} • ${escapeHtml(appr.target_device || "Device")}</span>
+                <div class="flex gap-2 mt-1">
+                    <button class="btn btn-xs btn-primary btn-appr-accept w-full">Approve</button>
+                    <button class="btn btn-xs btn-danger btn-appr-deny w-full">Deny</button>
+                </div>
+            `;
+            card.querySelector(".btn-appr-accept").onclick = async () => {
+                await apiRequest("/api/approvals/resolve", "POST", { request_id: reqId, decision: "approve", status: "APPROVED" });
+                showNotificationToast("Capability approved.", "success");
+                loadApprovals();
+            };
+            card.querySelector(".btn-appr-deny").onclick = async () => {
+                await apiRequest("/api/approvals/resolve", "POST", { request_id: reqId, decision: "deny", status: "REJECTED" });
+                showNotificationToast("Capability denied.", "warning");
+                loadApprovals();
+            };
+            container.appendChild(card);
+        });
+
+        // Render OAuth 2.1 Approvals
+        oauthPending.forEach(oa => {
+            const card = document.createElement("div");
+            card.className = "notif-card";
+            card.innerHTML = `
+                <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs font-bold text-primary truncate">${escapeHtml(oa.client_name || oa.client_id || "Remote AI Client")}</span>
+                    <span class="chip chip-sm chip-cyan">OAuth 2.1</span>
+                </div>
+                <span class="text-xs text-secondary">Requested scope: ${escapeHtml(oa.scope || "snow:mcp")}</span>
+                <div class="flex gap-2 mt-1">
+                    <button class="btn btn-xs btn-primary btn-oa-approve w-full">Approve</button>
+                    <button class="btn btn-xs btn-danger btn-oa-reject w-full">Reject</button>
+                </div>
+            `;
+            card.querySelector(".btn-oa-approve").onclick = async () => {
+                await apiRequest("/api/mcp/oauth/approve", "POST", { request_id: oa.request_id });
+                showNotificationToast("OAuth client authorized.", "success");
+                loadApprovals();
+            };
+            card.querySelector(".btn-oa-reject").onclick = async () => {
+                await apiRequest("/api/mcp/oauth/reject", "POST", { request_id: oa.request_id });
+                showNotificationToast("OAuth client rejected.", "warning");
+                loadApprovals();
+            };
+            container.appendChild(card);
+        });
+    }
+
+    function formatActivityEvent(ev) {
+        const rawAction = String(ev.capability || ev.action || ev.event_type || "activity").trim();
+        const key = rawAction.toLowerCase().replace(/^snow_/, "");
+        const actionLabels = {
+            "desktop_status": "Checked Windows PC status and telemetry",
+            "windows_system_info": "Checked Windows PC system information",
+            "windows_battery": "Checked Windows battery status",
+            "windows_launch_app": "Launched allowlisted Windows application",
+            "desktop_app_launch": "Launched Windows application",
+            "windows_file_list": "Listed authorized Windows folder",
+            "desktop_file_list": "Listed authorized Windows folder",
+            "windows_file_read": "Read file from authorized Windows directory",
+            "windows_file_write": "Wrote file to authorized Windows directory",
+            "windows_terminal_exec": "Executed Windows terminal command",
+            "desktop_exec": "Executed Windows terminal command",
+            "windows_clipboard_get": "Read Windows clipboard",
+            "windows_clipboard_set": "Updated Windows clipboard",
+            "desktop_clipboard_set": "Updated Windows clipboard",
+            "clipboard_buffer_add": "Saved item to shared clipboard buffer",
+            "clipboard_buffer_pin": "Pinned shared clipboard item",
+            "clipboard_buffer_unpin": "Unpinned shared clipboard item",
+            "clipboard_buffer_delete": "Deleted shared clipboard item",
+            "clipboard_buffer_clear": "Cleared shared clipboard buffer",
+            "clipboard_buffer_apply": "Applied shared clipboard item to device",
+            "media_control": "Adjusted media playback or volume",
+            "windows_media_control": "Adjusted Windows media playback or volume",
+            "share_link": "Shared link or note to device",
+            "windows_share_link": "Opened shared link on Windows",
+            "android_screenshot": "Captured Android screen",
+            "android_camera_capture": "Captured Android camera photo",
+            "android_ring": "Triggered Find My Phone ringer",
+            "android_file_list": "Listed Android device files",
+            "android_file_send": "Sent file to Android device",
+            "android_file_receive": "Downloaded file from Android device",
+            "android_apps_launch": "Launched Android application",
+            "pair_success": "Paired trusted device",
+            "auth_success": "Authenticated device session",
+            "auth_failed": "Blocked invalid authentication attempt",
+            "system_pause": "Paused SNOW background automation",
+            "system_resume": "Resumed SNOW background automation",
+        };
+        const title = actionLabels[key] || rawAction.replace(/[._-]+/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+        const rawPrincipal = String(ev.principal || ev.actor || "").toUpperCase();
+        const principalLabel = rawPrincipal.includes("OWNER")
+            ? "Owner"
+            : (rawPrincipal.includes("AI") || rawPrincipal.includes("MCP") ? "AI Assistant" : (ev.principal || "System"));
+
+        const rawOutcome = String(ev.outcome || ev.status || "OK").toUpperCase();
+        const outcomeLabel = (rawOutcome === "OK" || rawOutcome === "SUCCESS" || rawOutcome === "ALLOWED")
+            ? "Completed"
+            : (rawOutcome.includes("DENIED") || rawOutcome.includes("BLOCK") || rawOutcome.includes("REJECT") ? "Blocked" : rawOutcome);
+
+        const targetPart = ev.target_device ? ` on ${ev.target_device}` : "";
+        return {
+            title,
+            subtitle: `${principalLabel}${targetPart} • ${outcomeLabel}`,
+        };
     }
 
     async function loadActivityTimeline() {
-        const listEl = document.getElementById("activity-timeline-list");
-        if (!listEl) return;
-        const res = await apiRequest("/api/activity");
-        const acts = res.events || res.activities || res.items || res.records || [];
-        if (res && res.success && Array.isArray(acts) && acts.length > 0) {
-            listEl.innerHTML = "";
-            acts.slice(0, 5).forEach(act => {
-                const row = document.createElement("div");
-                row.className = "timeline-row";
-                row.innerHTML = `
-                    <span class="timeline-dot">•</span>
-                    <span class="timeline-text">${escapeHtml(act.message || act.description || act.event_type || "")}</span>
-                `;
-                listEl.appendChild(row);
-            });
-        } else {
-            listEl.innerHTML = `<div class="empty-state text-muted text-xs">No recent activity</div>`;
-        }
-    }
+        const container = document.getElementById("activity-timeline-container");
+        const diagBox = document.getElementById("diag-log-box");
+        const res = await apiRequest("/api/activity?limit=25");
+        const events = res?.events || res?.records || res?.activities || [];
 
-    // =========================================================================
-    // 12. Modals: Media Preview & Notification Reply
-    // =========================================================================
-
-    function initModals() {
-        // Media Preview Modal
-        const previewModal = document.getElementById("media-preview-modal");
-        const btnClosePreview = document.getElementById("btn-close-media-preview");
-        if (previewModal && btnClosePreview) {
-            btnClosePreview.addEventListener("click", () => {
-                previewModal.classList.add("d-none");
-            });
-        }
-
-        // Notification Reply Modal
-        const replyModal = document.getElementById("notif-reply-modal");
-        const btnCloseReply = document.getElementById("btn-close-notif-reply");
-        const btnSendReply = document.getElementById("btn-notif-reply-send");
-        if (replyModal && btnCloseReply) {
-            btnCloseReply.addEventListener("click", () => {
-                replyModal.classList.add("d-none");
-            });
-        }
-        if (btnSendReply) {
-            btnSendReply.addEventListener("click", async () => {
-                const textInp = document.getElementById("notif-reply-text");
-                const text = textInp ? textInp.value.trim() : "";
-                if (!text) {
-                    showNotificationToast("Please enter a reply message.", "warning");
-                    return;
-                }
-                const res = await apiRequest("/api/notifications/reply", "POST", { key: replyingNotificationKey, text });
-                if (res && res.success) {
-                    showNotificationToast("Reply sent successfully!", "success");
-                    if (replyModal) replyModal.classList.add("d-none");
-                    loadHomeWidgets();
-                } else {
-                    showNotificationToast(res?.error || "Failed sending reply", "error");
-                }
-            });
-        }
-    }
-
-    function openMediaPreview(src, title = "Preview") {
-        const modal = document.getElementById("media-preview-modal");
-        const img = document.getElementById("media-preview-img");
-        const titleEl = document.getElementById("media-preview-title");
-        const dlLink = document.getElementById("btn-download-preview");
-
-        if (modal && img) {
-            img.src = src;
-            if (titleEl) titleEl.textContent = title;
-            if (dlLink) dlLink.href = src;
-            modal.classList.remove("d-none");
-        }
-    }
-
-    function openReplyModal(key, title, snippet) {
-        replyingNotificationKey = key;
-        const modal = document.getElementById("notif-reply-modal");
-        const titleEl = document.getElementById("notif-reply-title");
-        const snippetEl = document.getElementById("notif-reply-snippet");
-        const textInp = document.getElementById("notif-reply-text");
-
-        if (modal) {
-            if (titleEl) titleEl.textContent = `Reply to ${title || "Notification"}`;
-            if (snippetEl) snippetEl.textContent = snippet || "";
-            if (textInp) {
-                textInp.value = "";
-                textInp.focus();
+        if (diagBox) {
+            if (events.length > 0) {
+                diagBox.textContent = events.slice(0, 20).map(ev => {
+                    const fmt = formatActivityEvent(ev);
+                    return `[${formatTimestamp(ev.timestamp)}] ${fmt.title} (${fmt.subtitle})`;
+                }).join("\n");
+            } else {
+                diagBox.textContent = `SNOW Core Online • ${canonicalSnowId}\nWeb UI Loopback: 127.0.0.1:8769`;
             }
-            modal.classList.remove("d-none");
         }
+
+        if (!container) return;
+        container.innerHTML = "";
+        if (!res || !res.success) {
+            container.innerHTML = `<span class="text-xs text-muted">Activity history unavailable while Core is offline.</span>`;
+            return;
+        }
+        if (events.length === 0) {
+            container.innerHTML = `<span class="text-xs text-muted">No recorded audit events yet.</span>`;
+            return;
+        }
+
+        events.slice(0, 15).forEach(ev => {
+            const fmt = formatActivityEvent(ev);
+            const row = document.createElement("div");
+            row.className = "flex items-center justify-between gap-2 text-xs p-2";
+            row.style.background = "var(--snow-bg-elevated)";
+            row.style.borderRadius = "var(--snow-radius-sm)";
+            row.innerHTML = `
+                <div class="flex flex-col min-w-0">
+                    <span class="font-medium text-primary truncate">${escapeHtml(fmt.title)}</span>
+                    <span class="text-muted truncate">${escapeHtml(fmt.subtitle)}</span>
+                </div>
+                <span class="text-muted mono" style="flex-shrink:0;">${escapeHtml(formatTimestamp(ev.timestamp))}</span>
+            `;
+            container.appendChild(row);
+        });
     }
 
     // =========================================================================
-    // 13. Command Palette (Ctrl+K)
+    // 11. Command Palette (Ctrl+K)
     // =========================================================================
 
     function initCommandPalette() {
-        if (!btnTopbarCommandPalette || !commandPaletteOverlay) return;
+        const overlay = document.getElementById("command-palette-overlay");
+        const trigger = document.getElementById("btn-topbar-command-palette");
+        const input = document.getElementById("command-palette-input");
+        const results = document.getElementById("command-palette-results");
 
-        btnTopbarCommandPalette.addEventListener("click", () => {
-            openCommandPalette();
-        });
+        function openPalette() {
+            if (overlay && input) {
+                overlay.classList.remove("d-none");
+                input.value = "";
+                filterResults("");
+                input.focus();
+            }
+        }
+        function closePalette() {
+            overlay?.classList.add("d-none");
+        }
 
-        document.addEventListener("keydown", (e) => {
+        if (trigger) trigger.onclick = openPalette;
+
+        window.addEventListener("keydown", (e) => {
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
-                e.preventDefault();
-                openCommandPalette();
-            } else if (e.key === "Escape" && !commandPaletteOverlay.classList.contains("d-none")) {
-                closeCommandPalette();
+                const tag = document.activeElement ? document.activeElement.tagName.toLowerCase() : "";
+                if (tag !== "input" && tag !== "textarea") {
+                    e.preventDefault();
+                    openPalette();
+                }
+            } else if (e.key === "Escape") {
+                closePalette();
+                document.getElementById("connect-modal")?.classList.add("d-none");
+                document.getElementById("poweroff-modal")?.classList.add("d-none");
+                document.getElementById("media-preview-modal")?.classList.add("d-none");
+                document.getElementById("notif-reply-modal")?.classList.add("d-none");
+                document.getElementById("share-link-modal")?.classList.add("d-none");
+                document.getElementById("mcp-qr-modal")?.classList.add("d-none");
+                document.getElementById("killswitch-modal")?.classList.add("d-none");
+                document.getElementById("device-island-container")?.classList.add("d-none");
             }
         });
 
-        commandPaletteOverlay.addEventListener("click", (e) => {
-            if (e.target === commandPaletteOverlay) {
-                closeCommandPalette();
-            }
+        overlay?.addEventListener("click", (e) => {
+            if (e.target === overlay) closePalette();
         });
 
-        const paletteItems = document.querySelectorAll(".palette-item");
-        paletteItems.forEach(item => {
-            item.addEventListener("click", () => {
-                const action = item.getAttribute("data-action");
-                handlePaletteAction(action);
-                closeCommandPalette();
+        function filterResults(q) {
+            results?.querySelectorAll(".palette-item").forEach(it => {
+                it.style.display = (!q || it.textContent.toLowerCase().includes(q)) ? "flex" : "none";
             });
+        }
+
+        input?.addEventListener("input", () => filterResults(input.value.trim().toLowerCase()));
+
+        results?.querySelectorAll(".palette-item").forEach(it => {
+            it.onclick = async () => {
+                const action = it.getAttribute("data-action");
+                closePalette();
+                if (action === "nav-overview") switchTab("overview");
+                else if (action === "nav-devices") switchTab("devices");
+                else if (action === "nav-files") switchTab("files");
+                else if (action === "nav-clipboard") switchTab("clipboard");
+                else if (action === "nav-settings") switchTab("settings");
+                else if (action === "act-ring") triggerRingPhone();
+                else if (action === "act-capture-phone") triggerScreenCapture();
+                else if (action === "act-capture-workflow") {
+                    showNotificationToast("Running capture_pc_to_phone workflow...", "info");
+                    await apiRequest("/api/workflows/run", "POST", { workflow_id: "capture_pc_to_phone" });
+                } else if (action === "act-sync-clip") {
+                    await apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: resolveTargetDeviceId() });
+                    showNotificationToast("Clipboard synchronized.", "success");
+                }
+            };
+        });
+    }
+
+    // =========================================================================
+    // 12. Global Modals (Connect, Peer Host, Share/Add Note, Media, Reply)
+    // =========================================================================
+
+    function initModals() {
+        const connectModal = document.getElementById("connect-modal");
+        document.getElementById("btn-close-connect-modal")?.addEventListener("click", () => connectModal?.classList.add("d-none"));
+
+        document.getElementById("btn-copy-modal-netid")?.addEventListener("click", () => {
+            const val = document.getElementById("modal-network-id")?.textContent || canonicalSnowId;
+            navigator.clipboard?.writeText(val).catch(() => {});
+            showNotificationToast(`Copied ${val}`, "success");
         });
 
-        if (commandPaletteInput) {
-            commandPaletteInput.addEventListener("input", (e) => {
-                const query = e.target.value.toLowerCase().trim();
-                paletteItems.forEach(it => {
-                    const text = it.textContent.toLowerCase();
-                    if (text.includes(query)) it.style.display = "block";
-                    else it.style.display = "none";
+        document.getElementById("btn-modal-connect-submit")?.addEventListener("click", async () => {
+            const val = document.getElementById("modal-connect-input")?.value.trim();
+            if (!val) return;
+            connectModal?.classList.add("d-none");
+            await handleUnifiedConnectInput(val);
+        });
+
+        document.getElementById("btn-connect-peer-submit")?.addEventListener("click", async () => {
+            const host = document.getElementById("connect-peer-host")?.value.trim();
+            const port = parseInt(document.getElementById("connect-peer-port")?.value || "8765", 10);
+            const pin = document.getElementById("connect-peer-pin")?.value.trim() || "";
+            const fp = document.getElementById("connect-peer-fp")?.value.trim() || "";
+            if (!host) {
+                showNotificationToast("Enter peer host IP address.", "warning");
+                return;
+            }
+            showNotificationToast(`Connecting to ${host}:${port}...`, "info");
+            const res = await apiRequest("/api/devices/connect-peer", "POST", {
+                host,
+                port,
+                pin,
+                expected_fingerprint: fp,
+            });
+            if (res && res.success) {
+                showNotificationToast("Connected to peer host!", "success");
+                connectModal?.classList.add("d-none");
+                refreshAllData();
+            } else {
+                showNotificationToast(res?.error || "Peer host connection failed", "error");
+            }
+        });
+
+        document.getElementById("btn-close-media-preview")?.addEventListener("click", () => {
+            document.getElementById("media-preview-modal")?.classList.add("d-none");
+        });
+
+        // Share Link / Add Clipboard Note Modal
+        const shareModal = document.getElementById("share-link-modal");
+        const closeShare = () => shareModal?.classList.add("d-none");
+        document.getElementById("btn-close-share-modal")?.addEventListener("click", closeShare);
+        document.getElementById("btn-share-modal-cancel")?.addEventListener("click", closeShare);
+        document.getElementById("btn-share-modal-submit")?.addEventListener("click", async () => {
+            const txt = document.getElementById("share-modal-input")?.value.trim() || "";
+            if (!txt) {
+                showNotificationToast("Please enter text or URL.", "warning");
+                return;
+            }
+            closeShare();
+            if (modalPurposeMode === "clipboard") {
+                const res = await apiRequest("/api/clipboard/buffer/add", "POST", { text: txt, is_pinned: false });
+                if (res && res.success) {
+                    showNotificationToast("Added note to shared clipboard!", "success");
+                    loadClipboardItems();
+                    loadHomeWidgets();
+                } else {
+                    showNotificationToast(res?.error || "Failed adding clipboard item", "error");
+                }
+            } else {
+                const isUrl = txt.startsWith("http://") || txt.startsWith("https://");
+                const targetId = resolveTargetDeviceId();
+                const res = await apiRequest("/api/share", "POST", {
+                    target: targetId ? "phone" : "windows",
+                    device_id: targetId,
+                    url: isUrl ? txt : "",
+                    text: isUrl ? "" : txt,
                 });
-            });
+                if (res && res.success) showNotificationToast("Shared successfully!", "success");
+                else showNotificationToast(res?.error || "Failed sharing content", "error");
+            }
+        });
+    }
+
+    function openConnectModal() {
+        const modal = document.getElementById("connect-modal");
+        if (modal) {
+            modal.classList.remove("d-none");
+            loadPairingQR();
         }
     }
 
-    function openCommandPalette() {
-        if (!commandPaletteOverlay) return;
-        commandPaletteOverlay.classList.remove("d-none");
-        if (commandPaletteInput) {
-            commandPaletteInput.value = "";
-            commandPaletteInput.focus();
+    function openTextModal(mode) {
+        modalPurposeMode = mode;
+        const modal = document.getElementById("share-link-modal");
+        const title = document.getElementById("share-modal-title");
+        const inp = document.getElementById("share-modal-input");
+        if (title) title.textContent = mode === "clipboard" ? "Add Clipboard Note" : "Share Link or Note";
+        if (inp) {
+            inp.value = "";
+            setTimeout(() => inp.focus(), 50);
         }
+        modal?.classList.remove("d-none");
     }
 
-    function closeCommandPalette() {
-        if (!commandPaletteOverlay) return;
-        commandPaletteOverlay.classList.add("d-none");
-    }
-
-    function handlePaletteAction(action) {
-        switch (action) {
-            case "nav-overview": switchTab("overview"); break;
-            case "nav-devices": switchTab("devices"); break;
-            case "nav-files": switchTab("files"); break;
-            case "nav-clipboard": switchTab("clipboard"); break;
-            case "nav-settings": switchTab("settings"); break;
-            case "act-ring":
-                apiRequest("/api/devices/ring", "POST", { device_id: activeDeviceId, duration_seconds: 5 });
-                showNotificationToast("Ringing phone...", "info");
-                break;
-            case "act-capture-phone":
-                apiRequest("/api/workflows/run", "POST", { workflow_id: "capture_pc_to_phone" });
-                triggerPhoneScreenCapture();
-                break;
-            case "act-camera":
-                apiRequest("/api/camera/capture", "POST", { device_id: activeDeviceId });
-                showNotificationToast("Taking camera photo...", "info");
-                break;
-            case "act-sync-clip":
-                apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: activeDeviceId });
-                showNotificationToast("Clipboard synchronized.", "success");
-                break;
-            case "act-pair-qr":
-                switchTab("devices");
-                loadPairingQR();
-                break;
+    function openMediaPreview(src, title = "Media Preview") {
+        const modal = document.getElementById("media-preview-modal");
+        const img = document.getElementById("media-preview-img");
+        const titleEl = document.getElementById("media-preview-title");
+        const dlBtn = document.getElementById("btn-download-preview");
+        if (modal && img) {
+            img.src = src;
+            if (titleEl) titleEl.textContent = title;
+            if (dlBtn) dlBtn.href = src;
+            modal.classList.remove("d-none");
         }
     }
 
     // =========================================================================
-    // Initialization Entrypoint
+    // 13. Background Polling & Non-Overwriting State Synchronization
     // =========================================================================
 
+    async function pollStateUpdates() {
+        // 1. System status & Core health
+        const [statusRes, sysStatus, fedRes] = await Promise.all([
+            apiRequest("/api/status"),
+            apiRequest("/api/system/status"),
+            apiRequest("/api/federation/grants"),
+        ]);
+
+        if (statusRes && statusRes.success) {
+            isCoreOnline = Boolean(statusRes.daemon_online ?? true);
+            if (statusRes.snow_id) canonicalSnowId = statusRes.snow_id;
+            if (statusRes.device_name) localHostIdentity = statusRes.device_name;
+            localHostTelemetry = statusRes.telemetry || {};
+            document.getElementById("core-canonical-id").textContent = canonicalSnowId;
+        } else {
+            isCoreOnline = false;
+        }
+
+        if (sysStatus && sysStatus.success) {
+            isCorePaused = Boolean(sysStatus.is_paused ?? sysStatus.data?.is_paused);
+        }
+        updateCoreStatusBadge();
+
+        if (fedRes && Array.isArray(fedRes.grants)) {
+            federationGrants = fedRes.grants;
+        }
+
+        // 2. Registered & Connected Devices
+        const devRes = await apiRequest("/api/devices");
+        if (devRes && Array.isArray(devRes.devices)) {
+            registeredDevices = devRes.devices;
+            const connectedRemotes = registeredDevices.filter(d => !isLocalNode(d) && d.is_connected);
+
+            if (!hasUserSelectedDevice && !activeDeviceId) {
+                activeDeviceId = connectedRemotes.length > 0 ? connectedRemotes[0].device_id : "local";
+            } else if (activeDeviceId && activeDeviceId !== "local") {
+                const stillExists = registeredDevices.some(d => d.device_id === activeDeviceId);
+                if (!stillExists) {
+                    activeDeviceId = "local";
+                }
+            }
+        }
+
+        const currentDev = getSelectedDeviceObj();
+        updateTopbarCapsule(currentDev);
+        renderDeviceIsland();
+
+        if (currentTab === "overview") {
+            updateHeroCard(currentDev);
+            loadHomeWidgets();
+        }
+
+        // 3. Global pending approvals counter (Capability + OAuth)
+        await loadApprovals();
+    }
+
+    async function refreshAllData() {
+        await pollStateUpdates();
+        if (currentTab === "devices") renderDevicesView();
+        else if (currentTab === "files") {
+            loadFiles(currentSubpath);
+            loadRemoteApps();
+        } else if (currentTab === "clipboard") loadClipboardItems();
+        else if (currentTab === "settings") loadAiSettingsView();
+    }
+
+    // Bootstrap entrypoint
     if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", initSession);
     } else {
         initSession();
     }
-
 })();

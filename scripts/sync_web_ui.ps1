@@ -20,7 +20,7 @@ if (-not (Test-Path $SourceStaticDir)) {
 }
 
 # 1. Validate required source assets exist
-$RequiredFiles = @("index.html", "app.js", "app.css")
+$RequiredFiles = @("index.html", "app.js", "app.css", "tokens.css", "theme-init.js")
 foreach ($req in $RequiredFiles) {
     $reqPath = Join-Path $SourceStaticDir $req
     if (-not (Test-Path $reqPath)) {

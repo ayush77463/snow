@@ -410,7 +410,8 @@ class AndroidCapabilityDispatcher(
             }
             "media_control" -> {
                 val act = data?.get("action") as? String
-                val res = mediaControlHandler.handleMediaControl(act)
+                val volValue = data?.get("value") as? Number
+                val res = mediaControlHandler.handleMediaControl(act, volValue)
                 Pair(res, null)
             }
             "share_link" -> {

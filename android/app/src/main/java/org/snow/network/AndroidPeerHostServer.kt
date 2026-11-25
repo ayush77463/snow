@@ -213,6 +213,8 @@ class AndroidPeerHostServer(
                         "action" to "pair_response",
                         "session_id" to newSessionId,
                         "device_id" to localDeviceId,
+                        "device_type" to "android",
+                        "device_name" to (android.os.Build.MODEL ?: "Android Peer"),
                         "auth_token" to newToken,
                         "manifest" to manifestProvider()
                     )
@@ -259,6 +261,8 @@ class AndroidPeerHostServer(
                         "status" to "success",
                         "session_id" to newSessionId,
                         "device_id" to localDeviceId,
+                        "device_type" to "android",
+                        "device_name" to (android.os.Build.MODEL ?: "Android Peer"),
                         "manifest" to manifestProvider()
                     )
                 )

@@ -648,12 +648,23 @@ class CapabilityEngine:
             item_id = params.get("item_id")
             if not item_id:
                 return CapabilityResponse(success=False, status="INVALID_ARGUMENT", error="Missing 'item_id'.")
-            p_res = self.clipboard_buffer.pin(str(item_id))
+            if "is_pinned" in params and not isinstance(params["is_pinned"], bool):
+                return CapabilityResponse(
+                    success=False,
+                    status="INVALID_ARGUMENT",
+                    error="'is_pinned' must be a boolean.",
+                )
+            desired_pin = params.get("is_pinned", True)
+            p_res = (
+                self.clipboard_buffer.pin(str(item_id))
+                if desired_pin
+                else self.clipboard_buffer.unpin(str(item_id))
+            )
             if not p_res.get("success"):
                 return CapabilityResponse(
                     success=False,
                     status=p_res.get("status", "ERROR"),
-                    error=p_res.get("error", f"Pin failed for item {item_id}"),
+                    error=p_res.get("error", f"Pin state update failed for item {item_id}"),
                 )
             return CapabilityResponse(
                 success=True,
@@ -903,7 +914,11 @@ class CapabilityEngine:
         # --- Media Controls (Phase 21) ---
         if action in ("media_control", "windows_media_control"):
             media_act = str(params.get("action", ""))
-            res = self.media_controller.handle_action(media_act)
+            vol_value = params.get("value")
+            if vol_value is not None:
+                res = self.media_controller.handle_action(media_act, value=vol_value)
+            else:
+                res = self.media_controller.handle_action(media_act)
             is_ok = res.get("success", False)
             return CapabilityResponse(
                 success=is_ok,

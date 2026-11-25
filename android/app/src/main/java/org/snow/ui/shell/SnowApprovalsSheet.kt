@@ -63,13 +63,14 @@ fun SnowApprovalsSheet(
     onDismiss: () -> Unit,
     pendingApprovals: List<PendingApprovalItem>,
     logs: List<UiLogEntry>,
-    onResolveApproval: (requestId: String, decision: String) -> Unit
+    onResolveApproval: (requestId: String, decision: String) -> Unit,
+    initialTab: Int = 0
 ) {
     if (!visible) return
 
     val colors = LocalSnowColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var selectedTab by remember { mutableStateOf(0) } // 0: Approvals, 1: Activity
+    var selectedTab by remember(visible, initialTab) { mutableStateOf(initialTab) } // 0: Approvals, 1: Activity
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,

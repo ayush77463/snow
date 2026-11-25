@@ -72,6 +72,14 @@ ACTION_TO_CAPABILITY: dict[str, str] = {
     "file_transfer_cancel": CAPABILITY_FILE_TRANSFER,
     "mesh_list_peers": CAPABILITY_MESH_LIST_PEERS,
     "peer_relay_request": CAPABILITY_PEER_RELAY,
+    "media_control": "media_control",
+    "windows_media_control": "media_control",
+    "share_link": "share_link",
+    "windows_share_link": "share_link",
+    "clipboard_buffer_pin": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_unpin": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_delete": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_buffer_clear": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
 }
 
 

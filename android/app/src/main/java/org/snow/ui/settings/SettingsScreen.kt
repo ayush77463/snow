@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.ViewQuilt
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -52,6 +53,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -64,10 +66,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import org.snow.service.AutoConnectTileService
+import org.snow.service.ClipSyncTileService
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
 import org.snow.ui.components.SnowFilterChip
@@ -108,6 +115,7 @@ fun SettingsScreen(
     updateStatusText: String,
     isUpdateAvailable: Boolean = false,
     updateVersionName: String = "",
+    updateDownloadProgress: Int? = null,
     onInstallUpdate: () -> Unit = {},
     logs: List<org.snow.ui.UiLogEntry> = emptyList(),
     onConnectManualIp: (String) -> Unit = {},
@@ -117,6 +125,7 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val colors = LocalSnowColors.current
     val clipboardManager = LocalClipboardManager.current
     var showNotificationGuide by remember { mutableStateOf(false) }
@@ -125,15 +134,31 @@ fun SettingsScreen(
     var relayInput by remember { mutableStateOf(relayEndpoint) }
     var manualConnectInput by remember { mutableStateOf("") }
 
-    val isNotificationAccessGranted = remember {
+    fun queryNotificationAccess(): Boolean =
         androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
-    }
-    val isAllFilesGranted = remember {
+
+    fun queryAllFilesAccess(): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
-    }
-    val isBatteryOptIgnored = remember {
+
+    fun queryBatteryOptIgnored(): Boolean {
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-        powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+        return powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+    }
+
+    var isNotificationAccessGranted by remember { mutableStateOf(queryNotificationAccess()) }
+    var isAllFilesGranted by remember { mutableStateOf(queryAllFilesAccess()) }
+    var isBatteryOptIgnored by remember { mutableStateOf(queryBatteryOptIgnored()) }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isNotificationAccessGranted = queryNotificationAccess()
+                isAllFilesGranted = queryAllFilesAccess()
+                isBatteryOptIgnored = queryBatteryOptIgnored()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     LazyColumn(
@@ -296,26 +321,61 @@ fun SettingsScreen(
 
                     Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
+                    fun requestQuickSettingsTile(serviceClass: Class<*>, label: String, iconRes: Int) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            try {
+                                val statusBarManager = context.getSystemService(android.app.StatusBarManager::class.java)
+                                statusBarManager?.requestAddTileService(
+                                    android.content.ComponentName(context, serviceClass),
+                                    label,
+                                    android.graphics.drawable.Icon.createWithResource(context, iconRes),
+                                    context.mainExecutor
+                                ) { _ -> }
+                            } catch (_: Exception) {
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Open Quick Settings edit mode to add the $label tile.",
+                                    android.widget.Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        } else {
+                            android.widget.Toast.makeText(
+                                context,
+                                "Swipe down Quick Settings and tap edit pencil to add $label",
+                                android.widget.Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+
                     PermissionRowItem(
                         icon = Icons.Default.ViewQuilt,
-                        title = "Quick Settings Tiles",
-                        subtitle = "SNOW Connect & SNOW Clip tiles for quick toggle",
+                        title = "Quick Settings: SNOW Connect",
+                        subtitle = "One-tap bridge auto-connect toggle tile",
                         statusText = "ADD",
                         isGranted = false,
                         onClick = {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                try {
-                                    val statusBarManager = context.getSystemService(android.app.StatusBarManager::class.java)
-                                    statusBarManager?.requestAddTileService(
-                                        android.content.ComponentName(context, "org.snow.tile.SnowConnectTileService"),
-                                        "SNOW Connect",
-                                        android.graphics.drawable.Icon.createWithResource(context, org.snow.R.drawable.ic_snow_logo),
-                                        java.util.concurrent.Executors.newSingleThreadExecutor()
-                                    ) { _ -> }
-                                } catch (_: Exception) { }
-                            } else {
-                                android.widget.Toast.makeText(context, "Swipe down Quick Settings and tap edit pencil to add SNOW tiles", android.widget.Toast.LENGTH_LONG).show()
-                            }
+                            requestQuickSettingsTile(
+                                AutoConnectTileService::class.java,
+                                "SNOW Connect",
+                                org.snow.R.drawable.ic_qs_snow
+                            )
+                        }
+                    )
+
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
+
+                    PermissionRowItem(
+                        icon = Icons.Default.ContentCopy,
+                        title = "Quick Settings: SNOW Clip",
+                        subtitle = "Instant clipboard push and sync tile",
+                        statusText = "ADD",
+                        isGranted = false,
+                        onClick = {
+                            requestQuickSettingsTile(
+                                ClipSyncTileService::class.java,
+                                "SNOW Clip",
+                                org.snow.R.drawable.ic_qs_clip
+                            )
                         }
                     )
                 }
@@ -326,34 +386,55 @@ fun SettingsScreen(
         item {
             SnowSectionHeader(title = "Application Updates")
             SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "SNOW Flagship",
-                            style = SnowTypography.titleSmall,
-                            color = colors.textPrimary
-                        )
-                        Text(
-                            text = updateStatusText.ifBlank { "v5.0 • Up to date" },
-                            style = SnowTypography.bodySmall,
-                            color = colors.textSecondary
-                        )
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "SNOW Flagship",
+                                style = SnowTypography.titleSmall,
+                                color = colors.textPrimary
+                            )
+                            Text(
+                                text = updateStatusText.ifBlank { "v5.0.0 • Up to date" },
+                                style = SnowTypography.bodySmall,
+                                color = colors.textSecondary
+                            )
+                        }
+                        if (isUpdateAvailable) {
+                            SnowGradientButton(
+                                text = "Download & Install v$updateVersionName",
+                                icon = Icons.Default.SystemUpdate,
+                                onClick = onInstallUpdate,
+                                enabled = updateDownloadProgress == null
+                            )
+                        } else {
+                            SnowTonalButton(
+                                text = "Check",
+                                icon = Icons.Default.SystemUpdate,
+                                onClick = onCheckAppUpdate
+                            )
+                        }
                     }
-                    if (isUpdateAvailable) {
-                        SnowGradientButton(
-                            text = "Download & Install v$updateVersionName",
-                            icon = Icons.Default.SystemUpdate,
-                            onClick = onInstallUpdate
+                    if (updateDownloadProgress != null) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = (updateDownloadProgress.coerceIn(0, 100) / 100f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(RoundedCornerShape(9999.dp)),
+                            color = colors.accentCyan,
+                            trackColor = colors.surfaceElevated
                         )
-                    } else {
-                        SnowTonalButton(
-                            text = "Check",
-                            icon = Icons.Default.SystemUpdate,
-                            onClick = onCheckAppUpdate
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Downloading signed update... ${updateDownloadProgress.coerceIn(0, 100)}%",
+                            style = SnowTypography.labelSmall,
+                            color = colors.accentCyan
                         )
                     }
                 }

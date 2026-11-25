@@ -269,6 +269,8 @@ class TestStage4CDirectUpdater(AioHTTPTestCase):
             zf.writestr("index.html", "NEW_INDEX")
             zf.writestr("app.js", "NEW_JS")
             zf.writestr("app.css", "NEW_CSS")
+            zf.writestr("tokens.css", "NEW_TOKENS")
+            zf.writestr("theme-init.js", "NEW_THEME_INIT")
 
         zip_bytes = zip_buffer.getvalue()
         sha256 = hashlib.sha256(zip_bytes).hexdigest()
@@ -304,7 +306,7 @@ class TestStage4CDirectUpdater(AioHTTPTestCase):
         )
 
         # Mock staged APK file
-        mock_apk = Path(self.test_dir) / "SNOW-Mobile-4.1.0.apk"
+        mock_apk = Path(self.test_dir) / "SNOW-Mobile-5.0.0.apk"
         mock_apk.write_bytes(b"PK\x03\x04MOCK_SIGNED_APK_CONTENT")
         server._get_staged_apk_path = lambda: mock_apk
 
@@ -321,8 +323,8 @@ class TestStage4CDirectUpdater(AioHTTPTestCase):
             self.assertEqual(response.status, 200)
             data = json.loads(response.text)
             self.assertTrue(data["available"])
-            self.assertEqual(data["version_code"], 1)
-            self.assertEqual(data["version_name"], "4.1.0")
+            self.assertEqual(data["version_code"], 2)
+            self.assertEqual(data["version_name"], "5.0.0")
             self.assertEqual(data["sha256"], compute_file_sha256(mock_apk))
 
             # 12. When no APK staged
@@ -351,7 +353,7 @@ class TestStage4CDirectUpdater(AioHTTPTestCase):
             storage_manager=storage_mgr,
         )
 
-        mock_apk = Path(self.test_dir) / "SNOW-Mobile-4.1.0.apk"
+        mock_apk = Path(self.test_dir) / "SNOW-Mobile-5.0.0.apk"
         mock_apk.write_bytes(b"PK\x03\x04MOCK_SIGNED_APK_BYTES")
         server._get_staged_apk_path = lambda: mock_apk
 

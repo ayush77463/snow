@@ -60,7 +60,9 @@ fun SnowDeviceSelectorIsland(
     pairedDevices: List<SavedDevice>,
     activeDeviceHost: String,
     onSelectDevice: (SavedDevice) -> Unit,
-    onJoinAnotherNetwork: () -> Unit
+    onJoinAnotherNetwork: () -> Unit,
+    federationGrants: List<Map<String, Any?>> = emptyList(),
+    onFederationGrantClick: () -> Unit = {}
 ) {
     if (!visible) return
 
@@ -278,7 +280,69 @@ fun SnowDeviceSelectorIsland(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     // OTHER NETWORKS Section
-                    SnowSectionHeader(title = "Cross-Network Federation")
+                    SnowSectionHeader(title = "OTHER NETWORKS")
+
+                    val activeFedGrants = federationGrants.filter {
+                        (it["status"]?.toString() ?: "ACTIVE").equals("ACTIVE", ignoreCase = true)
+                    }
+                    if (activeFedGrants.isEmpty()) {
+                        Text(
+                            text = "No remote federated networks connected.",
+                            style = SnowTypography.bodySmall,
+                            color = colors.textSecondary,
+                            modifier = Modifier.padding(bottom = 10.dp)
+                        )
+                    } else {
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(bottom = 10.dp)
+                        ) {
+                            activeFedGrants.forEach { grant ->
+                                val peerLabel = (grant["network_name"] as? String)
+                                    ?: (grant["peer_node_name"] as? String)
+                                    ?: (grant["peer_node_id"] as? String)
+                                    ?: (grant["grant_id"] as? String)?.take(12)
+                                    ?: "Federated Peer"
+                                val direction = grant["direction"]?.toString() ?: "INBOUND"
+                                val capsList = grant["allowed_capabilities"] as? List<*>
+                                val capsSummary = if (!capsList.isNullOrEmpty()) {
+                                    capsList.take(2).joinToString(", ")
+                                } else {
+                                    "Scoped Access"
+                                }
+                                Surface(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .border(1.dp, colors.borderSubtle, RoundedCornerShape(14.dp))
+                                        .clickable {
+                                            onFederationGrantClick()
+                                            onDismiss()
+                                        },
+                                    color = colors.surface
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = peerLabel,
+                                                style = SnowTypography.bodyMedium.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold),
+                                                color = colors.textPrimary
+                                            )
+                                            Text(
+                                                text = "$direction • $capsSummary",
+                                                style = SnowTypography.bodySmall,
+                                                color = colors.textSecondary
+                                            )
+                                        }
+                                        SnowStatusBadge(text = "Federated", type = SnowBadgeType.CONNECTED)
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     SnowTonalButton(
                         text = "+ Join Another Network",

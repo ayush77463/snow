@@ -864,7 +864,7 @@ class RemoteMcpGateway:
                     },
                     "serverInfo": {
                         "name": "SNOW Remote MCP Gateway",
-                        "version": "4.1.0",
+                        "version": "5.0.0",
                     },
                 },
             }

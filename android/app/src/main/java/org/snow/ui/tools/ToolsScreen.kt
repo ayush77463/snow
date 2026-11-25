@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material.icons.filled.VolumeDown
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Widgets
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
@@ -61,7 +62,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.snow.ui.PcFileItem
+import org.snow.ui.SnowUiRepository
 import org.snow.ui.TerminalExecutionState
+import kotlin.math.roundToInt
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
 import org.snow.ui.components.SnowEmptyState
@@ -105,9 +108,15 @@ fun ToolsScreen(
     onToggleScreenShare: (Boolean) -> Unit,
     onTriggerCameraCapture: () -> Unit,
     onSendMediaKey: (String) -> Unit,
+    onSendMediaVolume: (Int) -> Unit = {},
+    cameraDelivery: SnowUiRepository.CameraDeliveryInfo = SnowUiRepository.CameraDeliveryInfo(),
+    onRetryCameraUpload: () -> Unit = {},
+    onDismissCameraDelivery: () -> Unit = {},
     // Terminal parameters
     terminalState: TerminalExecutionState,
     onExecuteTerminalCommand: (String) -> Unit,
+    onConfirmTerminalCommand: (command: String, ticket: String) -> Unit = { _, _ -> },
+    onCancelTerminalCommand: () -> Unit = {},
     onClearTerminal: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -175,13 +184,19 @@ fun ToolsScreen(
                     isScreenSharing = isScreenSharing,
                     onToggleScreenShare = onToggleScreenShare,
                     onTriggerCameraCapture = onTriggerCameraCapture,
-                    onSendMediaKey = onSendMediaKey
+                    onSendMediaKey = onSendMediaKey,
+                    onSendMediaVolume = onSendMediaVolume,
+                    cameraDelivery = cameraDelivery,
+                    onRetryCameraUpload = onRetryCameraUpload,
+                    onDismissCameraDelivery = onDismissCameraDelivery
                 )
             }
             ToolSubTab.TERMINAL -> {
                 TerminalToolView(
                     terminalState = terminalState,
                     onExecuteCommand = onExecuteTerminalCommand,
+                    onConfirmCommand = onConfirmTerminalCommand,
+                    onCancelCommand = onCancelTerminalCommand,
                     onClearTerminal = onClearTerminal
                 )
             }
@@ -534,7 +549,11 @@ private fun MediaToolView(
     isScreenSharing: Boolean,
     onToggleScreenShare: (Boolean) -> Unit,
     onTriggerCameraCapture: () -> Unit,
-    onSendMediaKey: (String) -> Unit
+    onSendMediaKey: (String) -> Unit,
+    onSendMediaVolume: (Int) -> Unit = {},
+    cameraDelivery: SnowUiRepository.CameraDeliveryInfo = SnowUiRepository.CameraDeliveryInfo(),
+    onRetryCameraUpload: () -> Unit = {},
+    onDismissCameraDelivery: () -> Unit = {}
 ) {
     val colors = LocalSnowColors.current
 
@@ -566,8 +585,8 @@ private fun MediaToolView(
                 Divider(color = colors.borderSubtle)
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // Volume Slider & Mute
-                var volumeLevel by remember { mutableStateOf(0.7f) }
+                // Bounded Volume Slider (0..100 dispatched on drag release) & Mute
+                var volumeLevel by remember { mutableStateOf(70f) }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -581,9 +600,10 @@ private fun MediaToolView(
                     Spacer(modifier = Modifier.width(8.dp))
                     androidx.compose.material3.Slider(
                         value = volumeLevel,
-                        onValueChange = {
-                            volumeLevel = it
-                            if (it > 0.5f) onSendMediaKey("volume_up") else onSendMediaKey("volume_down")
+                        valueRange = 0f..100f,
+                        onValueChange = { volumeLevel = it.coerceIn(0f, 100f) },
+                        onValueChangeFinished = {
+                            onSendMediaVolume(volumeLevel.roundToInt().coerceIn(0, 100))
                         },
                         modifier = Modifier.weight(1f)
                     )
@@ -610,12 +630,18 @@ private fun MediaToolView(
                     SnowTonalButton(
                         text = "Volume -",
                         icon = Icons.Default.VolumeDown,
-                        onClick = { onSendMediaKey("volume_down") }
+                        onClick = {
+                            volumeLevel = (volumeLevel - 5f).coerceIn(0f, 100f)
+                            onSendMediaKey("volume_down")
+                        }
                     )
                     SnowTonalButton(
                         text = "Volume +",
                         icon = Icons.Default.VolumeUp,
-                        onClick = { onSendMediaKey("volume_up") }
+                        onClick = {
+                            volumeLevel = (volumeLevel + 5f).coerceIn(0f, 100f)
+                            onSendMediaKey("volume_up")
+                        }
                     )
                 }
             }
@@ -675,12 +701,57 @@ private fun MediaToolView(
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
-                            Text(text = "Remote Camera Capture", style = SnowTypography.titleSmall, color = colors.textPrimary)
-                            Text(text = "Request snapshot from phone", style = SnowTypography.bodySmall, color = colors.textSecondary)
+                            Text(text = "Camera Photo Delivery", style = SnowTypography.titleSmall, color = colors.textPrimary)
+                            Text(text = "Capture & upload photo to PC", style = SnowTypography.bodySmall, color = colors.textSecondary)
                         }
                     }
 
-                    SnowTonalButton(text = "Capture", onClick = onTriggerCameraCapture)
+                    SnowTonalButton(
+                        text = "Capture",
+                        onClick = onTriggerCameraCapture,
+                        enabled = cameraDelivery.status != SnowUiRepository.CameraDeliveryStatus.UPLOADING
+                    )
+                }
+
+                if (cameraDelivery.status != SnowUiRepository.CameraDeliveryStatus.IDLE) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.dp, colors.borderSubtle, RoundedCornerShape(12.dp)),
+                        color = colors.surfaceElevated
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            val badgeType = when (cameraDelivery.status) {
+                                SnowUiRepository.CameraDeliveryStatus.DELIVERED -> SnowBadgeType.CONNECTED
+                                SnowUiRepository.CameraDeliveryStatus.FAILED -> SnowBadgeType.ERROR
+                                else -> SnowBadgeType.STANDBY
+                            }
+                            val detailText = when (cameraDelivery.status) {
+                                SnowUiRepository.CameraDeliveryStatus.CAPTURING -> "Waiting for camera capture confirmation..."
+                                SnowUiRepository.CameraDeliveryStatus.UPLOADING -> "Uploading photo over HTTPS..."
+                                SnowUiRepository.CameraDeliveryStatus.DELIVERED -> "Delivered: ${cameraDelivery.fileName ?: "photo.jpg"}"
+                                SnowUiRepository.CameraDeliveryStatus.FAILED -> "Upload failed: ${cameraDelivery.error ?: "Network error"}"
+                                SnowUiRepository.CameraDeliveryStatus.IDLE -> ""
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                SnowStatusBadge(text = cameraDelivery.status.name, type = badgeType)
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    if (cameraDelivery.status == SnowUiRepository.CameraDeliveryStatus.FAILED) {
+                                        SnowTonalButton(text = "Retry", onClick = onRetryCameraUpload)
+                                    }
+                                    SnowOutlinedButton(text = "Dismiss", onClick = onDismissCameraDelivery)
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(text = detailText, style = SnowTypography.bodySmall, color = colors.textSecondary)
+                        }
+                    }
                 }
             }
         }
@@ -721,10 +792,69 @@ private fun MediaCircleButton(
 private fun TerminalToolView(
     terminalState: TerminalExecutionState,
     onExecuteCommand: (String) -> Unit,
+    onConfirmCommand: (command: String, ticket: String) -> Unit = { _, _ -> },
+    onCancelCommand: () -> Unit = {},
     onClearTerminal: () -> Unit
 ) {
     val colors = LocalSnowColors.current
     var commandInput by remember { mutableStateOf("") }
+
+    if (!terminalState.pendingTicket.isNullOrBlank() && !terminalState.pendingCommand.isNullOrBlank()) {
+        AlertDialog(
+            onDismissRequest = onCancelCommand,
+            title = {
+                Text(
+                    text = "Confirm Terminal Execution",
+                    style = SnowTypography.titleMedium,
+                    color = colors.textPrimary
+                )
+            },
+            text = {
+                Column {
+                    Text(
+                        text = "This command requires explicit owner confirmation on the desktop security gate:",
+                        style = SnowTypography.bodySmall,
+                        color = colors.textSecondary
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp)),
+                        color = colors.surfaceElevated
+                    ) {
+                        Text(
+                            text = terminalState.pendingCommand,
+                            style = SnowTypography.monospaceSmall,
+                            color = colors.accentCyan,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Ticket: ${terminalState.pendingTicket.take(12)}...",
+                        style = SnowTypography.labelSmall,
+                        color = colors.textMuted
+                    )
+                }
+            },
+            confirmButton = {
+                SnowGradientButton(
+                    text = "Approve & Run",
+                    onClick = {
+                        onConfirmCommand(terminalState.pendingCommand, terminalState.pendingTicket)
+                    }
+                )
+            },
+            dismissButton = {
+                SnowOutlinedButton(
+                    text = "Cancel",
+                    onClick = onCancelCommand
+                )
+            },
+            containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+        )
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Quick Command Chips

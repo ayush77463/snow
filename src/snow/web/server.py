@@ -18,6 +18,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import secrets
@@ -208,13 +209,9 @@ class SnowWebServer:
         """Return the user override directory if valid and complete, else bundled STATIC_DIR."""
         override_dir = (Path.home() / ".snow" / "web_override").resolve()
         if override_dir.is_dir():
-            idx = override_dir / "index.html"
-            js = override_dir / "app.js"
-            css = override_dir / "app.css"
+            required = ("index.html", "app.js", "app.css", "tokens.css", "theme-init.js")
             try:
-                if (idx.is_file() and idx.stat().st_size > 0 and
-                    js.is_file() and js.stat().st_size > 0 and
-                    css.is_file() and css.stat().st_size > 0):
+                if all((override_dir / name).is_file() and (override_dir / name).stat().st_size > 0 for name in required):
                     return override_dir
             except OSError:
                 pass
@@ -879,7 +876,7 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_media(self, request: web.Request) -> web.Response:
-        """Control media playback on Windows or Phone."""
+        """Control media playback and bounded system volume on Windows or Phone."""
         try:
             body = await request.json()
         except Exception:
@@ -888,8 +885,25 @@ class SnowWebServer:
         action = body.get("action", "")
         target = body.get("target", "windows")
         device_id = body.get("device_id", "")
+        if not isinstance(action, str) or not action.strip():
+            return web.json_response({"success": False, "error": "Missing or invalid media 'action'."}, status=400)
 
-        res = await self.bridge.media_control(action=action, target=target, device_id=device_id)
+        vol_value: Optional[int] = None
+        if "value" in body and body["value"] is not None:
+            raw_val = body["value"]
+            if isinstance(raw_val, bool) or not isinstance(raw_val, (int, float)):
+                return web.json_response({"success": False, "error": "Volume 'value' must be between 0 and 100."}, status=400)
+            num_val = float(raw_val)
+            if math.isnan(num_val) or math.isinf(num_val) or num_val < 0.0 or num_val > 100.0:
+                return web.json_response({"success": False, "error": "Volume 'value' must be between 0 and 100."}, status=400)
+            vol_value = int(round(num_val))
+
+        if vol_value is not None:
+            res = await self.bridge.media_control(
+                action=action.strip(), target=target, device_id=device_id, value=vol_value
+            )
+        else:
+            res = await self.bridge.media_control(action=action.strip(), target=target, device_id=device_id)
         return web.json_response(res)
 
     async def handle_api_share(self, request: web.Request) -> web.Response:
@@ -1617,12 +1631,15 @@ class SnowWebServer:
 
         # Frozen sibling paths (for snow.exe / snow-tray.exe)
         exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "packaging" / "output" / "SNOW-Mobile-5.0.0.apk")
+        candidates.append(exe_dir / "SNOW-Mobile-5.0.0.apk")
         candidates.append(exe_dir / "packaging" / "output" / "SNOW-Mobile-4.1.0.apk")
         candidates.append(exe_dir / "SNOW-Mobile-4.1.0.apk")
         candidates.append(exe_dir / "SNOW-Mobile.apk")
 
         # Repository paths
         repo_root = Path(__file__).resolve().parent.parent.parent.parent
+        candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile-5.0.0.apk")
         candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile-4.1.0.apk")
         candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile.apk")
         candidates.append(repo_root / "packaging" / "output" / "app-release.apk")
@@ -1671,7 +1688,7 @@ class SnowWebServer:
                     apk_path,
                     headers={
                         "Content-Type": "application/vnd.android.package-archive",
-                        "Content-Disposition": 'attachment; filename="SNOW-Mobile-4.1.0.apk"',
+                        "Content-Disposition": f'attachment; filename="{apk_path.name}"',
                     },
                 )
 
@@ -1733,7 +1750,7 @@ class SnowWebServer:
             apk_path,
             headers={
                 "Content-Type": "application/vnd.android.package-archive",
-                "Content-Disposition": 'attachment; filename="SNOW-Mobile-4.1.0.apk"',
+                "Content-Disposition": f'attachment; filename="{apk_path.name}"',
             },
         )
 
@@ -1770,6 +1787,9 @@ class SnowWebServer:
         except Exception as qre:
             logger.debug("Failed rendering APK download QR SVG: %s", qre)
 
+        from snow.updater import CURRENT_VERSION
+
+        resolved_name = apk_path.name if apk_path else f"SNOW-Mobile-{CURRENT_VERSION}.apk"
         return web.json_response({
             "success": True,
             "status": "SUCCESS",
@@ -1777,8 +1797,8 @@ class SnowWebServer:
             "download_url": qr_download_url,
             "local_download_url": local_download_url,
             "token": token,
-            "version": "4.1.0",
-            "file_name": "SNOW-Mobile-4.1.0.apk",
+            "version": CURRENT_VERSION,
+            "file_name": resolved_name,
             "svg": svg_content,
         })
 
@@ -2222,7 +2242,7 @@ class SnowWebServer:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "snow-test-runner", "version": "4.1.0"},
+                    "clientInfo": {"name": "snow-test-runner", "version": "5.0.0"},
                 },
             }
             if proc.stdin is None or proc.stdout is None:
@@ -2622,7 +2642,7 @@ class SnowWebServer:
 
     async def handle_api_system_status(self, request: web.Request) -> web.Response:
         """Query real Core runtime status, including active/paused state."""
-        res = await self.bridge.call("status")
+        res = await self.bridge.call("get_device_status")
         if not res.get("success"):
             return web.json_response({
                 "success": False,

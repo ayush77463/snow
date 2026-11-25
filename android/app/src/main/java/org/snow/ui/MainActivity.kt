@@ -1,10 +1,13 @@
 package org.snow.ui
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.OpenableColumns
@@ -16,15 +19,23 @@ import androidx.appcompat.app.AppCompatDelegate
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.snow.capabilities.CameraCaptureHandler
 import org.snow.security.SafeLog
 import org.snow.service.SnowForegroundService
 import org.snow.ui.settings.SettingsViewModel
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
 
 /**
  * Primary host activity providing Material 3 Jetpack Compose Flagship UI.
@@ -40,6 +51,52 @@ class MainActivity : AppCompatActivity() {
     private var isBound = false
 
     private var currentThemeMode by mutableIntStateOf(SettingsViewModel.THEME_SYSTEM)
+    private var pendingCameraCaptureFile: File? = null
+    private var pendingScreenshotPermissionCallback: ((Boolean) -> Unit)? = null
+
+    private val takePictureLauncher = registerForActivityResult(
+        ActivityResultContracts.TakePicture()
+    ) { success ->
+        val capturedFile = pendingCameraCaptureFile
+        pendingCameraCaptureFile = null
+        if (success && capturedFile != null && capturedFile.exists() && capturedFile.length() > 0) {
+            CameraCaptureHandler.stagedPhotoFile = capturedFile
+            CameraCaptureHandler.isUserInteractionActive = true
+            repository.uploadCameraPhoto { uploadSuccess, resOrErr ->
+                runOnUiThread {
+                    if (uploadSuccess) {
+                        Toast.makeText(this, "Photo delivered: ${resOrErr ?: "photo.jpg"}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Photo upload failed: ${resOrErr ?: "Network error"}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        } else {
+            try {
+                capturedFile?.delete()
+            } catch (_: Exception) {}
+            repository.dismissCameraDelivery()
+            Toast.makeText(this, "Camera capture cancelled", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            launchRealCameraCapture()
+        } else {
+            repository.dismissCameraDelivery()
+            Toast.makeText(this, "Camera permission is required to capture photos", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private val screenshotPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        pendingScreenshotPermissionCallback?.invoke(granted)
+        pendingScreenshotPermissionCallback = null
+    }
 
     private val screenCaptureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -156,6 +213,29 @@ class MainActivity : AppCompatActivity() {
                 themeMode = currentThemeMode,
                 onThemeModeChanged = { mode ->
                     currentThemeMode = mode
+                },
+                onLaunchCameraCapture = {
+                    if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        launchRealCameraCapture()
+                    } else {
+                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                    }
+                },
+                onRequestScreenshotPermission = { callback ->
+                    val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        Manifest.permission.READ_MEDIA_IMAGES
+                    } else {
+                        Manifest.permission.READ_EXTERNAL_STORAGE
+                    }
+                    if (ContextCompat.checkSelfPermission(this, perm) == PackageManager.PERMISSION_GRANTED) {
+                        callback(true)
+                    } else {
+                        pendingScreenshotPermissionCallback = callback
+                        screenshotPermissionLauncher.launch(perm)
+                    }
+                },
+                onSyncSystemBars = { isDarkTheme ->
+                    updateSystemBarsAppearance(isDarkTheme)
                 }
             )
         }
@@ -233,12 +313,35 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun launchRealCameraCapture() {
+        try {
+            repository.setCameraCapturing()
+            val cacheDir = File(cacheDir, "camera_captures").apply { mkdirs() }
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val outFile = File(cacheDir, "cap_${stamp}_${UUID.randomUUID().toString().take(6)}.jpg")
+            pendingCameraCaptureFile = outFile
+            val photoUri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", outFile)
+            takePictureLauncher.launch(photoUri)
+        } catch (e: Exception) {
+            try {
+                pendingCameraCaptureFile?.delete()
+            } catch (_: Exception) {}
+            pendingCameraCaptureFile = null
+            repository.setCameraFailed(e.message ?: "Unable to launch camera")
+            Toast.makeText(this, "Unable to launch camera: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
     private fun setupWindowInsets() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val isNight = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES
+        updateSystemBarsAppearance(isNight)
+    }
+
+    private fun updateSystemBarsAppearance(isDarkTheme: Boolean) {
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-        insetsController.isAppearanceLightStatusBars = !isNight
-        insetsController.isAppearanceLightNavigationBars = !isNight
+        insetsController.isAppearanceLightStatusBars = !isDarkTheme
+        insetsController.isAppearanceLightNavigationBars = !isDarkTheme
     }
 
     private fun resolveUriMetadata(uri: Uri): Pair<String, Long> {

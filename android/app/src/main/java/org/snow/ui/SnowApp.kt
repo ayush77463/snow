@@ -1,7 +1,11 @@
 package org.snow.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatDelegate
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -23,13 +27,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -48,10 +55,12 @@ import com.google.zxing.qrcode.QRCodeWriter
 import kotlinx.coroutines.launch
 import org.snow.network.ConnectionState
 import org.snow.network.DiscoveredPeer
-import org.snow.ui.components.SnowTonalButton
-import org.snow.ui.theme.SnowTypography
 import org.snow.network.PeerHostState
 import org.snow.ui.PcFileItem
+import org.snow.ui.components.SnowGradientButton
+import org.snow.ui.components.SnowOutlinedButton
+import org.snow.ui.components.SnowTonalButton
+import org.snow.ui.theme.SnowTypography
 import org.snow.ui.PendingApprovalItem
 import org.snow.ui.SavedDevice
 import org.snow.ui.connect.SnowConnectSheet
@@ -81,7 +90,10 @@ fun SnowApp(
     onPickSafFolder: () -> Unit,
     onToggleScreenShareConsent: () -> Unit,
     themeMode: Int,
-    onThemeModeChanged: (Int) -> Unit
+    onThemeModeChanged: (Int) -> Unit,
+    onLaunchCameraCapture: () -> Unit = {},
+    onRequestScreenshotPermission: ((Boolean) -> Unit) -> Unit = { it(false) },
+    onSyncSystemBars: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -101,19 +113,25 @@ fun SnowApp(
     val peerHostState by repository.peerHostState.collectAsState()
     val desktopWallpaper by repository.desktopWallpaper.collectAsState()
     val activePermissionProfile by repository.permissionProfileState.collectAsState()
+    val cameraDelivery by repository.cameraDelivery.collectAsState()
 
     // Navigation and Modal Visibility States
     var currentTab by remember { mutableStateOf(SnowTab.HOME) }
     var currentToolSubTab by remember { mutableStateOf(ToolSubTab.FILES) }
     var showDeviceIsland by remember { mutableStateOf(false) }
     var showApprovalsSheet by remember { mutableStateOf(false) }
+    var approvalsInitialTab by remember { mutableIntStateOf(0) }
     var showConnectSheet by remember { mutableStateOf(false) }
     var showPeerHostQrDialog by remember { mutableStateOf(false) }
     var peerHostQrJson by remember { mutableStateOf<String?>(null) }
     var generatedFederationCode by remember { mutableStateOf<String?>(null) }
     var updateInfo by remember { mutableStateOf<org.snow.transfer.FileTransferClient.AppUpdateInfo?>(null) }
+    var updateDownloadProgress by remember { mutableStateOf<Int?>(null) }
     var connectErrorMessage by remember { mutableStateOf<String?>(null) }
     var isConnectingByInput by remember { mutableStateOf(false) }
+    var showShareDialog by remember { mutableStateOf(false) }
+    var shareInput by remember { mutableStateOf("") }
+    var scrollToClipboardTrigger by remember { mutableIntStateOf(0) }
 
     // Files state
     var currentPcPath by remember { mutableStateOf("C:\\") }
@@ -135,13 +153,13 @@ fun SnowApp(
         mutableStateOf(prefs.getBoolean(SnowUiRepository.PREF_KEY_INSTANT_SYNC, true))
     }
     var autoSyncScreenshots by remember {
-        mutableStateOf(prefs.getBoolean(SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, true))
+        mutableStateOf(prefs.getBoolean(SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, false))
     }
     var autoConnectNearby by remember {
         mutableStateOf(prefs.getBoolean(SnowUiRepository.PREF_KEY_AUTO_CONNECT_ENABLED, true))
     }
     var alwaysOnRemoteAccess by remember {
-        mutableStateOf(!org.snow.service.SnowForegroundService.isDisconnectedByUser(context))
+        mutableStateOf(repository.isRemoteRelayEnabled())
     }
 
     // Determine currently active connected device
@@ -182,9 +200,9 @@ fun SnowApp(
         }
     }
 
-    // Refresh federation grants when on devices tab
-    LaunchedEffect(currentTab) {
-        if (currentTab == SnowTab.DEVICES && connectionState == ConnectionState.CONNECTED) {
+    // Refresh federation grants when on devices tab or opening floating device selector island
+    LaunchedEffect(currentTab, showDeviceIsland, connectionState) {
+        if ((currentTab == SnowTab.DEVICES || showDeviceIsland) && connectionState == ConnectionState.CONNECTED) {
             repository.listFederationGrants { success, grants, _ ->
                 if (success && grants != null) {
                     federationGrantsList = grants
@@ -197,6 +215,10 @@ fun SnowApp(
         AppCompatDelegate.MODE_NIGHT_YES -> true
         AppCompatDelegate.MODE_NIGHT_NO -> false
         else -> androidx.compose.foundation.isSystemInDarkTheme()
+    }
+
+    SideEffect {
+        onSyncSystemBars(isDark)
     }
 
     SnowTheme(darkTheme = isDark) {
@@ -215,7 +237,10 @@ fun SnowApp(
                     transportMode = transport,
                     unreadApprovalsCount = pendingApprovalsCount,
                     onCapsuleClick = { showDeviceIsland = true },
-                    onApprovalsClick = { showApprovalsSheet = true }
+                    onApprovalsClick = {
+                        approvalsInitialTab = 0
+                        showApprovalsSheet = true
+                    }
                 )
             },
             bottomBar = {
@@ -302,12 +327,35 @@ fun SnowApp(
                             },
                             onSendFiles = onPickFilesToUpload,
                             onOpenTool = { toolId ->
-                                currentTab = SnowTab.TOOLS
                                 when (toolId) {
-                                    "terminal" -> currentToolSubTab = ToolSubTab.TERMINAL
-                                    "media_screen", "media_camera", "media_control" -> currentToolSubTab = ToolSubTab.MEDIA
-                                    "apps" -> currentToolSubTab = ToolSubTab.APPS
-                                    else -> currentToolSubTab = ToolSubTab.FILES
+                                    "clipboard" -> {
+                                        scrollToClipboardTrigger++
+                                        repository.fetchClipboardBuffer()
+                                    }
+                                    "notifications" -> {
+                                        approvalsInitialTab = 1
+                                        showApprovalsSheet = true
+                                    }
+                                    "share" -> {
+                                        shareInput = ""
+                                        showShareDialog = true
+                                    }
+                                    "terminal" -> {
+                                        currentTab = SnowTab.TOOLS
+                                        currentToolSubTab = ToolSubTab.TERMINAL
+                                    }
+                                    "media_screen", "media_camera", "media_control" -> {
+                                        currentTab = SnowTab.TOOLS
+                                        currentToolSubTab = ToolSubTab.MEDIA
+                                    }
+                                    "apps" -> {
+                                        currentTab = SnowTab.TOOLS
+                                        currentToolSubTab = ToolSubTab.APPS
+                                    }
+                                    else -> {
+                                        currentTab = SnowTab.TOOLS
+                                        currentToolSubTab = ToolSubTab.FILES
+                                    }
                                 }
                             },
                             onNavigateTab = { currentTab = it },
@@ -325,14 +373,19 @@ fun SnowApp(
                                 }
                             },
                             onShareClipboardItem = { item ->
-                                context.startActivity(repository.createShareIntentForClipboardItem(item))
+                                repository.shareClipboardItem(item) { ok, err ->
+                                    if (!ok && !err.isNullOrBlank()) {
+                                        Toast.makeText(context, err, Toast.LENGTH_SHORT).show()
+                                    }
+                                }
                             },
                             onPinClipboardItem = { itemId, pinned ->
                                 repository.pinClipboardBufferItem(itemId, pinned)
                             },
                             onClearClipboardBuffer = {
                                 repository.clearClipboardBuffer()
-                            }
+                            },
+                            scrollToClipboardTrigger = scrollToClipboardTrigger
                         )
                     }
                     SnowTab.DEVICES -> {
@@ -352,7 +405,18 @@ fun SnowApp(
                                 repository.removeSavedDevice(dev.deviceId)
                             },
                             onUpdateTrustTier = { deviceId, tier ->
-                                repository.updateDeviceTrustTier(deviceId, tier)
+                                val canonical = SnowUiRepository.normalizeAccessProfile(tier)
+                                repository.updateDeviceTrustTier(deviceId, canonical)
+                                val targetDev = savedDevices.find { it.deviceId == deviceId }
+                                val activeHost = repository.currentTargetHost
+                                val isActiveDevice = targetDev != null && (
+                                    targetDev.host == activeHost ||
+                                        (activeHost == "127.0.0.1" && targetDev.host == "127.0.0.1") ||
+                                        (targetDev.host.isNotBlank() && targetDev.host == repository.connectedHost)
+                                    )
+                                if (isActiveDevice) {
+                                    repository.setAccessProfile(canonical)
+                                }
                             },
                             onPairDiscoveredPeer = { peer ->
                                 repository.connect(peer.ipAddress, peer.port)
@@ -442,18 +506,35 @@ fun SnowApp(
                                     repository.stopScreenShare()
                                 }
                             },
-                            onTriggerCameraCapture = {
-                                repository.setCameraCapturing()
-                                Toast.makeText(context, "Requested remote camera capture", Toast.LENGTH_SHORT).show()
-                            },
+                            onTriggerCameraCapture = onLaunchCameraCapture,
                             onSendMediaKey = { key ->
                                 repository.sendMediaKey(key) { success, err ->
                                     if (!success) Toast.makeText(context, "Media key failed: $err", Toast.LENGTH_SHORT).show()
                                 }
                             },
+                            onSendMediaVolume = { vol ->
+                                repository.sendMediaKey("volume_set", vol) { success, err ->
+                                    if (!success) Toast.makeText(context, "Volume set failed: $err", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            cameraDelivery = cameraDelivery,
+                            onRetryCameraUpload = {
+                                repository.retryCameraUpload { ok, err ->
+                                    Toast.makeText(context, if (ok) "Photo delivered: $err" else "Retry failed: $err", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onDismissCameraDelivery = {
+                                repository.dismissCameraDelivery()
+                            },
                             terminalState = terminalState,
                             onExecuteTerminalCommand = { cmd ->
                                 repository.executeTerminalCommand(cmd)
+                            },
+                            onConfirmTerminalCommand = { cmd, ticket ->
+                                repository.executeTerminalCommand(cmd, ticket)
+                            },
+                            onCancelTerminalCommand = {
+                                repository.cancelTerminalCommand()
                             },
                             onClearTerminal = {
                                 repository.clearTerminalOutput()
@@ -470,11 +551,17 @@ fun SnowApp(
                             },
                             alwaysOnRemoteAccess = alwaysOnRemoteAccess,
                             onToggleAlwaysOnRemoteAccess = { enabled ->
-                                alwaysOnRemoteAccess = enabled
-                                if (enabled) {
-                                    org.snow.service.SnowForegroundService.startAutoConnect(context)
+                                val ep = repository.getRemoteRelayEndpoint()
+                                if (enabled && ep.isBlank()) {
+                                    alwaysOnRemoteAccess = false
+                                    Toast.makeText(
+                                        context,
+                                        "Configure Remote Relay endpoint in Advanced Diagnostics first.",
+                                        Toast.LENGTH_LONG
+                                    ).show()
                                 } else {
-                                    org.snow.service.SnowForegroundService.stop(context)
+                                    alwaysOnRemoteAccess = enabled
+                                    repository.updateRemoteRelayConfig(enabled, ep)
                                 }
                             },
                             instantClipboardSync = instantClipboardSync,
@@ -485,8 +572,32 @@ fun SnowApp(
                             },
                             autoSyncScreenshots = autoSyncScreenshots,
                             onToggleAutoSyncScreenshots = { checked ->
-                                autoSyncScreenshots = checked
-                                prefs.edit().putBoolean(SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, checked).apply()
+                                if (checked) {
+                                    val perm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        Manifest.permission.READ_MEDIA_IMAGES
+                                    } else {
+                                        Manifest.permission.READ_EXTERNAL_STORAGE
+                                    }
+                                    if (ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED) {
+                                        autoSyncScreenshots = true
+                                        prefs.edit().putBoolean(SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, true).apply()
+                                        repository.screenshotObserver.register()
+                                    } else {
+                                        onRequestScreenshotPermission { granted ->
+                                            autoSyncScreenshots = granted
+                                            prefs.edit().putBoolean(SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, granted).apply()
+                                            if (granted) {
+                                                repository.screenshotObserver.register()
+                                            } else {
+                                                Toast.makeText(context, "Media permission required to auto-sync screenshots.", Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    autoSyncScreenshots = false
+                                    prefs.edit().putBoolean(SnowUiRepository.PREF_KEY_AUTO_SYNC_SCREENSHOTS, false).apply()
+                                    repository.screenshotObserver.unregister()
+                                }
                             },
                             autoConnectNearby = autoConnectNearby,
                             onToggleAutoConnectNearby = { checked ->
@@ -495,26 +606,32 @@ fun SnowApp(
                             },
                             mySnowId = repository.canonicalSnowId,
                             myDeviceId = repository.identity.deviceId,
-                            relayEndpoint = repository.getRemoteRelayEndpoint() ?: "",
+                            relayEndpoint = repository.getRemoteRelayEndpoint(),
                             onUpdateRelayEndpoint = { ep ->
                                 repository.setRemoteRelayEndpoint(ep)
+                                if (alwaysOnRemoteAccess) {
+                                    repository.updateRemoteRelayConfig(true, ep)
+                                }
                             },
                             onCheckAppUpdate = {
                                 appUpdateStatusText = "Checking..."
                                 repository.checkAppUpdate { info ->
                                     updateInfo = info
-                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v5.0 • Up to date"
+                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v5.0.0 • Up to date"
                                 }
                             },
                             updateStatusText = appUpdateStatusText,
                             isUpdateAvailable = updateInfo?.available == true,
                             updateVersionName = updateInfo?.versionName ?: "",
+                            updateDownloadProgress = updateDownloadProgress,
                             onInstallUpdate = {
                                 updateInfo?.let { info ->
+                                    updateDownloadProgress = 0
                                     repository.downloadAndInstallUpdate(
                                         info,
-                                        onProgress = {},
+                                        onProgress = { pct -> updateDownloadProgress = pct },
                                         onComplete = { success, msg ->
+                                            updateDownloadProgress = null
                                             Toast.makeText(context, if (success) "Update downloaded" else "Failed: $msg", Toast.LENGTH_SHORT).show()
                                         }
                                     )
@@ -557,6 +674,10 @@ fun SnowApp(
                     },
                     onJoinAnotherNetwork = {
                         showConnectSheet = true
+                    },
+                    federationGrants = federationGrantsList,
+                    onFederationGrantClick = {
+                        currentTab = SnowTab.DEVICES
                     }
                 )
 
@@ -571,8 +692,70 @@ fun SnowApp(
                                 pendingApprovalsList = pendingApprovalsList.filter { it.requestId != reqId }
                             }
                         }
-                    }
+                    },
+                    initialTab = approvalsInitialTab
                 )
+
+                if (showShareDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showShareDialog = false },
+                        title = {
+                            Text(
+                                text = "Share Link or Note",
+                                style = SnowTypography.titleMedium,
+                                color = colors.textPrimary
+                            )
+                        },
+                        text = {
+                            Column {
+                                Text(
+                                    text = "Send an HTTP/HTTPS URL or text note directly to the connected device:",
+                                    style = SnowTypography.bodySmall,
+                                    color = colors.textSecondary
+                                )
+                                Spacer(modifier = Modifier.height(10.dp))
+                                OutlinedTextField(
+                                    value = shareInput,
+                                    onValueChange = { shareInput = it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    placeholder = { Text("https://example.com or quick note...") },
+                                    singleLine = false,
+                                    shape = RoundedCornerShape(12.dp)
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            SnowGradientButton(
+                                text = "Send",
+                                onClick = {
+                                    val clean = shareInput.trim()
+                                    if (clean.isNotEmpty()) {
+                                        val isHttpUrl = clean.startsWith("https://", ignoreCase = true) ||
+                                            clean.startsWith("http://", ignoreCase = true)
+                                        repository.shareLink(
+                                            url = if (isHttpUrl) clean else null,
+                                            text = if (!isHttpUrl) clean else null
+                                        ) { ok, err ->
+                                            Toast.makeText(
+                                                context,
+                                                if (ok) "Shared successfully" else "Share failed: ${err ?: "Rejected"}",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                        showShareDialog = false
+                                    }
+                                }
+                            )
+                        },
+                        dismissButton = {
+                            SnowOutlinedButton(
+                                text = "Cancel",
+                                onClick = { showShareDialog = false }
+                            )
+                        },
+                        containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+                    )
+                }
 
                 SnowConnectSheet(
                     visible = showConnectSheet,

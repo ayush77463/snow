@@ -237,7 +237,10 @@ class SnowForegroundService : Service() {
         createNotificationChannel()
         registerNetworkCallback()
         val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val savedProfile = settingsPrefs.getString("permission_profile", "full_control") ?: "full_control"
+        val savedProfile = settingsPrefs.getString(
+            SnowUiRepository.PREF_KEY_PERMISSION_PROFILE,
+            settingsPrefs.getString("active_permission_profile", "full_control")
+        ) ?: "full_control"
         capabilityDispatcher.activePermissionProfile = savedProfile
         org.snow.ui.SnowUiRepository.getInstance(applicationContext).bindService(this)
         client.requestDispatcher = { action, data ->

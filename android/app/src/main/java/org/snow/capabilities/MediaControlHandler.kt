@@ -21,7 +21,7 @@ class MediaControlHandler(private val context: Context) {
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
-    fun handleMediaControl(action: String?): Map<String, Any?> {
+    fun handleMediaControl(action: String?, value: Number? = null): Map<String, Any?> {
         if (action.isNullOrBlank()) {
             return mapOf(
                 "status" to "error",
@@ -32,11 +32,13 @@ class MediaControlHandler(private val context: Context) {
         val canonical = action.trim().lowercase()
         val supportedActions = setOf(
             "play_pause", "play", "pause",
+            "stop",
             "next", "next_track",
             "previous", "prev", "prev_track",
             "volume_up", "vol_up",
             "volume_down", "vol_down",
-            "mute", "unmute", "toggle_mute"
+            "volume_set", "volume",
+            "mute", "unmute", "toggle_mute", "volume_mute"
         )
         if (!supportedActions.contains(canonical)) {
             return mapOf(
@@ -44,6 +46,20 @@ class MediaControlHandler(private val context: Context) {
                 "error" to "UNSUPPORTED_MEDIA_ACTION",
                 "message" to "Unsupported media action '$action' on Android client."
             )
+        }
+
+        val boundedVolume: Int? = if (canonical == "volume_set" || canonical == "volume") {
+            val raw = value?.toDouble()
+            if (raw == null || raw.isNaN() || raw.isInfinite() || raw < 0.0 || raw > 100.0) {
+                return mapOf(
+                    "status" to "error",
+                    "error" to "INVALID_VOLUME_LEVEL",
+                    "message" to "Volume level must be a number between 0 and 100."
+                )
+            }
+            raw.toInt().coerceIn(0, 100)
+        } else {
+            null
         }
 
         val am = audioManager
@@ -56,6 +72,7 @@ class MediaControlHandler(private val context: Context) {
 
         return when (canonical) {
             "play_pause", "play", "pause" -> dispatchKeyEvent(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, canonical)
+            "stop" -> dispatchKeyEvent(KeyEvent.KEYCODE_MEDIA_STOP, canonical)
             "next", "next_track" -> dispatchKeyEvent(KeyEvent.KEYCODE_MEDIA_NEXT, canonical)
             "previous", "prev", "prev_track" -> dispatchKeyEvent(KeyEvent.KEYCODE_MEDIA_PREVIOUS, canonical)
             "volume_up", "vol_up" -> {
@@ -74,7 +91,23 @@ class MediaControlHandler(private val context: Context) {
                     mapOf("status" to "error", "error" to (e.message ?: "Failed lowering volume"))
                 }
             }
-            "mute", "unmute", "toggle_mute" -> {
+            "volume_set", "volume" -> {
+                val bounded = boundedVolume ?: 0
+                try {
+                    val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                    val targetIndex = kotlin.math.round((bounded * maxVol) / 100.0).toInt().coerceIn(0, maxVol)
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, targetIndex, AudioManager.FLAG_SHOW_UI)
+                    mapOf(
+                        "status" to "success",
+                        "action" to "volume_set",
+                        "volume_percent" to bounded,
+                        "platform" to "android"
+                    )
+                } catch (e: Exception) {
+                    mapOf("status" to "error", "error" to (e.message ?: "Failed setting volume"))
+                }
+            }
+            "mute", "unmute", "toggle_mute", "volume_mute" -> {
                 try {
                     am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, AudioManager.FLAG_SHOW_UI)
                     mapOf("status" to "success", "action" to canonical, "platform" to "android")

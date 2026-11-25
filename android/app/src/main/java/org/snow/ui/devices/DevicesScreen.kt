@@ -54,6 +54,7 @@ import androidx.compose.ui.unit.sp
 import org.snow.network.DiscoveredPeer
 import org.snow.network.PeerHostState
 import org.snow.ui.SavedDevice
+import org.snow.ui.SnowUiRepository
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
 import org.snow.ui.components.SnowEmptyState
@@ -264,7 +265,7 @@ fun DevicesScreen(
                         value = joinCodeInput,
                         onValueChange = { joinCodeInput = it },
                         modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("e.g. 482 910 338") },
+                        placeholder = { Text("e.g. 000 000 000") },
                         singleLine = true,
                         shape = RoundedCornerShape(12.dp)
                     )
@@ -460,41 +461,56 @@ private fun DeviceListItem(
             Divider(color = colors.borderSubtle)
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Trust Tier Selector & Actions
+            // Canonical Access Profile Pills & Actions
+            val currentProfile = SnowUiRepository.normalizeAccessProfile(device.trustTier)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Trust Tier Pills
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    val currentTier = device.trustTier.ifBlank { "FULL" }.uppercase()
-                    TrustTierPill(label = "Full", selected = currentTier == "FULL", onClick = { onUpdateTier("FULL") })
-                    TrustTierPill(label = "Files", selected = currentTier == "FILES_ONLY", onClick = { onUpdateTier("FILES_ONLY") })
-                    TrustTierPill(label = "Read", selected = currentTier == "READ_ONLY", onClick = { onUpdateTier("READ_ONLY") })
-                }
+                TrustTierPill(
+                    label = "Full Control",
+                    selected = currentProfile == "full_control",
+                    onClick = { onUpdateTier("full_control") }
+                )
+                TrustTierPill(
+                    label = "Files & Clip",
+                    selected = currentProfile == "files_and_clipboard",
+                    onClick = { onUpdateTier("files_and_clipboard") }
+                )
+                TrustTierPill(
+                    label = "Clip Only",
+                    selected = currentProfile == "clipboard_only",
+                    onClick = { onUpdateTier("clipboard_only") }
+                )
+            }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (isActive) {
-                        SnowOutlinedButton(text = "Disconnect", onClick = onDisconnect)
-                    } else {
-                        SnowTonalButton(text = "Connect", onClick = onConnect)
-                    }
-                    Surface(
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(CircleShape)
-                            .clickable(onClick = onUnpair),
-                        color = colors.surfaceElevated
-                    ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Default.Delete,
-                                contentDescription = "Unpair",
-                                tint = Color(0xFFEF4444),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (isActive) {
+                    SnowOutlinedButton(text = "Disconnect", onClick = onDisconnect)
+                } else {
+                    SnowTonalButton(text = "Connect", onClick = onConnect)
+                }
+                Surface(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .clickable(onClick = onUnpair),
+                    color = colors.surfaceElevated
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "Unpair",
+                            tint = Color(0xFFEF4444),
+                            modifier = Modifier.size(18.dp)
+                        )
                     }
                 }
             }

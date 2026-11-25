@@ -639,7 +639,7 @@ class SnowWebSocketServer:
                         client.connection_id,
                     )
                     error_response = SnowMessage.create_error(
-                        code=ErrorCode.SERVICE_UNAVAILABLE,
+                        code=ErrorCode.UNAUTHORIZED,
                         message="SNOW Desktop Core is currently in PAUSE mode. Only OWNER_MANUAL operations are permitted.",
                         correlation_id=message.id,
                     )
@@ -739,6 +739,18 @@ class SnowWebSocketServer:
                 await self._handle_clipboard_buffer_add(client, message, data, session)
             elif action == "clipboard_buffer_apply":
                 await self._handle_clipboard_buffer_apply(client, message, data, session)
+            elif action == "clipboard_buffer_pin":
+                await self._handle_clipboard_buffer_pin(client, message, data, session, ctx)
+            elif action == "clipboard_buffer_unpin":
+                await self._handle_clipboard_buffer_unpin(client, message, data, session, ctx)
+            elif action == "clipboard_buffer_delete":
+                await self._handle_clipboard_buffer_delete(client, message, data, session, ctx)
+            elif action == "clipboard_buffer_clear":
+                await self._handle_clipboard_buffer_clear(client, message, data, session, ctx)
+            elif action == "media_control":
+                await self._handle_media_control(client, message, data, session, ctx)
+            elif action == "share_link":
+                await self._handle_share_link(client, message, data, session, ctx)
             elif action == "federation_create_invite":
                 await self._handle_federation_create_invite(client, message, data, session, is_owner)
             elif action == "federation_accept_invite":
@@ -936,7 +948,7 @@ class SnowWebSocketServer:
         item = buf.get_item(str(item_id), include_content=True)
         if not item:
             error_response = SnowMessage.create_error(
-                code=ErrorCode.NOT_FOUND,
+                code=ErrorCode.FILE_NOT_FOUND,
                 message=f"Item '{item_id}' not found in clipboard buffer.",
                 correlation_id=message.id,
             )
@@ -956,7 +968,7 @@ class SnowWebSocketServer:
         text_content = item.get("text_content") or ""
         if len(text_content.encode("utf-8")) > 65536:
             error_response = SnowMessage.create_error(
-                code=ErrorCode.PAYLOAD_TOO_LARGE,
+                code=ErrorCode.OVERSIZED_MESSAGE,
                 message="Clipboard text exceeds 64 KiB limit.",
                 correlation_id=message.id,
             )
@@ -1050,7 +1062,7 @@ class SnowWebSocketServer:
         res = await self.capability_engine.execute(req, ctx=ctx)
         if not res.success:
             error_response = SnowMessage.create_error(
-                code=ErrorCode.EXECUTION_FAILED,
+                code=ErrorCode.INTERNAL_ERROR,
                 message=res.error or "Failed to apply clipboard buffer item",
                 correlation_id=message.id,
             )
@@ -1074,6 +1086,249 @@ class SnowWebSocketServer:
             payload=payload,
         )
         await client.websocket.send(response.to_json())
+
+    async def _send_engine_wss_result(
+        self,
+        client: Any,
+        message: SnowMessage,
+        action: str,
+        params: dict[str, Any],
+        ctx: Optional[ExecutionContext],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Execute a validated request through CapabilityEngine and translate response/errors for WSS."""
+        effective_ctx = ctx or ExecutionContext(
+            principal=ExecutionPrincipal.AI_MCP,
+            device_id=session.device_id if session else None,
+            session_id=session.session_id if session else None,
+            origin="wss",
+        )
+        req = CapabilityRequest(action=action, params=params)
+        res = await self.capability_engine.execute(req, ctx=effective_ctx)
+
+        if not res.success:
+            status_upper = str(res.status or "").upper()
+            if status_upper in ("POLICY_DENIED", "UNAUTHORIZED", "APPROVAL_REQUIRED"):
+                err_code = ErrorCode.UNAUTHORIZED
+            elif status_upper in ("INVALID_ARGUMENT", "INVALID_PAYLOAD", "INVALID_URL_SCHEME", "INVALID_VOLUME_LEVEL", "UNSUPPORTED_MEDIA_ACTION"):
+                err_code = ErrorCode.INVALID_PAYLOAD
+            elif status_upper == "ITEM_NOT_FOUND":
+                err_code = ErrorCode.FILE_NOT_FOUND
+            else:
+                err_code = ErrorCode.INTERNAL_ERROR
+            error_response = SnowMessage.create_error(
+                code=err_code,
+                message=res.error or f"Capability '{action}' failed ({res.status}).",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        res_data = res.data if isinstance(res.data, dict) else {}
+        payload: dict[str, Any] = {
+            "status": "success",
+            "action": action,
+            "data": res_data,
+        }
+        if "item" in res_data:
+            payload["item"] = res_data["item"]
+        if "item_id" in res_data:
+            payload["item_id"] = res_data["item_id"]
+
+        response = SnowMessage.create_response(correlation_id=message.id, payload=payload)
+        await client.websocket.send(response.to_json())
+
+    @staticmethod
+    def _validate_clip_item_id(item_id: Any) -> Optional[str]:
+        if not isinstance(item_id, str) or not re.match(r"^cb_[0-9a-f]{12}_[0-9a-f]{6}$", item_id):
+            return None
+        return item_id
+
+    async def _handle_clipboard_buffer_pin(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle authenticated WSS request to pin or unpin a shared clipboard item."""
+        item_id = self._validate_clip_item_id(data.get("item_id"))
+        if not item_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Invalid or missing 'item_id'. Expected format: cb_<12hex>_<6hex>.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        params: dict[str, Any] = {"item_id": item_id}
+        if "is_pinned" in data:
+            if not isinstance(data["is_pinned"], bool):
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD,
+                    message="'is_pinned' must be a boolean.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+            params["is_pinned"] = data["is_pinned"]
+
+        await self._send_engine_wss_result(
+            client, message, "clipboard_buffer_pin", params, ctx, session
+        )
+
+    async def _handle_clipboard_buffer_unpin(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle authenticated WSS request to unpin a shared clipboard item."""
+        item_id = self._validate_clip_item_id(data.get("item_id"))
+        if not item_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Invalid or missing 'item_id'. Expected format: cb_<12hex>_<6hex>.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        await self._send_engine_wss_result(
+            client, message, "clipboard_buffer_unpin", {"item_id": item_id}, ctx, session
+        )
+
+    async def _handle_clipboard_buffer_delete(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle owner-only WSS request to delete a shared clipboard item."""
+        item_id = self._validate_clip_item_id(data.get("item_id"))
+        if not item_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Invalid or missing 'item_id'. Expected format: cb_<12hex>_<6hex>.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        await self._send_engine_wss_result(
+            client, message, "clipboard_buffer_delete", {"item_id": item_id}, ctx, session
+        )
+
+    async def _handle_clipboard_buffer_clear(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle owner-only WSS request to clear shared clipboard buffer items."""
+        unpinned_only = data.get("unpinned_only", True)
+        if not isinstance(unpinned_only, bool):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="'unpinned_only' must be a boolean.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        await self._send_engine_wss_result(
+            client,
+            message,
+            "clipboard_buffer_clear",
+            {"unpinned_only": unpinned_only},
+            ctx,
+            session,
+        )
+
+    async def _handle_media_control(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle authenticated WSS request for desktop media playback and bounded volume control."""
+        raw_action = data.get("action")
+        if not isinstance(raw_action, str) or not raw_action.strip():
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Missing or invalid 'action' in media_control request.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        params: dict[str, Any] = {"action": raw_action.strip()}
+        if "value" in data and data["value"] is not None:
+            val = data["value"]
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD,
+                    message="Media volume 'value' must be a number between 0 and 100.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+            params["value"] = val
+
+        await self._send_engine_wss_result(
+            client, message, "media_control", params, ctx, session
+        )
+
+    async def _handle_share_link(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+        ctx: Optional[ExecutionContext] = None,
+    ) -> None:
+        """Handle authenticated WSS request to share a validated HTTP/HTTPS URL or text note."""
+        url = data.get("url", "")
+        text = data.get("text", "")
+        if (url is not None and not isinstance(url, str)) or (text is not None and not isinstance(text, str)):
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="'url' and 'text' must be strings when provided.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        clean_url = (url or "").strip()
+        clean_text = (text or "").strip()
+        if not clean_url and not clean_text:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Either non-empty 'url' or 'text' must be provided.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        params: dict[str, Any] = {}
+        if clean_url:
+            params["url"] = clean_url
+        if clean_text:
+            params["text"] = clean_text
+
+        await self._send_engine_wss_result(
+            client, message, "share_link", params, ctx, session
+        )
 
     async def _handle_manifest_update(
         self,
@@ -1219,7 +1474,7 @@ class SnowWebSocketServer:
 
         if not target_device_id or not relay_action:
             error_response = SnowMessage.create_error(
-                code=ErrorCode.INVALID_REQUEST,
+                code=ErrorCode.INVALID_PAYLOAD,
                 message="Peer relay requires 'target_device_id' and 'action'.",
                 correlation_id=message.id,
             )
@@ -1842,7 +2097,7 @@ class SnowWebSocketServer:
             logger.warning("Unpair request missing device_id or auth_token from client [%s]",
                            client.connection_id)
             error_response = SnowMessage.create_error(
-                code=ErrorCode.INVALID_REQUEST,
+                code=ErrorCode.INVALID_PAYLOAD,
                 message="Unpair request requires 'device_id' and 'auth_token'.",
                 correlation_id=message.id,
             )
@@ -2368,7 +2623,7 @@ class SnowWebSocketServer:
             computed_sha256 = hashlib.sha256(target_path.read_bytes()).hexdigest()
             if sha256 and computed_sha256.lower() != sha256.lower():
                 error_response = SnowMessage.create_error(
-                    code=ErrorCode.CHECKSUM_MISMATCH,
+                    code=ErrorCode.INTEGRITY_MISMATCH,
                     message="Image SHA-256 verification mismatch.",
                     correlation_id=message.id,
                 )

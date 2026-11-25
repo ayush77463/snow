@@ -458,7 +458,7 @@ class SnowIpcServer:
                 "data": {"authenticated": True},
             }, True
 
-        if op == "get_device_status":
+        if op in ("get_device_status", "status"):
             status_data = self._handle_get_device_status()
             return {
                 "version": IPC_PROTOCOL_VERSION,

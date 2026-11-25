@@ -24,7 +24,8 @@ sealed class PairingState {
         val desktopName: String,
         val sessionId: String,
         val authToken: String? = null,
-        val trustTier: String = "peer"
+        val trustTier: String = "peer",
+        val deviceType: String? = null
     ) : PairingState()
 
     data class WrongPin(
@@ -266,12 +267,18 @@ class PairingFlow(
     /**
      * Mark state as Paired upon successful automatic post-connection authentication handshake.
      */
-    fun setAuthenticated(sessionId: String, desktopName: String = "SNOW Desktop", trustTier: String = "peer") {
+    fun setAuthenticated(
+        sessionId: String,
+        desktopName: String = "SNOW Desktop",
+        trustTier: String = "peer",
+        deviceType: String? = null
+    ) {
         val newState = PairingState.Paired(
             desktopId = "desktop-core",
             desktopName = desktopName,
             sessionId = sessionId,
-            trustTier = trustTier
+            trustTier = trustTier,
+            deviceType = deviceType
         )
         _state.value = newState
     }
@@ -280,12 +287,17 @@ class PairingFlow(
         return when (message.type) {
             MessageType.RESPONSE -> {
                 val payload = message.payload ?: emptyMap()
-                val data = payload["data"] as? Map<*, *>
+                val data = (payload["data"] as? Map<*, *>) ?: payload
                 val desktopId = data?.get("device_id") as? String ?: "unknown"
                 val desktopName = data?.get("device_name") as? String ?: "SNOW Desktop"
                 val sessionId = data?.get("session_id") as? String ?: "session-active"
                 val authToken = data?.get("auth_token") as? String
                 val trustTier = data?.get("trust_tier") as? String ?: "peer"
+                val manifest = data?.get("manifest") as? Map<*, *>
+                val deviceType = (data?.get("device_type") as? String)
+                    ?: (data?.get("platform") as? String)
+                    ?: (manifest?.get("platform") as? String)
+                    ?: (manifest?.get("device_type") as? String)
 
                 if (!authToken.isNullOrBlank()) {
                     tokenStorage?.saveToken(authToken)
@@ -296,7 +308,8 @@ class PairingFlow(
                     desktopName = desktopName,
                     sessionId = sessionId,
                     authToken = authToken,
-                    trustTier = trustTier
+                    trustTier = trustTier,
+                    deviceType = deviceType
                 )
             }
 
