@@ -76,6 +76,8 @@ CMD_STOP_CORE: int = 2004
 CMD_TOGGLE_AUTOSTART: int = 2005
 CMD_EXIT: int = 2006
 
+HAS_WIN32: bool = sys.platform == "win32"
+
 if sys.platform == "win32":
     LRESULT = ctypes.c_ssize_t
 
@@ -231,6 +233,17 @@ if sys.platform == "win32":
 
     _user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
     _user32.DispatchMessageW.restype = LRESULT
+
+    _user32.PostMessageW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    ]
+    _user32.PostMessageW.restype = wintypes.BOOL
+
+    _user32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+    _user32.SetThreadDesktop.restype = wintypes.BOOL
 
     _shell32.Shell_NotifyIconW.argtypes = [
         wintypes.DWORD,
@@ -636,18 +649,25 @@ class SnowTrayApp:
 
     def _resolve_snow_icon(self, hinstance: int) -> int:
         """Resolve and load the branded SNOW icon handle, falling back to IDI_APPLICATION."""
-        if not HAS_WIN32:
+        if sys.platform != "win32":
             return 0
-        from pathlib import Path
-        import sys
 
+        exe_dir = Path(sys.executable).resolve().parent
         candidates = [
             Path(__file__).resolve().parent.parent.parent.parent / "packaging" / "windows" / "snow.ico",
-            Path(sys.executable).parent / "packaging" / "windows" / "snow.ico",
-            Path(sys.executable).parent / "snow.ico",
-            Path(getattr(sys, "_MEIPASS", "")) / "packaging" / "windows" / "snow.ico",
-            Path(getattr(sys, "_MEIPASS", "")) / "snow.ico",
+            exe_dir / "packaging" / "windows" / "snow.ico",
+            exe_dir / "snow.ico",
+            exe_dir / "_internal" / "packaging" / "windows" / "snow.ico",
+            exe_dir / "_internal" / "snow.ico",
         ]
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            meipass_dir = Path(meipass)
+            candidates.extend([
+                meipass_dir / "packaging" / "windows" / "snow.ico",
+                meipass_dir / "snow.ico",
+            ])
+
         IMAGE_ICON = 1
         LR_LOADFROMFILE = 0x00000010
         LR_DEFAULTSIZE = 0x00000040
@@ -665,11 +685,12 @@ class SnowTrayApp:
                     )
                     if h_icon:
                         logger.debug("Loaded branded tray icon from %s", candidate)
-                        return h_icon
+                        return int(h_icon)
             except Exception:
                 pass
 
-        return _user32.LoadIconW(0, ctypes.c_wchar_p(IDI_APPLICATION))
+        fallback_icon = _user32.LoadIconW(0, ctypes.c_wchar_p(IDI_APPLICATION))
+        return int(fallback_icon) if fallback_icon else 0
 
     def _background_monitor(self) -> None:
         """Periodically refresh core status and tooltip in the background."""

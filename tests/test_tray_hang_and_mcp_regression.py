@@ -62,6 +62,58 @@ class TestTrayLifecycleAndDispatch(unittest.TestCase):
             app.dispatch_command(CMD_PAIR_DEVICE)
             mock_dash.assert_called_once_with("/?action=pair")
 
+    @unittest.skipUnless(sys.platform == "win32", "Win32 tray icon tests require Windows")
+    def test_tray_resolve_snow_icon_non_headless_windows(self) -> None:
+        """Verify _resolve_snow_icon returns a valid non-zero HICON and wires into NOTIFYICONDATAW."""
+        from pathlib import Path
+        import tempfile
+        import shutil
+        from snow.tray.app import NOTIFYICONDATAW, WNDCLASSEXW, _user32
+
+        app = SnowTrayApp(headless=False, auto_start_core=False)
+
+        # 1. Resolve packaged/repo icon directly without NameError
+        h_icon = app._resolve_snow_icon(0)
+        self.assertIsInstance(h_icon, int)
+        self.assertGreater(h_icon, 0)
+
+        # 2. Verify WNDCLASSEXW and NOTIFYICONDATAW accept the resolved HICON cleanly
+        wcex = WNDCLASSEXW()
+        wcex.hIcon = h_icon
+        wcex.hIconSm = h_icon
+        nid = NOTIFYICONDATAW()
+        nid.hIcon = h_icon
+        self.assertEqual(nid.hIcon, h_icon)
+
+        # 3. Verify _MEIPASS lookup works and missing-file fallback returns IDI_APPLICATION handle
+        tmp_dir = Path(tempfile.mkdtemp(prefix="snow_tray_ico_"))
+        try:
+            ico_src = Path(__file__).resolve().parents[1] / "packaging" / "windows" / "snow.ico"
+            if ico_src.is_file():
+                (tmp_dir / "snow.ico").write_bytes(ico_src.read_bytes())
+                with patch.object(sys, "_MEIPASS", str(tmp_dir), create=True):
+                    meipass_icon = app._resolve_snow_icon(0)
+                    self.assertGreater(meipass_icon, 0)
+
+            with patch("pathlib.Path.is_file", return_value=False):
+                fallback_icon = app._resolve_snow_icon(0)
+                self.assertGreater(fallback_icon, 0)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        # 4. Exercise non-headless run() window/icon registration path with mocked message loop
+        with patch.object(app, "refresh_status"), \
+             patch.object(_user32, "RegisterClassExW", return_value=1) as mock_reg, \
+             patch.object(_user32, "CreateWindowExW", return_value=12345), \
+             patch.object(_user32, "LoadCursorW", return_value=100), \
+             patch("ctypes.windll.shell32.Shell_NotifyIconW", return_value=1) as mock_notify, \
+             patch.object(_user32, "GetMessageW", return_value=0), \
+             patch.object(_user32, "PostMessageW", return_value=1):
+            rc = app.run()
+            self.assertEqual(rc, 0)
+            mock_reg.assert_called_once()
+            self.assertGreaterEqual(mock_notify.call_count, 1)
+
 
 class TestLocalMcpStdioProtocol(unittest.TestCase):
     """Verify local FastMCP stdio server protocol correctness."""
