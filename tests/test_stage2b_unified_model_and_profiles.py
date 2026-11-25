@@ -151,9 +151,10 @@ class TestSessionRouterProfileEnforcement(unittest.IsolatedAsyncioTestCase):
         registry.set_permission_profile("dev_123", "files_and_clipboard")
         self.assertEqual(registry.get_permission_profile("dev_123"), "files_and_clipboard")
 
-        # Invalid profile defaults safely to full_control
-        registry.set_permission_profile("dev_123", "invalid_custom_profile")
-        self.assertEqual(registry.get_permission_profile("dev_123"), "full_control")
+        # Unknown/invalid profile tiers must be rejected (never silently escalated)
+        with self.assertRaises(ValueError):
+            registry.set_permission_profile("dev_123", "invalid_custom_profile")
+        self.assertEqual(registry.get_permission_profile("dev_123"), "files_and_clipboard")
 
 
 class TestPermissionProfileApiEndpoint(unittest.IsolatedAsyncioTestCase):

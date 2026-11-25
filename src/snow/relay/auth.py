@@ -6,8 +6,109 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import time
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
+
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+SNOW_ID_REGEX = re.compile(r"^SNW-[A-Z0-9]{4}-[A-Z0-9]{4}$")
+NETWORK_ID_REGEX = re.compile(r"^SNW-NET-[A-F0-9]{8}$")
+
+
+def is_valid_snow_id(val: Any) -> bool:
+    """Validate whether a value conforms to the canonical SNOW ID format (^SNW-[A-Z0-9]{4}-[A-Z0-9]{4}$)."""
+    if not isinstance(val, str) or not val.strip():
+        return False
+    return bool(SNOW_ID_REGEX.match(val.strip().upper()))
+
+
+def is_valid_network_id(val: Any) -> bool:
+    """Validate canonical permanent network ID format (^SNW-NET-[A-F0-9]{8}$)."""
+    if not isinstance(val, str) or not val.strip():
+        return False
+    return bool(NETWORK_ID_REGEX.match(val.strip().upper()))
+
+
+def encode_ed25519_pubkey(raw_bytes: bytes) -> str:
+    """Encode raw 32-byte Ed25519 public key into canonical unpadded URL-safe Base64."""
+    if not isinstance(raw_bytes, (bytes, bytearray)) or len(raw_bytes) != 32:
+        raise ValueError("Ed25519 public key must be exactly 32 raw bytes.")
+    raw = bytes(raw_bytes)
+    Ed25519PublicKey.from_public_bytes(raw)
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_ed25519_pubkey(pubkey: str | bytes) -> bytes:
+    """Decode and validate an Ed25519 public key into canonical 32 raw bytes.
+
+    Canonical wire format is unpadded URL-safe Base64 of the raw 32-byte key.
+    """
+    if isinstance(pubkey, (bytes, bytearray)):
+        raw = bytes(pubkey)
+    elif isinstance(pubkey, str):
+        clean = pubkey.strip()
+        if not clean or len(clean) > 64:
+            raise ValueError("Malformed Ed25519 public key string.")
+        padding = "=" * ((4 - len(clean) % 4) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(clean + padding)
+        except Exception as exc:
+            raise ValueError(f"Invalid Base64 public key: {exc}") from exc
+    else:
+        raise ValueError("Public key must be bytes or URL-safe Base64 string.")
+
+    if len(raw) != 32:
+        raise ValueError(f"Ed25519 public key must decode to exactly 32 bytes, got {len(raw)}.")
+    try:
+        key_obj = Ed25519PublicKey.from_public_bytes(raw)
+        return key_obj.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    except Exception as exc:
+        raise ValueError(f"Invalid Ed25519 public key bytes: {exc}") from exc
+
+
+def derive_network_id_from_pubkey(pubkey: str | bytes) -> str:
+    """Derive canonical permanent network ID: SNW-NET-<sha256(raw_pubkey)[:8]> (uppercase hex)."""
+    raw = decode_ed25519_pubkey(pubkey)
+    digest_prefix = hashlib.sha256(raw).hexdigest()[:8].upper()
+    return f"SNW-NET-{digest_prefix}"
+
+
+def canonical_hub_challenge_message(
+    challenge_id: str,
+    network_id: str,
+    nonce: str,
+    expires_at: int,
+    device_id: str = "",
+) -> bytes:
+    """Canonical challenge payload signed by host Ed25519 key during hub authentication."""
+    clean_cid = str(challenge_id or "").strip()
+    clean_nid = str(network_id or "").strip().upper()
+    clean_nonce = str(nonce or "").strip()
+    clean_dev = str(device_id or "").strip()
+    return f"snow-hub-v1|{clean_cid}|{clean_nid}|{clean_nonce}|{int(expires_at)}|{clean_dev}".encode("utf-8")
+
+
+def verify_ed25519_signature(pubkey: str | bytes, message: bytes, signature_b64: str) -> bool:
+    """Verify an Ed25519 signature encoded as unpadded URL-safe Base64 over message bytes."""
+    if not isinstance(signature_b64, str) or not signature_b64.strip() or not isinstance(message, (bytes, bytearray)):
+        return False
+    clean_sig = signature_b64.strip()
+    if len(clean_sig) > 128:
+        return False
+    padding = "=" * ((4 - len(clean_sig) % 4) % 4)
+    try:
+        sig_bytes = base64.urlsafe_b64decode(clean_sig + padding)
+        if len(sig_bytes) != 64:
+            return False
+        raw_pub = decode_ed25519_pubkey(pubkey)
+        pub_obj = Ed25519PublicKey.from_public_bytes(raw_pub)
+        pub_obj.verify(sig_bytes, bytes(message))
+        return True
+    except Exception:
+        return False
 
 
 def create_relay_ticket(

@@ -753,6 +753,8 @@ class SnowWebSocketServer:
                 await self._handle_federation_accept_invite(client, message, data, session, is_owner)
             elif action == "federation_list_grants":
                 await self._handle_federation_list_grants(client, message, data, session, is_owner)
+            elif action == "federation_update_tier":
+                await self._handle_federation_update_tier(client, message, data, session, is_owner)
             elif action == "federation_revoke":
                 await self._handle_federation_revoke(client, message, data, session, is_owner)
             elif action == "federation_kill_switch":
@@ -1533,6 +1535,22 @@ class SnowWebSocketServer:
 
         # Case 1: Target is this local node!
         if target_device_id == local_id:
+            # Check both PeerCapabilityPolicy and active 5-tier device permission profile
+            from snow.network.router import is_action_allowed_by_profile
+            caller_profile = "full_control"
+            if getattr(self, "db_manager", None) is not None and hasattr(self.db_manager, "get_setting"):
+                saved_p = self.db_manager.get_setting(f"device_profile:{caller_device_id}")
+                if saved_p is not None:
+                    caller_profile = str(saved_p)
+            if not is_action_allowed_by_profile(caller_profile, relay_action):
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.UNAUTHORIZED,
+                    message=f"Operation '{relay_action}' blocked for device '{caller_device_id}' by permission tier '{caller_profile}'.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+
             cap = ACTION_TO_CAPABILITY.get(relay_action)
             relay_ctx = ExecutionContext(
                 principal=ExecutionPrincipal.AI_MCP,
@@ -1578,7 +1596,7 @@ class SnowWebSocketServer:
                 await client.websocket.send(err_resp.to_json())
                 return
 
-        # Case 2: Target is another node in mesh
+        # Case 2: Target is another node in mesh (propagate hop_limit & visited_nodes to prevent loops)
         router = getattr(self, "session_router", None) or getattr(self.core_server, "session_router", None)
         if router is not None and hasattr(router, "route_request"):
             relay_ctx = ExecutionContext(
@@ -1590,6 +1608,8 @@ class SnowWebSocketServer:
                 target=target_device_id,
                 data=relay_data,
                 ctx=relay_ctx,
+                hop_limit=next_hop_limit,
+                visited_peers=visited_nodes,
             )
             resp = SnowMessage.create_response(
                 correlation_id=message.id,
@@ -2083,11 +2103,22 @@ class SnowWebSocketServer:
     ) -> None:
         """Handle pairing verification or PIN generation request."""
         pin = data.get("pin")
+        handshake_token = data.get("handshake_token")
         client_device_id = data.get("device_id")
 
-        if pin is not None:
-            # PIN verification attempt
-            result = self.pairing_manager.verify_pin(str(pin), client_device_id=client_device_id)
+        # Never auto-trust based on USB cable attachment alone: require explicit PIN or owner-issued QR handshake token.
+        if pin is not None or handshake_token is not None:
+            if handshake_token is not None and (pin is None or str(pin).strip() == ""):
+                net_id = str(data.get("network_id") or "")
+                result = self.pairing_manager.verify_handshake_token(
+                    token=str(handshake_token),
+                    host_device_id=self.device_identity.device_id,
+                    client_device_id=client_device_id,
+                    network_id=net_id,
+                )
+            else:
+                # PIN verification attempt
+                result = self.pairing_manager.verify_pin(str(pin), client_device_id=client_device_id)
             if result.is_success:
                 logger.info("Successfully paired with device [%s] from client [%s]",
                             client_device_id, client.connection_id)
@@ -3482,6 +3513,7 @@ class SnowWebSocketServer:
         devs = data.get("allowed_device_ids")
         ttl = data.get("ttl_seconds", 600)
         grant_ttl = data.get("grant_ttl_seconds", 86400)
+        perm_tier = data.get("permission_tier")
 
         try:
             res = self.federation_manager.create_invitation(
@@ -3490,6 +3522,7 @@ class SnowWebSocketServer:
                 grant_ttl_seconds=grant_ttl,
                 ttl_seconds=ttl,
                 principal="OWNER_MANUAL",
+                permission_tier=perm_tier,
             )
             resp = SnowMessage.create_response(
                 correlation_id=message.id,
@@ -3565,6 +3598,57 @@ class SnowWebSocketServer:
             logger.error("Failed accepting federation invitation: %s", exc)
             err = SnowMessage.create_error(
                 code=ErrorCode.INTERNAL_ERROR,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+
+    async def _handle_federation_update_tier(
+        self, client: Any, message: SnowMessage, data: dict[str, Any], session: Any, is_owner: bool
+    ) -> None:
+        """Update the 5-tier permission level of a federation grant over authenticated Owner WSS."""
+        if not is_owner:
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Privileged federation administration requires OWNER_MANUAL authority.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        grant_id = str(data.get("grant_id") or "").strip()
+        tier = str(data.get("permission_tier") or "").strip().lower()
+        if not grant_id or not tier:
+            err = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Missing 'grant_id' or 'permission_tier'.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        try:
+            res = self.federation_manager.update_grant_permission_tier(
+                grant_id=grant_id,
+                permission_tier=tier,
+                principal="OWNER_MANUAL",
+            )
+            if not res.get("success"):
+                err = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD,
+                    message=res.get("error", "Failed updating federation tier."),
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(err.to_json())
+                return
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={"action": "federation_update_tier", **res, "status": "success"},
+            )
+            await client.websocket.send(resp.to_json())
+        except Exception as exc:
+            err = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD if isinstance(exc, ValueError) else ErrorCode.INTERNAL_ERROR,
                 message=str(exc),
                 correlation_id=message.id,
             )

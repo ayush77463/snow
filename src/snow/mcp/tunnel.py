@@ -30,6 +30,8 @@ import time
 from typing import Any, Optional
 import uuid
 
+from snow.core.config import resolve_default_hub_url, validate_hub_url
+
 logger = logging.getLogger(__name__)
 
 ALLOWED_TUNNEL_PORT: int = 8771
@@ -640,7 +642,7 @@ class _TunnelInstance:
                     res["relay_endpoint"] = f"wss://{clean_host}/v1/tunnel"
                 return res
 
-            # Case D: SNOW Render Relay reverse tunnel (permanent /u/{snow_id}/mcp URL)
+            # Case D: SNOW Render Relay reverse tunnel (permanent /u/{network_id}/mcp URL)
             elif provider_lower == "render":
                 if self.purpose != "mcp":
                     return {
@@ -648,33 +650,61 @@ class _TunnelInstance:
                         "status": "UNSUPPORTED_PROVIDER",
                         "error": "Render reverse MCP tunnel is only supported on the MCP gateway port (8771).",
                     }
-                if not resolved_custom_url or not resolved_custom_url.strip().lower().startswith(("https://", "http://")):
+                hub_candidate = (
+                    resolved_custom_url
+                    or tunnel_cfg.get("default_hub_url")
+                    or resolve_default_hub_url()
+                    or ""
+                ).strip()
+                if not hub_candidate:
                     return {
                         "success": False,
                         "status": "INVALID_URL",
-                        "error": "Enter your permanent Render Relay https:// URL in Permanent Tunnel Domain first.",
+                        "error": "Configure Default Hub URL (SNOW_DEFAULT_HUB_URL) or enter your Render Relay HTTPS URL first.",
                     }
-                base_url = resolved_custom_url.strip().rstrip("/")
-                ticket = token or tunnel_cfg.get("relay_ticket") or ""
-                if not ticket:
+                try:
+                    base_url = validate_hub_url(hub_candidate)
+                except ValueError as url_exc:
                     return {
                         "success": False,
-                        "status": "MISSING_TICKET",
-                        "error": "A Render relay ticket is required to register the permanent reverse MCP tunnel.",
+                        "status": "INVALID_URL",
+                        "error": str(url_exc),
                     }
-                from snow.security.identity import load_or_create_device_identity
-                ident = load_or_create_device_identity()
-                snow_id = str(tunnel_cfg.get("snow_id") or ident.snow_id).strip().upper()
+                from snow.security.identity import (
+                    load_or_create_device_identity,
+                    load_or_create_network_key_identity,
+                )
+                dev_ident = load_or_create_device_identity()
+                snow_id = str(tunnel_cfg.get("snow_id") or dev_ident.snow_id).strip().upper()
+                ticket = token or tunnel_cfg.get("relay_ticket") or ""
                 ws_scheme = "wss://" if base_url.startswith("https://") else "ws://"
                 clean_host = base_url.split("://", 1)[1]
                 relay_ws_url = f"{ws_scheme}{clean_host}/v1/tunnel"
                 from snow.relay.mcp_forwarder import RelayMcpForwarder
-                forwarder = RelayMcpForwarder(
-                    relay_ws_url=relay_ws_url,
-                    snow_id=snow_id,
-                    ticket=ticket,
-                    local_gateway_url=f"http://127.0.0.1:{target_port}",
-                )
+
+                if ticket:
+                    forwarder = RelayMcpForwarder(
+                        relay_ws_url=relay_ws_url,
+                        snow_id=snow_id,
+                        ticket=ticket,
+                        local_gateway_url=f"http://127.0.0.1:{target_port}",
+                        device_id=dev_ident.device_id,
+                        device_name=dev_ident.device_name,
+                    )
+                    route_id = snow_id
+                else:
+                    net_ident = load_or_create_network_key_identity()
+                    forwarder = RelayMcpForwarder(
+                        relay_ws_url=relay_ws_url,
+                        snow_id=snow_id,
+                        local_gateway_url=f"http://127.0.0.1:{target_port}",
+                        network_key_identity=net_ident,
+                        hub_http_url=base_url,
+                        device_id=dev_ident.device_id,
+                        device_name=dev_ident.device_name,
+                    )
+                    route_id = net_ident.network_id
+
                 ok, err = await forwarder.start(timeout=timeout)
                 if not ok:
                     return {
@@ -685,7 +715,7 @@ class _TunnelInstance:
                 self._mcp_forwarder = forwarder
                 self._provider = "render"
                 self._background_active = True
-                self._public_url = f"{base_url}/u/{snow_id}"
+                self._public_url = f"{base_url}/u/{route_id}"
                 self._started_at = time.time()
                 return {
                     "success": True,
@@ -693,6 +723,7 @@ class _TunnelInstance:
                     "purpose": self.purpose,
                     "provider": "render",
                     "snow_id": snow_id,
+                    "network_id": getattr(forwarder, "network_id", "") or route_id,
                     "public_url": self._public_url,
                     "mcp_endpoint": f"{self._public_url}/mcp",
                 }

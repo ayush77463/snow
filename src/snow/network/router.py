@@ -45,6 +45,15 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "desktop_clipboard_set": "desktop.clipboard.write",
     "desktop_clipboard_sync_toggle": "desktop.clipboard.read",
     "desktop_file_list": "desktop.file.list",
+    "windows_clipboard_get": "desktop.clipboard.read",
+    "windows_clipboard_set": "desktop.clipboard.write",
+    "windows_file_list": "desktop.file.list",
+    "windows_system_info": "desktop.status",
+    "windows_battery": "desktop.battery",
+    "desktop.system.info": "desktop.status",
+    "desktop.file.list": "desktop.file.list",
+    "desktop.file.read": "desktop.file.list",
+    "android.status": "android.telemetry.get",
     "desktop_file_stage_download": "desktop.file.transfer",
     "desktop_app_launch": "desktop.apps.launch",
     "mesh_list_peers": "mesh.list_peers",
@@ -101,6 +110,18 @@ ROUTER_ACTION_TO_CAPABILITY: dict[str, str] = {
     "clipboard_buffer_list": "desktop.clipboard.read",
     "clipboard_buffer_add": "desktop.clipboard.write",
     "clipboard_buffer_apply": "desktop.clipboard.write",
+    "whatsapp_send": "android.messaging.whatsapp",
+    "android_whatsapp_send": "android.messaging.whatsapp",
+    "snow_android_whatsapp_send": "android.messaging.whatsapp",
+    "dnd_toggle": "android.system.dnd",
+    "android_dnd_toggle": "android.system.dnd",
+    "snow_android_dnd_toggle": "android.system.dnd",
+    "windows_hotkey": "desktop.input.hotkey",
+    "snow_windows_hotkey": "desktop.input.hotkey",
+    "windows_brightness_set": "desktop.display.brightness",
+    "snow_windows_brightness_set": "desktop.display.brightness",
+    "cross_network_execute": "network.federation.execute",
+    "snow_cross_network_execute": "network.federation.execute",
 }
 
 # Mapping from high-level unified actions to physical peer wire actions
@@ -122,6 +143,12 @@ ACTION_TO_WIRE_ACTION: dict[str, str] = {
     "snow_android_launch_app": "launch_app",
     "android_send_message": "send_message",
     "snow_android_send_message": "send_message",
+    "android_whatsapp_send": "whatsapp_send",
+    "snow_android_whatsapp_send": "whatsapp_send",
+    "whatsapp_send": "whatsapp_send",
+    "android_dnd_toggle": "android_dnd_toggle",
+    "snow_android_dnd_toggle": "android_dnd_toggle",
+    "dnd_toggle": "android_dnd_toggle",
     "android_clipboard_push": "clipboard_push",
     "snow_android_clipboard_push": "clipboard_push",
     "android_clipboard_pull": "clipboard_pull",
@@ -147,22 +174,41 @@ ACTION_TO_WIRE_ACTION: dict[str, str] = {
 # Alias for backward-compatible routing lookups
 ACTION_ROUTING = ROUTER_ACTION_TO_CAPABILITY
 
-# Permission Profile Presets (Stage 2B)
+# Canonical 5-tier cross-network permission presets (V5.2 Stage 6B WS4)
+PERMISSION_PROFILE_ORDER: tuple[str, ...] = (
+    "full_control",
+    "files_and_clipboard",
+    "files_only",
+    "clipboard_only",
+    "not_allowed",
+)
+VALID_PERMISSION_PROFILES: frozenset[str] = frozenset(PERMISSION_PROFILE_ORDER)
+
 PERMISSION_PROFILES: dict[str, dict[str, Any]] = {
     "full_control": {
         "name": "Full Control",
-        "description": "Full access to all capabilities.",
-        "allowed_categories": {"telemetry", "clipboard", "files", "apps", "execution", "media", "system"},
+        "description": "Full access to all permitted capabilities.",
+        "allowed_categories": {"telemetry", "clipboard", "files", "apps", "execution", "media", "system", "cross_network"},
     },
     "files_and_clipboard": {
         "name": "Files & Clipboard",
         "description": "Access to file transfers, clipboard sync, and device telemetry. Execution, apps, screen and camera are blocked.",
         "allowed_categories": {"telemetry", "clipboard", "files"},
     },
+    "files_only": {
+        "name": "Files Only",
+        "description": "Access restricted strictly to file operations and basic telemetry.",
+        "allowed_categories": {"telemetry", "files"},
+    },
     "clipboard_only": {
         "name": "Clipboard Only",
         "description": "Access restricted strictly to clipboard synchronization and telemetry.",
         "allowed_categories": {"telemetry", "clipboard"},
+    },
+    "not_allowed": {
+        "name": "Not Allowed",
+        "description": "All remote and AI capabilities are blocked for this peer.",
+        "allowed_categories": set(),
     },
 }
 
@@ -170,8 +216,11 @@ CAPABILITY_CATEGORY_MAP: dict[str, str] = {
     # Telemetry
     "desktop_status": "telemetry",
     "desktop.status": "telemetry",
+    "desktop.system.info": "telemetry",
+    "windows_system_info": "telemetry",
     "desktop_battery": "telemetry",
     "desktop.battery": "telemetry",
+    "windows_battery": "telemetry",
     "android_battery": "telemetry",
     "snow_android_battery": "telemetry",
     "android_battery_status": "telemetry",
@@ -182,10 +231,13 @@ CAPABILITY_CATEGORY_MAP: dict[str, str] = {
     "snow_android_ring": "telemetry",
     "mesh_list_peers": "telemetry",
     "android.telemetry.get": "telemetry",
+    "android.status": "telemetry",
     "android.ringer.ring": "telemetry",
     # Clipboard
     "desktop_clipboard_get": "clipboard",
     "desktop_clipboard_set": "clipboard",
+    "windows_clipboard_get": "clipboard",
+    "windows_clipboard_set": "clipboard",
     "desktop.clipboard.read": "clipboard",
     "desktop.clipboard.write": "clipboard",
     "android_clipboard_get": "clipboard",
@@ -204,6 +256,9 @@ CAPABILITY_CATEGORY_MAP: dict[str, str] = {
     "clipboard_buffer_apply": "clipboard",
     # Files
     "desktop_file_list": "files",
+    "windows_file_list": "files",
+    "windows_file_search": "files",
+    "desktop_file_search": "files",
     "desktop_file_stage_download": "files",
     "desktop.file.list": "files",
     "desktop.file.read": "files",
@@ -283,17 +338,106 @@ CAPABILITY_CATEGORY_MAP: dict[str, str] = {
     "android_send_message": "system",
     "snow_android_send_message": "system",
     "android.messaging.send_intent": "system",
+    "whatsapp_send": "system",
+    "android_whatsapp_send": "system",
+    "snow_android_whatsapp_send": "system",
+    "android.messaging.whatsapp": "system",
+    "android_dnd_toggle": "system",
+    "snow_android_dnd_toggle": "system",
+    "dnd_toggle": "system",
+    "android.system.dnd": "system",
+    "windows_hotkey": "execution",
+    "snow_windows_hotkey": "execution",
+    "desktop.input.hotkey": "execution",
+    "windows_brightness_set": "system",
+    "snow_windows_brightness_set": "system",
+    "desktop.display.brightness": "system",
+    "windows_notify": "system",
+    "snow_windows_notify": "system",
+    "windows_lock_screen": "execution",
+    "snow_windows_lock_screen": "execution",
+    "windows_active_window": "telemetry",
+    "snow_windows_active_window": "telemetry",
+    "windows_list_windows": "telemetry",
+    "snow_windows_list_windows": "telemetry",
+    "windows_focus_window": "apps",
+    "snow_windows_focus_window": "apps",
+    "web_open": "apps",
+    "snow_web_open": "apps",
+    "youtube_play": "media",
+    "snow_youtube_play": "media",
+    "system_volume_set": "media",
+    "snow_system_volume_set": "media",
+    "cross_network_execute": "cross_network",
+    "snow_cross_network_execute": "cross_network",
+    "network.federation.execute": "cross_network",
 }
 
 
-def is_action_allowed_by_profile(profile: str, action: str) -> bool:
-    """Determine whether an action is permitted under the given permission profile."""
-    clean_prof = (profile or "full_control").strip().lower()
-    if clean_prof not in PERMISSION_PROFILES:
-        clean_prof = "full_control"
+def normalize_permission_tier(profile: Optional[str]) -> Optional[str]:
+    """Normalize a permission tier string or return None if unknown/invalid (fail-closed)."""
+    if not isinstance(profile, str):
+        return None
+    clean = profile.strip().lower()
+    if clean in VALID_PERMISSION_PROFILES:
+        return clean
+    return None
+
+
+def intersect_tier_categories(tier_a: Optional[str], tier_b: Optional[str]) -> set[str]:
+    """Compute effective allowed capability categories from device tier ∩ grant tier.
+
+    Unknown or missing tiers fail closed (empty set).
+    """
+    norm_a = normalize_permission_tier(tier_a)
+    norm_b = normalize_permission_tier(tier_b)
+    if norm_a is None or norm_b is None:
+        return set()
+    return set(PERMISSION_PROFILES[norm_a]["allowed_categories"]) & set(
+        PERMISSION_PROFILES[norm_b]["allowed_categories"]
+    )
+
+
+def is_action_allowed_by_profile(profile: Optional[str], action: str) -> bool:
+    """Determine whether an action is permitted under the given permission profile.
+
+    Fails closed on unknown/empty tiers or 'not_allowed'.
+    """
+    clean_prof = normalize_permission_tier(profile)
+    if clean_prof is None:
+        return False
     allowed_cats = PERMISSION_PROFILES[clean_prof]["allowed_categories"]
+    if not allowed_cats:
+        return False
     cat = CAPABILITY_CATEGORY_MAP.get(action, "system")
     return cat in allowed_cats
+
+
+def is_action_allowed_by_tier_intersection(
+    tier_a: Optional[str], tier_b: Optional[str], action: str
+) -> bool:
+    """Evaluate action allowance under the intersection of two 5-tier profiles."""
+    allowed_cats = intersect_tier_categories(tier_a, tier_b)
+    if not allowed_cats:
+        return False
+    cat = CAPABILITY_CATEGORY_MAP.get(action, "system")
+    return cat in allowed_cats
+
+
+def classify_transport_badge(
+    transport: Optional[str] = None,
+    host: Optional[str] = None,
+    connection_mode: Optional[str] = None,
+) -> str:
+    """Return the unified Web/Android transport badge label."""
+    t = (transport or "").strip().lower()
+    h = (host or "").strip().lower()
+    m = (connection_mode or "").strip().lower()
+    if "usb" in t or t == "adb" or (h in ("127.0.0.1", "localhost", "::1") and "relay" not in t and "remote" not in m):
+        return "USB • Zero Data"
+    if any(k in t for k in ("relay", "remote", "hub", "federated")) or m == "remote_only":
+        return "Remote • Uses Data"
+    return "Wi-Fi • Zero Data"
 
 
 class SessionRouter:
@@ -325,7 +469,45 @@ class SessionRouter:
         self._outbound_clients: dict[str, SnowPeerClient] = {}
         # Outbound peer tokens for direct dials: device_id -> token
         self._peer_tokens: dict[str, str] = {}
+        # Bounded transfer idempotency cache across route failover switches: (device_id, transfer_id) -> result
+        self._completed_transfer_routes: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _is_loopback_host(host: Optional[str]) -> bool:
+        clean = (host or "").strip().lower()
+        return clean in ("127.0.0.1", "::1", "localhost")
+
+    def _with_transport_badge(
+        self,
+        res: dict[str, Any],
+        transport: Optional[str] = None,
+        host: Optional[str] = None,
+        connection_mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        enriched = dict(res)
+        if not enriched.get("transport_badge"):
+            enriched["transport_badge"] = classify_transport_badge(
+                transport=transport or enriched.get("transport"),
+                host=host or enriched.get("last_known_endpoint"),
+                connection_mode=connection_mode,
+            )
+        return enriched
+
+    def _resolve_effective_profile(self, device_id: str, node: DeviceNode) -> str:
+        """Resolve latest device permission profile, prioritizing DB over stale cache."""
+        raw_profile = getattr(node, "permission_profile", None)
+        if self.db_manager is not None and hasattr(self.db_manager, "get_setting"):
+            try:
+                saved = self.db_manager.get_setting(f"device_profile:{device_id}")
+                if isinstance(saved, str):
+                    raw_profile = saved
+            except Exception:
+                pass
+        if raw_profile is None:
+            return "full_control"
+        clean = normalize_permission_tier(str(raw_profile))
+        return clean if clean is not None else "invalid"
 
     def register_peer_token(self, device_id: str, token: str) -> None:
         """Register an authentication token for outbound direct dials to a peer."""
@@ -347,6 +529,8 @@ class SessionRouter:
         required_capability: Optional[str] = None,
         ctx: Optional[ExecutionContext] = None,
         timeout: float = 30.0,
+        hop_limit: int = 3,
+        visited_peers: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Resolve target, establish transport session if needed, and dispatch capability action.
 
@@ -357,6 +541,8 @@ class SessionRouter:
             required_capability: Explicit capability string, or derived from action if omitted.
             ctx: Immutable execution context (defaults to AI_MCP for cross-device calls).
             timeout: Dispatch response timeout in seconds.
+            hop_limit: Remaining mesh hop budget for peer relay requests.
+            visited_peers: Already-visited node IDs to prevent routing loops.
 
         Returns:
             Structured dictionary with success, status, data/error, and routing diagnostics.
@@ -368,6 +554,30 @@ class SessionRouter:
         )
 
         attempted_transports: list[str] = []
+
+        # Loop and hop-limit enforcement
+        try:
+            remaining_hops = int(hop_limit)
+        except (TypeError, ValueError):
+            remaining_hops = 3
+        traversed = [str(p) for p in (visited_peers or []) if isinstance(p, str) and p.strip()]
+        local_node_id = getattr(getattr(self.node_registry, "local_identity", None), "device_id", None)
+        if local_node_id and local_node_id in traversed:
+            return {
+                "success": False,
+                "status": "ROUTING_LOOP_DETECTED",
+                "error": f"Routing loop detected: node '{local_node_id}' is already in visited peers.",
+                "target_device_id": None,
+                "attempted_transports": attempted_transports,
+            }
+        if remaining_hops <= 0:
+            return {
+                "success": False,
+                "status": "HOP_LIMIT_EXCEEDED",
+                "error": "Mesh routing hop limit exceeded.",
+                "target_device_id": None,
+                "attempted_transports": attempted_transports,
+            }
 
         # =====================================================================
         # Step 1: Pre-flight Capability and Target Resolution
@@ -399,8 +609,8 @@ class SessionRouter:
         last_state = str(node.reachability_state)
         last_endpoint = f"{node.host}:{node.wss_port}" if node.host else None
 
-        # Step 1B: Permission Profile Backend Enforcement
-        profile = getattr(node, "permission_profile", "full_control") or "full_control"
+        # Step 1B: Live Permission Profile Backend Enforcement (Fail-Closed 5-Tier)
+        profile = self._resolve_effective_profile(device_id, node)
         if not is_action_allowed_by_profile(profile, action):
             logger.warning(
                 "Action '%s' blocked for device [%s] by permission profile '%s'",
@@ -432,6 +642,17 @@ class SessionRouter:
         ) and effective_ctx.principal == ExecutionPrincipal.OWNER_MANUAL:
             clean_data["principal"] = effective_ctx.principal.value
 
+        # Transfer idempotency check across route failovers (Stage 6B WS3)
+        transfer_id = str(clean_data.get("transfer_id") or "").strip()
+        is_transfer_op = bool(
+            transfer_id
+            and action in ("file_send_request", "file_receive_request", "android_file_receive", "desktop_file_stage_download")
+        )
+        if is_transfer_op:
+            cached_tx = self._completed_transfer_routes.get((device_id, transfer_id))
+            if cached_tx is not None:
+                return dict(cached_tx, idempotent_replay=True)
+
         # Query persisted connection mode policy for target device
         paired_rec = self.db_manager.get_paired_device(device_id) if self.db_manager else None
         conn_mode = getattr(paired_rec, "connection_mode", "auto") if paired_rec else "auto"
@@ -451,10 +672,15 @@ class SessionRouter:
                     attempted_transports=attempted_transports,
                 )
                 if relay_tunnel_res is not None:
+                    relay_tunnel_res = self._with_transport_badge(
+                        relay_tunnel_res, transport="remote_relay", connection_mode="remote_only"
+                    )
+                    if is_transfer_op and relay_tunnel_res.get("success"):
+                        self._record_transfer_route(device_id, transfer_id, relay_tunnel_res)
                     return relay_tunnel_res
 
             status_val = "RELAY_UNAVAILABLE" if not (self.relay_enabled and self.relay_client and getattr(self.relay_client, "_is_connected", False)) else "DEVICE_UNREACHABLE"
-            return {
+            return self._with_transport_badge({
                 "success": False,
                 "status": status_val,
                 "error": f"Remote relay routing failed or is unavailable for device '{device_id}' (mode: remote_only).",
@@ -463,40 +689,63 @@ class SessionRouter:
                 "last_reachability_state": last_state,
                 "last_known_endpoint": last_endpoint,
                 "connection_mode": "remote_only",
-            }
+            }, transport="remote_relay", connection_mode="remote_only")
 
         # =====================================================================
-        # Tier 1: Active Session Routing
+        # Tier 1: Hybrid Active Session Routing (USB > Wi-Fi LAN > Remote)
         # =====================================================================
-        # Check 1A: Inbound active WebSocket session
+        candidate_dispatches: list[tuple[int, str, Any]] = []
         if self.ws_server is not None:
             session = self.ws_server.session_manager.get_session_by_device(device_id)
             if session and session.connection_id:
                 conn = self.ws_server.connection_manager.get(session.connection_id)
                 if conn and conn.is_active:
-                    attempted_transports.append("active_inbound_wss")
-                    logger.debug(
-                        "Router Tier 1: Dispatching '%s' to [%s] via active inbound WSS session [%s]",
-                        action,
-                        device_id,
-                        session.session_id,
-                    )
-                    return await self._dispatch_over_inbound_wss(
-                        session.connection_id, action, clean_data, timeout, node, attempted_transports
-                    )
+                    sess_transport = (getattr(node, "transport", None) or "").strip().lower()
+                    sess_host = (getattr(node, "host", None) or "").strip().lower()
+                    if sess_transport == "usb_adb" or (self._is_loopback_host(sess_host) and "relay" not in sess_transport):
+                        prio, label = 0, "active_inbound_wss"
+                    elif "relay" in sess_transport or "remote" in sess_transport:
+                        prio, label = 2, "active_inbound_wss"
+                    else:
+                        prio, label = 1, "active_inbound_wss"
+                    candidate_dispatches.append((prio, label, ("inbound", session)))
 
-        # Check 1B: Active outbound peer client session
         outbound_client = self._outbound_clients.get(device_id)
         if outbound_client is not None and outbound_client.is_connected:
-            attempted_transports.append("active_outbound_peer")
+            out_host = getattr(outbound_client, "host", None) or getattr(node, "host", None)
+            if self._is_loopback_host(out_host):
+                prio, label = 0, "active_outbound_peer"
+            else:
+                prio, label = 1, "active_outbound_peer"
+            candidate_dispatches.append((prio, label, ("outbound", outbound_client)))
+
+        candidate_dispatches.sort(key=lambda item: item[0])
+        for prio, label, (kind, handle) in candidate_dispatches:
+            if prio == 2 and conn_mode == "local_only":
+                continue
+            attempted_transports.append(label)
             logger.debug(
-                "Router Tier 1: Dispatching '%s' to [%s] via active outbound peer connection",
+                "Router Tier 1 (prio=%d): Dispatching '%s' to [%s] via %s",
+                prio,
                 action,
                 device_id,
+                label,
             )
-            return await self._dispatch_over_peer_client(
-                outbound_client, action, clean_data, timeout, node, attempted_transports
-            )
+            if kind == "inbound":
+                res = await self._dispatch_over_inbound_wss(
+                    handle.connection_id, action, clean_data, timeout, node, attempted_transports
+                )
+            else:
+                res = await self._dispatch_over_peer_client(
+                    handle, action, clean_data, timeout, node, attempted_transports
+                )
+            badge_transport = "usb_adb" if prio == 0 else ("remote_relay" if prio == 2 else "wifi_lan")
+            res["transport"] = badge_transport
+            res = self._with_transport_badge(res, transport=badge_transport, host=getattr(node, "host", None))
+            if is_transfer_op and res.get("success"):
+                self._record_transfer_route(device_id, transfer_id, res)
+            if res.get("success") or res.get("status") not in ("TIMEOUT", "TRANSPORT_ERROR", "DEVICE_UNREACHABLE"):
+                return res
 
         # =====================================================================
         # Tier 2: Outbound Direct Connection (for PERSISTENT_DAEMON or FOREGROUND_HOST peers)
@@ -525,6 +774,11 @@ class SessionRouter:
                     attempted_transports=attempted_transports,
                 )
                 if direct_res is not None:
+                    tr = "usb_adb" if self._is_loopback_host(dial_host) else "wifi_lan"
+                    direct_res["transport"] = tr
+                    direct_res = self._with_transport_badge(direct_res, transport=tr, host=dial_host)
+                    if is_transfer_op and direct_res.get("success"):
+                        self._record_transfer_route(device_id, transfer_id, direct_res)
                     return direct_res
             else:
                 logger.debug("Router Tier 2 skipped: No known IP endpoint for [%s]", device_id)
@@ -570,9 +824,15 @@ class SessionRouter:
                     elapsed,
                     action,
                 )
-                return await self._dispatch_over_inbound_wss(
+                res = await self._dispatch_over_inbound_wss(
                     reconnected_session.connection_id, action, clean_data, timeout, node, attempted_transports
                 )
+                tr = "usb_adb" if self._is_loopback_host(getattr(node, "host", None)) else "wifi_lan"
+                res["transport"] = tr
+                res = self._with_transport_badge(res, transport=tr, host=getattr(node, "host", None))
+                if is_transfer_op and res.get("success"):
+                    self._record_transfer_route(device_id, transfer_id, res)
+                return res
 
         # Policy Rule: local_only strictly forbids relay hops or remote tunnels
         if conn_mode == "local_only":
@@ -589,17 +849,26 @@ class SessionRouter:
             }
 
         # =====================================================================
-        # Tier 3.5: Authenticated Peer Relay
+        # Tier 3.5: Authenticated Peer Relay (bounded hops + loop guard)
         # =====================================================================
-        relay_res = await self._attempt_peer_relay(
-            node=node,
-            action=action,
-            clean_data=clean_data,
-            timeout=timeout,
-            attempted_transports=attempted_transports,
-        )
-        if relay_res is not None:
-            return relay_res
+        next_visited = list(traversed)
+        if local_node_id and local_node_id not in next_visited:
+            next_visited.append(local_node_id)
+        if remaining_hops > 1:
+            relay_res = await self._attempt_peer_relay(
+                node=node,
+                action=action,
+                clean_data=clean_data,
+                timeout=timeout,
+                attempted_transports=attempted_transports,
+                hop_limit=remaining_hops - 1,
+                visited_nodes=next_visited,
+            )
+            if relay_res is not None:
+                relay_res = self._with_transport_badge(relay_res, transport="remote_relay")
+                if is_transfer_op and relay_res.get("success"):
+                    self._record_transfer_route(device_id, transfer_id, relay_res)
+                return relay_res
 
         # =====================================================================
         # Tier 3.75: Dedicated Remote E2E Relay Tunnel
@@ -615,6 +884,9 @@ class SessionRouter:
                 attempted_transports=attempted_transports,
             )
             if relay_tunnel_res is not None:
+                relay_tunnel_res = self._with_transport_badge(relay_tunnel_res, transport="remote_relay")
+                if is_transfer_op and relay_tunnel_res.get("success"):
+                    self._record_transfer_route(device_id, transfer_id, relay_tunnel_res)
                 return relay_tunnel_res
 
         # =====================================================================
@@ -635,6 +907,12 @@ class SessionRouter:
             "target_device_id": device_id,
             "last_known_endpoint": last_endpoint,
         }
+
+    def _record_transfer_route(self, device_id: str, transfer_id: str, res: dict[str, Any]) -> None:
+        while len(self._completed_transfer_routes) >= 512:
+            oldest = next(iter(self._completed_transfer_routes))
+            self._completed_transfer_routes.pop(oldest, None)
+        self._completed_transfer_routes[(device_id, transfer_id)] = dict(res)
 
     # =========================================================================
     # Internal Dispatch & Transport Helpers
@@ -870,11 +1148,14 @@ class SessionRouter:
         clean_data: dict[str, Any],
         timeout: float,
         attempted_transports: list[str],
+        hop_limit: int = 2,
+        visited_nodes: Optional[list[str]] = None,
     ) -> Optional[dict[str, Any]]:
         """Attempt to route request through an active intermediate peer (Tier 3.5)."""
+        visited = list(visited_nodes or [])
         # 1. Check active outbound clients
         for peer_id, client in list(self._outbound_clients.items()):
-            if peer_id == node.device_id or not client.is_connected:
+            if peer_id == node.device_id or peer_id in visited or not client.is_connected:
                 continue
             attempted_transports.append(f"relay_outbound:{peer_id}")
             try:
@@ -884,8 +1165,8 @@ class SessionRouter:
                         "target_device_id": node.device_id,
                         "action": action,
                         "data": clean_data,
-                        "hop_limit": 2,
-                        "visited_nodes": [],
+                        "hop_limit": hop_limit,
+                        "visited_nodes": visited,
                     },
                 )
                 resp = await client.send_message(relay_msg, timeout=timeout)
@@ -906,7 +1187,7 @@ class SessionRouter:
         if self.ws_server is not None:
             active_sessions = self.ws_server.session_manager.list_active_sessions()
             for sess in active_sessions:
-                if sess.device_id == node.device_id or not sess.connection_id:
+                if sess.device_id == node.device_id or sess.device_id in visited or not sess.connection_id:
                     continue
                 conn = self.ws_server.connection_manager.get(sess.connection_id)
                 if not conn or not conn.is_active:
@@ -920,8 +1201,8 @@ class SessionRouter:
                             "target_device_id": node.device_id,
                             "action": action,
                             "data": clean_data,
-                            "hop_limit": 2,
-                            "visited_nodes": [],
+                            "hop_limit": hop_limit,
+                            "visited_nodes": visited,
                         },
                         timeout=timeout,
                     )

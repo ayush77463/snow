@@ -39,24 +39,23 @@ class AndroidCapabilityDispatcher(
     var activePermissionProfile: String = "full_control"
 
     fun isActionAllowedByProfile(action: String): Boolean {
-        return when (activePermissionProfile.lowercase()) {
-            "clipboard_only" -> {
-                action in setOf(
-                    "battery_status", "android_battery", "android_battery_status",
-                    "clipboard_pull", "clipboard_push", "android_clipboard_pull",
-                    "android_clipboard_push", "android_clipboard_get", "android_clipboard_set"
-                )
-            }
-            "files_and_clipboard" -> {
-                action in setOf(
-                    "battery_status", "android_battery", "android_battery_status",
-                    "clipboard_pull", "clipboard_push", "android_clipboard_pull",
-                    "android_clipboard_push", "android_clipboard_get", "android_clipboard_set",
-                    "file_list", "android_file_list", "file_send_request", "file_receive_request",
-                    "android_file_receive", "ring_phone", "android_ring"
-                )
-            }
-            else -> true // full_control
+        val norm = activePermissionProfile.trim().lowercase()
+        val telemetry = setOf("battery_status", "android_battery", "android_battery_status")
+        val clipboard = setOf(
+            "clipboard_pull", "clipboard_push", "android_clipboard_pull",
+            "android_clipboard_push", "android_clipboard_get", "android_clipboard_set"
+        )
+        val files = setOf(
+            "file_list", "android_file_list", "file_send_request",
+            "file_receive_request", "android_file_receive", "ring_phone", "android_ring"
+        )
+        return when (norm) {
+            "not_allowed" -> false
+            "clipboard_only" -> action in (telemetry + clipboard)
+            "files_only" -> action in (telemetry + files)
+            "files_and_clipboard" -> action in (telemetry + clipboard + files)
+            "full_control" -> true
+            else -> false // Fail closed on unknown tier
         }
     }
 
@@ -454,12 +453,32 @@ class AndroidCapabilityDispatcher(
                 }
             }
             "notification_reply" -> {
-                val key = data?.get("key") as? String ?: ""
-                val text = data?.get("text") as? String ?: ""
+                val key = (data?.get("key") as? String)
+                    ?: (data?.get("notification_key") as? String)
+                    ?: ""
+                val text = (data?.get("text") as? String)
+                    ?: (data?.get("reply_text") as? String)
+                    ?: ""
                 if (key.isBlank() || text.isBlank()) {
                     Pair(mapOf("status" to "error", "error" to "Notification key and non-empty reply text are required."), null)
                 } else {
                     val res = org.snow.service.SnowNotificationListenerService.replyToNotification(key, text)
+                    Pair(res, null)
+                }
+            }
+            "whatsapp_send", "android_whatsapp_send", "snow_android_whatsapp_send" -> {
+                val recipient = data?.get("recipient") as? String
+                val message = data?.get("message") as? String
+                val userConfirmed = (data?.get("user_confirmed") as? Boolean) ?: false
+                val res = WhatsAppHandler(context).composeWhatsApp(recipient, message, userConfirmed)
+                Pair(res, null)
+            }
+            "android_dnd_toggle", "snow_android_dnd_toggle", "dnd_toggle" -> {
+                val enabled = data?.get("enabled") as? Boolean
+                if (enabled == null) {
+                    Pair(mapOf("status" to "error", "error" to "INVALID_ARGUMENT", "message" to "Boolean 'enabled' is required."), null)
+                } else {
+                    val res = DndHandler(context).toggleDnd(enabled)
                     Pair(res, null)
                 }
             }

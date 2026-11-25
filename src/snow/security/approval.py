@@ -210,7 +210,7 @@ class ApprovalPolicyEngine:
             if meta and meta.read_only_hint:
                 return False, None, "LOW"
 
-            # Sensitive cross-device writes and transfers require owner approval
+            # Sensitive cross-device writes, messaging, and cross-network execution require owner approval
             if canonical_action in (
                 "android_file_send",
                 "snow_android_file_send",
@@ -218,8 +218,27 @@ class ApprovalPolicyEngine:
                 "snow_transfer_file",
                 "android_send_message",
                 "snow_android_send_message",
+                "android_whatsapp_send",
+                "snow_android_whatsapp_send",
+                "whatsapp_send",
+                "android_notification_reply",
+                "snow_android_notification_reply",
+                "notification_reply",
+                "cross_network_execute",
+                "snow_cross_network_execute",
             ):
-                return True, f"AI-initiated cross-device operation '{canonical_action}' requires owner approval.", "HIGH"
+                return True, f"AI-initiated operation '{canonical_action}' requires explicit owner approval.", "HIGH"
+
+            # High-impact desktop close shortcut (alt+f4) requires explicit owner approval
+            if canonical_action in ("windows_hotkey", "snow_windows_hotkey"):
+                raw_chord = str(params.get("shortcut", "") or "")
+                norm_chord = "+".join(p.strip().lower() for p in raw_chord.split("+") if p.strip())
+                if norm_chord == "alt+f4":
+                    return (
+                        True,
+                        "Windows shortcut 'alt+f4' closes active applications and requires explicit owner approval.",
+                        "HIGH",
+                    )
 
             # Terminal execution: Safe echo auto-allowed; other arbitrary commands require owner approval
             if canonical_action in ("windows_terminal_exec", "snow_windows_terminal_exec", "desktop_exec"):

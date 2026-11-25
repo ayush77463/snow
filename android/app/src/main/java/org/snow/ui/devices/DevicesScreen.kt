@@ -429,9 +429,9 @@ private fun DeviceListItem(
     val isPhone = device.isPhone
     val transportLabel = when {
         isPhone -> "Direct Peer"
-        device.host == "127.0.0.1" || device.host == "localhost" -> "USB"
-        device.host.contains("relay") || device.host.contains("tunnel") || device.connectionMode == "remote_only" -> "Remote"
-        else -> "Wi-Fi"
+        device.host == "127.0.0.1" || device.host == "localhost" -> "USB • Zero Data"
+        device.host.contains("relay") || device.host.contains("tunnel") || device.connectionMode == "remote_only" -> "Remote • Uses Data"
+        else -> "Wi-Fi • Zero Data"
     }
 
     SnowCard(
@@ -487,28 +487,46 @@ private fun DeviceListItem(
             Divider(color = colors.borderSubtle)
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Canonical Access Profile Pills & Actions
+            // Canonical 5-Tier Access Profile Pills
             val currentProfile = SnowUiRepository.normalizeAccessProfile(device.trustTier)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                TrustTierPill(
-                    label = "Full Control",
-                    selected = currentProfile == "full_control",
-                    onClick = { onUpdateTier("full_control") }
-                )
-                TrustTierPill(
-                    label = "Files & Clip",
-                    selected = currentProfile == "files_and_clipboard",
-                    onClick = { onUpdateTier("files_and_clipboard") }
-                )
-                TrustTierPill(
-                    label = "Clip Only",
-                    selected = currentProfile == "clipboard_only",
-                    onClick = { onUpdateTier("clipboard_only") }
-                )
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TrustTierPill(
+                        label = "Full Control",
+                        selected = currentProfile == "full_control",
+                        onClick = { onUpdateTier("full_control") }
+                    )
+                    TrustTierPill(
+                        label = "Files & Clip",
+                        selected = currentProfile == "files_and_clipboard",
+                        onClick = { onUpdateTier("files_and_clipboard") }
+                    )
+                    TrustTierPill(
+                        label = "Files Only",
+                        selected = currentProfile == "files_only",
+                        onClick = { onUpdateTier("files_only") }
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TrustTierPill(
+                        label = "Clip Only",
+                        selected = currentProfile == "clipboard_only",
+                        onClick = { onUpdateTier("clipboard_only") }
+                    )
+                    TrustTierPill(
+                        label = "Not Allowed",
+                        selected = currentProfile == "not_allowed",
+                        onClick = { onUpdateTier("not_allowed") }
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(10.dp))

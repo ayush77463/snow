@@ -1,7 +1,7 @@
 """Unified static MCP tool registry for SNOW.
 
 Exposes standardized MCP tools for both Windows and Android capabilities to AI assistants.
-All 48 tools are statically discoverable via list_tools, even when the Core or Android
+All 54 tools are statically discoverable via list_tools, even when the Core or Android
 device is currently offline.
 
 In Phase 8:
@@ -25,7 +25,7 @@ ALL_TOOL_NAMES: List[str] = [meta.name for meta in list_capabilities()]
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 48 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 54 static MCP tools onto the provided FastMCP server instance."""
     # Wrap server.tool to automatically populate MCP ToolAnnotations (readOnlyHint, destructiveHint)
     _orig_tool = server.tool
 
@@ -970,6 +970,105 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
                 "data": result.get("data"),
             }, indent=2)
         return json.dumps(result.get("data", {}) or result, indent=2)
+
+    # =========================================================================
+    # V5.2.0 Stage 6B Additions (49..54 -> 54 Total Tools)
+    # =========================================================================
+
+    @server.tool(
+        name="snow_android_whatsapp_send",
+        description=(
+            "Prepare a WhatsApp draft on a connected Android phone for explicit user review and tap-to-send. "
+            "Requires recipient, non-empty message, and explicit owner approval for AI calls."
+        ),
+    )
+    async def snow_android_whatsapp_send(
+        recipient: str,
+        message: str,
+        user_confirmed: bool = False,
+        target_device: str = "",
+    ) -> str:
+        """Prepare an explicit-consent WhatsApp draft on the target Android phone."""
+        result = await bridge.android_whatsapp_send(
+            recipient=recipient,
+            message=message,
+            user_confirmed=user_confirmed,
+            target_device=target_device,
+        )
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_android_notification_reply",
+        description="Reply directly to a connected Android notification supporting RemoteInput direct reply.",
+    )
+    async def snow_android_notification_reply(
+        notification_key: str,
+        reply_text: str,
+        target_device: str = "",
+    ) -> str:
+        """Send a direct reply to an active Android notification key."""
+        result = await bridge.android_notification_reply(
+            notification_key=notification_key,
+            reply_text=reply_text,
+            target_device=target_device,
+        )
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_windows_hotkey",
+        description=(
+            "Dispatch an allowlisted Windows keyboard shortcut (win+d, alt+tab, ctrl+shift+s, win+tab, "
+            "ctrl+c, ctrl+v, win+e, or approval-gated alt+f4)."
+        ),
+    )
+    async def snow_windows_hotkey(shortcut: str) -> str:
+        """Trigger an allowlisted Windows shortcut chord."""
+        result = await bridge.windows_hotkey(shortcut=shortcut)
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_windows_brightness_set",
+        description="Set the Windows display brightness level cleanly between 0 and 100.",
+    )
+    async def snow_windows_brightness_set(level: int) -> str:
+        """Adjust Windows display brightness percentage (0-100)."""
+        result = await bridge.windows_brightness_set(level=level)
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_android_dnd_toggle",
+        description=(
+            "Enable or disable Do Not Disturb on a connected Android device when Notification Policy Access is granted."
+        ),
+    )
+    async def snow_android_dnd_toggle(enabled: bool, target_device: str = "") -> str:
+        """Toggle Android Do Not Disturb mode."""
+        result = await bridge.android_dnd_toggle(enabled=enabled, target_device=target_device)
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_cross_network_execute",
+        description=(
+            "Execute an explicitly permitted capability on a peer device in a federated SNOW network "
+            "enforcing 5-tier grant ∩ device intersections and explicit approval gates."
+        ),
+    )
+    async def snow_cross_network_execute(
+        target_network_id: str,
+        target_device_id: str,
+        capability: str,
+        params: Optional[dict[str, Any]] = None,
+        grant_token: str = "",
+    ) -> str:
+        """Execute a capability across a federated SNOW network boundary."""
+        result = await bridge.cross_network_execute(
+            target_network_id=target_network_id,
+            target_device_id=target_device_id,
+            capability=capability,
+            params=params,
+            grant_token=grant_token,
+        )
+        return json.dumps(result, indent=2)
 
 
 def register_clipboard_buffer_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:

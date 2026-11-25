@@ -18,11 +18,77 @@ Configuration Error-Handling Policy:
 from dataclasses import dataclass
 import math
 import os
-from typing import FrozenSet
+from typing import Any, FrozenSet, Optional
+import urllib.parse
 
 VALID_LOG_LEVELS: FrozenSet[str] = frozenset(
     {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 )
+_LOOPBACK_HUB_HOSTS: FrozenSet[str] = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def validate_hub_url(url: str, allow_dev_loopback: Optional[bool] = None) -> str:
+    """Validate and normalize SNOW_DEFAULT_HUB_URL / configured hub endpoint URL.
+
+    Security rules:
+    - Requires HTTPS for remote hub URLs.
+    - Rejects embedded userinfo/credentials, unexpected paths, query strings, and fragments.
+    - Permits HTTP ONLY for loopback hosts when explicit development mode is enabled.
+    """
+    if not isinstance(url, str):
+        raise ValueError("Hub URL must be a string.")
+    clean = url.strip()
+    if not clean:
+        raise ValueError("Hub URL cannot be empty.")
+    if any(ch.isspace() or ord(ch) < 32 for ch in clean):
+        raise ValueError("Hub URL contains invalid whitespace or control characters.")
+
+    parsed = urllib.parse.urlparse(clean)
+    scheme = (parsed.scheme or "").lower()
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise ValueError("Hub URL must not contain embedded credentials.")
+    if parsed.query or parsed.fragment or parsed.params:
+        raise ValueError("Hub URL must not contain query parameters or URL fragments.")
+    if parsed.path not in ("", "/"):
+        raise ValueError(f"Hub URL must be a root origin without unexpected paths, got path {parsed.path!r}.")
+    host = (parsed.hostname or "").strip().lower()
+    if not host or not parsed.netloc:
+        raise ValueError("Hub URL missing valid hostname.")
+
+    dev_allowed = (
+        allow_dev_loopback
+        if allow_dev_loopback is not None
+        else os.getenv("SNOW_ALLOW_DEV_HUB_HTTP", "0").strip().lower() in ("1", "true", "yes")
+    )
+    if scheme == "https":
+        pass
+    elif scheme == "http" and dev_allowed and host in _LOOPBACK_HUB_HOSTS:
+        pass
+    else:
+        raise ValueError(
+            "Hub URL must use https:// (http:// loopback is only permitted with explicit development configuration)."
+        )
+
+    return f"{scheme}://{parsed.netloc}".rstrip("/")
+
+
+def resolve_default_hub_url(
+    db_manager: Any = None,
+    explicit: Optional[str] = None,
+    allow_dev_loopback: Optional[bool] = None,
+) -> str:
+    """Resolve and validate configured hub URL from explicit override, DB setting, or SNOW_DEFAULT_HUB_URL."""
+    candidates: list[Optional[str]] = [explicit]
+    if db_manager is not None and hasattr(db_manager, "get_setting"):
+        try:
+            candidates.append(db_manager.get_setting("default_hub_url", ""))
+        except Exception:
+            pass
+    candidates.append(os.getenv("SNOW_DEFAULT_HUB_URL", ""))
+    for raw in candidates:
+        if isinstance(raw, str) and raw.strip():
+            return validate_hub_url(raw.strip(), allow_dev_loopback=allow_dev_loopback)
+    return ""
 
 
 @dataclass(frozen=True)
@@ -60,6 +126,7 @@ class CoreConfig:
     relay_url: str = ""
     relay_group_id: str = ""
     relay_ticket: str = ""
+    default_hub_url: str = ""
     staged_apk_path: str | None = None
 
     def __post_init__(self) -> None:
@@ -180,6 +247,11 @@ class CoreConfig:
             raise ValueError(f"device_connect_grace_period must be numeric, got {type(self.device_connect_grace_period).__name__}")
         if not math.isfinite(self.device_connect_grace_period) or self.device_connect_grace_period <= 0:
             raise ValueError(f"device_connect_grace_period must be a finite positive number (> 0), got {self.device_connect_grace_period}")
+
+        # Validate default_hub_url if set
+        if self.default_hub_url:
+            validated_hub = validate_hub_url(self.default_hub_url)
+            object.__setattr__(self, "default_hub_url", validated_hub)
 
     @classmethod
     def from_env(cls) -> "CoreConfig":
@@ -459,6 +531,8 @@ class CoreConfig:
         relay_url = os.getenv("SNOW_RELAY_URL", "").strip()
         relay_group_id = os.getenv("SNOW_RELAY_GROUP_ID", "").strip()
         relay_ticket = os.getenv("SNOW_RELAY_TICKET", "").strip()
+        raw_default_hub = os.getenv("SNOW_DEFAULT_HUB_URL", "").strip()
+        default_hub_url = validate_hub_url(raw_default_hub) if raw_default_hub else ""
 
         return cls(
             app_name=app_name,
@@ -489,4 +563,5 @@ class CoreConfig:
             relay_url=relay_url,
             relay_group_id=relay_group_id,
             relay_ticket=relay_ticket,
+            default_hub_url=default_hub_url,
         )

@@ -166,7 +166,7 @@ fun SnowConnectSheet(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Manual IP or Code",
+                            text = "SNOW ID or Network Code",
                             style = SnowTypography.titleSmall,
                             color = colors.textPrimary
                         )
@@ -189,7 +189,7 @@ fun SnowConnectSheet(
                     if (showManualInput) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Enter a Host:Port, SNOW ID, or 9-digit federation code.",
+                            text = "Enter a SNOW ID (SNW-...) or 9-digit network invite code.",
                             style = SnowTypography.bodySmall,
                             color = colors.textSecondary
                         )
@@ -201,7 +201,7 @@ fun SnowConnectSheet(
                             modifier = Modifier.fillMaxWidth(),
                             placeholder = {
                                 Text(
-                                    text = "192.168.1.50:8765 or SNW-XXXX-XXXX",
+                                    text = "SNW-XXXX-XXXX or 123-456-789",
                                     style = SnowTypography.bodyMedium,
                                     color = colors.textMuted
                                 )

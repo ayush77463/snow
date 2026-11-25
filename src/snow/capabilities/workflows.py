@@ -221,12 +221,111 @@ PRESET_PC_SCREENSHOT = WorkflowDefinition(
     max_timeout_seconds=30.0,
 )
 
+PRESET_STUDY_MODE = WorkflowDefinition(
+    workflow_id="study_mode",
+    name="Study Mode",
+    description="Enable distraction-free focus: optionally enable phone DND when permitted, adjust Windows volume down cleanly, and post a desktop summary notification.",
+    steps=[
+        WorkflowStep(
+            step_id="step_phone_dnd",
+            capability="android_dnd_toggle",
+            name="Enable Phone Do Not Disturb",
+            description="Request Do Not Disturb mode on the connected Android phone if permitted.",
+            params_template={"enabled": True},
+            target_device="android",
+            is_mutating=True,
+            requires_approval=False,
+        ),
+        WorkflowStep(
+            step_id="step_desktop_volume",
+            capability="media_control",
+            name="Quiet Windows Volume",
+            description="Lower Windows master volume to a distraction-free study level.",
+            params_template={"action": "volume_set", "value": 15},
+            is_mutating=True,
+            requires_approval=False,
+        ),
+        WorkflowStep(
+            step_id="step_study_notify",
+            capability="windows_notify",
+            name="Notify Study Mode Active",
+            description="Post a confirmation toast on Windows.",
+            params_template={"title": "SNOW Study Mode", "message": "Study Mode active."},
+            is_mutating=False,
+            requires_approval=False,
+        ),
+    ],
+    is_mutating=True,
+    requires_approval=False,
+    max_timeout_seconds=25.0,
+)
+
+PRESET_FIND_AND_SEND_FILE = WorkflowDefinition(
+    workflow_id="find_and_send_file",
+    name="Find & Send File to Phone",
+    description="Search allowed Windows roots for a matching file query and transfer the first match securely over HTTPS to Android.",
+    steps=[
+        WorkflowStep(
+            step_id="step_find_file",
+            capability="windows_file_search",
+            name="Search Allowed PC Files",
+            description="Search scoped PC roots for the requested file query.",
+            params_template={"limit": 5},
+            is_mutating=False,
+            requires_approval=False,
+        ),
+        WorkflowStep(
+            step_id="step_deliver_to_phone",
+            capability="android_file_send",
+            name="Deliver File to Phone",
+            description="Deliver the matched PC file securely over HTTPS to the connected Android phone.",
+            target_device="android",
+            is_mutating=True,
+            requires_approval=True,
+        ),
+    ],
+    is_mutating=True,
+    requires_approval=True,
+    max_timeout_seconds=45.0,
+)
+
+PRESET_CAPTURE_AND_SHARE = WorkflowDefinition(
+    workflow_id="capture_and_share",
+    name="Capture & Share Screenshot",
+    description="Capture the Windows desktop screenshot with consent and share/deliver it to the connected Android device.",
+    steps=[
+        WorkflowStep(
+            step_id="step_capture_screen",
+            capability="windows_screenshot",
+            name="Capture Windows Screen",
+            description="Acquire desktop screen capture as an encoded PNG.",
+            is_mutating=False,
+            requires_approval=True,
+        ),
+        WorkflowStep(
+            step_id="step_deliver_to_phone",
+            capability="android_file_send",
+            name="Send Capture to Phone",
+            description="Deliver the captured PNG over HTTPS to the connected Android device.",
+            target_device="android",
+            is_mutating=True,
+            requires_approval=True,
+        ),
+    ],
+    is_mutating=True,
+    requires_approval=True,
+    max_timeout_seconds=45.0,
+)
+
 # Immutable fixed registry of allowable workflows
 WORKFLOW_REGISTRY: dict[str, WorkflowDefinition] = {
     PRESET_DEVICE_HEALTH.workflow_id: PRESET_DEVICE_HEALTH,
     PRESET_CAPTURE_PC_TO_PHONE.workflow_id: PRESET_CAPTURE_PC_TO_PHONE,
     PRESET_SHARE_CLIPBOARD.workflow_id: PRESET_SHARE_CLIPBOARD,
     PRESET_PC_SCREENSHOT.workflow_id: PRESET_PC_SCREENSHOT,
+    PRESET_STUDY_MODE.workflow_id: PRESET_STUDY_MODE,
+    PRESET_FIND_AND_SEND_FILE.workflow_id: PRESET_FIND_AND_SEND_FILE,
+    PRESET_CAPTURE_AND_SHARE.workflow_id: PRESET_CAPTURE_AND_SHARE,
 }
 
 
@@ -391,6 +490,11 @@ class WorkflowOrchestrator:
 
             # Merge step template with validated parameters
             step_params = dict(step.params_template)
+            if step.step_id == "step_find_file":
+                if "query" in input_params:
+                    step_params["query"] = str(input_params["query"])
+                if "root_path" in input_params:
+                    step_params["root_path"] = str(input_params["root_path"])
             # Propagate outputs from previous steps when relevant
             if step.step_id == "step_deliver_to_phone" and "step_capture_screen" in accumulated_data:
                 cap_data = accumulated_data["step_capture_screen"]
@@ -402,6 +506,19 @@ class WorkflowOrchestrator:
                     step_params["sha256"] = cap_data["sha256"]
                 if "transfer_id" in cap_data:
                     step_params["transfer_id"] = cap_data["transfer_id"]
+            elif step.step_id == "step_deliver_to_phone" and "step_find_file" in accumulated_data:
+                find_data = accumulated_data["step_find_file"]
+                matches = find_data.get("matches") if isinstance(find_data, dict) else None
+                if isinstance(matches, list) and matches:
+                    first_match = matches[0]
+                    if isinstance(first_match, dict):
+                        fp = first_match.get("full_path") or first_match.get("path")
+                        if fp:
+                            step_params["file_path"] = fp
+                        if first_match.get("name"):
+                            step_params["file_name"] = first_match["name"]
+                elif "file_path" in input_params:
+                    step_params["file_path"] = input_params["file_path"]
 
             target_dev = step.target_device or input_params.get("target_device")
 
@@ -531,7 +648,11 @@ class WorkflowOrchestrator:
 
             elif not resp.success:
                 # If non-critical cross-device peer is offline, mark as PARTIAL instead of failing entire workflow
-                is_optional_peer_step = step.step_id in ("step_phone_battery", "step_deliver_to_phone") and resp.status in (
+                is_optional_peer_step = step.step_id in (
+                    "step_phone_battery",
+                    "step_deliver_to_phone",
+                    "step_phone_dnd",
+                ) and resp.status in (
                     "DEVICE_NOT_FOUND",
                     "NO_DEVICES_PAIRED",
                     "ROUTER_UNAVAILABLE",

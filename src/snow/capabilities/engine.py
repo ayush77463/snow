@@ -498,6 +498,31 @@ class CapabilityEngine:
                 error=None if is_ok else res.get("error"),
             )
 
+        if action in ("windows_hotkey", "snow_windows_hotkey"):
+            shortcut = params.get("shortcut", "")
+            res = await self.system.send_hotkey(shortcut)
+            is_ok = bool(res.get("success"))
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "HOTKEY_FAILED"),
+                data=res,
+                error=None if is_ok else res.get("error"),
+            )
+
+        if action in ("windows_brightness_set", "snow_windows_brightness_set"):
+            level = params.get("level")
+            res = await self.system.set_brightness(level)
+            is_ok = bool(res.get("success"))
+            return CapabilityResponse(
+                success=is_ok,
+                status=res.get("status", "SUCCESS" if is_ok else "UNSUPPORTED_DISPLAY"),
+                data=res,
+                error=None if is_ok else res.get("error"),
+            )
+
+        if action in ("cross_network_execute", "snow_cross_network_execute"):
+            return await self._execute_cross_network_capability(params=params, ctx=ctx)
+
         if action in ("windows_list_windows", "snow_windows_list_windows"):
             include_empty = bool(params.get("include_empty_titles", False))
             try:
@@ -1366,6 +1391,8 @@ class CapabilityEngine:
             "android_send_message", "snow_android_send_message", "send_message",
             "android_ring", "snow_android_ring", "ring_phone",
             "android_clipboard_push", "snow_android_clipboard_push", "clipboard_push",
+            "android_whatsapp_send", "snow_android_whatsapp_send", "whatsapp_send",
+            "android_dnd_toggle", "snow_android_dnd_toggle", "dnd_toggle",
         }
         if action in CROSS_DEVICE_ACTIONS:
             router = getattr(self, "session_router", None)
@@ -1404,4 +1431,151 @@ class CapabilityEngine:
             success=False,
             status="UNKNOWN_ACTION",
             error=f"Unsupported capability action: '{action}'",
+        )
+
+    async def _execute_cross_network_capability(
+        self,
+        params: dict[str, Any],
+        ctx: ExecutionContext,
+    ) -> CapabilityResponse:
+        """Validate active federation grant, 5-tier intersection, ACLs, and route safely."""
+        from snow.network.federation import (
+            FederationManager,
+            is_capability_forbidden_for_federation,
+        )
+        from snow.network.router import is_action_allowed_by_tier_intersection
+
+        target_network_id = str(params.get("target_network_id") or "").strip()
+        target_device_id = str(params.get("target_device_id") or "").strip()
+        capability = str(params.get("capability") or "").strip()
+        grant_token = str(params.get("grant_token") or "").strip()
+        sub_params = dict(params.get("params") or {}) if isinstance(params.get("params"), dict) else {}
+
+        if not target_network_id or not target_device_id or target_device_id == "*" or not capability:
+            return CapabilityResponse(
+                success=False,
+                status="INVALID_ARGUMENT",
+                error="Explicit 'target_network_id', non-wildcard 'target_device_id', and 'capability' are required.",
+            )
+
+        # Reject shell execution / forbidden administrative capabilities immediately
+        if is_capability_forbidden_for_federation(capability) or capability.lower() in (
+            "desktop_exec", "windows_terminal", "cmd", "powershell", "bash", "sh", "cross_network_execute", "snow_cross_network_execute"
+        ):
+            return CapabilityResponse(
+                success=False,
+                status="CAPABILITY_NOT_PERMITTED",
+                error=f"Capability '{capability}' is strictly forbidden for cross-network execution.",
+            )
+
+        if not self.db_manager or not hasattr(self.db_manager, "list_federation_grants"):
+            return CapabilityResponse(
+                success=False,
+                status="FEDERATION_UNAVAILABLE",
+                error="Federation grant database is unavailable.",
+            )
+
+        fed_mgr = FederationManager(db_manager=self.db_manager)
+        grants = fed_mgr.list_grants(active_only=False)
+        matching_grant = next(
+            (g for g in grants if g.get("network_id") == target_network_id),
+            None,
+        )
+        if not matching_grant:
+            return CapabilityResponse(
+                success=False,
+                status="GRANT_NOT_FOUND",
+                error=f"No federation grant found for target network '{target_network_id}'.",
+            )
+
+        if matching_grant.get("status") != "ACTIVE":
+            return CapabilityResponse(
+                success=False,
+                status=f"FEDERATION_GRANT_{matching_grant.get('status', 'INACTIVE')}",
+                error=f"Federation grant for network '{target_network_id}' is {matching_grant.get('status')}.",
+            )
+
+        allowed_devs = matching_grant.get("allowed_device_ids") or []
+        if not allowed_devs or "*" in allowed_devs or target_device_id not in allowed_devs:
+            return CapabilityResponse(
+                success=False,
+                status="DEVICE_ACCESS_DENIED",
+                error=f"Device '{target_device_id}' is outside federation grant scope.",
+            )
+
+        allowed_caps = matching_grant.get("allowed_capabilities") or []
+        if not allowed_caps or "*" in allowed_caps or capability not in allowed_caps:
+            return CapabilityResponse(
+                success=False,
+                status="CAPABILITY_NOT_PERMITTED",
+                error=f"Capability '{capability}' is not allowed by federation grant.",
+            )
+
+        # Check 5-tier intersection (grant tier ∩ device tier)
+        grant_tier = matching_grant.get("permission_tier")
+        device_tier = self.db_manager.get_setting(f"device_profile:{target_device_id}") if hasattr(self.db_manager, "get_setting") else None
+        if grant_tier and grant_tier != "custom":
+            eff_dev_tier = device_tier or "full_control"
+            if not is_action_allowed_by_tier_intersection(grant_tier, eff_dev_tier, capability):
+                return CapabilityResponse(
+                    success=False,
+                    status="PERMISSION_DENIED",
+                    error=f"Capability '{capability}' denied by 5-tier intersection (grant={grant_tier}, device={eff_dev_tier}).",
+                )
+        elif device_tier:
+            from snow.network.router import is_action_allowed_by_profile
+            if not is_action_allowed_by_profile(device_tier, capability):
+                return CapabilityResponse(
+                    success=False,
+                    status="PERMISSION_DENIED",
+                    error=f"Capability '{capability}' denied by device permission tier '{device_tier}'.",
+                )
+
+        if grant_token:
+            valid, val_err = fed_mgr.validate_federated_request(
+                token=grant_token,
+                target_network_id="",
+                target_device_id=target_device_id,
+                capability=capability,
+                target_device_tier=device_tier,
+            )
+            if not valid:
+                return CapabilityResponse(
+                    success=False,
+                    status="PERMISSION_DENIED",
+                    error=val_err or "Federated grant token validation failed.",
+                )
+
+        # Strip caller override fields from nested params and execute through router/engine cleanly
+        clean_sub = dict(sub_params)
+        clean_sub.pop("principal", None)
+        clean_sub.pop("trust_tier", None)
+        clean_sub["target_network_id"] = target_network_id
+        clean_sub["federation_grant_id"] = matching_grant.get("grant_id")
+
+        hop_limit = params.get("hop_limit", 2)
+        visited_peers = params.get("visited_peers") if isinstance(params.get("visited_peers"), list) else []
+
+        router = getattr(self, "session_router", None)
+        if router and hasattr(router, "route_request"):
+            route_res = await router.route_request(
+                action=capability,
+                target=target_device_id,
+                data=clean_sub,
+                ctx=ctx,
+                hop_limit=hop_limit,
+                visited_peers=visited_peers,
+            )
+            is_ok = bool(route_res.get("success"))
+            return CapabilityResponse(
+                success=is_ok,
+                status=route_res.get("status", "SUCCESS" if is_ok else "ERROR"),
+                data=route_res.get("data") if "data" in route_res else route_res,
+                error=route_res.get("error"),
+            )
+
+        return CapabilityResponse(
+            success=False,
+            status="ROUTER_UNAVAILABLE",
+            error="No active SessionRouter available for federated execution.",
         )

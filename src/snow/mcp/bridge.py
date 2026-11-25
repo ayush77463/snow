@@ -1890,3 +1890,171 @@ class SnowMcpBridge:
             fed_mgr = FederationManager(db_manager=db_mgr)
             return fed_mgr.global_kill_switch(reason=reason, principal="OWNER_MANUAL")
         return {"success": False, "status": "CORE_OFFLINE", "error": "Core daemon IPC offline and database unavailable."}
+
+    # =========================================================================
+    # V5.2.0 Stage 6B Capabilities (6 new tools -> 54 Total Tools)
+    # =========================================================================
+
+    async def android_whatsapp_send(
+        self,
+        recipient: str,
+        message: str,
+        user_confirmed: bool = False,
+        target_device: str = "",
+    ) -> dict[str, Any]:
+        """Prepare an explicit-consent WhatsApp draft on a connected Android phone."""
+        if not isinstance(recipient, str) or not recipient.strip():
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'recipient' must be a non-empty contact name or phone number.",
+            }
+        clean_recipient = recipient.strip()
+        if len(clean_recipient) > 64 or any(ord(ch) < 32 or ord(ch) == 127 for ch in clean_recipient):
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'recipient' contains illegal control characters or exceeds 64 characters.",
+            }
+        if not isinstance(message, str) or not message.strip():
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'message' must be a non-empty string.",
+            }
+        clean_msg = message.strip()
+        if len(clean_msg) > 2000 or "\x00" in clean_msg:
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'message' must not contain null bytes or exceed 2000 characters.",
+            }
+        params: dict[str, Any] = {
+            "recipient": clean_recipient,
+            "message": clean_msg,
+            "user_confirmed": bool(user_confirmed),
+        }
+        if target_device and str(target_device).strip():
+            params["target"] = str(target_device).strip()
+            params["device_id"] = str(target_device).strip()
+        return await self._execute_local_or_ipc("android_whatsapp_send", params)
+
+    async def android_notification_reply(
+        self,
+        notification_key: str,
+        reply_text: str,
+        target_device: str = "",
+    ) -> dict[str, Any]:
+        """Reply directly to an active Android notification supporting RemoteInput."""
+        if not isinstance(notification_key, str) or not notification_key.strip():
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'notification_key' must be a non-empty notification key string.",
+            }
+        clean_key = notification_key.strip()
+        if len(clean_key) > 512 or any(ord(ch) < 32 for ch in clean_key):
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'notification_key' contains illegal control characters or exceeds 512 characters.",
+            }
+        if not isinstance(reply_text, str) or not reply_text.strip():
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'reply_text' must be a non-empty string.",
+            }
+        clean_reply = reply_text.strip()
+        if len(clean_reply) > 2000 or "\x00" in clean_reply:
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'reply_text' contains null bytes or exceeds 2000 characters.",
+            }
+        params: dict[str, Any] = {
+            "key": clean_key,
+            "notification_key": clean_key,
+            "text": clean_reply,
+            "reply_text": clean_reply,
+        }
+        if target_device and str(target_device).strip():
+            params["target"] = str(target_device).strip()
+            params["device_id"] = str(target_device).strip()
+        return await self._execute_local_or_ipc("android_notification_reply", params)
+
+    async def windows_hotkey(self, shortcut: str) -> dict[str, Any]:
+        """Trigger an allowlisted Windows keyboard shortcut safely via SendInput."""
+        from snow.capabilities.windows.system import ALLOWED_HOTKEYS, normalize_hotkey_shortcut
+
+        if not isinstance(shortcut, str) or not shortcut.strip():
+            return {
+                "success": False,
+                "status": "INVALID_HOTKEY",
+                "error": "'shortcut' must be a non-empty allowlisted hotkey string.",
+            }
+        norm = normalize_hotkey_shortcut(shortcut)
+        if norm not in ALLOWED_HOTKEYS:
+            return {
+                "success": False,
+                "status": "INVALID_HOTKEY",
+                "error": f"Hotkey '{shortcut}' is not in the explicit allowlist: {', '.join(sorted(ALLOWED_HOTKEYS.keys()))}.",
+            }
+        return await self._execute_local_or_ipc("windows_hotkey", {"shortcut": norm})
+
+    async def windows_brightness_set(self, level: int) -> dict[str, Any]:
+        """Set Windows primary display brightness cleanly between 0 and 100."""
+        if isinstance(level, bool) or not isinstance(level, int) or level < 0 or level > 100:
+            return {
+                "success": False,
+                "status": "INVALID_BRIGHTNESS_LEVEL",
+                "error": "'level' must be an integer between 0 and 100.",
+            }
+        return await self._execute_local_or_ipc("windows_brightness_set", {"level": int(level)})
+
+    async def android_dnd_toggle(self, enabled: bool, target_device: str = "") -> dict[str, Any]:
+        """Toggle Do Not Disturb mode on a connected Android phone."""
+        if not isinstance(enabled, bool):
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'enabled' must be a strict boolean (true or false).",
+            }
+        params: dict[str, Any] = {"enabled": enabled}
+        if target_device and str(target_device).strip():
+            params["target"] = str(target_device).strip()
+            params["device_id"] = str(target_device).strip()
+        return await self._execute_local_or_ipc("android_dnd_toggle", params)
+
+    async def cross_network_execute(
+        self,
+        target_network_id: str,
+        target_device_id: str,
+        capability: str,
+        params: Optional[dict[str, Any]] = None,
+        grant_token: str = "",
+    ) -> dict[str, Any]:
+        """Execute a permitted capability across a federated SNOW network boundary."""
+        if not isinstance(target_network_id, str) or not target_network_id.strip():
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "'target_network_id' is required."}
+        if not isinstance(target_device_id, str) or not target_device_id.strip() or target_device_id.strip() == "*":
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "'target_device_id' must be an explicit non-wildcard device identifier.",
+            }
+        if not isinstance(capability, str) or not capability.strip():
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "'capability' is required."}
+        if params is not None and not isinstance(params, dict):
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "'params' must be a JSON object if provided."}
+
+        return await self._execute_local_or_ipc(
+            "cross_network_execute",
+            {
+                "target_network_id": target_network_id.strip(),
+                "target_device_id": target_device_id.strip(),
+                "capability": capability.strip(),
+                "params": dict(params) if params else {},
+                "grant_token": str(grant_token or "").strip(),
+            },
+        )

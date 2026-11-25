@@ -379,6 +379,187 @@ def _default_focus_window_win32(
         }
 
 
+ALLOWED_HOTKEYS: dict[str, tuple[int, ...]] = {
+    "win+d": (0x5B, 0x44),
+    "alt+tab": (0x12, 0x09),
+    "ctrl+shift+s": (0x11, 0x10, 0x53),
+    "win+tab": (0x5B, 0x09),
+    "ctrl+c": (0x11, 0x43),
+    "ctrl+v": (0x11, 0x56),
+    "win+e": (0x5B, 0x45),
+    "alt+f4": (0x12, 0x73),
+}
+
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_EXTENDEDKEY = 0x0001
+_EXTENDED_VKS = frozenset({0x5B, 0x5C})
+
+
+def normalize_hotkey_shortcut(shortcut: str) -> str:
+    """Normalize hotkey chord formatting cleanly for strict allowlist comparison."""
+    parts = [p.strip().lower() for p in (shortcut or "").split("+") if p.strip()]
+    return "+".join(parts)
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG)),
+    ]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG)),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
+    ]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", _INPUT_UNION),
+    ]
+
+
+class _PHYSICAL_MONITOR(ctypes.Structure):
+    _fields_ = [
+        ("hPhysicalMonitor", wintypes.HANDLE),
+        ("szPhysicalMonitorDescription", wintypes.WCHAR * 128),
+    ]
+
+
+def _default_send_hotkey_win32(shortcut: str) -> dict[str, Any]:
+    """Dispatch an allowlisted chord via Win32 SendInput (zero shell execution)."""
+    norm = normalize_hotkey_shortcut(shortcut)
+    if norm not in ALLOWED_HOTKEYS:
+        return {
+            "success": False,
+            "status": "INVALID_HOTKEY",
+            "error": f"Hotkey '{shortcut}' is not in the explicit SNOW allowlist.",
+        }
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_PLATFORM",
+            "error": "Windows hotkeys are only supported on Windows.",
+        }
+
+    vkeys = ALLOWED_HOTKEYS[norm]
+    inputs: list[_INPUT] = []
+    for vk in vkeys:
+        flags = _KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0
+        inputs.append(_INPUT(type=_INPUT_KEYBOARD, union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=vk, dwFlags=flags))))
+    for vk in reversed(vkeys):
+        flags = _KEYEVENTF_KEYUP | (_KEYEVENTF_EXTENDEDKEY if vk in _EXTENDED_VKS else 0)
+        inputs.append(_INPUT(type=_INPUT_KEYBOARD, union=_INPUT_UNION(ki=_KEYBDINPUT(wVk=vk, dwFlags=flags))))
+
+    user32 = ctypes.windll.user32
+    arr_type = _INPUT * len(inputs)
+    arr = arr_type(*inputs)
+    sent = int(user32.SendInput(len(inputs), ctypes.byref(arr), ctypes.sizeof(_INPUT)))
+    if sent != len(inputs):
+        return {
+            "success": False,
+            "status": "HOTKEY_FAILED",
+            "shortcut": norm,
+            "error": f"Win32 SendInput dispatched {sent}/{len(inputs)} keyboard events.",
+        }
+    return {
+        "success": True,
+        "status": "SUCCESS",
+        "shortcut": norm,
+        "events_dispatched": sent,
+        "message": f"Dispatched Windows shortcut '{norm}'.",
+    }
+
+
+def _default_set_brightness_win32(level: int) -> dict[str, Any]:
+    """Adjust primary monitor brightness cleanly via Win32 dxva2.dll DDC/CI."""
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_PLATFORM",
+            "error": "Display brightness adjustment is only supported on Windows.",
+        }
+
+    try:
+        user32 = ctypes.windll.user32
+        dxva2 = ctypes.windll.dxva2
+        hwnd = user32.GetForegroundWindow() or user32.GetDesktopWindow()
+        hmon = user32.MonitorFromWindow(hwnd, 1)  # MONITOR_DEFAULTTOPRIMARY = 1
+        if not hmon:
+            return {
+                "success": False,
+                "status": "UNSUPPORTED_DISPLAY",
+                "error": "No active physical monitor handle found.",
+            }
+        num_monitors = wintypes.DWORD(0)
+        if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, ctypes.byref(num_monitors)) or num_monitors.value == 0:
+            return {
+                "success": False,
+                "status": "UNSUPPORTED_DISPLAY",
+                "error": "Display does not expose physical monitor brightness controls.",
+            }
+        monitors = (_PHYSICAL_MONITOR * num_monitors.value)()
+        if not dxva2.GetPhysicalMonitorsFromHMONITOR(hmon, num_monitors.value, monitors):
+            return {
+                "success": False,
+                "status": "UNSUPPORTED_DISPLAY",
+                "error": "Failed enumerating physical monitor handles.",
+            }
+        try:
+            updated = 0
+            for mon in monitors:
+                if dxva2.SetMonitorBrightness(mon.hPhysicalMonitor, wintypes.DWORD(level)):
+                    updated += 1
+            if updated == 0:
+                return {
+                    "success": False,
+                    "status": "UNSUPPORTED_DISPLAY",
+                    "error": "Monitor rejected DDC/CI brightness adjustment (unsupported hardware or virtual display).",
+                }
+            return {
+                "success": True,
+                "status": "SUCCESS",
+                "level": int(level),
+                "monitors_updated": updated,
+                "message": f"Set display brightness to {int(level)}%.",
+            }
+        finally:
+            dxva2.DestroyPhysicalMonitors(num_monitors.value, monitors)
+    except Exception as exc:
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_DISPLAY",
+            "error": f"Display brightness control unavailable: {exc}",
+        }
+
+
 class WindowsSystemControls:
     """Thread-safe, testable Windows workstation & shell notification capabilities."""
 
@@ -389,12 +570,16 @@ class WindowsSystemControls:
         lock_fn: Optional[Callable[[], dict[str, Any]]] = None,
         list_windows_fn: Optional[Callable[[bool, int], dict[str, Any]]] = None,
         focus_window_fn: Optional[Callable[[Optional[int], str, str], dict[str, Any]]] = None,
+        send_hotkey_fn: Optional[Callable[[str], dict[str, Any]]] = None,
+        set_brightness_fn: Optional[Callable[[int], dict[str, Any]]] = None,
     ) -> None:
         self._active_window_fn = active_window_fn or _default_active_window_win32
         self._notify_fn = notify_fn or _default_notify_win32
         self._lock_fn = lock_fn or _default_lock_workstation_win32
         self._list_windows_fn = list_windows_fn or _default_list_windows_win32
         self._focus_window_fn = focus_window_fn or _default_focus_window_win32
+        self._send_hotkey_fn = send_hotkey_fn or _default_send_hotkey_win32
+        self._set_brightness_fn = set_brightness_fn or _default_set_brightness_win32
 
     def get_active_window_sync(self) -> dict[str, Any]:
         """Synchronously inspect the active foreground window title and process."""
@@ -560,3 +745,57 @@ class WindowsSystemControls:
     ) -> dict[str, Any]:
         """Asynchronously focus an open Windows desktop window."""
         return await asyncio.to_thread(self.focus_window_sync, hwnd, title_contains, process_name)
+
+    def send_hotkey_sync(self, shortcut: str) -> dict[str, Any]:
+        """Validate allowlisted shortcut chord and dispatch via Win32 SendInput."""
+        if not isinstance(shortcut, str) or not shortcut.strip():
+            return {
+                "success": False,
+                "status": "INVALID_HOTKEY",
+                "error": "'shortcut' must be a non-empty allowlisted hotkey string.",
+            }
+        norm = normalize_hotkey_shortcut(shortcut)
+        if norm not in ALLOWED_HOTKEYS:
+            return {
+                "success": False,
+                "status": "INVALID_HOTKEY",
+                "error": (
+                    f"Hotkey '{shortcut}' is not permitted. Allowed shortcuts: "
+                    f"{', '.join(sorted(ALLOWED_HOTKEYS.keys()))}."
+                ),
+            }
+        try:
+            res = self._send_hotkey_fn(norm)
+            return dict(res) if isinstance(res, dict) else {"success": False, "status": "HOTKEY_FAILED"}
+        except Exception as exc:
+            logger.error("Failed dispatching hotkey '%s': %s", norm, exc)
+            return {"success": False, "status": "HOTKEY_FAILED", "error": str(exc)}
+
+    async def send_hotkey(self, shortcut: str) -> dict[str, Any]:
+        """Asynchronously dispatch an allowlisted Windows hotkey."""
+        return await asyncio.to_thread(self.send_hotkey_sync, shortcut)
+
+    def set_brightness_sync(self, level: Any) -> dict[str, Any]:
+        """Validate display brightness percentage (0..100 strict int) and apply via DDC/CI."""
+        if isinstance(level, bool) or not isinstance(level, int):
+            return {
+                "success": False,
+                "status": "INVALID_BRIGHTNESS_LEVEL",
+                "error": "Brightness 'level' must be an integer between 0 and 100.",
+            }
+        if level < 0 or level > 100:
+            return {
+                "success": False,
+                "status": "INVALID_BRIGHTNESS_LEVEL",
+                "error": "Brightness 'level' must be between 0 and 100.",
+            }
+        try:
+            res = self._set_brightness_fn(int(level))
+            return dict(res) if isinstance(res, dict) else {"success": False, "status": "UNSUPPORTED_DISPLAY"}
+        except Exception as exc:
+            logger.error("Failed setting Windows brightness level %s: %s", level, exc)
+            return {"success": False, "status": "UNSUPPORTED_DISPLAY", "error": str(exc)}
+
+    async def set_brightness(self, level: Any) -> dict[str, Any]:
+        """Asynchronously set primary monitor brightness (0..100)."""
+        return await asyncio.to_thread(self.set_brightness_sync, level)

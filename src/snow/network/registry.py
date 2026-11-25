@@ -34,6 +34,15 @@ from snow.security.identity import DeviceIdentity, load_or_create_device_identit
 logger = logging.getLogger(__name__)
 
 
+VALID_PERMISSION_PROFILES: tuple[str, ...] = (
+    "full_control",
+    "files_and_clipboard",
+    "files_only",
+    "clipboard_only",
+    "not_allowed",
+)
+
+
 class NodeRegistry:
     """Thread-safe unified registry for all local, paired, connected, and discovered nodes."""
 
@@ -67,8 +76,11 @@ class NodeRegistry:
         try:
             for p in self.db_manager.list_paired_devices():
                 saved_prof = self.db_manager.get_setting(f"device_profile:{p.device_id}")
-                if saved_prof and saved_prof in ("full_control", "files_and_clipboard", "clipboard_only"):
-                    self._permission_profiles[p.device_id] = saved_prof
+                if isinstance(saved_prof, str):
+                    if saved_prof in VALID_PERMISSION_PROFILES:
+                        self._permission_profiles[p.device_id] = saved_prof
+                    else:
+                        self._permission_profiles[p.device_id] = "not_allowed"
         except Exception as exc:
             logger.debug("Failed hydrating permission profiles: %s", exc)
 
@@ -270,11 +282,16 @@ class NodeRegistry:
                 pass
 
     def set_permission_profile(self, device_id: str, profile: str) -> None:
-        """Set and persist the active permission profile for a device."""
+        """Set and persist the active permission profile for a device.
+
+        Rejects unknown/invalid tier strings with ValueError instead of elevating defaults.
+        """
+        clean = (profile or "").strip().lower()
+        if clean not in VALID_PERMISSION_PROFILES:
+            raise ValueError(
+                f"Invalid permission tier '{profile}'. Must be one of: {', '.join(VALID_PERMISSION_PROFILES)}."
+            )
         with self._lock:
-            clean = (profile or "full_control").strip().lower()
-            if clean not in ("full_control", "files_and_clipboard", "clipboard_only"):
-                clean = "full_control"
             self._permission_profiles[device_id] = clean
             try:
                 self.db_manager.set_setting(f"device_profile:{device_id}", clean)
@@ -282,15 +299,19 @@ class NodeRegistry:
                 logger.warning("Failed persisting device profile for [%s]: %s", device_id, exc)
 
     def get_permission_profile(self, device_id: str) -> str:
-        """Get the active permission profile for a device (hydrating from DB if needed, defaults to full_control)."""
+        """Get the active permission profile for a device (fails closed on corrupt stored tier)."""
         with self._lock:
             if device_id in self._permission_profiles:
                 return self._permission_profiles[device_id]
             try:
                 saved = self.db_manager.get_setting(f"device_profile:{device_id}")
-                if saved and saved in ("full_control", "files_and_clipboard", "clipboard_only"):
-                    self._permission_profiles[device_id] = saved
-                    return saved
+                if isinstance(saved, str):
+                    clean = saved.strip().lower()
+                    if clean in VALID_PERMISSION_PROFILES:
+                        self._permission_profiles[device_id] = clean
+                        return clean
+                    self._permission_profiles[device_id] = "not_allowed"
+                    return "not_allowed"
             except Exception:
                 pass
             return "full_control"

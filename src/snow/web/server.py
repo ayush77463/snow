@@ -684,19 +684,34 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_devices_connect_peer(self, request: web.Request) -> web.Response:
-        """Federate with another SNOW Core or Android Peer Host on the local network."""
+        """Federate or connect to another SNOW Core or Android Peer Host by host/port or SNOW ID."""
         try:
             body = await request.json()
         except Exception:
             return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
 
+        snow_id_query = (body.get("snow_id") or "").strip().upper()
         host = (body.get("host") or "").strip()
         port_raw = body.get("port", 8765)
         pin = (body.get("pin") or "").strip()
         expected_fingerprint = (body.get("expected_fingerprint") or "").strip()
 
+        if not host and snow_id_query:
+            resolved_entry = await self._resolve_snow_id_directory(snow_id_query)
+            if not resolved_entry.get("found"):
+                return web.json_response({
+                    "success": False,
+                    "status": "SNOW_ID_NOT_FOUND",
+                    "error": resolved_entry.get("error") or f"Could not resolve SNOW ID '{snow_id_query}'.",
+                }, status=404)
+            host = str(resolved_entry.get("host") or "").strip()
+            if resolved_entry.get("port"):
+                port_raw = resolved_entry.get("port")
+            if not expected_fingerprint and resolved_entry.get("cert_fingerprint"):
+                expected_fingerprint = str(resolved_entry.get("cert_fingerprint"))
+
         if not host:
-            return web.json_response({"success": False, "error": "Missing required field 'host'."}, status=400)
+            return web.json_response({"success": False, "error": "Missing required field 'host' or resolvable 'snow_id'."}, status=400)
 
         try:
             port = int(port_raw)
@@ -766,9 +781,13 @@ class SnowWebServer:
         if not device_id:
             return web.json_response({"success": False, "error": "Missing required field 'device_id'."}, status=400)
 
-        if profile not in ("full_control", "files_and_clipboard", "clipboard_only"):
+        from snow.network.router import VALID_PERMISSION_PROFILES
+        if profile not in VALID_PERMISSION_PROFILES:
             return web.json_response(
-                {"success": False, "error": f"Invalid permission profile '{profile}'. Must be 'full_control', 'files_and_clipboard', or 'clipboard_only'."},
+                {
+                    "success": False,
+                    "error": f"Invalid permission profile '{profile}'. Must be one of: {', '.join(sorted(VALID_PERMISSION_PROFILES))}.",
+                },
                 status=400,
             )
 
@@ -808,19 +827,95 @@ class SnowWebServer:
             })
 
     async def handle_api_network_identity(self, request: web.Request) -> web.Response:
-        """Query local SNOW Network identity."""
+        """Query local SNOW Network identity (including Ed25519 SNW-NET identity & hub URL)."""
         try:
+            from snow.core.config import resolve_default_hub_url
             from snow.network.network_model import SnowNetworkManager
+            from snow.security.identity import load_or_create_network_key_identity
+
             db_mgr = self.bridge.capability_engine.db_manager
             net_mgr = SnowNetworkManager(db_manager=db_mgr)
-            ident = net_mgr.get_network_identity()
+            ident = net_mgr.get_network_identity().to_dict()
+            key_ident = load_or_create_network_key_identity()
+            hub_url = resolve_default_hub_url(db_manager=db_mgr)
+            ident["network_key_id"] = key_ident.network_id
+            ident["public_key_b64"] = key_ident.public_key_b64
+            ident["default_hub_url"] = hub_url
+            ident["permanent_mcp_url"] = f"{hub_url}/u/{key_ident.network_id}/mcp" if hub_url else ""
             return web.json_response({
                 "success": True,
                 "status": "SUCCESS",
-                "identity": ident.to_dict(),
+                "identity": ident,
             })
         except Exception as exc:
             return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_settings_hub_get(self, request: web.Request) -> web.Response:
+        """Return configured Default Hub URL setting and permanent Ed25519 network metadata."""
+        from snow.core.config import resolve_default_hub_url
+        from snow.security.identity import load_or_create_network_key_identity
+
+        db_mgr = getattr(self, "db_manager", None) or getattr(self.bridge.capability_engine, "db_manager", None)
+        hub_url = resolve_default_hub_url(db_manager=db_mgr)
+        key_ident = load_or_create_network_key_identity()
+        return web.json_response({
+            "success": True,
+            "default_hub_url": hub_url,
+            "network_id": key_ident.network_id,
+            "public_key_b64": key_ident.public_key_b64,
+            "permanent_mcp_url": f"{hub_url}/u/{key_ident.network_id}/mcp" if hub_url else "",
+        })
+
+    async def handle_api_settings_hub_post(self, request: web.Request) -> web.Response:
+        """Persist or clear Default Hub URL with strict HTTPS / dev-loopback validation."""
+        from snow.core.config import resolve_default_hub_url, validate_hub_url
+        from snow.mcp.tunnel import load_tunnel_config, save_tunnel_config
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"success": False, "error": "JSON object expected."}, status=400)
+
+        raw_url = body.get("default_hub_url", "")
+        if raw_url is None:
+            raw_url = ""
+        if not isinstance(raw_url, str):
+            return web.json_response({"success": False, "error": "default_hub_url must be a string."}, status=400)
+
+        clean = raw_url.strip()
+        if clean:
+            try:
+                clean = validate_hub_url(clean)
+            except ValueError as exc:
+                return web.json_response({"success": False, "status": "INVALID_URL", "error": str(exc)}, status=400)
+
+        db_mgr = getattr(self, "db_manager", None) or getattr(self.bridge.capability_engine, "db_manager", None)
+        if db_mgr is not None:
+            if clean:
+                db_mgr.set_setting("default_hub_url", clean)
+            elif hasattr(db_mgr, "delete_setting"):
+                db_mgr.delete_setting("default_hub_url")
+            else:
+                db_mgr.set_setting("default_hub_url", "")
+
+        try:
+            tcfg = load_tunnel_config()
+            if clean:
+                tcfg["default_hub_url"] = clean
+            else:
+                tcfg.pop("default_hub_url", None)
+            save_tunnel_config(tcfg)
+        except Exception:
+            pass
+
+        resolved = resolve_default_hub_url(db_manager=db_mgr)
+        return web.json_response({
+            "success": True,
+            "status": "UPDATED",
+            "default_hub_url": resolved,
+        })
 
     async def handle_api_network_identity_update(self, request: web.Request) -> web.Response:
         """Update local SNOW Network name."""
@@ -887,6 +982,20 @@ class SnowWebServer:
             })
 
         payload = res.get("data", {})
+
+        # Master QR: Include network identity and default hub URL for zero-setup discovery
+        try:
+            from snow.core.config import resolve_default_hub_url
+            from snow.security.identity import load_or_create_network_key_identity
+            db_mgr = getattr(self, "db_manager", None) or getattr(self.bridge.capability_engine, "db_manager", None)
+            hub_url = resolve_default_hub_url(db_manager=db_mgr)
+            key_ident = load_or_create_network_key_identity()
+            if key_ident and key_ident.network_id:
+                payload.setdefault("network_id", key_ident.network_id)
+            if hub_url:
+                payload.setdefault("hub_url", hub_url)
+        except Exception:
+            pass
 
         # Master QR: If Remote Device Relay tunnel is active, enrich payload with relay credentials
         if hasattr(self, "tunnel_manager"):
@@ -2408,6 +2517,78 @@ class SnowWebServer:
             failed_attempts_store=self._federation_failed_attempts,
         )
 
+    async def _resolve_snow_id_directory(self, snow_id: str) -> dict[str, Any]:
+        """Resolve a SNOW Device ID or Network ID across local registry, LAN discovery, and Default Hub."""
+        from snow.core.config import resolve_default_hub_url
+        from snow.relay.auth import is_valid_network_id, is_valid_snow_id
+        from snow.security.identity import generate_snow_id, load_or_create_device_identity
+
+        clean_id = (snow_id or "").strip().upper()
+        if not (is_valid_snow_id(clean_id) or is_valid_network_id(clean_id)):
+            return {"success": False, "found": False, "status": "INVALID_SNOW_ID", "error": "Invalid SNOW ID format."}
+
+        db_mgr = getattr(self, "db_manager", None) or getattr(self.bridge.capability_engine, "db_manager", None)
+        local_ident = load_or_create_device_identity()
+        if local_ident.snow_id.upper() == clean_id:
+            return {
+                "success": True,
+                "found": True,
+                "source": "local",
+                "snow_id": clean_id,
+                "device_id": local_ident.device_id,
+                "host": "127.0.0.1",
+                "port": 8765,
+            }
+
+        # 1. Paired DB & NodeRegistry lookup
+        if db_mgr and hasattr(db_mgr, "list_paired_devices"):
+            for p in db_mgr.list_paired_devices():
+                cand_snow = generate_snow_id(seed=p.device_id).upper()
+                if cand_snow == clean_id or str(p.device_id).upper() == clean_id:
+                    return {
+                        "success": True,
+                        "found": True,
+                        "source": "paired_db",
+                        "snow_id": clean_id,
+                        "device_id": p.device_id,
+                        "device_name": p.device_name,
+                        "host": p.last_known_host or "",
+                        "port": p.last_known_port or 8765,
+                        "cert_fingerprint": p.cert_fingerprint or "",
+                    }
+
+        # 2. Query Default Hub Directory when configured
+        hub_url = resolve_default_hub_url(db_manager=db_mgr)
+        if hub_url:
+            import aiohttp
+            target_url = f"{hub_url.rstrip('/')}/v1/directory/resolve/{clean_id}"
+            try:
+                timeout = aiohttp.ClientTimeout(total=4.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(target_url) as resp:
+                        if resp.status == 200:
+                            hub_data = await resp.json()
+                            if isinstance(hub_data, dict) and (hub_data.get("online") or hub_data.get("found") or hub_data.get("snow_id")):
+                                return {
+                                    "success": True,
+                                    "found": True,
+                                    "source": "hub_directory",
+                                    "snow_id": clean_id,
+                                    "hub_url": hub_url,
+                                    **hub_data,
+                                }
+            except Exception as exc:
+                logger.debug("Hub directory lookup failed for %s: %s", clean_id, exc)
+
+        return {"success": False, "found": False, "status": "NOT_FOUND", "error": f"No reachable peer found for '{clean_id}'."}
+
+    async def handle_api_directory_resolve(self, request: web.Request) -> web.Response:
+        """Resolve a SNOW ID or Network ID across local mesh and default cloud hub."""
+        snow_id = request.match_info.get("snow_id", "").strip()
+        res = await self._resolve_snow_id_directory(snow_id)
+        status = 200 if res.get("found") else (400 if res.get("status") == "INVALID_SNOW_ID" else 404)
+        return web.json_response(res, status=status)
+
     async def handle_api_federation_grants(self, request: web.Request) -> web.Response:
         """List active and revoked cross-network federation grants."""
         try:
@@ -2437,6 +2618,7 @@ class SnowWebServer:
             devs = body.get("allowed_device_ids")
             grant_ttl = int(body.get("grant_ttl_seconds", 86400))
             ttl = int(body.get("ttl_seconds", 600))
+            perm_tier = body.get("permission_tier")
 
             res = fed_mgr.create_invitation(
                 allowed_capabilities=caps,
@@ -2444,6 +2626,7 @@ class SnowWebServer:
                 grant_ttl_seconds=grant_ttl,
                 ttl_seconds=ttl,
                 principal="OWNER_MANUAL",
+                permission_tier=perm_tier,
             )
             return web.json_response(res)
         except ValueError as ve:
@@ -2452,6 +2635,30 @@ class SnowWebServer:
             return web.json_response({"success": False, "error": str(pe)}, status=403)
         except Exception as exc:
             logger.error("Failed creating federation invitation: %s", exc)
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_federation_tier(self, request: web.Request) -> web.Response:
+        """Update the 5-tier permission preset for an active federation grant immediately."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+
+        grant_id = str(body.get("grant_id", "")).strip()
+        tier = str(body.get("permission_tier", "")).strip().lower()
+        if not grant_id or not tier:
+            return web.json_response({"success": False, "error": "Missing 'grant_id' or 'permission_tier'."}, status=400)
+
+        try:
+            fed_mgr = self._get_federation_manager()
+            res = fed_mgr.update_grant_permission_tier(grant_id, tier, principal="OWNER_MANUAL")
+            status_code = 200 if res.get("success") else 404
+            return web.json_response(res, status=status_code)
+        except ValueError as ve:
+            return web.json_response({"success": False, "error": str(ve)}, status=400)
+        except PermissionError as pe:
+            return web.json_response({"success": False, "error": str(pe)}, status=403)
+        except Exception as exc:
             return web.json_response({"success": False, "error": str(exc)}, status=500)
 
     async def handle_api_federation_accept(self, request: web.Request) -> web.Response:
@@ -2777,7 +2984,7 @@ class SnowWebServer:
                 "status": "SUCCESS",
                 "tools_count": tools_count,
                 "tools": tool_names,
-                "expected_count": 48,
+                "expected_count": 54,
                 "is_frozen": getattr(sys, "frozen", False),
                 "command": cmd,
                 "args": args,
@@ -2901,6 +3108,7 @@ class SnowWebServer:
             "relay_public_url",
             "public_url",
             "custom_url",
+            "default_hub_url",
         }
 
         current_cfg = load_tunnel_config()
@@ -3325,6 +3533,8 @@ class SnowWebServer:
         app.router.add_get("/api/relay/status", self.handle_api_relay_status)
         app.router.add_get("/api/relay/config", self.handle_api_relay_config_get)
         app.router.add_post("/api/relay/config", self.handle_api_relay_config_post)
+        app.router.add_get("/api/settings/hub", self.handle_api_settings_hub_get)
+        app.router.add_post("/api/settings/hub", self.handle_api_settings_hub_post)
         app.router.add_get("/api/mcp-gateway/status", self.handle_api_mcp_gateway_status)
 
         # Screen streaming & Camera delivery routes (Phase 26A)
@@ -3363,9 +3573,11 @@ class SnowWebServer:
         app.router.add_post("/api/account-discovery/config", self.handle_api_account_discovery_config)
 
         # Cross-Network Federation & Session Controls (Phase 30)
+        app.router.add_get("/api/directory/resolve/{snow_id}", self.handle_api_directory_resolve)
         app.router.add_get("/api/federation/grants", self.handle_api_federation_grants)
         app.router.add_post("/api/federation/invite", self.handle_api_federation_invite)
         app.router.add_post("/api/federation/accept", self.handle_api_federation_accept)
+        app.router.add_post("/api/federation/tier", self.handle_api_federation_tier)
         app.router.add_post("/api/federation/revoke", self.handle_api_federation_revoke)
         app.router.add_post("/api/federation/kill-switch", self.handle_api_federation_kill_switch)
 

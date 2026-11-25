@@ -65,7 +65,7 @@ class Stage51ReleaseRegressionTest {
 
         assertEquals("USB • Zero Data", resolveTransportBadge("127.0.0.1:8765"))
         assertEquals("USB • Zero Data", resolveTransportBadge("localhost:8765"))
-        assertEquals("Relay • Uses Data", resolveTransportBadge("https://snow-relay.onrender.com:8770"))
+        assertEquals("Remote • Uses Data", resolveTransportBadge("https://snow-relay.onrender.com:8770"))
         assertEquals("Wi-Fi • Zero Data", resolveTransportBadge("192.168.1.42:8765"))
 
         val transferClientSrc = resolveModuleFile("src/main/java/org/snow/transfer/FileTransferClient.kt").readText()

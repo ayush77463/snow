@@ -1524,13 +1524,22 @@ class SnowIpcServer:
             device_id = payload_data.get("device_id")
             profile = (payload_data.get("profile") or "").strip().lower()
 
-            if not device_id or profile not in ("full_control", "files_and_clipboard", "clipboard_only"):
+            if not device_id or profile not in (
+                "full_control",
+                "files_and_clipboard",
+                "files_only",
+                "clipboard_only",
+                "not_allowed",
+            ):
                 return {
                     "version": IPC_PROTOCOL_VERSION,
                     "request_id": request_id,
                     "success": False,
                     "status": "INVALID_ARGUMENT",
-                    "error": "Missing or invalid 'device_id' or 'profile' ('full_control'/'files_and_clipboard'/'clipboard_only' required).",
+                    "error": (
+                        "Missing or invalid 'device_id' or 'profile' "
+                        "('full_control'/'files_and_clipboard'/'files_only'/'clipboard_only'/'not_allowed' required)."
+                    ),
                 }, now_authed
 
             paired_dev = self.core_server.db_manager.get_paired_device(device_id)
@@ -1927,7 +1936,22 @@ class SnowIpcServer:
                 )
 
             fp = cert_info.fingerprint_sha256 if cert_info else ""
+            from snow.core.config import resolve_default_hub_url
+            from snow.security.identity import load_or_create_network_key_identity
             from snow.security.pairing import create_qr_pairing_payload
+
+            try:
+                key_ident = load_or_create_network_key_identity()
+                network_key_id = key_ident.network_id
+            except Exception:
+                network_key_id = ""
+            hub_url = resolve_default_hub_url(db_manager=getattr(cs, "db_manager", None)) or None
+            handshake_token = pm.issue_handshake_token(
+                host_device_id=node_id,
+                network_id=network_key_id,
+                trust_tier=trust_tier,
+                ttl_seconds=pm.pin_lifetime or 120.0,
+            )
 
             try:
                 qr_payload = create_qr_pairing_payload(
@@ -1937,6 +1961,9 @@ class SnowIpcServer:
                     cert_fingerprint=fp,
                     pin=pin,
                     trust_tier=trust_tier,
+                    handshake_token=handshake_token,
+                    network_id=network_key_id or None,
+                    hub_url=hub_url,
                 )
                 return {
                     "version": IPC_PROTOCOL_VERSION,

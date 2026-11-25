@@ -63,9 +63,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
         fun normalizeAccessProfile(raw: String): String {
             return when (raw.trim().lowercase()) {
-                "files_and_clipboard", "files & clipboard", "files_only", "files & clip" -> "files_and_clipboard"
+                "full_control", "full control", "full" -> "full_control"
+                "files_and_clipboard", "files & clipboard", "files & clip" -> "files_and_clipboard"
+                "files_only", "files only" -> "files_only"
                 "clipboard_only", "clipboard only", "read_only", "clip only" -> "clipboard_only"
-                else -> "full_control"
+                "not_allowed", "not allowed", "none", "blocked", "deny" -> "not_allowed"
+                else -> "not_allowed"
             }
         }
 
@@ -595,6 +598,33 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         _revocationNotice.value = reason?.takeIf { it.isNotBlank() } ?: "Device access revoked by PC host."
     }
 
+    fun pairDeviceWithHandshakeToken(
+        handshakeToken: String,
+        networkId: String? = null,
+        onStateChanged: ((PairingState) -> Unit)? = null
+    ) {
+        val client = serviceRef?.client
+        if (client == null) {
+            appendLog("WARN", TAG, "Cannot complete QR handshake pairing: WebSocket client not connected.")
+            onStateChanged?.invoke(PairingState.Error("WebSocket client not connected."))
+            return
+        }
+        appendLog("INFO", TAG, "Submitting single-use QR handshake token...")
+        pairingFlow.submitHandshakeToken(handshakeToken, networkId, client) { state ->
+            appendLog("INFO", TAG, "QR handshake pairing state changed: $state")
+            if (state is PairingState.Paired) {
+                client.setAuthenticated(state.sessionId, state.trustTier, state.desktopName, state.deviceType)
+                _authState.value = AuthState.Authenticated(
+                    state.sessionId,
+                    state.trustTier,
+                    state.desktopName,
+                    state.deviceType
+                )
+            }
+            onStateChanged?.invoke(state)
+        }
+    }
+
     fun pairDevice(pin: String, onStateChanged: ((PairingState) -> Unit)? = null) {
         val client = serviceRef?.client
         if (client == null) {
@@ -872,13 +902,26 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val nodeId = payload.optString("id", "").trim()
         val port = payload.optInt("port", 8765)
         val pin = payload.optString("pin", "").trim()
+        val handshakeToken = payload.optString("handshake_token", "").trim()
+        val networkId = payload.optString("network_id", "").trim()
+        val hubUrl = payload.optString("hub_url", "").trim()
         val fp = payload.optString("fp", "").replace(":", "").replace(" ", "").trim()
 
-        if (nodeId.isEmpty() || pin.length != 6 || !pin.all { it.isDigit() } || fp.length != 64) {
-            val err = "Invalid QR payload schema (missing id, invalid 6-digit pin, or invalid fingerprint)."
+        val hasValidPin = pin.length == 6 && pin.all { it.isDigit() }
+        val hasValidHandshake = handshakeToken.length >= 16
+        if (nodeId.isEmpty() || (!hasValidPin && !hasValidHandshake) || fp.length != 64) {
+            val err = "Invalid QR payload schema (missing id, handshake token/pin, or invalid fingerprint)."
             appendLog("ERROR", TAG, err)
             onComplete(false, err)
             return
+        }
+
+        if (hubUrl.startsWith("https://") || hubUrl.startsWith("http://")) {
+            val normHub = normalizeRelayUrl(hubUrl)
+            if (normHub.isNotBlank()) {
+                updateRemoteRelayConfig(true, normHub)
+                appendLog("INFO", TAG, "QR onboarding configured Default Hub endpoint: $normHub")
+            }
         }
 
         val rawIps = payload.optJSONArray("ips")
@@ -967,8 +1010,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     onComplete(true, null)
                     return@launch
                 } else if (state == ConnectionState.CONNECTED && auth is AuthState.ConnectedUnauthenticated) {
-                    appendLog("INFO", TAG, "Connection established; auto-submitting pairing PIN from QR...")
-                    pairDevice(pin) { pState ->
+                    val onQrPairingResult: (PairingState) -> Unit = { pState ->
                         when (pState) {
                             is PairingState.Paired -> {
                                 appendLog("INFO", TAG, "QR pairing successful [tier=${pState.trustTier}]")
@@ -976,11 +1018,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                 onComplete(true, null)
                             }
                             is PairingState.WrongPin -> {
-                                appendLog("ERROR", TAG, "QR pairing failed: Invalid PIN (${pState.remainingAttempts} attempts remaining)")
+                                appendLog("ERROR", TAG, "QR pairing failed: Invalid credentials (${pState.remainingAttempts} attempts remaining)")
                                 onComplete(false, pState.message)
                             }
                             is PairingState.Expired -> {
-                                appendLog("ERROR", TAG, "QR pairing failed: PIN expired")
+                                appendLog("ERROR", TAG, "QR pairing failed: Credential expired")
                                 onComplete(false, pState.message)
                             }
                             is PairingState.Locked -> {
@@ -993,6 +1035,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                             }
                             else -> {}
                         }
+                    }
+                    if (hasValidHandshake) {
+                        appendLog("INFO", TAG, "Connection established; submitting single-use QR handshake token...")
+                        pairDeviceWithHandshakeToken(handshakeToken, networkId, onQrPairingResult)
+                    } else {
+                        appendLog("INFO", TAG, "Connection established; auto-submitting pairing PIN from QR...")
+                        pairDevice(pin, onQrPairingResult)
                     }
                     return@launch
                 } else if (state == ConnectionState.DISCONNECTED && attempts > 15) {
@@ -1025,8 +1074,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             return
         }
 
-        // 1. Check SNOW ID: Full (SNW-XXXX-XXXX) or Short (SNW-XXXX, DEV-XXXX)
-        val snowIdRegex = Regex("^(SNW-[A-Z0-9]{4}-[A-Z0-9]{4}|SNW-[A-Z0-9]{4}|DEV-[A-Z0-9]{4})$", RegexOption.IGNORE_CASE)
+        // 1. Check SNOW ID / Network ID: Full (SNW-XXXX-XXXX), Network (SNW-NET-XXXXXXXX), or Short
+        val snowIdRegex = Regex("^(SNW-NET-[A-F0-9]{8}|SNW-[A-Z0-9]{4}-[A-Z0-9]{4}|SNW-[A-Z0-9]{4}|DEV-[A-Z0-9]{4})$", RegexOption.IGNORE_CASE)
         if (snowIdRegex.matches(input)) {
             val upperSnowId = input.uppercase()
             appendLog("INFO", TAG, "Resolving connection for SNOW ID: $upperSnowId")
@@ -1057,12 +1106,47 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 return
             }
 
-            // Fallback: If remote relay is configured and enabled, attempt connecting via Remote Relay
-            val relayEndpoint = getRemoteRelayEndpoint()
-            if (isRemoteRelayEnabled() && relayEndpoint.isNotBlank()) {
-                appendLog("INFO", TAG, "Local resolution failed for $upperSnowId; falling back to configured Remote Relay: $relayEndpoint")
-                connectRelay(relayEndpoint)
-                onResult(true, "Connecting to $upperSnowId via Remote Relay", "relay")
+            // Hub directory resolution fallback (GET /v1/directory/resolve/{snowId}) before relay cascade
+            val hubBase = getRemoteRelayEndpoint()
+                .replace("wss://", "https://")
+                .replace("ws://", "http://")
+                .removeSuffix("/v1/tunnel")
+                .trimEnd('/')
+            if (hubBase.startsWith("https://") || hubBase.startsWith("http://")) {
+                repoScope.launch(Dispatchers.IO) {
+                    var resolvedOnline = false
+                    try {
+                        val req = okhttp3.Request.Builder()
+                            .url("$hubBase/v1/directory/resolve/${java.net.URLEncoder.encode(upperSnowId, "UTF-8")}")
+                            .get()
+                            .build()
+                        val httpClient = okhttp3.OkHttpClient.Builder()
+                            .callTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                            .build()
+                        httpClient.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val bodyStr = resp.body?.string() ?: "{}"
+                                val obj = org.json.JSONObject(bodyStr)
+                                resolvedOnline = obj.optBoolean("online", false) || obj.has("network_id") || obj.has("snow_id")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        appendLog("WARN", TAG, "Hub directory lookup failed for $upperSnowId: ${e.message}")
+                    }
+                    kotlinx.coroutines.withContext(Dispatchers.Main) {
+                        val relayEp = getRemoteRelayEndpoint()
+                        if (resolvedOnline && relayEp.isNotBlank()) {
+                            connectRelay(relayEp)
+                            onResult(true, "Connecting to $upperSnowId via Cloud Hub Directory", "hub_directory")
+                        } else if (isRemoteRelayEnabled() && relayEp.isNotBlank()) {
+                            connectRelay(relayEp)
+                            onResult(true, "Connecting to $upperSnowId via Remote Relay", "relay")
+                        } else {
+                            connect("127.0.0.1", 8765)
+                            onResult(true, "Initiated transport cascade for $upperSnowId", "cascade")
+                        }
+                    }
+                }
                 return
             }
 
@@ -3696,7 +3780,8 @@ fun resolveTransportBadge(endpoint: String?): String {
         ep.startsWith("127.0.0.1") || ep.startsWith("localhost") -> "USB • Zero Data"
         ep.contains("relay", ignoreCase = true) ||
             ep.contains("tunnel", ignoreCase = true) ||
-            ep.contains(":8770") -> "Relay • Uses Data"
+            ep.contains("hub", ignoreCase = true) ||
+            ep.contains(":8770") -> "Remote • Uses Data"
         else -> "Wi-Fi • Zero Data"
     }
 }

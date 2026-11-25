@@ -145,11 +145,13 @@ class Stage5CClosureRegressionTest {
         assertTrue(fgSource.contains("SnowUiRepository.PREF_KEY_PERMISSION_PROFILE"))
 
         assertEquals("full_control", SnowUiRepository.normalizeAccessProfile("FULL"))
-        assertEquals("files_and_clipboard", SnowUiRepository.normalizeAccessProfile("FILES_ONLY"))
+        assertEquals("files_only", SnowUiRepository.normalizeAccessProfile("FILES_ONLY"))
         assertEquals("clipboard_only", SnowUiRepository.normalizeAccessProfile("READ_ONLY"))
         assertEquals("files_and_clipboard", SnowUiRepository.normalizeAccessProfile("files_and_clipboard"))
         assertEquals("clipboard_only", SnowUiRepository.normalizeAccessProfile("clipboard_only"))
         assertEquals("full_control", SnowUiRepository.normalizeAccessProfile("full_control"))
+        assertEquals("not_allowed", SnowUiRepository.normalizeAccessProfile("not_allowed"))
+        assertEquals("not_allowed", SnowUiRepository.normalizeAccessProfile("unknown_tier"))
 
         val devicesSource = resolveModuleFile("src/main/java/org/snow/ui/devices/DevicesScreen.kt").readText()
         assertTrue(devicesSource.contains("\"Full Control\""))

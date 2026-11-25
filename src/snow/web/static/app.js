@@ -1745,7 +1745,11 @@
         // Federation Controls
         document.getElementById("btn-federation-gen-invite")?.addEventListener("click", async () => {
             showNotificationToast("Generating 9-digit federation invite...", "info");
-            const res = await apiRequest("/api/federation/invite", "POST", { ttl_seconds: 600 });
+            const permTier = document.getElementById("federation-invite-tier")?.value || "files_and_clipboard";
+            const res = await apiRequest("/api/federation/invite", "POST", {
+                ttl_seconds: 600,
+                permission_tier: permTier,
+            });
             const displayInvite = document.getElementById("federation-invite-display");
             const code = res?.code || res?.invite_code;
             if (res && res.success && code && displayInvite) {
@@ -1852,7 +1856,7 @@
 
     async function handleUnifiedConnectInput(rawVal) {
         if (!rawVal) {
-            showNotificationToast("Enter a 9-digit invite code or peer IP:port.", "warning");
+            showNotificationToast("Enter a SNOW ID (SNW-...) or 9-digit network invite code.", "warning");
             return;
         }
         const digitsOnly = rawVal.replace(/\D/g, "");
@@ -1868,6 +1872,28 @@
             return;
         }
 
+        const cleanId = rawVal.trim().toUpperCase();
+        if (/^SNW-(NET-[A-F0-9]{8}|[A-Z0-9]{4}-[A-Z0-9]{4})$/i.test(cleanId)) {
+            showNotificationToast(`Resolving SNOW ID ${cleanId}...`, "info");
+            const dirRes = await apiRequest(`/api/directory/resolve/${encodeURIComponent(cleanId)}`);
+            if (!dirRes || !dirRes.found) {
+                showNotificationToast(dirRes?.error || `No online peer found for ${cleanId}.`, "error");
+                return;
+            }
+            if (dirRes.host) {
+                const connRes = await apiRequest("/api/devices/connect-peer", "POST", { snow_id: cleanId });
+                if (connRes && connRes.success) {
+                    showNotificationToast(`Connected to ${cleanId}!`, "success");
+                    refreshAllData();
+                } else {
+                    showNotificationToast(connRes?.error || `Found ${cleanId} via ${dirRes.source || "directory"}, pairing confirmation may be required.`, "info");
+                }
+                return;
+            }
+            showNotificationToast(`Resolved ${cleanId} via cloud hub directory!`, "success");
+            return;
+        }
+
         const parsed = parseHostAndPort(rawVal);
         if (!parsed) return;
         showNotificationToast(`Connecting to ${parsed.host}:${parsed.port}...`, "info");
@@ -1876,7 +1902,7 @@
             showNotificationToast("Connected to peer device!", "success");
             refreshAllData();
         } else {
-            showNotificationToast(res?.error || "Connection failed (use Manual IP section if PIN required)", "error");
+            showNotificationToast(res?.error || "Connection failed (check Advanced Diagnostics if manual PIN needed)", "error");
         }
     }
 
@@ -1969,8 +1995,10 @@
                     <div class="flex items-center gap-2">
                         <select class="form-input text-xs dev-profile-select" style="width: auto; padding: 5px 8px;" title="Permission Profile">
                             <option value="full_control" ${permProf === "full_control" ? "selected" : ""}>Full Control</option>
-                            <option value="files_and_clipboard" ${permProf === "files_and_clipboard" ? "selected" : ""}>Files &amp; Clip</option>
-                            <option value="clipboard_only" ${permProf === "clipboard_only" ? "selected" : ""}>Clip Only</option>
+                            <option value="files_and_clipboard" ${permProf === "files_and_clipboard" ? "selected" : ""}>Files &amp; Clipboard</option>
+                            <option value="files_only" ${permProf === "files_only" ? "selected" : ""}>Files Only</option>
+                            <option value="clipboard_only" ${permProf === "clipboard_only" ? "selected" : ""}>Clipboard Only</option>
+                            <option value="not_allowed" ${permProf === "not_allowed" ? "selected" : ""}>Not Allowed</option>
                         </select>
                         <select class="form-input text-xs dev-connmode-select" style="width: auto; padding: 5px 8px;" title="Connection Mode">
                             <option value="auto" ${connMode === "auto" ? "selected" : ""}>Auto</option>
@@ -2239,19 +2267,41 @@
         if (federationGrants.length > 0) {
             federationGrants.forEach(g => {
                 const row = document.createElement("div");
-                row.className = "flex items-center justify-between text-xs p-2";
+                row.className = "flex items-center justify-between text-xs p-2 gap-2";
                 row.style.background = "var(--snow-bg-elevated)";
                 row.style.borderRadius = "var(--snow-radius-sm)";
                 row.style.border = "1px solid var(--snow-border)";
                 const label = g.network_name || g.peer_node_name || g.peer_node_id || g.grant_id;
                 const status = g.status || "ACTIVE";
+                const curTier = g.permission_tier || "files_and_clipboard";
                 row.innerHTML = `
-                    <div class="flex flex-col min-w-0">
+                    <div class="flex flex-col min-w-0 flex-1">
                         <strong class="truncate text-primary">${escapeHtml(label)}</strong>
                         <span class="text-muted">${escapeHtml(g.direction || "INBOUND")} • ${escapeHtml(status)}</span>
                     </div>
-                    ${status === "ACTIVE" ? `<button class="btn btn-xs btn-danger btn-revoke-grant">Revoke</button>` : `<span class="chip chip-sm chip-neutral">${escapeHtml(status)}</span>`}
+                    ${status === "ACTIVE" ? `
+                        <select class="form-input text-xs fed-tier-select" style="width: auto; padding: 3px 6px;" title="Grant Permission Tier">
+                            <option value="full_control" ${curTier === "full_control" ? "selected" : ""}>Full Control</option>
+                            <option value="files_and_clipboard" ${curTier === "files_and_clipboard" ? "selected" : ""}>Files &amp; Clipboard</option>
+                            <option value="files_only" ${curTier === "files_only" ? "selected" : ""}>Files Only</option>
+                            <option value="clipboard_only" ${curTier === "clipboard_only" ? "selected" : ""}>Clipboard Only</option>
+                            <option value="not_allowed" ${curTier === "not_allowed" ? "selected" : ""}>Not Allowed</option>
+                        </select>
+                        <button class="btn btn-xs btn-danger btn-revoke-grant">Revoke</button>
+                    ` : `<span class="chip chip-sm chip-neutral">${escapeHtml(status)}</span>`}
                 `;
+                row.querySelector(".fed-tier-select")?.addEventListener("change", async (e) => {
+                    const tierRes = await apiRequest("/api/federation/tier", "POST", {
+                        grant_id: g.grant_id,
+                        permission_tier: e.target.value,
+                    });
+                    if (tierRes && tierRes.success) {
+                        showNotificationToast(`Updated federation tier to ${e.target.value}.`, "success");
+                        refreshAllData();
+                    } else {
+                        showNotificationToast(tierRes?.error || "Failed updating federation tier", "error");
+                    }
+                });
                 row.querySelector(".btn-revoke-grant")?.addEventListener("click", async () => {
                     await apiRequest("/api/federation/revoke", "POST", { grant_id: g.grant_id });
                     showNotificationToast("Federation grant revoked.", "info");
@@ -2978,12 +3028,25 @@
 
     function initAiSettingsView() {
         document.getElementById("btn-mcp-test-local")?.addEventListener("click", async () => {
-            showNotificationToast("Testing 48 local FastMCP tools...", "info");
+            showNotificationToast("Testing 54 local FastMCP tools...", "info");
             const res = await apiRequest("/api/mcp/test-local", "POST", {});
             if (res && res.success) {
-                showNotificationToast(`All ${res.tools_count || 48} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
+                showNotificationToast(`All ${res.tools_count || 54} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
             } else {
                 showNotificationToast(res?.error || "MCP self-test failed", "error");
+            }
+        });
+
+        document.getElementById("btn-save-default-hub-url")?.addEventListener("click", async () => {
+            const inp = document.getElementById("setting-default-hub-url");
+            const val = inp ? inp.value.trim() : "";
+            const res = await apiRequest("/api/settings/hub", "POST", { default_hub_url: val });
+            if (res && res.success) {
+                showNotificationToast(val ? "Default Hub URL saved." : "Default Hub URL cleared.", "success");
+                loadHubSettings();
+                loadAiTunnelStatus();
+            } else {
+                showNotificationToast(res?.error || "Invalid Hub URL", "error");
             }
         });
 
@@ -3197,9 +3260,23 @@
         await Promise.all([
             loadAiHostStatus(),
             loadAiTunnelStatus(),
+            loadHubSettings(),
             loadApprovals(),
             loadActivityTimeline(),
         ]);
+    }
+
+    async function loadHubSettings() {
+        const res = await apiRequest("/api/settings/hub");
+        if (!res || !res.success) return;
+        const hubInp = document.getElementById("setting-default-hub-url");
+        const netBadge = document.getElementById("diag-network-key-id");
+        const mcpRouteEl = document.getElementById("diag-hub-permanent-mcp");
+        if (hubInp && document.activeElement !== hubInp) {
+            hubInp.value = res.default_hub_url || "";
+        }
+        if (netBadge) netBadge.textContent = res.network_id || "--";
+        if (mcpRouteEl) mcpRouteEl.textContent = res.permanent_mcp_url || "Configure Default Hub URL";
     }
 
     async function loadAiHostStatus() {
@@ -3245,7 +3322,7 @@
 
         if (statusRes && statusRes.active && statusRes.public_url) {
             if (statusBadge) {
-                statusBadge.textContent = "Active • 48 Tools Ready";
+                statusBadge.textContent = "Active • 54 Tools Ready";
                 statusBadge.className = "chip chip-emerald";
             }
             if (btnToggle) btnToggle.textContent = "Stop Tunnel";

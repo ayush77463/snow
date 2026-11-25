@@ -164,8 +164,8 @@ def validate_registry() -> tuple[bool, list[str]]:
         if not isinstance(meta.tier, str) or not meta.tier.strip():
             errors.append(f"Capability '{name}': tier must be non-empty string.")
 
-    if len(_CAPABILITY_REGISTRY) != 48:
-        errors.append(f"Expected exactly 48 registered capabilities (42 V5.1.0 baseline + 6 V5.2 Stage 6A additions), found {len(_CAPABILITY_REGISTRY)}.")
+    if len(_CAPABILITY_REGISTRY) != 54:
+        errors.append(f"Expected exactly 54 registered capabilities (48 Stage 6A baseline + 6 V5.2 Stage 6B additions), found {len(_CAPABILITY_REGISTRY)}.")
 
     return (len(errors) == 0, errors)
 
@@ -668,6 +668,69 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         requires_approval=False,
         os_classification="cross_platform",
         description="List secret-redacted cross-network federation grants and peer reachability state.",
+    ),
+    # -------------------------------------------------------------------------
+    # V5.2.0 Stage 6B Additions (6 new tools -> 54 total)
+    # -------------------------------------------------------------------------
+    CapabilityMetadata(
+        name="snow_android_whatsapp_send",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="android",
+        description="Prepare an explicit-consent WhatsApp message draft on a connected Android phone (requires user tap to send).",
+    ),
+    CapabilityMetadata(
+        name="snow_android_notification_reply",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="android",
+        description="Reply directly to an active Android notification supporting RemoteInput direct reply.",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_hotkey",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=False,
+        os_classification="windows",
+        description="Trigger an allowlisted Windows keyboard shortcut (win+d, alt+tab, ctrl+shift+s, win+tab, ctrl+c, ctrl+v, win+e, alt+f4 [approval gated]).",
+    ),
+    CapabilityMetadata(
+        name="snow_windows_brightness_set",
+        category=ToolCategory.LOCAL_WINDOWS,
+        tier=ToolCategory.LOCAL_WINDOWS.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="windows",
+        description="Set the primary Windows display brightness percentage cleanly between 0 and 100.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_dnd_toggle",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Toggle Do Not Disturb mode on a connected Android phone when Notification Policy Access is granted.",
+    ),
+    CapabilityMetadata(
+        name="snow_cross_network_execute",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="cross_platform",
+        description="Execute an authorized capability on an explicit federated peer device within active 5-tier grant boundaries.",
     ),
 ]
 

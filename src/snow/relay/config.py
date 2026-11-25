@@ -27,6 +27,12 @@ class RelayConfig:
     default_snow_id: Optional[str] = None
     max_http_forward_bytes: int = 2 * 1024 * 1024
     http_forward_timeout_seconds: float = 30.0
+    host_lease_seconds: float = 60.0
+    hub_challenge_ttl_seconds: float = 60.0
+    hub_session_ttl_seconds: float = 3600.0
+    max_hub_challenges: int = 2048
+    max_hub_sessions: int = 4096
+    max_hosts_per_network: int = 16
 
     @classmethod
     def from_env(cls) -> RelayConfig:
@@ -49,4 +55,10 @@ class RelayConfig:
             default_snow_id=raw_default_snow,
             max_http_forward_bytes=int(os.getenv("SNOW_RELAY_MAX_HTTP_FORWARD_BYTES", str(2 * 1024 * 1024))),
             http_forward_timeout_seconds=float(os.getenv("SNOW_RELAY_HTTP_FORWARD_TIMEOUT_SEC", "30.0")),
+            host_lease_seconds=float(os.getenv("SNOW_RELAY_HOST_LEASE_SEC", "60.0")),
+            hub_challenge_ttl_seconds=float(os.getenv("SNOW_RELAY_HUB_CHALLENGE_TTL_SEC", "60.0")),
+            hub_session_ttl_seconds=float(os.getenv("SNOW_RELAY_HUB_SESSION_TTL_SEC", "3600.0")),
+            max_hub_challenges=int(os.getenv("SNOW_RELAY_MAX_HUB_CHALLENGES", "2048")),
+            max_hub_sessions=int(os.getenv("SNOW_RELAY_MAX_HUB_SESSIONS", "4096")),
+            max_hosts_per_network=int(os.getenv("SNOW_RELAY_MAX_HOSTS_PER_NETWORK", "16")),
         )

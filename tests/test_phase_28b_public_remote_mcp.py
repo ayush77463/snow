@@ -395,7 +395,7 @@ class TestPhase28BRemoteMcpGateway(AioHTTPTestCase):
         result = data.get("result", {})
         tools = result.get("tools", [])
 
-        self.assertEqual(len(tools), 48, f"Expected 48 capabilities, found {len(tools)}")
+        self.assertEqual(len(tools), 54, f"Expected 54 capabilities, found {len(tools)}")
 
         # Verify each tool has annotations with strict boolean values
         for tool in tools:

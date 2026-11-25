@@ -1,4 +1,4 @@
-# Minimal, secure container image for self-hosting the SNOW Relay Service
+# Minimal, secure container image for self-hosting the SNOW Relay Service (Render Free Tier)
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -6,13 +6,19 @@ WORKDIR /app
 # Non-root user for security
 RUN groupadd -r snow && useradd -r -g snow snow
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir .
+# Install only the runtime dependencies genuinely required by snow.relay
+RUN pip install --no-cache-dir \
+    "aiohttp>=3.10.0" \
+    "cryptography>=43.0.0"
 
-COPY src/ /app/src/
+# Copy only the minimal snow.relay package structure (no desktop modules, databases, or secrets)
+RUN mkdir -p /app/src/snow/relay && chown -R snow:snow /app
+COPY --chown=snow:snow src/snow/__init__.py /app/src/snow/__init__.py
+COPY --chown=snow:snow src/snow/relay/ /app/src/snow/relay/
 
 ENV PYTHONPATH="/app/src"
 ENV SNOW_RELAY_HOST="0.0.0.0"
+ENV SNOW_RELAY_ENABLED="1"
 
 EXPOSE 8770
 

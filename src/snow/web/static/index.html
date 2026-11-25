@@ -448,7 +448,15 @@
                                         <h3 class="card-title">Cross-Network Federation</h3>
                                         <span class="chip chip-sm chip-cyan">Anti-transitive</span>
                                     </div>
-                                    <button id="btn-federation-kill-switch" class="btn btn-xs btn-danger">Kill Switch</button>
+                                    <div class="flex items-center gap-2">
+                                        <select id="federation-invite-tier" class="form-input text-xs" style="width: auto; padding: 4px 8px;" title="Default Tier for New Network Invite">
+                                            <option value="files_and_clipboard" selected>Files &amp; Clipboard</option>
+                                            <option value="full_control">Full Control</option>
+                                            <option value="files_only">Files Only</option>
+                                            <option value="clipboard_only">Clipboard Only</option>
+                                        </select>
+                                        <button id="btn-federation-kill-switch" class="btn btn-xs btn-danger">Kill Switch</button>
+                                    </div>
                                 </div>
                                 <p class="text-xs text-muted">9-digit mutual invites with explicit capability and TTL scoping. Zero privilege inheritance.</p>
                                 <div class="flex items-center gap-2 flex-wrap">
@@ -502,7 +510,7 @@
                                     </div>
                                     <div class="text-xs text-muted truncate">Fingerprint: <span id="pairing-device-fp" class="mono">--</span></div>
                                     <div class="flex gap-2">
-                                        <input type="text" id="pairing-input" class="form-input" placeholder="Enter 192.168.x.x:8765 or 9-digit code">
+                                        <input type="text" id="pairing-input" class="form-input" placeholder="Enter SNOW ID (SNW-...) or 9-digit network code">
                                         <button id="btn-pairing-connect" class="btn btn-primary btn-sm">Connect</button>
                                     </div>
                                     <div class="flex gap-2">
@@ -715,7 +723,7 @@
                         <div class="card-header-row">
                             <div class="flex items-center gap-2">
                                 <h3 class="card-title">Connect AI Assistants</h3>
-                                <span class="chip chip-sm chip-emerald">FastMCP 48 Tools</span>
+                                <span class="chip chip-sm chip-emerald">FastMCP 54 Tools</span>
                             </div>
                             <button id="btn-mcp-test-local" class="btn btn-sm btn-tonal">Test Local MCP</button>
                         </div>
@@ -771,7 +779,7 @@
                             </div>
                             <button id="btn-mcp-tunnel-toggle" class="btn btn-sm btn-primary">Start Tunnel</button>
                         </div>
-                        <p class="text-xs text-muted">Exposes the 48-tool MCP gateway with OAuth 2.1 human-in-the-loop approval.</p>
+                        <p class="text-xs text-muted">Exposes the 54-tool MCP gateway with OAuth 2.1 human-in-the-loop approval.</p>
                         <div class="flex gap-2">
                             <input type="text" id="mcp-tunnel-url-display" class="form-input text-xs mono" readonly value="http://127.0.0.1:8771/mcp">
                             <button id="btn-mcp-copy-url" class="btn btn-sm btn-tonal">Copy Link</button>
@@ -863,13 +871,24 @@
                                     </div>
                                 </div>
 
-                                <!-- Collapsed Accordion for Technical Ports -->
+                                <!-- Collapsed Accordion for Technical Ports & Default Hub URL -->
                                 <details class="advanced-accordion">
                                     <summary>
-                                        <span>Technical Ports &amp; Loopback Architecture</span>
-                                        <span class="chip chip-sm chip-neutral">View Ports</span>
+                                        <span>Technical Ports &amp; Loopback Architecture &amp; Default Cloud Hub</span>
+                                        <span class="chip chip-sm chip-neutral">Advanced</span>
                                     </summary>
-                                    <div class="flex flex-col gap-2 mt-2 text-xs text-muted">
+                                    <div class="flex flex-col gap-3 mt-2 text-xs text-muted">
+                                        <div class="form-group">
+                                            <div class="flex items-center justify-between gap-2">
+                                                <label class="form-label" for="setting-default-hub-url">Default SNOW Hub URL (Zero-Setup Relay)</label>
+                                                <span id="diag-network-key-id" class="chip chip-sm chip-cyan mono">--</span>
+                                            </div>
+                                            <div class="flex gap-2">
+                                                <input type="text" id="setting-default-hub-url" class="form-input text-xs mono" placeholder="https://snow-relay.onrender.com">
+                                                <button id="btn-save-default-hub-url" class="btn btn-xs btn-primary">Save Hub</button>
+                                            </div>
+                                            <div class="text-xs text-muted truncate mt-1">Permanent MCP Route: <span id="diag-hub-permanent-mcp" class="mono text-primary">--</span></div>
+                                        </div>
                                         <div>Web Dashboard Binding: <strong id="diag-port" class="mono text-primary">127.0.0.1:8769</strong></div>
                                         <div class="flex gap-1 flex-wrap mono">
                                             <span class="chip chip-sm chip-cyan">:8765 Control WSS</span>
@@ -918,7 +937,7 @@
                     <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                 </button>
             </div>
-            <p class="text-xs text-muted">Scan QR with SNOW Mobile, or enter a 9-digit federation invite or peer LAN address.</p>
+            <p class="text-xs text-muted">Scan QR with SNOW Mobile (zero-PIN handshake), or connect using a SNOW ID or 9-digit network invite code.</p>
             <div class="flex gap-4 items-center">
                 <div id="modal-qr-container" class="flex items-center justify-center p-2" style="background: #FFF; width: 140px; height: 140px; border-radius: var(--snow-radius-md); flex-shrink: 0;"></div>
                 <div class="flex flex-col gap-2 flex-1 min-w-0">
@@ -940,17 +959,17 @@
             </div>
 
             <div class="form-group">
-                <label class="form-label">9-Digit Federation Invite Code or IP:Port</label>
+                <label class="form-label">SNOW ID or 9-Digit Network Invite Code</label>
                 <div class="flex gap-2">
-                    <input type="text" id="modal-connect-input" class="form-input mono" placeholder="e.g. 123-456-789 or 192.168.1.50:8765">
+                    <input type="text" id="modal-connect-input" class="form-input mono" placeholder="e.g. SNW-A1B2-C3D4 or 123-456-789">
                     <button id="btn-modal-connect-submit" class="btn btn-primary btn-sm">Connect</button>
                 </div>
             </div>
 
-            <details class="peer-connect-accordion">
+            <details class="peer-connect-accordion" id="connect-advanced-accordion">
                 <summary>
-                    <span>Connect to Peer Host (Manual IP &amp; PIN)</span>
-                    <span class="text-xs text-cyan">LAN Direct</span>
+                    <span>Advanced Diagnostics (Manual Peer IP &amp; PIN)</span>
+                    <span class="text-xs text-cyan">LAN Manual</span>
                 </summary>
                 <div class="flex flex-col gap-2 mt-2">
                     <div class="flex gap-2">

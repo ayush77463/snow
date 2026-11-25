@@ -558,6 +558,17 @@ class RemoteMcpGateway:
             safe_req_id = html.escape(req_id)
             safe_poll_tok = html.escape(poll_token)
 
+            raw_prefix = ""
+            if get_client_ip(request, trusted_proxies=None) in self.trusted_proxies:
+                cand_prefix = (request.headers.get("X-Forwarded-Prefix") or "").strip().rstrip("/")
+                if re.match(r"^/u/(SNW-NET-[A-F0-9]{8}|SNW-[A-Z0-9]{4}-[A-Z0-9]{4})$", cand_prefix):
+                    raw_prefix = cand_prefix
+            if not raw_prefix and self.public_url:
+                pub_path = urllib.parse.urlparse(self.public_url).path.rstrip("/")
+                if re.match(r"^/u/(SNW-NET-[A-F0-9]{8}|SNW-[A-Z0-9]{4}-[A-Z0-9]{4})$", pub_path):
+                    raw_prefix = pub_path
+            safe_prefix = html.escape(raw_prefix)
+
             consent_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -760,7 +771,7 @@ class RemoteMcpGateway:
 <body>
   <main class="card">
     <div class="brand-row">
-      <img src="/snow_logo.png" alt="SNOW Logo" class="brand-logo" width="40" height="40">
+      <img src="{safe_prefix}/snow_logo.png" alt="SNOW Logo" class="brand-logo" width="40" height="40">
       <div>
         <h1>SNOW MCP Authorization</h1>
         <p class="subtitle">OAuth 2.1 + PKCE Capability Bridge</p>
@@ -793,7 +804,7 @@ class RemoteMcpGateway:
 
     <div id="oauth-live-status" class="status-note" role="status" aria-live="polite"></div>
 
-    <form method="POST" action="/oauth/authorize">
+    <form method="POST" action="{safe_prefix}/oauth/authorize">
       <input type="hidden" name="client_id" value="{safe_client_id}">
       <input type="hidden" name="redirect_uri" value="{safe_redirect}">
       <input type="hidden" name="response_type" value="code">
@@ -815,11 +826,12 @@ class RemoteMcpGateway:
     (function () {{
       var reqId = "{safe_req_id}";
       var pollTok = "{safe_poll_tok}";
+      var apiPrefix = "{safe_prefix}";
       var statusEl = document.getElementById("oauth-live-status");
       if (!reqId || !pollTok) return;
       var pollTimer = setInterval(async function () {{
         try {{
-          var res = await fetch("/oauth/status?request_id=" + encodeURIComponent(reqId) + "&poll_token=" + encodeURIComponent(pollTok));
+          var res = await fetch(apiPrefix + "/oauth/status?request_id=" + encodeURIComponent(reqId) + "&poll_token=" + encodeURIComponent(pollTok));
           if (!res.ok) return;
           var data = await res.json();
           if (data.status === "APPROVED" && data.redirect_url) {{

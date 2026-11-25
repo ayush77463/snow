@@ -507,8 +507,8 @@ fun SettingsScreen(
 
                         Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
 
-                        // Remote Relay Endpoint Configuration
-                        Text(text = "Remote Relay Endpoint", style = SnowTypography.labelSmall, color = colors.textMuted)
+                        // Default Hub / Remote Relay Endpoint Configuration
+                        Text(text = "Default Hub / Relay Endpoint", style = SnowTypography.labelSmall, color = colors.textMuted)
                         Spacer(modifier = Modifier.height(6.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -517,7 +517,7 @@ fun SettingsScreen(
                             OutlinedTextField(
                                 value = relayInput,
                                 onValueChange = { relayInput = it },
-                                placeholder = { Text("wss://relay.example.com", style = SnowTypography.monospaceSmall) },
+                                placeholder = { Text("https://snow-relay.onrender.com", style = SnowTypography.monospaceSmall) },
                                 modifier = Modifier.weight(1f),
                                 singleLine = true,
                                 shape = RoundedCornerShape(10.dp)

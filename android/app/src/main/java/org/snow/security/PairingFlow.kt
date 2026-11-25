@@ -150,6 +150,65 @@ class PairingFlow(
     }
 
     /**
+     * Submit a single-use QR handshake token directly to the host (zero 6-digit PIN entry).
+     */
+    fun submitHandshakeToken(
+        handshakeToken: String,
+        networkId: String? = null,
+        client: SnowWebSocketClient,
+        onStateChanged: ((PairingState) -> Unit)? = null
+    ): Boolean {
+        val cleanToken = handshakeToken.trim()
+        if (cleanToken.length < 16) {
+            val errorState = PairingState.Error("Invalid QR handshake token.")
+            _state.value = errorState
+            onStateChanged?.invoke(errorState)
+            return false
+        }
+        if (_state.value is PairingState.Locked) {
+            return false
+        }
+        if (client.connectionState.value != ConnectionState.CONNECTED) {
+            val lostState = PairingState.ConnectionLost("Cannot complete QR handshake: Not connected.")
+            _state.value = lostState
+            onStateChanged?.invoke(lostState)
+            return false
+        }
+        if (!isSubmitting.compareAndSet(false, true)) {
+            return false
+        }
+        lastSubmitTimeMs = System.currentTimeMillis()
+        _state.value = PairingState.InProgress
+        onStateChanged?.invoke(PairingState.InProgress)
+
+        val manifestMap = DeviceNode.buildAndroidManifest(null).toMap()
+        val host = client.currentTargetHost
+        val isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
+        val requestData = mutableMapOf<String, Any>(
+            "device_id" to identity.deviceId,
+            "device_name" to identity.deviceName,
+            "handshake_token" to cleanToken,
+            "manifest" to manifestMap,
+            "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
+            "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
+        )
+        if (!networkId.isNullOrBlank()) {
+            requestData["network_id"] = networkId.trim().uppercase()
+        }
+
+        client.sendRequest(
+            action = "pair_request",
+            data = requestData
+        ) { message ->
+            isSubmitting.set(false)
+            val newState = handlePairingResponse(message)
+            _state.value = newState
+            onStateChanged?.invoke(newState)
+        }
+        return true
+    }
+
+    /**
      * Explicitly reset in-flight submission lock.
      */
     fun resetSubmitting() {

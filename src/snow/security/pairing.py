@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -97,6 +98,8 @@ class PairingManager:
         self._is_paired: bool = False
         self._paired_device_id: Optional[str] = None
         self._session_id: Optional[str] = None
+        # Single-use QR handshake tokens: sha256(token) -> metadata
+        self._handshake_tokens: dict[str, dict[str, Any]] = {}
 
     @property
     def is_locked(self) -> bool:
@@ -170,6 +173,164 @@ class PairingManager:
                 state["owner_pin"] = self._owner_pin
                 state["peer_pin"] = self._peer_pin
             return state
+
+    def issue_handshake_token(
+        self,
+        host_device_id: str,
+        network_id: str = "",
+        trust_tier: str = "owner",
+        ttl_seconds: float = 120.0,
+    ) -> str:
+        """Issue a single-use, host-bound, short-lived QR handshake token.
+
+        Enables zero-PIN Join-My-Network QR pairing while preserving explicit owner
+        initiation (only issued on explicit QR generation) and anti-replay protection.
+        """
+        clean_host = (host_device_id or "").strip()
+        if not clean_host:
+            raise ValueError("host_device_id is required to issue a handshake token.")
+        bounded_ttl = max(15.0, min(float(ttl_seconds), 300.0))
+        clean_tier = "peer" if str(trust_tier).strip().lower() == "peer" else "owner"
+        raw_token = secrets.token_urlsafe(24)
+        token_digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        now = self.time_provider()
+
+        with self._lock:
+            # Prune expired tokens and enforce bounded memory
+            expired_keys = [
+                k for k, meta in self._handshake_tokens.items()
+                if now >= float(meta.get("expires_at", 0.0)) or bool(meta.get("used"))
+            ]
+            for k in expired_keys:
+                self._handshake_tokens.pop(k, None)
+            while len(self._handshake_tokens) >= 32:
+                oldest_key = next(iter(self._handshake_tokens))
+                self._handshake_tokens.pop(oldest_key, None)
+
+            self._handshake_tokens[token_digest] = {
+                "host_device_id": clean_host,
+                "network_id": (network_id or "").strip().upper(),
+                "trust_tier": clean_tier,
+                "issued_at": now,
+                "expires_at": now + bounded_ttl,
+                "used": False,
+            }
+        return raw_token
+
+    def verify_handshake_token(
+        self,
+        token: str,
+        host_device_id: str,
+        client_device_id: Optional[str] = None,
+        network_id: str = "",
+    ) -> VerificationResult:
+        """Verify and atomically consume a single-use QR handshake token."""
+        with self._lock:
+            if self._is_locked:
+                return VerificationResult(
+                    outcome=PairingOutcome.LOCKED,
+                    message="Pairing is locked due to excessive failed attempts.",
+                    remaining_attempts=0,
+                )
+
+            clean_token = (token or "").strip()
+            clean_host = (host_device_id or "").strip()
+            clean_net = (network_id or "").strip().upper()
+            now = self.time_provider()
+
+            if len(clean_token) < 16 or len(clean_token) > 256:
+                return VerificationResult(
+                    outcome=PairingOutcome.INVALID_PIN,
+                    message="Malformed handshake token.",
+                    remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
+                )
+
+            digest = hashlib.sha256(clean_token.encode("utf-8")).hexdigest()
+            matched_key: Optional[str] = None
+            matched_entry: Optional[dict[str, Any]] = None
+            for k, meta in self._handshake_tokens.items():
+                if hmac.compare_digest(k, digest):
+                    matched_key = k
+                    matched_entry = meta
+                    break
+
+            if matched_entry is None:
+                self._failed_attempts += 1
+                if self._failed_attempts >= self.max_attempts:
+                    self._is_locked = True
+                return VerificationResult(
+                    outcome=PairingOutcome.INVALID_PIN,
+                    message="Invalid or unknown QR handshake token.",
+                    remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
+                )
+
+            if matched_entry.get("used"):
+                return VerificationResult(
+                    outcome=PairingOutcome.INVALID_PIN,
+                    message="QR handshake token has already been used.",
+                    remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
+                )
+
+            if now >= float(matched_entry.get("expires_at", 0.0)):
+                if matched_key:
+                    self._handshake_tokens.pop(matched_key, None)
+                return VerificationResult(
+                    outcome=PairingOutcome.EXPIRED,
+                    message="QR handshake token has expired. Generate a fresh QR code.",
+                    remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
+                )
+
+            bound_host = str(matched_entry.get("host_device_id", ""))
+            if not bound_host or not hmac.compare_digest(bound_host, clean_host):
+                return VerificationResult(
+                    outcome=PairingOutcome.INVALID_PIN,
+                    message="QR handshake token is not bound to this host.",
+                    remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
+                )
+
+            bound_net = str(matched_entry.get("network_id", ""))
+            if bound_net and clean_net and not hmac.compare_digest(bound_net, clean_net):
+                return VerificationResult(
+                    outcome=PairingOutcome.INVALID_PIN,
+                    message="QR handshake token is bound to a different SNOW network.",
+                    remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
+                )
+
+            # Consume atomically (single-use)
+            matched_entry["used"] = True
+            matched_entry["used_by"] = client_device_id or "unknown"
+            assigned_tier = str(matched_entry.get("trust_tier", "owner"))
+            self._is_paired = True
+            self._failed_attempts = 0
+            self._active_pin = None
+            self._owner_pin = None
+            self._peer_pin = None
+            self._pending_device_id = None
+            self._pending_device_name = None
+            session_id = str(uuid.uuid4())
+            self._session_id = session_id
+            self._paired_device_id = client_device_id
+
+            logger.info(
+                "QR handshake pairing succeeded for device [%s] (tier=%s, session_id=%s)",
+                client_device_id,
+                assigned_tier,
+                session_id,
+            )
+            return VerificationResult(
+                outcome=PairingOutcome.SUCCESS,
+                message="QR handshake pairing successful.",
+                remaining_attempts=self.max_attempts,
+                session_id=session_id,
+                paired_device_id=client_device_id,
+                assigned_trust_tier=assigned_tier,
+            )
+
+    def revoke_handshake_token(self, token: str) -> bool:
+        """Invalidate an unused QR handshake token."""
+        digest = hashlib.sha256((token or "").strip().encode("utf-8")).hexdigest()
+        with self._lock:
+            return self._handshake_tokens.pop(digest, None) is not None
 
     def cancel_pin(self) -> dict[str, Any]:
         """Immediately cancel and invalidate any currently active pairing PIN."""
@@ -393,7 +554,7 @@ def create_qr_pairing_payload(
     candidate_ips: List[str],
     port: int,
     cert_fingerprint: str,
-    pin: str,
+    pin: Optional[str] = None,
     version: int = 1,
     trust_tier: str = "owner",
     allow_usb_loopback: bool = False,
@@ -401,6 +562,9 @@ def create_qr_pairing_payload(
     relay_ticket: Optional[str] = None,
     group_id: Optional[str] = None,
     snow_id: Optional[str] = None,
+    handshake_token: Optional[str] = None,
+    network_id: Optional[str] = None,
+    hub_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """Construct a validated QR pairing payload for SNOW zero-friction onboarding.
 
@@ -411,8 +575,11 @@ def create_qr_pairing_payload(
       "ips": ["<candidate_ip>"],
       "port": 8765,
       "fp": "<sha256_cert_fingerprint>",
-      "pin": "<six_digit_pin>",
+      "pin": "<optional_six_digit_pin>",
+      "handshake_token": "<optional_single_use_qr_token>",
       "tier": "owner",
+      "network_id": "<optional_network_id>",
+      "hub_url": "<optional_default_hub_url>",
       "relay_url": "<optional_relay_endpoint>",
       "relay_ticket": "<optional_short_lived_ticket>",
       "group_id": "<optional_group_id>"
@@ -428,9 +595,17 @@ def create_qr_pairing_payload(
     if not isinstance(port, int) or port < 1 or port > 65535:
         raise ValueError(f"Invalid port: {port}. Must be between 1 and 65535.")
 
-    clean_pin = str(pin).strip()
-    if len(clean_pin) != 6 or not clean_pin.isdigit():
-        raise ValueError(f"PIN must be exactly 6 decimal digits, got '{clean_pin}'.")
+    clean_handshake = str(handshake_token).strip() if handshake_token is not None else ""
+    if clean_handshake:
+        if len(clean_handshake) < 16 or len(clean_handshake) > 256 or not re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_handshake):
+            raise ValueError("handshake_token must be 16-256 URL-safe token characters.")
+
+    clean_pin = str(pin).strip() if pin is not None else ""
+    if clean_pin:
+        if len(clean_pin) != 6 or not clean_pin.isdigit():
+            raise ValueError(f"PIN must be exactly 6 decimal digits, got '{clean_pin}'.")
+    elif not clean_handshake:
+        raise ValueError("PIN must be exactly 6 decimal digits when handshake_token is not provided.")
 
     # Clean & normalize fingerprint (remove colons/spaces, normalize to 64 uppercase hex chars)
     raw_fp = cert_fingerprint.replace(":", "").replace(" ", "").strip().upper()
@@ -478,9 +653,26 @@ def create_qr_pairing_payload(
         "ips": filtered_ips,
         "port": port,
         "fp": raw_fp,
-        "pin": clean_pin,
         "tier": clean_tier,
     }
+    if clean_pin:
+        payload["pin"] = clean_pin
+    if clean_handshake:
+        payload["handshake_token"] = clean_handshake
+    if network_id is not None:
+        clean_net = str(network_id).strip().upper()
+        if clean_net:
+            if not re.match(r"^[A-Z0-9\-_]{4,64}$", clean_net):
+                raise ValueError(f"Malformed network_id in QR payload: '{clean_net}'.")
+            payload["network_id"] = clean_net
+    if hub_url is not None:
+        clean_hub = str(hub_url).strip()
+        if clean_hub:
+            if not (clean_hub.startswith("https://") or clean_hub.startswith("http://")):
+                raise ValueError(f"Invalid hub_url scheme: '{clean_hub}'.")
+            if any(c in clean_hub for c in (" ", "\n", "\r", "\t", "<", ">", '"')):
+                raise ValueError(f"Malformed hub_url: '{clean_hub}'.")
+            payload["hub_url"] = clean_hub
 
     if relay_url is not None:
         clean_url = str(relay_url).strip()
@@ -538,8 +730,18 @@ def validate_qr_pairing_payload(
     if not isinstance(port, int) or port < 1 or port > 65535:
         raise ValueError(f"Missing or invalid 'port' in QR payload: {port}.")
 
-    pin = str(payload.get("pin", "")).strip()
-    if len(pin) != 6 or not pin.isdigit():
+    raw_handshake = payload.get("handshake_token")
+    clean_handshake = str(raw_handshake).strip() if raw_handshake is not None else ""
+    if clean_handshake:
+        if len(clean_handshake) < 16 or len(clean_handshake) > 256 or not re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_handshake):
+            raise ValueError("Invalid handshake_token format in QR payload.")
+
+    raw_pin = payload.get("pin")
+    pin = str(raw_pin).strip() if raw_pin is not None else ""
+    if pin:
+        if len(pin) != 6 or not pin.isdigit():
+            raise ValueError("PIN must be exactly 6 decimal digits.")
+    elif not clean_handshake:
         raise ValueError("PIN must be exactly 6 decimal digits.")
 
     fp = str(payload.get("fp", "")).replace(":", "").replace(" ", "").strip().upper()
@@ -586,9 +788,30 @@ def validate_qr_pairing_payload(
         "ips": filtered_ips,
         "port": port,
         "fp": fp,
-        "pin": pin,
         "tier": clean_tier,
     }
+    if pin:
+        res["pin"] = pin
+    if clean_handshake:
+        res["handshake_token"] = clean_handshake
+
+    raw_net_id = payload.get("network_id")
+    if raw_net_id is not None:
+        clean_net = str(raw_net_id).strip().upper()
+        if clean_net:
+            if not re.match(r"^[A-Z0-9\-_]{4,64}$", clean_net):
+                raise ValueError(f"Malformed network_id in QR payload: '{clean_net}'.")
+            res["network_id"] = clean_net
+
+    raw_hub_url = payload.get("hub_url")
+    if raw_hub_url is not None:
+        clean_hub = str(raw_hub_url).strip()
+        if clean_hub:
+            if not (clean_hub.startswith("https://") or clean_hub.startswith("http://")):
+                raise ValueError(f"Invalid hub_url in QR payload: '{clean_hub}'.")
+            if any(c in clean_hub for c in (" ", "\n", "\r", "\t", "<", ">", '"')):
+                raise ValueError(f"Malformed hub_url in QR payload: '{clean_hub}'.")
+            res["hub_url"] = clean_hub
 
     raw_relay_url = payload.get("relay_url")
     if raw_relay_url is not None:

@@ -50,6 +50,142 @@ logger = logging.getLogger(__name__)
 CODE_PATTERN = re.compile(r"^\d{3}-\d{3}-\d{3}$")
 RAW_CODE_DIGITS = 9
 
+# Canonical 5-tier cross-network federation presets (V5.2 Stage 6B WS4)
+VALID_FEDERATION_TIERS: tuple[str, ...] = (
+    "full_control",
+    "files_and_clipboard",
+    "files_only",
+    "clipboard_only",
+    "not_allowed",
+)
+
+FEDERATION_TIER_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    "full_control": (
+        "android.status",
+        "desktop.system.info",
+        "desktop.file.list",
+        "desktop.file.read",
+        "windows_system_info",
+        "windows_battery",
+        "windows_file_list",
+        "windows_clipboard_get",
+        "windows_clipboard_set",
+        "windows_hotkey",
+        "windows_brightness_set",
+        "windows_notify",
+        "android_battery",
+        "android_file_list",
+        "android_file_send",
+        "android_file_receive",
+        "android_clipboard_pull",
+        "android_clipboard_push",
+        "android_notifications_list",
+        "android_notification_reply",
+        "android_whatsapp_send",
+        "android_dnd_toggle",
+        "android_ring",
+        "media_control",
+        "share_link",
+    ),
+    "files_and_clipboard": (
+        "android.status",
+        "desktop.system.info",
+        "desktop.file.list",
+        "desktop.file.read",
+        "windows_system_info",
+        "windows_battery",
+        "windows_file_list",
+        "windows_clipboard_get",
+        "windows_clipboard_set",
+        "android_battery",
+        "android_file_list",
+        "android_file_send",
+        "android_file_receive",
+        "android_clipboard_pull",
+        "android_clipboard_push",
+    ),
+    "files_only": (
+        "android.status",
+        "desktop.system.info",
+        "desktop.file.list",
+        "desktop.file.read",
+        "windows_system_info",
+        "windows_battery",
+        "windows_file_list",
+        "android_battery",
+        "android_file_list",
+        "android_file_send",
+        "android_file_receive",
+    ),
+    "clipboard_only": (
+        "android.status",
+        "desktop.system.info",
+        "windows_system_info",
+        "windows_battery",
+        "windows_clipboard_get",
+        "windows_clipboard_set",
+        "android_battery",
+        "android_clipboard_pull",
+        "android_clipboard_push",
+    ),
+    "not_allowed": (),
+}
+
+FEDERATION_CAPABILITY_ALIAS_TO_ACTION: dict[str, str] = {
+    "android.status": "android_battery",
+    "desktop.system.info": "desktop_status",
+    "desktop.file.list": "desktop_file_list",
+    "desktop.file.read": "desktop_file_list",
+    "desktop.file.transfer": "desktop_file_stage_download",
+    "desktop.exec": "desktop_exec",
+    "desktop.clipboard.read": "desktop_clipboard_get",
+    "desktop.clipboard.write": "desktop_clipboard_set",
+    "android.files.transfer": "android_file_list",
+    "android.clipboard.get": "android_clipboard_pull",
+    "android.clipboard.set": "android_clipboard_push",
+}
+
+_FED_TIER_ALLOWED_CATEGORIES: dict[str, frozenset[str]] = {
+    "full_control": frozenset({"telemetry", "clipboard", "files", "apps", "execution", "media", "system"}),
+    "files_and_clipboard": frozenset({"telemetry", "clipboard", "files"}),
+    "files_only": frozenset({"telemetry", "files"}),
+    "clipboard_only": frozenset({"telemetry", "clipboard"}),
+    "not_allowed": frozenset(),
+}
+
+_FED_CAPABILITY_CATEGORY: dict[str, str] = {
+    "android.status": "telemetry",
+    "desktop.system.info": "telemetry",
+    "windows_system_info": "telemetry",
+    "windows_battery": "telemetry",
+    "android_battery": "telemetry",
+    "android_ring": "telemetry",
+    "desktop.file.list": "files",
+    "desktop.file.read": "files",
+    "desktop.file.transfer": "files",
+    "windows_file_list": "files",
+    "android_file_list": "files",
+    "android_file_send": "files",
+    "android_file_receive": "files",
+    "transfer_file": "files",
+    "desktop.clipboard.read": "clipboard",
+    "desktop.clipboard.write": "clipboard",
+    "windows_clipboard_get": "clipboard",
+    "windows_clipboard_set": "clipboard",
+    "android_clipboard_pull": "clipboard",
+    "android_clipboard_push": "clipboard",
+    "media_control": "media",
+    "windows_media_control": "media",
+    "share_link": "apps",
+    "windows_hotkey": "execution",
+    "windows_brightness_set": "system",
+    "windows_notify": "system",
+    "android_notifications_list": "system",
+    "android_notification_reply": "system",
+    "android_whatsapp_send": "system",
+    "android_dnd_toggle": "system",
+}
+
 # Centralized destructive and administrative capability denylist for cross-network federation (Repair 1)
 FORBIDDEN_FEDERATED_CAPABILITIES: frozenset[str] = frozenset({
     "desktop.exec",
@@ -264,6 +400,7 @@ class FederationManager:
         grant_ttl_seconds: int = 86400,
         ttl_seconds: int = 600,
         principal: Any = "OWNER_MANUAL",
+        permission_tier: Optional[str] = None,
     ) -> dict[str, Any]:
         """Generate a 9-digit mutual federation invitation code.
 
@@ -275,6 +412,16 @@ class FederationManager:
         if ttl_seconds > 600:
             ttl_seconds = 600  # Strict invariant: max 10 minutes
 
+        clean_tier: Optional[str] = None
+        if permission_tier is not None:
+            clean_tier = str(permission_tier).strip().lower()
+            if clean_tier not in VALID_FEDERATION_TIERS:
+                raise ValueError(
+                    f"Unknown permission tier '{permission_tier}'. Must be one of: {', '.join(VALID_FEDERATION_TIERS)}."
+                )
+            if clean_tier == "not_allowed":
+                raise ValueError("Cannot create an active federation invitation with tier 'not_allowed'.")
+
         # Validate allowed capabilities (must be non-empty and free of forbidden entries/wildcards)
         if allowed_capabilities is not None:
             if not allowed_capabilities:
@@ -283,6 +430,8 @@ class FederationManager:
                 if is_capability_forbidden_for_federation(c):
                     raise ValueError(f"Capability '{c}' is forbidden for cross-network federation.")
             caps = list(allowed_capabilities)
+        elif clean_tier is not None:
+            caps = list(FEDERATION_TIER_CAPABILITIES[clean_tier])
         else:
             caps = ["android.status", "desktop.system.info"]
 
@@ -318,6 +467,8 @@ class FederationManager:
             allowed_device_ids_json=json.dumps(devices),
             grant_ttl_seconds=grant_ttl_seconds,
         )
+        if clean_tier and hasattr(self.db_manager, "set_setting"):
+            self.db_manager.set_setting(f"federation_invite_tier:{invite_id}", clean_tier)
 
         # Audit log (never log raw code)
         self.db_manager.log_activity(
@@ -329,6 +480,7 @@ class FederationManager:
             details={
                 "invite_id": invite_id,
                 "ttl_seconds": ttl_seconds,
+                "permission_tier": clean_tier,
                 "allowed_capabilities": caps,
                 "allowed_device_ids": devices,
             },
@@ -343,6 +495,7 @@ class FederationManager:
             "expires_timestamp": expires_str,
             "network_id": self.local_network_id,
             "network_name": self.local_network_name,
+            "permission_tier": clean_tier,
         }
 
     def accept_invitation(
@@ -454,6 +607,14 @@ class FederationManager:
             allowed_device_ids_json=allowed_devs,
             auth_token_hash=token_h,
         )
+        invite_tier = None
+        if hasattr(self.db_manager, "get_setting"):
+            try:
+                invite_tier = self.db_manager.get_setting(f"federation_invite_tier:{invite_id}")
+            except Exception:
+                invite_tier = None
+        if invite_tier and invite_tier in VALID_FEDERATION_TIERS and hasattr(self.db_manager, "set_setting"):
+            self.db_manager.set_setting(f"federation_grant_tier:{grant_id}", invite_tier)
 
         # Audit log
         self.db_manager.log_activity(
@@ -467,6 +628,7 @@ class FederationManager:
                 "peer_network_id": peer_network_id,
                 "peer_network_name": peer_network_name,
                 "grant_ttl_seconds": grant_ttl,
+                "permission_tier": invite_tier,
             },
         )
 
@@ -479,6 +641,7 @@ class FederationManager:
             "network_name": peer_network_name,
             "peer_node_id": peer_node_id,
             "expires_timestamp": grant_expires_str,
+            "permission_tier": invite_tier,
             "allowed_capabilities": json.loads(allowed_caps),
             "allowed_device_ids": json.loads(allowed_devs),
         }
@@ -615,6 +778,48 @@ class FederationManager:
             "timestamp": current_utc_timestamp(),
         }
 
+    def update_grant_permission_tier(
+        self,
+        grant_id: str,
+        permission_tier: str,
+        principal: Any = "OWNER_MANUAL",
+    ) -> dict[str, Any]:
+        """Set or downgrade the 5-tier permission level of a federation grant immediately.
+
+        AI_MCP is strictly forbidden from altering federation tiers.
+        """
+        self._assert_human_owner_principal(principal)
+        clean_tier = str(permission_tier or "").strip().lower()
+        if clean_tier not in VALID_FEDERATION_TIERS:
+            raise ValueError(
+                f"Unknown permission tier '{permission_tier}'. Must be one of: {', '.join(VALID_FEDERATION_TIERS)}."
+            )
+
+        grant = self.db_manager.get_federation_grant(grant_id)
+        if not grant:
+            return {"success": False, "status": "GRANT_NOT_FOUND", "error": f"Grant '{grant_id}' does not exist."}
+
+        if hasattr(self.db_manager, "set_setting"):
+            self.db_manager.set_setting(f"federation_grant_tier:{grant_id}", clean_tier)
+
+        if clean_tier == "not_allowed":
+            self.db_manager.revoke_federation_grant(grant_id, reason="Tier set to not_allowed")
+
+        self.db_manager.log_activity(
+            event_type="FEDERATION_TIER_UPDATED",
+            principal=str(principal),
+            target_device=grant.get("peer_node_id") or grant_id,
+            capability="network.federation.tier",
+            outcome="SUCCESS",
+            details={"grant_id": grant_id, "permission_tier": clean_tier},
+        )
+        return {
+            "success": True,
+            "status": "UPDATED",
+            "grant_id": grant_id,
+            "permission_tier": clean_tier,
+        }
+
     def list_grants(self, active_only: bool = False) -> list[dict[str, Any]]:
         """List all registered federation grants with secret redaction."""
         rows = self.db_manager.list_federation_grants(active_only=active_only)
@@ -628,6 +833,13 @@ class FederationManager:
             else:
                 status = r["status"]
 
+            saved_tier = None
+            if hasattr(self.db_manager, "get_setting"):
+                try:
+                    saved_tier = self.db_manager.get_setting(f"federation_grant_tier:{r['grant_id']}")
+                except Exception:
+                    saved_tier = None
+            allowed_caps = json.loads(r.get("allowed_capabilities_json", "[]"))
             results.append({
                 "grant_id": r["grant_id"],
                 "network_id": r["network_id"],
@@ -637,9 +849,10 @@ class FederationManager:
                 "peer_cert_fingerprint": r["peer_cert_fingerprint"],
                 "direction": r["direction"],
                 "status": status,
+                "permission_tier": saved_tier or "custom",
                 "created_timestamp": r["created_timestamp"],
                 "expires_timestamp": r["expires_timestamp"],
-                "allowed_capabilities": json.loads(r.get("allowed_capabilities_json", "[]")),
+                "allowed_capabilities": allowed_caps,
                 "allowed_device_ids": json.loads(r.get("allowed_device_ids_json", "[]")),
                 "last_used_timestamp": r.get("last_used_timestamp"),
                 "revoked_timestamp": r.get("revoked_timestamp"),
@@ -648,12 +861,74 @@ class FederationManager:
             })
         return results
 
+    def _infer_tier_from_capabilities(self, allowed_caps: list[str]) -> Optional[str]:
+        if not allowed_caps:
+            return "not_allowed"
+        return None
+
+    def _check_tier_intersection_for_capability(
+        self,
+        grant: dict[str, Any],
+        target_device_id: str,
+        capability: str,
+        target_device_tier: Optional[str] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """Enforce effective device_tier ∩ federation_grant_tier intersection."""
+        action_name = FEDERATION_CAPABILITY_ALIAS_TO_ACTION.get(capability, capability)
+        cat = _FED_CAPABILITY_CATEGORY.get(capability) or _FED_CAPABILITY_CATEGORY.get(action_name)
+
+        grant_tier: Optional[str] = None
+        if hasattr(self.db_manager, "get_setting"):
+            try:
+                raw_gt = self.db_manager.get_setting(f"federation_grant_tier:{grant['grant_id']}")
+                if raw_gt is not None:
+                    grant_tier = str(raw_gt).strip().lower()
+            except Exception:
+                grant_tier = None
+
+        if grant_tier is not None:
+            if grant_tier not in _FED_TIER_ALLOWED_CATEGORIES:
+                return False, f"PERMISSION_DENIED: Unknown federation grant tier '{grant_tier}'."
+            if grant_tier == "not_allowed":
+                return False, "PERMISSION_DENIED: Federation grant tier is set to 'not_allowed'."
+            allowed_grant_cats = _FED_TIER_ALLOWED_CATEGORIES[grant_tier]
+            effective_cat = cat or "system"
+            if effective_cat not in allowed_grant_cats:
+                return (
+                    False,
+                    f"PERMISSION_DENIED: Capability '{capability}' blocked by federation grant tier '{grant_tier}'.",
+                )
+
+        # Check target device tier (fail-closed if stored value is invalid)
+        raw_dev_tier = target_device_tier
+        if raw_dev_tier is None and hasattr(self.db_manager, "get_setting"):
+            try:
+                raw_dev_tier = self.db_manager.get_setting(f"device_profile:{target_device_id}")
+            except Exception:
+                raw_dev_tier = None
+        if raw_dev_tier is not None:
+            dev_tier = str(raw_dev_tier).strip().lower()
+            if dev_tier not in _FED_TIER_ALLOWED_CATEGORIES:
+                return False, f"PERMISSION_DENIED: Unknown device permission tier '{dev_tier}'."
+            if dev_tier == "not_allowed":
+                return False, f"PERMISSION_DENIED: Device '{target_device_id}' permission tier is 'not_allowed'."
+            allowed_dev_cats = _FED_TIER_ALLOWED_CATEGORIES[dev_tier]
+            effective_cat = cat or "system"
+            if effective_cat not in allowed_dev_cats:
+                return (
+                    False,
+                    f"PERMISSION_DENIED: Capability '{capability}' blocked by device permission tier '{dev_tier}'.",
+                )
+
+        return True, None
+
     def validate_federated_request(
         self,
         token: str,
         target_network_id: str,
         target_device_id: str,
         capability: str,
+        target_device_tier: Optional[str] = None,
     ) -> tuple[bool, Optional[str]]:
         """Validate an incoming federated request against security invariants and ACLs.
 
@@ -661,6 +936,7 @@ class FederationManager:
         - Invariant 4: Token validity and non-expired grant.
         - Invariant 7: Anti-transitivity (TRANSIT_ROUTING_FORBIDDEN).
         - Invariant 3: Device and capability ACL containment.
+        - Stage 6B WS4: Five-tier device ∩ federation grant intersection (fail-closed).
 
         Returns:
             (True, None) if authorized, or (False, error_reason) if denied.
@@ -689,6 +965,16 @@ class FederationManager:
         # Invariant: Forbidden denylist checked first
         if is_capability_forbidden_for_federation(capability):
             return False, f"CAPABILITY_NOT_PERMITTED: Capability '{capability}' is strictly forbidden for federated access."
+
+        # 5-tier device ∩ federation grant intersection check
+        tier_ok, tier_err = self._check_tier_intersection_for_capability(
+            grant=grant,
+            target_device_id=target_device_id,
+            capability=capability,
+            target_device_tier=target_device_tier,
+        )
+        if not tier_ok:
+            return False, tier_err
 
         # Device ACL check (Fail-closed)
         allowed_devs = json.loads(grant.get("allowed_device_ids_json", "[]"))
