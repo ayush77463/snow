@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: snow-relay
+    runtime: docker
+    dockerfilePath: ./src/snow/relay/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: SNOW_RELAY_HOST
+        value: "0.0.0.0"
+      - key: SNOW_RELAY_ENABLED
+        value: "1"
+      - key: SNOW_RELAY_SECRET
+        generateValue: true

@@ -40,6 +40,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -217,6 +219,7 @@ private fun SnowApprovalCard(
             Spacer(modifier = Modifier.height(12.dp))
 
             // Action Buttons
+            val haptic = LocalHapticFeedback.current
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End
@@ -226,7 +229,10 @@ private fun SnowApprovalCard(
                     modifier = Modifier
                         .clip(RoundedCornerShape(9999.dp))
                         .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.4f), RoundedCornerShape(9999.dp))
-                        .clickable(onClick = onDeny),
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onDeny()
+                        },
                     shape = RoundedCornerShape(9999.dp),
                     color = Color(0xFFEF4444).copy(alpha = 0.1f)
                 ) {
@@ -255,7 +261,10 @@ private fun SnowApprovalCard(
                 Surface(
                     modifier = Modifier
                         .clip(RoundedCornerShape(9999.dp))
-                        .clickable(onClick = onApprove),
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onApprove()
+                        },
                     shape = RoundedCornerShape(9999.dp),
                     color = colors.accentEmerald
                 ) {

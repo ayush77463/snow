@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import ssl
+import sys
 import time
 from typing import Any, Dict, Optional
 import uuid
@@ -795,28 +796,37 @@ class SnowHttpTransferServer:
 
     def _get_staged_apk_path(self) -> Optional[Path]:
         """Resolve and validate the staged signed Android APK path with strict containment."""
+        import re as _re
         configured = getattr(self.config, "staged_apk_path", None)
         if configured:
             p = Path(configured).resolve()
             if p.is_file() and p.suffix.lower() == ".apk":
                 return p
 
-        repo_root = Path(__file__).resolve().parent.parent.parent.parent
-        expected_dir = (repo_root / "packaging" / "output").resolve()
-        for apk_name in ("SNOW-Mobile-5.0.0.apk", "SNOW-Mobile-4.1.0.apk", "SNOW-Mobile.apk"):
-            candidate = (expected_dir / apk_name).resolve()
-            try:
-                if candidate.is_relative_to(expected_dir) and candidate.is_file():
-                    return candidate
-            except (ValueError, OSError):
-                pass
+        def _apk_sort_key(path_obj: Path) -> tuple[int, ...]:
+            m = _re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", path_obj.name)
+            if m:
+                return tuple(int(g or 0) for g in m.groups())
+            return (0, 0, 0)
 
-        cwd_expected = (Path.cwd() / "packaging" / "output").resolve()
-        for apk_name in ("SNOW-Mobile-5.0.0.apk", "SNOW-Mobile-4.1.0.apk", "SNOW-Mobile.apk"):
-            cwd_candidate = (cwd_expected / apk_name).resolve()
+        repo_root = Path(__file__).resolve().parent.parent.parent.parent
+        search_dirs: list[Path] = [
+            (repo_root / "packaging" / "output").resolve(),
+            (Path.cwd() / "packaging" / "output").resolve(),
+        ]
+        if getattr(sys, "frozen", False):
+            search_dirs.insert(0, (Path(sys.executable).resolve().parent / "packaging" / "output").resolve())
+
+        for base_dir in search_dirs:
             try:
-                if cwd_candidate.is_relative_to(cwd_expected) and cwd_candidate.is_file():
-                    return cwd_candidate
+                if not base_dir.is_dir():
+                    continue
+                versioned = sorted(base_dir.glob("SNOW-Mobile-*.apk"), key=_apk_sort_key, reverse=True)
+                candidates = [*versioned, base_dir / "SNOW-Mobile.apk"]
+                for candidate in candidates:
+                    resolved = candidate.resolve()
+                    if resolved.is_relative_to(base_dir) and resolved.is_file():
+                        return resolved
             except (ValueError, OSError):
                 pass
 
@@ -835,6 +845,8 @@ class SnowHttpTransferServer:
             })
 
         import hashlib
+        import json as _json
+        import re as _re
         h = hashlib.sha256()
         with open(apk_path, "rb") as f:
             while chunk := f.read(65536):
@@ -842,11 +854,34 @@ class SnowHttpTransferServer:
         sha256 = h.hexdigest()
         size_bytes = apk_path.stat().st_size
 
-        version_name = getattr(self.config, "version", "5.0.0") or "5.0.0"
+        version_name = getattr(self.config, "version", "5.1.0") or "5.1.0"
+        version_code = 3 if version_name.startswith("5.1") else 2
+
+        name_match = _re.search(r"SNOW-Mobile-(\d+\.\d+\.\d+)\.apk$", apk_path.name, _re.IGNORECASE)
+        if name_match:
+            version_name = name_match.group(1)
+            version_code = 3 if version_name.startswith("5.1") else (2 if version_name.startswith("5.0") else 1)
+
+        manifest_file = apk_path.parent / "update_manifest.json"
+        if manifest_file.is_file():
+            try:
+                m_data = _json.loads(manifest_file.read_text(encoding="utf-8"))
+                android_meta = m_data.get("android") if isinstance(m_data, dict) else None
+                if isinstance(android_meta, dict) and (
+                    not android_meta.get("apk_name") or android_meta.get("apk_name") == apk_path.name
+                ):
+                    if isinstance(android_meta.get("version_code"), int):
+                        version_code = android_meta["version_code"]
+                    if isinstance(android_meta.get("version_name"), str) and android_meta["version_name"].strip():
+                        version_name = android_meta["version_name"].strip()
+            except Exception:
+                pass
+
         return web.json_response({
             "available": True,
-            "version_code": 2,
+            "version_code": version_code,
             "version_name": version_name,
+            "apk_name": apk_path.name,
             "size_bytes": size_bytes,
             "sha256": sha256
         })

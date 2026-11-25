@@ -22,12 +22,9 @@ SRC_DIR = REPO_ROOT / "src"
 datas = [
     (str(SRC_DIR / "snow" / "web" / "static"), "snow/web/static"),
 ]
-if (REPO_ROOT / "snow.png").is_file():
-    datas.append((str(REPO_ROOT / "snow.png"), "."))
 if (REPO_ROOT / "packaging" / "windows" / "snow.ico").is_file():
     datas.append((str(REPO_ROOT / "packaging" / "windows" / "snow.ico"), "packaging/windows"))
-    datas.append((str(REPO_ROOT / "packaging" / "windows" / "snow.ico"), "."))
-if (REPO_ROOT / "packaging" / "bin" / "cloudflared.exe").is_file():
+if os.environ.get("SNOW_BUNDLE_CLOUDFLARED") == "1" and (REPO_ROOT / "packaging" / "bin" / "cloudflared.exe").is_file():
     datas.append((str(REPO_ROOT / "packaging" / "bin" / "cloudflared.exe"), "bin"))
 
 # Hidden imports required by dynamic dispatch and asyncio
@@ -67,12 +64,38 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "numpy", "scipy", "pandas"],
+    excludes=[
+        "tkinter",
+        "matplotlib",
+        "numpy",
+        "scipy",
+        "pandas",
+        "unittest",
+        "pydoc",
+        "doctest",
+        "setuptools",
+        "pip",
+        "textual",
+        "rich",
+        "pytest",
+        "PIL.AvifImagePlugin",
+        "PIL._avif",
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
+
+# Strip optional Pillow AVIF codecs (~7.9 MB) cleanly if pulled by generic hooks
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if not any(
+        tok in entry[0].lower().replace("\\", "/")
+        for tok in ("pil/_avif", "libavif", "libaom", "dav1d")
+    )
+]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

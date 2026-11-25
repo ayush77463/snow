@@ -151,8 +151,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _activeTransfer = MutableStateFlow<ActiveTransferInfo?>(null)
     val activeTransfer: StateFlow<ActiveTransferInfo?> = _activeTransfer.asStateFlow()
 
+    private val _pendingApprovals = MutableStateFlow<List<PendingApprovalItem>>(emptyList())
+    val pendingApprovals: StateFlow<List<PendingApprovalItem>> = _pendingApprovals.asStateFlow()
+
     private val _pendingApprovalsCount = MutableStateFlow(0)
     val pendingApprovalsCount: StateFlow<Int> = _pendingApprovalsCount.asStateFlow()
+
+    private val approvalsFetchInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val approvalsPendingQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val approvalsEpoch = java.util.concurrent.atomic.AtomicLong(0L)
 
     private val _phoneTelemetry = MutableStateFlow(PhoneTelemetry.UNAVAILABLE)
     val phoneTelemetry: StateFlow<PhoneTelemetry> = _phoneTelemetry.asStateFlow()
@@ -312,16 +319,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         tokenStorage = tokenStorage,
                         useTls = true
                     )
-                    // Auto-restore Instant Sync only if enabled in preferences
+                    // Auto-restore Instant Sync (enabled by default unless user explicitly disabled)
                     val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                    if (prefs.getBoolean(PREF_KEY_INSTANT_SYNC, false)) {
+                    if (prefs.getBoolean(PREF_KEY_INSTANT_SYNC, true)) {
                         toggleInstantClipboardSync(true)
                     }
                     if (prefs.getBoolean(PREF_KEY_AUTO_SYNC_SCREENSHOTS, false)) {
                         screenshotObserver.register()
                     }
-                    // Fetch latest shared clipboard buffer items
+                    // Fetch latest shared clipboard buffer items and pending approvals immediately on auth
                     fetchClipboardBuffer()
+                    refreshPendingApprovals(force = true)
                     // Update identity-first saved device history and endpoint ring buffer
                     recordSuccessfulConnection(
                         host = host,
@@ -334,6 +342,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 } else {
                     _fileTransferClient = null
                     screenshotObserver.unregister()
+                    approvalsEpoch.incrementAndGet()
+                    approvalsFetchInFlight.set(false)
+                    approvalsPendingQueued.set(false)
+                    _pendingApprovals.value = emptyList()
+                    _pendingApprovalsCount.value = 0
                 }
             }
         }
@@ -367,7 +380,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         prefs.edit().putString("last_connected_host", cleanHost).putInt("last_connected_port", port).apply()
 
-        // Reset retry counter on explicit manual connection attempt
+        // Reset retry counter and manual-disconnect lock on explicit manual connection attempt
+        SnowForegroundService.setDisconnectedByUser(appContext, false)
         connectionAttemptCount = 0
         connectedHost = cleanHost
         _connectedEndpoint.value = "$cleanHost:$port"
@@ -410,14 +424,54 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     fun disconnect() {
         appendLog("INFO", TAG, "Disconnecting from desktop.")
+        cancelActiveTransfer()
+        SnowForegroundService.setDisconnectedByUser(appContext, true)
         val intent = Intent(appContext, SnowForegroundService::class.java).apply {
             action = SnowForegroundService.ACTION_DISCONNECT
         }
         appContext.startService(intent)
+        approvalsEpoch.incrementAndGet()
+        approvalsPendingQueued.set(false)
+        _pendingApprovals.value = emptyList()
+        _pendingApprovalsCount.value = 0
         _connectedEndpoint.value = null
         connectedHost = ""
         invalidateWallpaperCache()
+        _authState.value = AuthState.Disconnected
         _connectionState.value = ConnectionState.DISCONNECTED
+    }
+
+    fun disconnectAll() {
+        appendLog("INFO", TAG, "Disconnect All requested by user.")
+        cancelActiveTransfer()
+        SnowForegroundService.setDisconnectedByUser(appContext, true)
+        serviceRef?.stopRelay()
+        stopPeerHost()
+        val intent = Intent(appContext, SnowForegroundService::class.java).apply {
+            action = SnowForegroundService.ACTION_DISCONNECT
+        }
+        appContext.startService(intent)
+        approvalsEpoch.incrementAndGet()
+        approvalsPendingQueued.set(false)
+        _pendingApprovals.value = emptyList()
+        _pendingApprovalsCount.value = 0
+        _connectedEndpoint.value = null
+        connectedHost = ""
+        invalidateWallpaperCache()
+        _authState.value = AuthState.Disconnected
+        _connectionState.value = ConnectionState.DISCONNECTED
+    }
+
+    fun setAutoReconnectEnabled(enabled: Boolean) {
+        appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(PREF_KEY_AUTO_CONNECT_ENABLED, enabled)
+            .apply()
+        if (enabled) {
+            SnowForegroundService.setDisconnectedByUser(appContext, false)
+        } else {
+            serviceRef?.cancelAutoConnect()
+        }
     }
 
     fun pairDevice(pin: String, onStateChanged: ((PairingState) -> Unit)? = null) {
@@ -1364,7 +1418,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         org.snow.capabilities.ClipboardHandler.isUserIntentGranted = true
 
         val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        if (!prefs.getBoolean(PREF_KEY_INSTANT_SYNC, false)) return
+        if (!prefs.getBoolean(PREF_KEY_INSTANT_SYNC, true)) return
         if (!isConnectedAndAuthenticated()) return
 
         try {
@@ -2002,6 +2056,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                         val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                         val clip = ClipData.newUri(appContext.contentResolver, "Image", contentUri)
                                         cm.setPrimaryClip(clip)
+                                        ClipboardHandler.grantImeUriPermission(appContext, contentUri)
+                                        ClipboardHandler.postShareFallbackNotification(
+                                            appContext,
+                                            contentUri,
+                                            "image/png",
+                                            isUserInitiated = true
+                                        )
                                         recordIncomingClipboardText(sha256)
                                         appendLog("INFO", TAG, "Pulled image from PC to clipboard.")
                                         onComplete(true, "Image pulled to phone clipboard.")
@@ -2551,6 +2612,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     val targetHost = client.currentTargetHost
 
                     val stagedFile = File(safFolderManager.getStagingDir(), "${transferId}_$fileName")
+                    val routeBadge = resolveTransportBadge(_connectedEndpoint.value)
 
                     _activeTransfer.value = ActiveTransferInfo(
                         transferId = transferId,
@@ -2558,7 +2620,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         direction = "DOWNLOAD",
                         bytesTransferred = 0L,
                         totalBytes = item.size,
-                        status = "IN_PROGRESS"
+                        status = "IN_PROGRESS",
+                        transportLabel = routeBadge
                     )
 
                     activeDownloadJob = repoScope.launch(Dispatchers.IO) {
@@ -2586,6 +2649,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                             _activeTransfer.value = _activeTransfer.value?.copy(status = "COMPLETED")
                                             appendLog("INFO", TAG, "Download complete and committed to SAF: $savedPath")
                                             onComplete(true, savedPath)
+                                            repoScope.launch {
+                                                kotlinx.coroutines.delay(1500L)
+                                                val cur = _activeTransfer.value
+                                                if (cur?.transferId == transferId && cur.status == "COMPLETED") {
+                                                    _activeTransfer.value = null
+                                                }
+                                            }
                                         } else {
                                             val commitErr = commitResult.exceptionOrNull()?.message ?: "Failed writing to SAF destination"
                                             _activeTransfer.value = _activeTransfer.value?.copy(status = "FAILED")
@@ -2594,16 +2664,33 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                         }
                                     }
                                     is FileTransferClient.TransferResult.Error -> {
-                                        _activeTransfer.value = _activeTransfer.value?.copy(status = "FAILED")
-                                        appendLog("ERROR", TAG, "Download failed: ${dlRes.message}")
-                                        onComplete(false, dlRes.message)
+                                        if (dlRes.message.equals("Transfer cancelled", ignoreCase = true)) {
+                                            _activeTransfer.value = null
+                                            onComplete(false, "Transfer cancelled")
+                                        } else {
+                                            _activeTransfer.value = _activeTransfer.value?.copy(status = "FAILED")
+                                            appendLog("ERROR", TAG, "Download failed: ${dlRes.message}")
+                                            onComplete(false, dlRes.message)
+                                        }
                                     }
                                     is FileTransferClient.TransferResult.Duplicate -> {
                                         _activeTransfer.value = _activeTransfer.value?.copy(status = "DUPLICATE")
                                         appendLog("WARN", TAG, "Duplicate file: ${dlRes.fileName}")
                                         onComplete(true, dlRes.fileName)
+                                        repoScope.launch {
+                                            kotlinx.coroutines.delay(1500L)
+                                            val cur = _activeTransfer.value
+                                            if (cur?.transferId == transferId && cur.status == "DUPLICATE") {
+                                                _activeTransfer.value = null
+                                            }
+                                        }
                                     }
                                 }
+                            }
+                        } catch (_: kotlinx.coroutines.CancellationException) {
+                            repoScope.launch(Dispatchers.Main) {
+                                _activeTransfer.value = null
+                                onComplete(false, "Transfer cancelled")
                             }
                         } catch (e: Exception) {
                             repoScope.launch(Dispatchers.Main) {
@@ -2646,15 +2733,18 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
 
         val transferPort = 8766 // Standard SNOW file transfer port
+        val uploadTransferId = "upload_${System.currentTimeMillis()}"
+        val routeBadge = resolveTransportBadge(_connectedEndpoint.value)
 
         appendLog("INFO", TAG, "Starting file upload to PC: $fileName ($fileSize bytes)...")
         _activeTransfer.value = ActiveTransferInfo(
-            transferId = "upload_${System.currentTimeMillis()}",
+            transferId = uploadTransferId,
             fileName = fileName,
             direction = "UPLOAD",
             bytesTransferred = 0L,
             totalBytes = fileSize,
-            status = "IN_PROGRESS"
+            status = "IN_PROGRESS",
+            transportLabel = routeBadge
         )
 
         activeDownloadJob = repoScope.launch(Dispatchers.IO) {
@@ -2678,18 +2768,42 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                             _activeTransfer.value = _activeTransfer.value?.copy(status = "COMPLETED")
                             appendLog("INFO", TAG, "Upload to PC complete: $fileName (SHA-256: ${upRes.sha256.take(8)}...)")
                             onComplete(true, fileName)
+                            repoScope.launch {
+                                kotlinx.coroutines.delay(1500L)
+                                val cur = _activeTransfer.value
+                                if (cur?.transferId == uploadTransferId && cur.status == "COMPLETED") {
+                                    _activeTransfer.value = null
+                                }
+                            }
                         }
                         is FileTransferClient.TransferResult.Duplicate -> {
                             _activeTransfer.value = _activeTransfer.value?.copy(status = "DUPLICATE")
                             appendLog("WARN", TAG, "File already exists on PC: $fileName")
                             onComplete(true, fileName)
+                            repoScope.launch {
+                                kotlinx.coroutines.delay(1500L)
+                                val cur = _activeTransfer.value
+                                if (cur?.transferId == uploadTransferId && cur.status == "DUPLICATE") {
+                                    _activeTransfer.value = null
+                                }
+                            }
                         }
                         is FileTransferClient.TransferResult.Error -> {
-                            _activeTransfer.value = _activeTransfer.value?.copy(status = "FAILED")
-                            appendLog("ERROR", TAG, "Upload failed: ${upRes.message}")
-                            onComplete(false, upRes.message)
+                            if (upRes.message.equals("Transfer cancelled", ignoreCase = true)) {
+                                _activeTransfer.value = null
+                                onComplete(false, "Transfer cancelled")
+                            } else {
+                                _activeTransfer.value = _activeTransfer.value?.copy(status = "FAILED")
+                                appendLog("ERROR", TAG, "Upload failed: ${upRes.message}")
+                                onComplete(false, upRes.message)
+                            }
                         }
                     }
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                repoScope.launch(Dispatchers.Main) {
+                    _activeTransfer.value = null
+                    onComplete(false, "Transfer cancelled")
                 }
             } catch (e: Exception) {
                 repoScope.launch(Dispatchers.Main) {
@@ -2704,8 +2818,20 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun cancelActiveTransfer() {
         val active = _activeTransfer.value ?: return
         appendLog("INFO", TAG, "User cancelled active transfer: ${active.fileName}")
+        serviceRef?.transferClient?.cancelActiveTransfer()
+        _fileTransferClient?.cancelActiveTransfer()
         activeDownloadJob?.cancel()
-        _activeTransfer.value = active.copy(status = "CANCELLED")
+        activeDownloadJob = null
+        _activeTransfer.value = null
+    }
+
+    fun dismissActiveTransfer() {
+        val current = _activeTransfer.value ?: return
+        if (current.status == "IN_PROGRESS" || current.status == "STARTING") {
+            cancelActiveTransfer()
+        } else {
+            _activeTransfer.value = null
+        }
     }
 
     // --- Logging ---
@@ -2727,39 +2853,71 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Approvals Feed (Phase 24) ---
 
-    fun fetchPendingApprovals(callback: (Result<List<PendingApprovalItem>>) -> Unit) {
+    fun onApprovalEventReceived() {
+        refreshPendingApprovals(force = true)
+    }
+
+    fun refreshPendingApprovals(
+        force: Boolean = false,
+        callback: ((Result<List<PendingApprovalItem>>) -> Unit)? = null
+    ) {
         val client = serviceRef?.client
-        if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
-            callback(Result.failure(IllegalStateException("Not connected to SNOW Desktop Core.")))
+        if (client == null || _connectionState.value != ConnectionState.CONNECTED || _authState.value !is AuthState.Authenticated) {
+            callback?.invoke(Result.failure(IllegalStateException("Not connected to SNOW Desktop Core.")))
+            return
+        }
+        if (!approvalsFetchInFlight.compareAndSet(false, true)) {
+            if (force) {
+                approvalsPendingQueued.set(true)
+            }
+            callback?.invoke(Result.success(_pendingApprovals.value))
             return
         }
 
+        val epoch = approvalsEpoch.get()
         client.sendRequest("approval_list", emptyMap()) { resp ->
             repoScope.launch {
-                if (resp.isSuccess) {
-                    val rawList = resp.payload?.get("requests") as? List<*> ?: emptyList<Any>()
-                    val items = rawList.filterIsInstance<Map<String, Any?>>().map { m ->
-                        PendingApprovalItem(
-                            requestId = m["request_id"] as? String ?: "",
-                            principal = m["principal"] as? String ?: "AI_MCP",
-                            action = m["action"] as? String ?: "",
-                            targetDevice = m["target_device"] as? String ?: "local",
-                            riskLevel = m["risk_level"] as? String ?: "MEDIUM",
-                            reason = m["reason"] as? String ?: "",
-                            timeRemainingSeconds = (m["time_remaining_seconds"] as? Number)?.toDouble() ?: 0.0,
-                            sanitizedParams = (m["sanitized_params"] as? Map<*, *>)?.entries?.associate {
-                                it.key.toString() to it.value
-                            } ?: emptyMap()
-                        )
+                try {
+                    if (resp.isSuccess) {
+                        val rawList = resp.payload?.get("requests") as? List<*> ?: emptyList<Any>()
+                        val items = rawList.filterIsInstance<Map<String, Any?>>().map { m ->
+                            PendingApprovalItem(
+                                requestId = m["request_id"] as? String ?: "",
+                                principal = m["principal"] as? String ?: "AI_MCP",
+                                action = m["action"] as? String ?: "",
+                                targetDevice = m["target_device"] as? String ?: "local",
+                                riskLevel = m["risk_level"] as? String ?: "MEDIUM",
+                                reason = m["reason"] as? String ?: "",
+                                timeRemainingSeconds = (m["time_remaining_seconds"] as? Number)?.toDouble() ?: 0.0,
+                                sanitizedParams = (m["sanitized_params"] as? Map<*, *>)?.entries?.associate {
+                                    it.key.toString() to it.value
+                                } ?: emptyMap()
+                            )
+                        }
+                        if (approvalsEpoch.get() == epoch && _authState.value is AuthState.Authenticated) {
+                            _pendingApprovals.value = items
+                            _pendingApprovalsCount.value = items.size
+                        }
+                        callback?.invoke(Result.success(items))
+                    } else {
+                        val err = resp.error?.message ?: (resp.payload?.get("error") as? String) ?: "Failed fetching approvals"
+                        callback?.invoke(Result.failure(RuntimeException(err)))
                     }
-                    _pendingApprovalsCount.value = items.size
-                    callback(Result.success(items))
-                } else {
-                    val err = resp.error?.message ?: (resp.payload?.get("error") as? String) ?: "Failed fetching approvals"
-                    callback(Result.failure(RuntimeException(err)))
+                } finally {
+                    approvalsFetchInFlight.set(false)
+                    if (approvalsPendingQueued.getAndSet(false) &&
+                        approvalsEpoch.get() == epoch &&
+                        _authState.value is AuthState.Authenticated
+                    ) {
+                        refreshPendingApprovals(force = false)
+                    }
                 }
             }
         }
+    }
+
+    fun fetchPendingApprovals(callback: (Result<List<PendingApprovalItem>>) -> Unit) {
+        refreshPendingApprovals(force = true, callback = callback)
     }
 
     fun resolveApproval(requestId: String, decision: String, callback: (Result<String>) -> Unit) {
@@ -2774,6 +2932,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         client.sendRequest("approval_resolve", data) { resp ->
             repoScope.launch {
                 if (resp.isSuccess) {
+                    val remaining = _pendingApprovals.value.filter { it.requestId != requestId }
+                    _pendingApprovals.value = remaining
+                    _pendingApprovalsCount.value = remaining.size
+                    refreshPendingApprovals(force = true)
                     val msg = resp.payload?.get("message") as? String ?: cleanDecision
                     callback(Result.success(msg))
                 } else {
@@ -3317,8 +3479,30 @@ data class ActiveTransferInfo(
     val direction: String,
     val bytesTransferred: Long,
     val totalBytes: Long,
-    val status: String
+    val status: String,
+    val transportLabel: String = "Wi-Fi • Zero Data"
 )
+
+fun formatTransferBytes(bytes: Long): String {
+    val safe = if (bytes < 0L) 0L else bytes
+    return when {
+        safe < 1024L -> "$safe B"
+        safe < 1024L * 1024L -> String.format(java.util.Locale.US, "%.1f KB", safe / 1024.0)
+        safe < 1024L * 1024L * 1024L -> String.format(java.util.Locale.US, "%.1f MB", safe / (1024.0 * 1024.0))
+        else -> String.format(java.util.Locale.US, "%.2f GB", safe / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fun resolveTransportBadge(endpoint: String?): String {
+    val ep = endpoint?.trim().orEmpty()
+    return when {
+        ep.startsWith("127.0.0.1") || ep.startsWith("localhost") -> "USB • Zero Data"
+        ep.contains("relay", ignoreCase = true) ||
+            ep.contains("tunnel", ignoreCase = true) ||
+            ep.contains(":8770") -> "Relay • Uses Data"
+        else -> "Wi-Fi • Zero Data"
+    }
+}
 
 data class PhoneTelemetry(
     val batteryPercent: Int,

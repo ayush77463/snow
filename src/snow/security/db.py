@@ -991,6 +991,18 @@ class DatabaseManager:
             cur = conn.execute("DELETE FROM app_settings WHERE key = ?;", (key,))
             return cur.rowcount > 0
 
+    def list_settings_prefix(self, prefix: str) -> dict[str, str]:
+        """List configuration settings whose key starts with an exact prefix."""
+        if not prefix:
+            return {}
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT key, value FROM app_settings;")
+            return {
+                row["key"]: row["value"]
+                for row in cur.fetchall()
+                if isinstance(row["key"], str) and row["key"].startswith(prefix)
+            }
+
     # Phase 30: Cross-Network Federation Operations
 
     def create_federation_invitation(

@@ -2,8 +2,10 @@ package org.snow.transfer
 
 import android.content.Context
 import android.net.Uri
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -21,9 +23,12 @@ import org.snow.security.TokenStorage
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Client for reliable, authenticated, bidirectional streaming file transfers between
@@ -114,6 +119,16 @@ open class FileTransferClient(
     )
 
     private val httpClient: OkHttpClient = customClient ?: buildHttpClient()
+    private val activeCall = AtomicReference<Call?>(null)
+    private val transferCancelled = AtomicBoolean(false)
+
+    /**
+     * Cancel any active in-flight HTTP file upload or download immediately.
+     */
+    fun cancelActiveTransfer() {
+        transferCancelled.set(true)
+        activeCall.getAndSet(null)?.cancel()
+    }
 
     private fun buildHttpClient(): OkHttpClient {
         val builder = OkHttpClient.Builder()
@@ -277,6 +292,9 @@ open class FileTransferClient(
                     var totalWritten = resumeOffset
 
                     while (input.read(buffer).also { bytesRead = it } != -1) {
+                        if (transferCancelled.get() || Thread.currentThread().isInterrupted) {
+                            throw IOException("Transfer cancelled")
+                        }
                         sink.write(buffer, 0, bytesRead)
                         totalWritten += bytesRead
                         val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
@@ -307,9 +325,12 @@ open class FileTransferClient(
         }
 
         val request = reqBuilder.post(requestBody).build()
+        transferCancelled.set(false)
+        val call = httpClient.newCall(request)
+        activeCall.set(call)
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            call.execute().use { response ->
                 if (response.isSuccessful) {
                     val bodyStr = response.body?.string() ?: "{}"
                     val json = JSONObject(bodyStr)
@@ -324,9 +345,19 @@ open class FileTransferClient(
                     TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
                 }
             }
+        } catch (e: CancellationException) {
+            call.cancel()
+            throw e
         } catch (e: Exception) {
-            SafeLog.e(TAG, "Upload exception: ${e.message}", e)
-            TransferResult.Error(transferId, e.message ?: "Upload network exception")
+            if (transferCancelled.get() || call.isCanceled()) {
+                SafeLog.i(TAG, "Upload cancelled by user: $fileName")
+                TransferResult.Error(transferId, "Transfer cancelled")
+            } else {
+                SafeLog.e(TAG, "Upload exception: ${e.message}", e)
+                TransferResult.Error(transferId, e.message ?: "Upload network exception")
+            }
+        } finally {
+            activeCall.compareAndSet(call, null)
         }
     }
 
@@ -373,6 +404,9 @@ open class FileTransferClient(
                     var totalWritten = resumeOffset
 
                     while (input.read(buffer).also { bytesRead = it } != -1) {
+                        if (transferCancelled.get() || Thread.currentThread().isInterrupted) {
+                            throw IOException("Transfer cancelled")
+                        }
                         sink.write(buffer, 0, bytesRead)
                         totalWritten += bytesRead
                         val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
@@ -403,9 +437,12 @@ open class FileTransferClient(
         }
 
         val request = reqBuilder.post(requestBody).build()
+        transferCancelled.set(false)
+        val call = httpClient.newCall(request)
+        activeCall.set(call)
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            call.execute().use { response ->
                 if (response.isSuccessful) {
                     val bodyStr = response.body?.string() ?: "{}"
                     val json = JSONObject(bodyStr)
@@ -417,9 +454,19 @@ open class FileTransferClient(
                     TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
                 }
             }
+        } catch (e: CancellationException) {
+            call.cancel()
+            throw e
         } catch (e: Exception) {
-            SafeLog.e(TAG, "Upload URI exception: ${e.message}", e)
-            TransferResult.Error(transferId, e.message ?: "Upload network exception")
+            if (transferCancelled.get() || call.isCanceled()) {
+                SafeLog.i(TAG, "Upload URI cancelled by user: $fileName")
+                TransferResult.Error(transferId, "Transfer cancelled")
+            } else {
+                SafeLog.e(TAG, "Upload URI exception: ${e.message}", e)
+                TransferResult.Error(transferId, e.message ?: "Upload network exception")
+            }
+        } finally {
+            activeCall.compareAndSet(call, null)
         }
     }
 
@@ -455,9 +502,12 @@ open class FileTransferClient(
         }
 
         val request = reqBuilder.get().build()
+        transferCancelled.set(false)
+        val call = httpClient.newCall(request)
+        activeCall.set(call)
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            call.execute().use { response ->
                 if (response.code != 200 && response.code != 206) {
                     return@withContext TransferResult.Error(
                         transferId,
@@ -482,6 +532,9 @@ open class FileTransferClient(
                         var downloaded = if (append) resumeOffset else 0L
 
                         while (input.read(buffer).also { bytesRead = it } != -1) {
+                            if (transferCancelled.get() || Thread.currentThread().isInterrupted) {
+                                throw IOException("Transfer cancelled")
+                            }
                             output.write(buffer, 0, bytesRead)
                             downloaded += bytesRead
                             val percent = if (totalExpected > 0) ((downloaded * 100) / totalExpected).toInt() else 100
@@ -521,9 +574,21 @@ open class FileTransferClient(
                 SafeLog.i(TAG, "Download completed and verified: ${destinationFile.name}")
                 TransferResult.Success(transferId, actualSha256, destinationFile)
             }
+        } catch (e: CancellationException) {
+            call.cancel()
+            partFile.delete()
+            throw e
         } catch (e: Exception) {
-            SafeLog.e(TAG, "Download exception: ${e.message}", e)
-            TransferResult.Error(transferId, e.message ?: "Download exception")
+            if (transferCancelled.get() || call.isCanceled()) {
+                partFile.delete()
+                SafeLog.i(TAG, "Download cancelled by user: ${destinationFile.name}")
+                TransferResult.Error(transferId, "Transfer cancelled")
+            } else {
+                SafeLog.e(TAG, "Download exception: ${e.message}", e)
+                TransferResult.Error(transferId, e.message ?: "Download exception")
+            }
+        } finally {
+            activeCall.compareAndSet(call, null)
         }
     }
 

@@ -70,6 +70,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -141,13 +143,13 @@ fun HomeScreen(
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
     val listState = rememberLazyListState()
     val isPhonePeer = connectedDevice?.isPhone == true
 
     LaunchedEffect(scrollToClipboardTrigger) {
         if (scrollToClipboardTrigger > 0) {
-            val clipboardHeaderIdx = if (activeTransfer != null) 3 else 2
-            listState.animateScrollToItem(clipboardHeaderIdx)
+            listState.animateScrollToItem(2)
         }
     }
 
@@ -165,16 +167,6 @@ fun HomeScreen(
     ) {
         item {
             Spacer(modifier = Modifier.height(8.dp))
-        }
-
-        // Active Transfer Card (State D)
-        if (activeTransfer != null) {
-            item {
-                ActiveTransferCard(
-                    transfer = activeTransfer,
-                    onCancel = onCancelTransfer
-                )
-            }
         }
 
         // Main State Card
@@ -359,6 +351,7 @@ private fun PcConnectedHeroCard(
     onNavigateTab: (SnowTab) -> Unit
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
     val hostName = device?.deviceName?.ifBlank { null } ?: pcTelemetry.hostname ?: "SNOW Desktop"
     val isUsb = endpoint?.startsWith("127.0.0.1") == true || endpoint?.startsWith("localhost") == true
     val transport = if (isUsb) "USB High-Speed" else if (endpoint?.contains("relay") == true) "Relay Tunnel" else "Local Wi-Fi"
@@ -492,13 +485,19 @@ private fun PcConnectedHeroCard(
                 SnowGradientButton(
                     text = "Send Files",
                     icon = Icons.Default.Send,
-                    onClick = onSendFiles,
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSendFiles()
+                    },
                     modifier = Modifier.weight(1f)
                 )
                 SnowTonalButton(
                     text = "Lock PC",
                     icon = Icons.Default.Lock,
-                    onClick = onLockPc,
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onLockPc()
+                    },
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -874,100 +873,8 @@ private fun DisconnectedRadarCard(
 }
 
 /**
- * State D: Active Transfer Progress Card
+ * Telemetry Metric Column
  */
-@Composable
-private fun ActiveTransferCard(
-    transfer: ActiveTransferInfo,
-    onCancel: () -> Unit
-) {
-    val colors = LocalSnowColors.current
-    val isUpload = transfer.direction.equals("upload", ignoreCase = true)
-    val progress = if (transfer.totalBytes > 0) (transfer.bytesTransferred.toFloat() / transfer.totalBytes).coerceIn(0f, 1f) else 0f
-
-    SnowCard(
-        modifier = Modifier.fillMaxWidth(),
-        cornerRadius = 18.dp
-    ) {
-        Column {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = if (isUpload) Icons.Default.FileUpload else Icons.Default.FileDownload,
-                        contentDescription = null,
-                        tint = colors.accentCyan,
-                        modifier = Modifier.size(22.dp)
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column {
-                        Text(
-                            text = transfer.fileName,
-                            style = SnowTypography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-                            color = colors.textPrimary
-                        )
-                        Text(
-                            text = if (isUpload) "Uploading..." else "Downloading...",
-                            style = SnowTypography.bodySmall,
-                            color = colors.textSecondary
-                        )
-                    }
-                }
-
-                Surface(
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .clickable(onClick = onCancel),
-                    color = colors.surfaceElevated
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Default.Close,
-                            contentDescription = "Cancel Transfer",
-                            tint = colors.textMuted,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            LinearProgressIndicator(
-                progress = progress,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp)
-                    .clip(RoundedCornerShape(9999.dp)),
-                color = colors.accentCyan,
-                trackColor = colors.surfaceElevated
-            )
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = "${(progress * 100).toInt()}%",
-                    style = SnowTypography.labelSmall,
-                    color = colors.textPrimary
-                )
-                Text(
-                    text = "${transfer.bytesTransferred / (1024 * 1024)} / ${transfer.totalBytes / (1024 * 1024)} MB",
-                    style = SnowTypography.labelSmall,
-                    color = colors.textSecondary
-                )
-            }
-        }
-    }
-}
-
 @Composable
 private fun TelemetryMetric(label: String, value: String) {
     val colors = LocalSnowColors.current
@@ -993,11 +900,15 @@ private fun CircularToolButton(
     onClick: () -> Unit
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onClick)
+            .clickable {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onClick()
+            }
             .padding(4.dp)
     ) {
         Surface(

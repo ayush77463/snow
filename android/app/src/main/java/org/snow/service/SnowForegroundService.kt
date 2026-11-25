@@ -111,6 +111,11 @@ class SnowForegroundService : Service() {
     @Volatile internal var userDisconnected = false
     private var autoConnectJob: Job? = null
 
+    fun cancelAutoConnect() {
+        autoConnectJob?.cancel()
+        autoConnectJob = null
+    }
+
     fun startRelay(endpoint: String) {
         if (endpoint.isBlank()) return
         stopRelay()
@@ -234,6 +239,7 @@ class SnowForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         createNotificationChannel()
         registerNetworkCallback()
         val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
@@ -746,6 +752,9 @@ class SnowForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        if (activeInstance === this) {
+            activeInstance = null
+        }
         super.onDestroy()
         unregisterNetworkCallback()
         liveScreenHandler.stopStreaming()
@@ -813,6 +822,25 @@ class SnowForegroundService : Service() {
 
         @Volatile
         var isUserDisconnected: Boolean = false
+
+        @Volatile
+        private var activeInstance: SnowForegroundService? = null
+
+        @JvmStatic
+        fun setDisconnectedByUser(context: Context, disconnected: Boolean) {
+            isUserDisconnected = disconnected
+            activeInstance?.let { instance ->
+                instance.userDisconnected = disconnected
+                if (disconnected) {
+                    instance.autoConnectJob?.cancel()
+                    instance.autoConnectJob = null
+                }
+            }
+            context.getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(PREF_USER_DISCONNECTED, disconnected)
+                .apply()
+        }
 
         fun isDisconnectedByUser(context: Context): Boolean {
             val prefs = context.getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)

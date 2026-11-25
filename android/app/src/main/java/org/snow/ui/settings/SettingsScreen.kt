@@ -418,7 +418,7 @@ fun SettingsScreen(
                                 color = colors.textPrimary
                             )
                             Text(
-                                text = updateStatusText.ifBlank { "v5.0.0 • Up to date" },
+                                text = updateStatusText.ifBlank { "v5.1.0 • Up to date" },
                                 style = SnowTypography.bodySmall,
                                 color = colors.textSecondary
                             )
@@ -560,48 +560,6 @@ fun SettingsScreen(
                                 }
                             )
                         }
-
-                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
-
-                        // Logs Header & Actions
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(text = "Diagnostic Logs (${logs.size})", style = SnowTypography.labelSmall, color = colors.textMuted)
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                SnowOutlinedButton(text = "Copy", onClick = onCopyLogs)
-                                SnowOutlinedButton(text = "Clear", onClick = onClearLogs)
-                            }
-                        }
-
-                        if (logs.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Surface(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(110.dp)
-                                    .clip(RoundedCornerShape(8.dp)),
-                                color = colors.surfaceElevated
-                            ) {
-                                androidx.compose.foundation.lazy.LazyColumn(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(8.dp)
-                                ) {
-                                    items(logs.takeLast(15)) { log ->
-                                        Text(
-                                            text = "[${log.timestamp}] [${log.level}] ${log.tag}: ${log.message}",
-                                            style = SnowTypography.monospaceSmall.copy(fontSize = 10.sp),
-                                            color = if (log.level == "ERROR") Color(0xFFEF4444) else colors.textSecondary
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(14.dp))
 
                         SnowOutlinedButton(
                             text = "Reset Trust & Unpair All",

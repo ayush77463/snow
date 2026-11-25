@@ -12,11 +12,14 @@ import argparse
 import asyncio
 import hashlib
 import html
+import inspect
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import secrets
+import sys
 import time
 from typing import Any, Dict, List, Optional
 import urllib.parse
@@ -24,6 +27,7 @@ import uuid
 
 from aiohttp import web
 
+from snow import __version__ as SNOW_VERSION
 from snow.mcp.bridge import SnowMcpBridge
 from snow.mcp.oauth import OAuthServer
 from snow.mcp.registry import get_capability_metadata, list_capabilities
@@ -41,6 +45,12 @@ SUPPORTED_MCP_PROTOCOL_VERSIONS: list[str] = [
     "2024-11-05",
 ]
 MCP_PROTOCOL_VERSION: str = SUPPORTED_MCP_PROTOCOL_VERSIONS[0]
+PUBLIC_ICON_PATHS: frozenset[str] = frozenset({
+    "/favicon.ico",
+    "/snow_logo.png",
+    "/icon.png",
+    "/apple-touch-icon.png",
+})
 
 
 class BoundedRateLimiter:
@@ -239,9 +249,11 @@ class RemoteMcpGateway:
                 text="Misdirected Request: Invalid Host header for configured service.",
             )
 
-        # Origin header check if present
+        # Origin header check if present (exact-path GET/HEAD exemption for public brand icons)
+        clean_path = request.path or "/"
+        is_public_icon_req = request.method in ("GET", "HEAD") and clean_path in PUBLIC_ICON_PATHS
         origin_header = request.headers.get("Origin")
-        if origin_header:
+        if origin_header and not is_public_icon_req:
             parsed = urllib.parse.urlparse(origin_header)
             origin_host = (parsed.hostname or parsed.netloc.split(":")[0] or "").strip().lower()
             if origin_host not in allowed_base_hosts:
@@ -281,8 +293,52 @@ class RemoteMcpGateway:
         self.app.router.add_get("/mcp", self.handle_mcp_get_sse)
         self.app.router.add_delete("/mcp", self.handle_mcp_delete_session)
 
+        # 4. Public Branding Icon Routes (for OAuth & ChatGPT/Claude Connectors UI)
+        for icon_path in sorted(PUBLIC_ICON_PATHS):
+            self.app.router.add_get(icon_path, self.handle_public_icon)
+
         # Health
         self.app.router.add_get("/health", self.handle_health)
+
+    def _resolve_icon_asset(self, request_path: str) -> tuple[Optional[Path], str]:
+        """Resolve local static asset path and Content-Type for public icon routes."""
+        filename = request_path.rsplit("/", 1)[-1].lower()
+        module_dir = Path(__file__).resolve().parent.parent
+        meipass = getattr(sys, "_MEIPASS", None)
+        base_dirs = [module_dir / "web" / "static"]
+        if meipass:
+            base_dirs.append(Path(meipass) / "snow" / "web" / "static")
+            base_dirs.append(Path(meipass))
+        repo_root = module_dir.parent.parent
+        if filename == "favicon.ico":
+            candidates = [d / "favicon.ico" for d in base_dirs] + [repo_root / "packaging" / "windows" / "snow.ico"]
+            content_type = "image/x-icon"
+        else:
+            candidates = [d / "snow_logo.png" for d in base_dirs] + [repo_root / "snow.png"]
+            content_type = "image/png"
+        for cand in candidates:
+            try:
+                if cand.is_file():
+                    return cand, content_type
+            except Exception:
+                pass
+        return None, content_type
+
+    async def handle_public_icon(self, request: web.Request) -> web.Response:
+        """Serve public SNOW logo/favicon with CORS headers for remote AI connectors."""
+        asset_path, content_type = self._resolve_icon_asset(request.path or "/snow_logo.png")
+        if asset_path is None:
+            return web.Response(status=404, text="Icon not found.")
+        payload = asset_path.read_bytes()
+        return web.Response(
+            body=payload,
+            content_type=content_type,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=86400",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({
@@ -454,10 +510,10 @@ class RemoteMcpGateway:
                 "redirect_uri": redirect_uri,
             }
 
-            # Register in pending authorization queue for 1-click dashboard approval
+            # Register in pending authorization queue for 1-click dashboard & companion approval
             req_id = f"auth_req_{secrets.token_hex(8)}"
             poll_token = secrets.token_urlsafe(32)
-            self._pending_authorizations[req_id] = {
+            pending_rec = {
                 "request_id": req_id,
                 "poll_token": poll_token,
                 "client_id": client_id,
@@ -473,6 +529,17 @@ class RemoteMcpGateway:
                 "auth_code": None,
                 "redirect_url": None,
             }
+            self._pending_authorizations[req_id] = pending_rec
+            self._publish_pending_oauth_to_db(pending_rec)
+            self._schedule_core_oauth_event("APPROVAL_REQUESTED", {
+                "request_id": req_id,
+                "principal": client.client_name or client_id,
+                "action": "oauth_authorize",
+                "target_device": "Remote MCP Gateway",
+                "risk_level": "HIGH",
+                "scope": scope,
+                "kind": "oauth",
+            })
 
             # Prune expired consent tokens
             expired_csrf = [k for k, v in self._consent_tokens.items() if now > v.get("expires_at", 0)]
@@ -561,7 +628,6 @@ class RemoteMcpGateway:
   </script>
 </body>
 </html>"""
-            return web.Response(text=consent_html, content_type="text/html")
             return web.Response(text=consent_html, content_type="text/html")
 
         # POST Request Handling — Rate limit consent submissions
@@ -864,7 +930,7 @@ class RemoteMcpGateway:
                     },
                     "serverInfo": {
                         "name": "SNOW Remote MCP Gateway",
-                        "version": "5.0.0",
+                        "version": SNOW_VERSION,
                     },
                 },
             }
@@ -1096,15 +1162,92 @@ class RemoteMcpGateway:
         return web.Response(status=404, text="Session not found.", headers={"MCP-Protocol-Version": proto_ver})
 
     # =========================================================================
-    # Owner-Friendly OAuth Approval Queue (Stage 3B)
+    # Owner-Friendly OAuth Approval Queue (Stage 3B + Cross-Device Sync)
     # =========================================================================
+
+    def _publish_pending_oauth_to_db(self, rec: dict[str, Any]) -> None:
+        """Persist non-secret pending OAuth metadata to SQLite app_settings for Core/Android visibility."""
+        db = getattr(getattr(self, "oauth_server", None), "db_manager", None)
+        if not db or not hasattr(db, "set_setting"):
+            return
+        req_id = rec.get("request_id")
+        if not req_id:
+            return
+        safe_meta = {
+            "request_id": req_id,
+            "client_id": rec.get("client_id", ""),
+            "client_name": rec.get("client_name", ""),
+            "scope": rec.get("scope", "snow:mcp"),
+            "redirect_uri": rec.get("redirect_uri", ""),
+            "created_at": rec.get("created_at", 0.0),
+            "expires_at": rec.get("expires_at", 0.0),
+            "status": rec.get("status", "PENDING"),
+        }
+        try:
+            db.set_setting(f"oauth_req:{req_id}", json.dumps(safe_meta))
+        except Exception as exc:
+            logger.debug("Unable to publish OAuth pending record [%s]: %s", req_id, exc)
+
+    def _clear_oauth_db_record(self, req_id: str) -> None:
+        db = getattr(getattr(self, "oauth_server", None), "db_manager", None)
+        if not db or not hasattr(db, "delete_setting"):
+            return
+        try:
+            db.delete_setting(f"oauth_req:{req_id}")
+            db.delete_setting(f"oauth_dec:{req_id}")
+        except Exception:
+            pass
+
+    def _schedule_core_oauth_event(self, event_type: str, req_data: dict[str, Any]) -> None:
+        """Best-effort async IPC notification to Core so connected owners receive push events."""
+        bridge = getattr(self, "bridge", None)
+        if not bridge or not hasattr(bridge, "call"):
+            return
+        if not inspect.iscoroutinefunction(bridge.call):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            async def _push() -> None:
+                try:
+                    await bridge.call(
+                        "approval_oauth_event",
+                        payload={"event_type": event_type, "request": req_data},
+                    )
+                except Exception:
+                    pass
+            loop.create_task(_push())
+        except RuntimeError:
+            pass
+
+    def _reconcile_external_oauth_decisions(self) -> None:
+        """Apply owner decisions recorded by Core/Android via SQLite app_settings."""
+        db = getattr(getattr(self, "oauth_server", None), "db_manager", None)
+        if not db or not hasattr(db, "get_setting"):
+            return
+        for req_id, rec in list(self._pending_authorizations.items()):
+            if rec.get("status") != "PENDING":
+                continue
+            try:
+                raw_dec = db.get_setting(f"oauth_dec:{req_id}")
+                if not raw_dec:
+                    continue
+                dec_obj = json.loads(raw_dec)
+                dec_status = str(dec_obj.get("status", "")).upper()
+                if dec_status == "APPROVED":
+                    self.approve_authorization(req_id, notify_core=False)
+                elif dec_status == "REJECTED":
+                    self.reject_authorization(req_id, notify_core=False)
+            except Exception as exc:
+                logger.debug("Error reconciling external OAuth decision for %s: %s", req_id, exc)
 
     def list_pending_authorizations(self) -> list[dict[str, Any]]:
         """List active pending OAuth authorization requests awaiting owner consent."""
+        self._reconcile_external_oauth_decisions()
         now = time.time()
         expired = [k for k, v in self._pending_authorizations.items() if now > v.get("expires_at", 0)]
         for k in expired:
             self._pending_authorizations.pop(k, None)
+            self._clear_oauth_db_record(k)
         return [
             {
                 "request_id": v["request_id"],
@@ -1113,13 +1256,14 @@ class RemoteMcpGateway:
                 "scope": v["scope"],
                 "redirect_uri": v["redirect_uri"],
                 "created_at": v["created_at"],
+                "expires_at": v["expires_at"],
                 "status": v["status"],
             }
             for v in self._pending_authorizations.values()
             if v["status"] == "PENDING"
         ]
 
-    def approve_authorization(self, request_id: str) -> dict[str, Any]:
+    def approve_authorization(self, request_id: str, notify_core: bool = True) -> dict[str, Any]:
         """Approve pending authorization request from owner dashboard without raw secret typing."""
         rec = self._pending_authorizations.get(request_id)
         if not rec:
@@ -1144,6 +1288,12 @@ class RemoteMcpGateway:
             {"code": code_or_err, "state": rec.get("state", "")}
         )
         rec["redirect_url"] = target_redirect
+        self._clear_oauth_db_record(request_id)
+        if notify_core:
+            self._schedule_core_oauth_event(
+                "APPROVAL_RESOLVED",
+                {"request_id": request_id, "decision": "APPROVE", "kind": "oauth"},
+            )
         logger.info("Owner approved OAuth request [%s] for client [%s]", request_id, rec["client_id"])
         return {
             "success": True,
@@ -1153,12 +1303,18 @@ class RemoteMcpGateway:
             "redirect_url": target_redirect,
         }
 
-    def reject_authorization(self, request_id: str) -> dict[str, Any]:
+    def reject_authorization(self, request_id: str, notify_core: bool = True) -> dict[str, Any]:
         """Reject pending authorization request from owner dashboard."""
         rec = self._pending_authorizations.get(request_id)
         if not rec:
             return {"success": False, "error": "Authorization request not found or expired."}
         rec["status"] = "REJECTED"
+        self._clear_oauth_db_record(request_id)
+        if notify_core:
+            self._schedule_core_oauth_event(
+                "APPROVAL_RESOLVED",
+                {"request_id": request_id, "decision": "DENY", "kind": "oauth"},
+            )
         logger.info("Owner rejected OAuth request [%s] for client [%s]", request_id, rec["client_id"])
         return {"success": True, "status": "REJECTED", "request_id": request_id}
 
@@ -1175,6 +1331,7 @@ class RemoteMcpGateway:
 
         now = time.time()
         async with self._pending_auth_lock:
+            self._reconcile_external_oauth_decisions()
             rec = self._pending_authorizations.get(req_id)
             if not rec:
                 return web.json_response({"status": "NOT_FOUND"}, status=404)

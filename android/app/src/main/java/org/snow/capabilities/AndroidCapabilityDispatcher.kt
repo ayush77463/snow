@@ -101,6 +101,18 @@ class AndroidCapabilityDispatcher(
             }
             "android_camera_capture", "camera_capture" -> {
                 if (!cameraCaptureHandler.hasCameraPermission()) {
+                    val reqIntent = Intent(context, org.snow.ui.MainActivity::class.java).apply {
+                        this.action = Intent.ACTION_MAIN
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        putExtra("request_camera_capture", true)
+                    }
+                    ActionNotificationHelper.postActionNotification(
+                        context = context,
+                        title = "Camera Photo Requested",
+                        content = "Tap to capture & send to PC",
+                        intent = reqIntent
+                    )
                     return mapOf(
                         "success" to false,
                         "status" to "CAMERA_PERMISSION_REQUIRED",
@@ -109,11 +121,23 @@ class AndroidCapabilityDispatcher(
                     )
                 }
                 if (!cameraCaptureHandler.isInteractionPermitted() && CameraCaptureHandler.mockBitmapProvider == null) {
+                    val reqIntent = Intent(context, org.snow.ui.MainActivity::class.java).apply {
+                        this.action = Intent.ACTION_MAIN
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        putExtra("request_camera_capture", true)
+                    }
+                    ActionNotificationHelper.postActionNotification(
+                        context = context,
+                        title = "Camera Photo Requested",
+                        content = "Tap to capture & send to PC",
+                        intent = reqIntent
+                    )
                     return mapOf(
                         "success" to false,
                         "status" to "FOREGROUND_USER_INTERACTION_REQUIRED",
-                        "error" to "Camera capture requires SNOW to be in the foreground with active visible user interaction.",
-                        "remediation_hint" to "Open SNOW on your Android phone and confirm camera capture."
+                        "error" to "Camera capture requires SNOW to be in the foreground with active visible user interaction. Action notification posted.",
+                        "remediation_hint" to "Tap 'Camera Photo Requested' on your phone to capture & send to PC."
                     )
                 }
             }
@@ -128,9 +152,9 @@ class AndroidCapabilityDispatcher(
                 }
                 val instantSyncEnabled = try {
                     context.getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, android.content.Context.MODE_PRIVATE)
-                        ?.getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_INSTANT_SYNC, false) ?: false
+                        ?.getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_INSTANT_SYNC, true) ?: true
                 } catch (_: Exception) {
-                    false
+                    true
                 }
                 if (!ClipboardHandler.isUserIntentGranted && !instantSyncEnabled) {
                     return mapOf(
@@ -466,9 +490,12 @@ class AndroidCapabilityDispatcher(
                         operation = operation,
                         riskLevel = riskLevel,
                     )
-                } else if (eventType == "APPROVAL_RESOLVED" && reqId.isNotBlank()) {
+                } else if ((eventType == "APPROVAL_RESOLVED" || eventType == "APPROVAL_EXPIRED") && reqId.isNotBlank()) {
                     ActionNotificationHelper.cancelApprovalNotification(context, reqId)
                 }
+                try {
+                    org.snow.ui.SnowUiRepository.getInstance(context).onApprovalEventReceived()
+                } catch (_: Exception) {}
                 Pair(mapOf("status" to "success"), null)
             }
             else -> {

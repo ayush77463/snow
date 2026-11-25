@@ -106,6 +106,10 @@ class SnowWebServer:
         self._usb_status_cache_time: float = 0.0
         self._usb_status_lock = asyncio.Lock()
 
+        # Track active dashboard-initiated file transfer tasks for cancellation
+        self._active_file_downloads: dict[str, asyncio.Task[Any]] = {}
+        self._active_file_downloads_lock = asyncio.Lock()
+
     # =========================================================================
     # Security Middleware
     # =========================================================================
@@ -847,15 +851,76 @@ class SnowWebServer:
             "svg": svg_content,
         })
 
+    def _get_configured_transfer_dirs(self) -> tuple[Path, Path]:
+        """Resolve configured PC transfers and captures directories."""
+        sm = getattr(getattr(self, "transfer_server", None), "storage_manager", None)
+        transfers_dir = getattr(sm, "base_dir", None)
+        if not transfers_dir:
+            transfers_dir = Path.home() / ".snow" / "transfers"
+        captures_dir = getattr(sm, "captures_dir", None)
+        if not captures_dir:
+            captures_dir = Path.home() / ".snow" / "captures"
+        return Path(transfers_dir).resolve(), Path(captures_dir).resolve()
+
+    async def _is_remote_windows_device(self, device_id: str, device_type_hint: str = "") -> bool:
+        """Determine whether device_id refers to a non-local remote Windows/Desktop peer."""
+        if not device_id:
+            return False
+        hint = (device_type_hint or "").strip().lower()
+        if hint in ("windows", "desktop", "pc", "windows_pc"):
+            return True
+        if hint in ("android", "phone", "mobile"):
+            return False
+        if hasattr(self, "db_manager") and self.db_manager:
+            try:
+                rec = self.db_manager.get_paired_device(device_id)
+                if rec:
+                    platform = str(getattr(rec, "platform", "") or "").lower()
+                    role = str(getattr(rec, "role", "") or "").lower()
+                    if "windows" in platform or "desktop" in platform or role == "desktop":
+                        return True
+                    if "android" in platform or role == "android":
+                        return False
+            except Exception:
+                pass
+        return False
+
     async def handle_api_files(self, request: web.Request) -> web.Response:
-        """Enumerate files in the phone's storage (Full Shared Storage or SAF fallback)."""
+        """Enumerate files on connected Android phone or remote Peer PC storage."""
         device_id = request.query.get("device_id", "")
+        device_type_hint = request.query.get("device_type", "")
         subpath = request.query.get("subpath", "")
         scope = request.query.get("scope", "full")
         if "hide_hidden" in request.query:
             show_hidden = not (request.query.get("hide_hidden", "false").lower() in ("true", "1"))
         else:
             show_hidden = request.query.get("show_hidden", "false").lower() in ("true", "1")
+
+        transfers_dir, _ = self._get_configured_transfer_dirs()
+
+        if await self._is_remote_windows_device(device_id, device_type_hint):
+            res = await self.bridge.send_device_request(
+                device_id=device_id,
+                action="desktop_file_list",
+                data={"path": subpath, "limit": 100},
+                timeout=30.0,
+            )
+            data_dict = res.get("data") if isinstance(res.get("data"), dict) else {}
+            raw_items = data_dict.get("files") or data_dict.get("items") or res.get("files") or []
+            return web.json_response({
+                "success": res.get("success", False),
+                "status": res.get("status", "SUCCESS"),
+                "items": raw_items,
+                "storage_mode": "desktop_remote",
+                "directory": data_dict.get("directory") or subpath or "Home",
+                "parent": data_dict.get("parent"),
+                "folder_name": data_dict.get("directory") or "Home",
+                "subpath": data_dict.get("directory") or subpath,
+                "destination_dir": str(transfers_dir),
+                "data": data_dict,
+                "error": res.get("error"),
+            })
+
         res = await self.bridge.android_file_list(
             subpath=subpath,
             device_id=device_id,
@@ -882,6 +947,7 @@ class SnowWebServer:
             "storage_mode": storage_mode,
             "folder_name": folder_name,
             "subpath": subpath,
+            "destination_dir": str(transfers_dir),
             "data": res.get("data", {}),
             "error": res.get("error"),
         })
@@ -896,16 +962,94 @@ class SnowWebServer:
         device_id = body.get("device_id", "")
         file_name = body.get("file_name", "")
         subpath = body.get("subpath", "")
+        transfer_client_key = str(body.get("client_transfer_id") or secrets.token_hex(8))
 
         if not file_name or not isinstance(file_name, str):
             return web.json_response({"success": False, "error": "Missing required field 'file_name'."}, status=400)
 
-        res = await self.bridge.android_file_receive(
-            file_name=file_name,
-            subpath=subpath,
-            device_id=device_id,
+        transfers_dir, _ = self._get_configured_transfer_dirs()
+
+        task = asyncio.create_task(
+            self.bridge.android_file_receive(
+                file_name=file_name,
+                subpath=subpath,
+                device_id=device_id,
+            )
         )
+        async with self._active_file_downloads_lock:
+            self._active_file_downloads[transfer_client_key] = task
+
+        try:
+            res = await task
+        except asyncio.CancelledError:
+            return web.json_response(
+                {"success": False, "status": "CANCELLED", "error": "File download cancelled by user."},
+                status=499,
+            )
+        finally:
+            async with self._active_file_downloads_lock:
+                self._active_file_downloads.pop(transfer_client_key, None)
+
+        if isinstance(res, dict):
+            res = dict(res)
+            res.setdefault("destination_dir", str(transfers_dir))
+            data_dict = res.get("data")
+            if isinstance(data_dict, dict):
+                data_copy = dict(data_dict)
+                data_copy.setdefault("destination_dir", str(transfers_dir))
+                data_copy.setdefault("destination_path", str(transfers_dir / Path(file_name).name))
+                res["data"] = data_copy
         return web.json_response(res)
+
+    async def handle_api_files_destinations(self, request: web.Request) -> web.Response:
+        """Return configured PC transfers and captures directories for Dashboard display."""
+        transfers_dir, captures_dir = self._get_configured_transfer_dirs()
+        return web.json_response({
+            "success": True,
+            "pc_transfers_dir": str(transfers_dir),
+            "pc_captures_dir": str(captures_dir),
+        })
+
+    async def handle_api_open_transfers_folder(self, request: web.Request) -> web.Response:
+        """Open ONLY the configured PC transfers folder in OS file explorer."""
+        transfers_dir, _ = self._get_configured_transfer_dirs()
+        transfers_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32" and hasattr(os, "startfile"):
+                await asyncio.to_thread(os.startfile, str(transfers_dir))
+                return web.json_response({
+                    "success": True,
+                    "opened": True,
+                    "path": str(transfers_dir),
+                })
+            return web.json_response({
+                "success": True,
+                "opened": False,
+                "path": str(transfers_dir),
+                "message": "Transfers directory ready.",
+            })
+        except Exception as exc:
+            logger.warning("Failed opening transfers folder '%s': %s", transfers_dir, exc)
+            return web.json_response({
+                "success": False,
+                "opened": False,
+                "path": str(transfers_dir),
+                "error": f"Unable to open folder: {exc}",
+            }, status=500)
+
+    async def handle_api_files_transfer_cancel(self, request: web.Request) -> web.Response:
+        """Cancel active dashboard-initiated file downloads cleanly."""
+        cancelled = 0
+        async with self._active_file_downloads_lock:
+            for tid, task in list(self._active_file_downloads.items()):
+                if task and not task.done():
+                    task.cancel()
+                    cancelled += 1
+        return web.json_response({
+            "success": True,
+            "status": "CANCELLED",
+            "cancelled_count": cancelled,
+        })
 
     async def handle_api_notifications(self, request: web.Request) -> web.Response:
         """List active non-sensitive notifications from the connected phone."""
@@ -1770,23 +1914,28 @@ class SnowWebServer:
 
     def _find_candidate_apk(self) -> Optional[Path]:
         """Resolve the mobile APK binary across frozen, package output, and local build paths."""
+        import re as _re
         candidates = []
         env_apk = os.environ.get("SNOW_ANDROID_APK_PATH")
         if env_apk:
             candidates.append(Path(env_apk).resolve())
 
+        def _apk_ver_key(p: Path) -> tuple[int, ...]:
+            m = _re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", p.name)
+            return tuple(int(g or 0) for g in m.groups()) if m else (0, 0, 0)
+
         # Frozen sibling paths (for snow.exe / snow-tray.exe)
         exe_dir = Path(sys.executable).resolve().parent
-        candidates.append(exe_dir / "packaging" / "output" / "SNOW-Mobile-5.0.0.apk")
-        candidates.append(exe_dir / "SNOW-Mobile-5.0.0.apk")
-        candidates.append(exe_dir / "packaging" / "output" / "SNOW-Mobile-4.1.0.apk")
-        candidates.append(exe_dir / "SNOW-Mobile-4.1.0.apk")
+        for folder in (exe_dir / "packaging" / "output", exe_dir):
+            if folder.is_dir():
+                candidates.extend(sorted(folder.glob("SNOW-Mobile-*.apk"), key=_apk_ver_key, reverse=True))
         candidates.append(exe_dir / "SNOW-Mobile.apk")
 
         # Repository paths
         repo_root = Path(__file__).resolve().parent.parent.parent.parent
-        candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile-5.0.0.apk")
-        candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile-4.1.0.apk")
+        repo_out = repo_root / "packaging" / "output"
+        if repo_out.is_dir():
+            candidates.extend(sorted(repo_out.glob("SNOW-Mobile-*.apk"), key=_apk_ver_key, reverse=True))
         candidates.append(repo_root / "packaging" / "output" / "SNOW-Mobile.apk")
         candidates.append(repo_root / "packaging" / "output" / "app-release.apk")
         candidates.append(repo_root / "android" / "app" / "build" / "outputs" / "apk" / "release" / "app-release.apk")
@@ -2287,6 +2436,25 @@ class SnowWebServer:
                 "error": f"Failed removing USB reverse mappings: {exc}",
             }, status=500)
 
+    async def handle_api_usb_unlock_permissions(self, request: web.Request) -> web.Response:
+        """Best-effort unlock of SNOW Android runtime/special permissions over authorized USB ADB."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        serial = body.get("serial") if isinstance(body, dict) else None
+        from snow.core.usb import unlock_android_permissions
+        try:
+            res = await asyncio.to_thread(unlock_android_permissions, serial=serial)
+            return web.json_response(res, status=200 if res.get("success") else 400)
+        except Exception as exc:
+            logger.error("Failed unlocking Android permissions via USB: %s", exc)
+            return web.json_response({
+                "success": False,
+                "status": "ERROR",
+                "error": f"Failed unlocking Android permissions via USB: {exc}",
+            }, status=500)
+
     async def handle_api_mcp_setup(self, request: web.Request) -> web.Response:
         """Configure SNOW MCP server across AI assistant hosts."""
         try:
@@ -2388,7 +2556,7 @@ class SnowWebServer:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "snow-test-runner", "version": "5.0.0"},
+                    "clientInfo": {"name": "snow-test-runner", "version": "5.1.0"},
                 },
             }
             if proc.stdin is None or proc.stdout is None:
@@ -2551,6 +2719,8 @@ class SnowWebServer:
             "mcp_cloudflare_token",
             "relay_cloudflare_token",
             "cloudflare_token",
+            "relay_ticket",
+            "snow_id",
             "mcp_public_url",
             "relay_public_url",
             "public_url",
@@ -2579,9 +2749,9 @@ class SnowWebServer:
                         status=400,
                     )
             if k == "provider" and clean_v:
-                if clean_v.lower() not in ("cloudflared", "tailscale", "custom"):
+                if clean_v.lower() not in ("cloudflared", "tailscale", "render", "custom"):
                     return web.json_response(
-                        {"success": False, "status": "INVALID_PROVIDER", "error": "Provider must be 'cloudflared', 'tailscale', or 'custom'."},
+                        {"success": False, "status": "INVALID_PROVIDER", "error": "Provider must be 'cloudflared', 'tailscale', 'render', or 'custom'."},
                         status=400,
                     )
             # Never overwrite real credential with redacted token
@@ -2932,6 +3102,9 @@ class SnowWebServer:
         app.router.add_get("/api/pair/qr", self.handle_api_pair_qr)
         app.router.add_post("/api/pair/qr", self.handle_api_pair_qr)
         app.router.add_get("/api/files", self.handle_api_files)
+        app.router.add_get("/api/files/destinations", self.handle_api_files_destinations)
+        app.router.add_post("/api/files/open-transfers-folder", self.handle_api_open_transfers_folder)
+        app.router.add_post("/api/files/transfer/cancel", self.handle_api_files_transfer_cancel)
         app.router.add_post("/api/files/download", self.handle_api_file_download)
         app.router.add_get("/api/notifications", self.handle_api_notifications)
         app.router.add_post("/api/notifications/dismiss", self.handle_api_notification_dismiss)
@@ -2998,6 +3171,7 @@ class SnowWebServer:
         app.router.add_get("/api/usb/status", self.handle_api_usb_status)
         app.router.add_post("/api/usb/connect", self.handle_api_usb_connect)
         app.router.add_post("/api/usb/disconnect", self.handle_api_usb_disconnect)
+        app.router.add_post("/api/usb/unlock-permissions", self.handle_api_usb_unlock_permissions)
         app.router.add_post("/api/mcp/setup", self.handle_api_mcp_setup)
         app.router.add_post("/api/mcp/gateway/toggle", self.handle_api_mcp_gateway_toggle)
         app.router.add_post("/api/mcp/test-local", self.handle_api_mcp_test_local)

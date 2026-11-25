@@ -36,10 +36,33 @@ class AndroidContractAndSyncTest {
         assertTrue((violation?.get("remediation_hint") as String).contains("foreground"))
     }
 
+    private fun contextWithInstantSync(enabled: Boolean): ContextWrapper {
+        val prefs = object : android.content.SharedPreferences {
+            private val values = mutableMapOf<String, Any?>(
+                org.snow.ui.SnowUiRepository.PREF_KEY_INSTANT_SYNC to enabled
+            )
+            override fun getAll(): MutableMap<String, *> = values
+            override fun getString(key: String?, defValue: String?): String? = defValue
+            override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+            override fun getInt(key: String?, defValue: Int): Int = defValue
+            override fun getLong(key: String?, defValue: Long): Long = defValue
+            override fun getFloat(key: String?, defValue: Float): Float = defValue
+            override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+                (values[key] as? Boolean) ?: defValue
+            override fun contains(key: String?): Boolean = values.containsKey(key)
+            override fun edit(): android.content.SharedPreferences.Editor = throw UnsupportedOperationException()
+            override fun registerOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun unregisterOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+        }
+        return object : ContextWrapper(null) {
+            override fun getSharedPreferences(name: String?, mode: Int) = prefs
+        }
+    }
+
     @Test
     fun testValidateExecutionContractClipboardUserConfirmationRequired() {
-        val dummyContext = object : ContextWrapper(null) {}
-        val dispatcher = AndroidCapabilityDispatcher(dummyContext, transferClientProvider = { null })
+        val disabledSyncContext = contextWithInstantSync(false)
+        val dispatcher = AndroidCapabilityDispatcher(disabledSyncContext, transferClientProvider = { null })
 
         ClipboardHandler.isAppInForeground = true
         ClipboardHandler.isUserIntentGranted = false
@@ -49,6 +72,10 @@ class AndroidContractAndSyncTest {
         assertEquals(false, violation?.get("success"))
         assertEquals("USER_CONFIRMATION_REQUIRED", violation?.get("status"))
         assertTrue((violation?.get("remediation_hint") as String).contains("Confirm"))
+
+        // Default true allows foreground pull without extra prompt
+        val defaultDispatcher = AndroidCapabilityDispatcher(object : ContextWrapper(null) {}, transferClientProvider = { null })
+        assertNull(defaultDispatcher.validateExecutionContract("clipboard_pull", null))
     }
 
     @Test

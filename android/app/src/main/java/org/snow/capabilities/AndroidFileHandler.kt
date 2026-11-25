@@ -1,11 +1,15 @@
 package org.snow.capabilities
 
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.snow.security.SafeLog
 import org.snow.transfer.FileTransferClient
+import org.snow.ui.files.SafFolderManager
 import java.io.File
 
 /**
@@ -84,42 +88,102 @@ class AndroidFileHandler(
             return@withContext mapOf("status" to "error", "error" to "FileTransferClient not initialized.")
         }
 
-        val destinationDir = getTransfersDirectory()
-        val destinationFile = File(destinationDir, safeFileName)
+        val safManager = try {
+            SafFolderManager(context)
+        } catch (_: Exception) {
+            null
+        }
+        val safUri = try {
+            safManager?.getDestinationUri()
+        } catch (_: Exception) {
+            null
+        }
+        val stagingDir = try {
+            safManager?.getStagingDir() ?: File(context.cacheDir, "snow_staging").apply { mkdirs() }
+        } catch (_: Exception) {
+            getTransfersDirectory()
+        }
+        val stagedFile = File(stagingDir, "${transferId}_$safeFileName")
 
         SafeLog.i(TAG, "Downloading incoming file '$safeFileName' [transfer_id=$transferId]...")
         val result = client.downloadFile(
             serverHost = serverHost,
             transferPort = transferPort,
             transferId = transferId,
-            destinationFile = destinationFile,
+            destinationFile = stagedFile,
             expectedSha256 = expectedSha256,
             resume = true
         )
 
         when (result) {
             is FileTransferClient.TransferResult.Success -> {
-                SafeLog.i(TAG, "Download successful: ${destinationFile.absolutePath} (${destinationFile.length()} bytes)")
+                val expectedBytes = stagedFile.length()
+                val commitOutcome = commitDownloadedFile(
+                    stagedFile = stagedFile,
+                    safeFileName = safeFileName,
+                    expectedBytes = expectedBytes,
+                    safManager = safManager,
+                    hasConfiguredSaf = (safUri != null),
+                )
+                if (commitOutcome.isFailure) {
+                    try { stagedFile.delete() } catch (_: Exception) {}
+                    val errMsg = commitOutcome.exceptionOrNull()?.message ?: "Failed saving downloaded file."
+                    SafeLog.e(TAG, "Commit failed for '$safeFileName': $errMsg")
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "transfer_id" to transferId,
+                        "error" to errMsg
+                    )
+                }
+                val (savedPath, storageMode) = commitOutcome.getOrThrow()
+                SafeLog.i(TAG, "Download successful [$storageMode]: $savedPath ($expectedBytes bytes)")
                 mapOf(
                     "status" to "success",
                     "transfer_id" to transferId,
                     "file_name" to safeFileName,
-                    "bytes_downloaded" to destinationFile.length(),
+                    "bytes_downloaded" to expectedBytes,
                     "sha256" to result.sha256,
-                    "saved_path" to destinationFile.absolutePath
+                    "saved_path" to savedPath,
+                    "storage_mode" to storageMode,
                 )
             }
             is FileTransferClient.TransferResult.Duplicate -> {
+                val bytes = if (stagedFile.exists()) stagedFile.length() else 0L
+                val commitOutcome = if (stagedFile.exists()) {
+                    commitDownloadedFile(
+                        stagedFile = stagedFile,
+                        safeFileName = safeFileName,
+                        expectedBytes = bytes,
+                        safManager = safManager,
+                        hasConfiguredSaf = (safUri != null),
+                    )
+                } else {
+                    val defaultDisplay = safManager?.getDestinationDisplayName() ?: "Downloads/SNOW"
+                    Result.success(defaultDisplay to if (safUri != null) "saf_tree" else "public_downloads")
+                }
+                if (commitOutcome.isFailure) {
+                    try { stagedFile.delete() } catch (_: Exception) {}
+                    val errMsg = commitOutcome.exceptionOrNull()?.message ?: "Failed saving duplicate file."
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "transfer_id" to transferId,
+                        "error" to errMsg
+                    )
+                }
+                val (savedPath, storageMode) = commitOutcome.getOrThrow()
                 mapOf(
                     "status" to "success",
                     "transfer_id" to transferId,
                     "file_name" to safeFileName,
-                    "bytes_downloaded" to destinationFile.length(),
+                    "bytes_downloaded" to bytes,
                     "sha256" to result.sha256,
+                    "saved_path" to savedPath,
+                    "storage_mode" to storageMode,
                     "message" to "File already exists with matching SHA-256."
                 )
             }
             is FileTransferClient.TransferResult.Error -> {
+                try { stagedFile.delete() } catch (_: Exception) {}
                 SafeLog.e(TAG, "Download failed: ${result.message}")
                 mapOf(
                     "status" to "error",
@@ -127,6 +191,88 @@ class AndroidFileHandler(
                     "error" to result.message
                 )
             }
+        }
+    }
+
+    private fun commitDownloadedFile(
+        stagedFile: File,
+        safeFileName: String,
+        expectedBytes: Long,
+        safManager: SafFolderManager?,
+        hasConfiguredSaf: Boolean,
+    ): Result<Pair<String, String>> {
+        if (!stagedFile.exists()) {
+            return Result.failure(IllegalStateException("Staged transfer file missing before destination commit."))
+        }
+
+        // 1. User-configured SAF directory takes strict precedence when configured
+        if (hasConfiguredSaf && safManager != null) {
+            val safRes = safManager.commitVerifiedDownload(stagedFile, safeFileName)
+            return safRes.map { saved -> saved to "saf_tree" }
+        }
+
+        // 2. Supported public Downloads/SNOW destination via MediaStore (Android 10+ / scoped storage safe)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = try { context.contentResolver } catch (_: Exception) { null }
+            if (resolver != null) {
+                try {
+                    val values = ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, safeFileName)
+                        put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                        put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/SNOW")
+                        put(MediaStore.Downloads.IS_PENDING, 1)
+                    }
+                    val itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    if (itemUri != null) {
+                        var copied = 0L
+                        resolver.openOutputStream(itemUri)?.use { out ->
+                            stagedFile.inputStream().use { input ->
+                                copied = input.copyTo(out)
+                            }
+                            out.flush()
+                        } ?: throw IllegalStateException("ContentResolver output stream unavailable")
+                        if (copied != expectedBytes) {
+                            resolver.delete(itemUri, null, null)
+                            throw IllegalStateException("Incomplete MediaStore write ($copied/$expectedBytes bytes)")
+                        }
+                        val publishValues = ContentValues().apply {
+                            put(MediaStore.Downloads.IS_PENDING, 0)
+                        }
+                        resolver.update(itemUri, publishValues, null, null)
+                        stagedFile.delete()
+                        return Result.success("Downloads/SNOW/$safeFileName" to "public_downloads")
+                    }
+                } catch (e: Exception) {
+                    SafeLog.w(TAG, "MediaStore Downloads save fell back: ${e.message}")
+                }
+            }
+        }
+
+        // 3. Direct public Downloads/SNOW file commit (or SAF fallback if available)
+        if (safManager != null) {
+            val directRes = safManager.commitVerifiedDownload(stagedFile, safeFileName)
+            if (directRes.isSuccess) {
+                return directRes.map { saved -> saved to "public_downloads" }
+            }
+        }
+
+        // 4. Last-resort verified app-scoped fallback (primarily for constrained test hosts)
+        val fallbackDir = getTransfersDirectory()
+        val targetFile = File(fallbackDir, safeFileName)
+        return try {
+            stagedFile.inputStream().use { input ->
+                targetFile.outputStream().use { out ->
+                    input.copyTo(out)
+                    out.flush()
+                }
+            }
+            if (!targetFile.exists() || targetFile.length() != expectedBytes) {
+                return Result.failure(IllegalStateException("Destination file write verification failed."))
+            }
+            stagedFile.delete()
+            Result.success(targetFile.absolutePath to "app_transfers")
+        } catch (e: Exception) {
+            Result.failure(e)
         }
     }
 

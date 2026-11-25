@@ -34,10 +34,15 @@
     }
 
     function formatTimestamp(ts) {
-        if (!ts) return "";
+        if (!ts && ts !== 0) return "";
         try {
-            if (typeof ts === "number") {
-                return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            if (typeof ts === "number" || (/^\d+(\.\d+)?$/.test(String(ts).trim()))) {
+                const rawNum = Number(ts);
+                const ms = rawNum > 1e12 ? rawNum : rawNum * 1000;
+                const d = new Date(ms);
+                if (!isNaN(d.getTime())) {
+                    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+                }
             }
             const d = new Date(ts);
             if (!isNaN(d.getTime())) {
@@ -94,6 +99,8 @@
     let activeDeviceId = "";
     let hasUserSelectedDevice = false;
     let currentSubpath = "";
+    let currentRemoteParent = "";
+    let currentStorageMode = "saf_tree";
     let isCorePaused = false;
     let isCoreOnline = true;
     let registeredDevices = [];
@@ -109,6 +116,8 @@
     let localHostTelemetry = {};
     let canonicalSnowId = "SNW-LOCAL";
     let activeUploadXhr = null;
+    let activeDownloadController = null;
+    let pcTransfersDestDir = "";
     let pendingUpdateMeta = null;
     let modalPurposeMode = "share"; // "share" | "clipboard"
     let screenStreamTimer = null;
@@ -117,6 +126,9 @@
     let isPollStateInFlight = false;
     let screenFrameErrorCount = 0;
     let lastKnownStreamState = "IDLE";
+    let isCaptureStreamActive = false;
+    let lastCaptureTitle = "Capture Preview";
+    let lastFocusedBeforeLightbox = null;
 
     // =========================================================================
     // API Helpers & Identity Classification
@@ -677,6 +689,8 @@
     function selectActiveDevice(deviceId, userExplicit = false) {
         activeDeviceId = deviceId || "local";
         if (userExplicit) hasUserSelectedDevice = true;
+        currentSubpath = "";
+        currentRemoteParent = "";
 
         const dev = getSelectedDeviceObj();
         updateTopbarCapsule(dev);
@@ -790,15 +804,27 @@
             loadHomeWidgets();
         });
 
-        // Active Transfer Cancel
-        document.getElementById("btn-active-transfer-cancel")?.addEventListener("click", () => {
-            if (activeUploadXhr) {
-                activeUploadXhr.abort();
-                activeUploadXhr = null;
-                showNotificationToast("File transfer cancelled.", "warning");
+        // Active Transfer Cancel (supports both upload XHR and active downloads)
+        document.getElementById("btn-active-transfer-cancel")?.addEventListener("click", cancelActiveTransfer);
+        document.getElementById("btn-files-transfer-cancel")?.addEventListener("click", cancelActiveTransfer);
+
+        document.getElementById("btn-capture-screen-trigger")?.addEventListener("click", triggerScreenCapture);
+        document.getElementById("btn-capture-camera-trigger")?.addEventListener("click", triggerCameraCapture);
+        document.getElementById("btn-stop-screen-stream")?.addEventListener("click", stopRemoteScreenStream);
+        document.getElementById("btn-enlarge-capture")?.addEventListener("click", () => {
+            const latestImg = document.getElementById("latest-capture-img");
+            if (latestImg && latestImg.getAttribute("src")) {
+                openMediaPreview(latestImg.src, lastCaptureTitle, isCaptureStreamActive);
             }
-            document.getElementById("active-transfer-container")?.classList.add("d-none");
-            document.getElementById("topbar-active-transfer-chip")?.classList.add("d-none");
+        });
+        document.getElementById("btn-retry-screen-stream")?.addEventListener("click", () => {
+            screenFrameErrorCount = 0;
+            pollScreenStreamStatus();
+        });
+        document.addEventListener("visibilitychange", () => {
+            if (!document.hidden && isCaptureStreamActive) {
+                fetchNextScreenFrame();
+            }
         });
 
         document.getElementById("btn-hero-refresh-wallpaper")?.addEventListener("click", () => {
@@ -899,6 +925,7 @@
     function setScreenViewerState(mode, subtitle = "") {
         const badge = document.getElementById("screen-stream-badge");
         const stopBtn = document.getElementById("btn-stop-screen-stream");
+        const enlargeBtn = document.getElementById("btn-enlarge-capture");
         const img = document.getElementById("latest-capture-img");
         const placeholder = document.getElementById("latest-capture-placeholder");
         const statusText = document.getElementById("latest-capture-status-text");
@@ -906,6 +933,7 @@
         const metaEl = document.getElementById("screen-stream-meta");
 
         if (mode === "STREAMING") {
+            isCaptureStreamActive = true;
             if (badge) {
                 badge.textContent = "Live Stream";
                 badge.className = "chip chip-sm chip-emerald";
@@ -917,17 +945,20 @@
                 metaEl.classList.remove("d-none");
             }
         } else if (mode === "ERROR") {
+            isCaptureStreamActive = false;
             if (badge) {
                 badge.textContent = "Stream Error";
                 badge.className = "chip chip-sm chip-rose";
             }
             stopBtn?.classList.add("d-none");
             if (img) img.style.display = "none";
+            enlargeBtn?.classList.add("d-none");
             placeholder?.classList.remove("d-none");
             if (statusText) statusText.textContent = subtitle || "Failed loading live screen frame.";
             retryBtn?.classList.remove("d-none");
             metaEl?.classList.add("d-none");
         } else if (mode === "STOPPED") {
+            isCaptureStreamActive = false;
             if (badge) {
                 badge.textContent = "Stopped";
                 badge.className = "chip chip-sm chip-amber";
@@ -936,6 +967,7 @@
             retryBtn?.classList.add("d-none");
             if (img && !img.getAttribute("src")) {
                 placeholder?.classList.remove("d-none");
+                enlargeBtn?.classList.add("d-none");
             }
             if (statusText) statusText.textContent = subtitle || "Live screen stream stopped.";
             if (metaEl) {
@@ -943,6 +975,7 @@
                 metaEl.classList.remove("d-none");
             }
         } else {
+            isCaptureStreamActive = false;
             if (badge) {
                 badge.textContent = "Standby";
                 badge.className = "chip chip-sm chip-neutral";
@@ -951,6 +984,11 @@
             retryBtn?.classList.add("d-none");
             metaEl?.classList.add("d-none");
         }
+
+        const lbStop = document.getElementById("btn-lightbox-stop-stream");
+        const lbBadge = document.getElementById("media-preview-stream-badge");
+        lbStop?.classList.toggle("d-none", !isCaptureStreamActive);
+        lbBadge?.classList.toggle("d-none", !isCaptureStreamActive);
     }
 
     function stopScreenFramePolling() {
@@ -962,21 +1000,32 @@
     }
 
     function fetchNextScreenFrame() {
-        if (isScreenFrameInFlight) return;
+        if (document.hidden || isScreenFrameInFlight) return;
         isScreenFrameInFlight = true;
         const frameUrl = `/api/screen/frame?t=${Date.now()}`;
         const preloader = new Image();
         preloader.onload = () => {
             isScreenFrameInFlight = false;
             screenFrameErrorCount = 0;
+            lastCaptureTitle = "Live Android Screen";
             const latestImg = document.getElementById("latest-capture-img");
+            const enlargeBtn = document.getElementById("btn-enlarge-capture");
             const placeholder = document.getElementById("latest-capture-placeholder");
             if (latestImg) {
                 latestImg.src = frameUrl;
                 latestImg.style.display = "block";
-                latestImg.onclick = () => openMediaPreview(frameUrl, "Live Android Screen");
+                latestImg.onclick = () => openMediaPreview(latestImg.src, "Live Android Screen", isCaptureStreamActive);
             }
+            enlargeBtn?.classList.remove("d-none");
             placeholder?.classList.add("d-none");
+
+            const mediaModal = document.getElementById("media-preview-modal");
+            const mediaPreviewImg = document.getElementById("media-preview-img");
+            const dlBtn = document.getElementById("btn-download-preview");
+            if (mediaModal && !mediaModal.classList.contains("d-none") && mediaPreviewImg) {
+                mediaPreviewImg.src = frameUrl;
+                if (dlBtn) dlBtn.href = frameUrl;
+            }
         };
         preloader.onerror = () => {
             isScreenFrameInFlight = false;
@@ -990,7 +1039,7 @@
     }
 
     async function pollScreenStreamStatus() {
-        if (isScreenStatusPolling) return;
+        if (document.hidden || isScreenStatusPolling) return;
         isScreenStatusPolling = true;
         try {
             const st = await apiRequest("/api/screen/status");
@@ -1040,27 +1089,84 @@
             showNotificationToast("Select or connect an online phone for camera capture.", "warning");
             return;
         }
-        showNotificationToast("Capturing photo via phone camera...", "info");
+        const statusText = document.getElementById("latest-capture-status-text");
+        if (statusText) statusText.textContent = "Requesting camera photo on phone...";
+        showNotificationToast("Requesting phone camera capture...", "info");
+
+        let baselineFilename = "";
+        try {
+            const preResp = await fetch(`/api/camera/latest?t=${Date.now()}`);
+            if (preResp.status === 200) baselineFilename = preResp.headers.get("X-Snow-Filename") || "";
+        } catch (e) {}
+
         const res = await apiRequest("/api/camera/capture", "POST", { device_id: targetId });
         if (res && res.success) {
+            const fileName = res.file_name || res.data?.file_name;
             showNotificationToast("Camera photo captured!", "success");
-            setTimeout(() => {
-                showCapturePreview(`/api/camera/latest?t=${Date.now()}`, "Camera Photo");
-            }, 1200);
-        } else {
-            showNotificationToast(res?.error || "Failed capturing camera photo", "error");
+            const imgSrc = fileName
+                ? `/api/captures/${encodeURIComponent(fileName)}?t=${Date.now()}`
+                : `/api/camera/latest?t=${Date.now()}`;
+            showCapturePreview(imgSrc, "Camera Photo", false);
+            return;
         }
+
+        const errStr = String(res?.error || res?.status || "");
+        const awaitingTap = errStr.includes("FOREGROUND_USER_INTERACTION_REQUIRED")
+            || errStr.includes("CAMERA_PERMISSION_REQUIRED")
+            || errStr.includes("CAMERA_APPROVAL_NOTIFICATION_POSTED")
+            || errStr.toLowerCase().includes("notification");
+        if (!awaitingTap) {
+            if (statusText) statusText.textContent = errStr || "Camera capture failed";
+            showNotificationToast(errStr || "Failed capturing camera photo", "error");
+            return;
+        }
+
+        if (statusText) statusText.textContent = "Tap 'Camera Photo Requested' on your phone, snap a photo, and confirm...";
+        showNotificationToast("Tap the Camera notification on your phone to capture & send photo.", "info");
+
+        let attempts = 0;
+        let inFlight = false;
+        const pollTimer = setInterval(async () => {
+            if (document.hidden || inFlight) return;
+            inFlight = true;
+            try {
+                attempts++;
+                const camResp = await fetch(`/api/camera/latest?t=${Date.now()}`);
+                if (camResp.status === 200) {
+                    const fname = camResp.headers.get("X-Snow-Filename") || "";
+                    if (fname && fname !== baselineFilename) {
+                        clearInterval(pollTimer);
+                        showCapturePreview(`/api/camera/latest?t=${Date.now()}`, "Camera Photo", false);
+                        showNotificationToast("Camera photo received!", "success");
+                        return;
+                    }
+                }
+                if (attempts >= 35) {
+                    clearInterval(pollTimer);
+                    if (statusText) statusText.textContent = "Camera photo request timed out or was cancelled.";
+                    showNotificationToast("Camera photo request timed out.", "warning");
+                }
+            } finally {
+                inFlight = false;
+            }
+        }, 1200);
     }
 
-    function showCapturePreview(imgUrl, title) {
+    function showCapturePreview(imgUrl, title, autoOpenModal = false) {
+        lastCaptureTitle = title || "Capture Preview";
         const latestImg = document.getElementById("latest-capture-img");
+        const enlargeBtn = document.getElementById("btn-enlarge-capture");
         const placeholder = document.getElementById("latest-capture-placeholder");
         if (latestImg && placeholder) {
             latestImg.src = imgUrl;
             latestImg.style.display = "block";
+            latestImg.onclick = () => openMediaPreview(latestImg.src, lastCaptureTitle, isCaptureStreamActive);
+            enlargeBtn?.classList.remove("d-none");
             placeholder.classList.add("d-none");
         }
-        openMediaPreview(imgUrl, title);
+        if (autoOpenModal) {
+            openMediaPreview(imgUrl, lastCaptureTitle, isCaptureStreamActive);
+        }
     }
 
     async function triggerMediaAction(action, extra = {}) {
@@ -1576,6 +1682,32 @@
                 showNotificationToast("Copied Relay URL!", "success");
             }
         });
+
+        document.getElementById("btn-usb-unlock-permissions")?.addEventListener("click", async () => {
+            const btn = document.getElementById("btn-usb-unlock-permissions");
+            const statusEl = document.getElementById("usb-unlock-status");
+            if (btn) btn.disabled = true;
+            if (statusEl) {
+                statusEl.textContent = "Unlocking Android permissions over USB ADB...";
+                statusEl.className = "text-xs text-cyan";
+            }
+            const res = await apiRequest("/api/usb/unlock-permissions", "POST", {});
+            if (btn) btn.disabled = false;
+            if (res && res.success) {
+                if (statusEl) {
+                    statusEl.textContent = res.message || "Permissions unlocked via USB.";
+                    statusEl.className = "text-xs text-emerald";
+                }
+                showNotificationToast(res.message || "Phone permissions unlocked!", "success");
+            } else {
+                const errMsg = res?.error || res?.message || "USB permission unlock failed.";
+                if (statusEl) {
+                    statusEl.textContent = errMsg;
+                    statusEl.className = "text-xs text-rose";
+                }
+                showNotificationToast(errMsg, "warning");
+            }
+        });
     }
 
     async function handleUnifiedConnectInput(rawVal) {
@@ -1805,7 +1937,7 @@
                 if (apkUrlEl) apkUrlEl.textContent = res.download_url || "Ready for LAN download";
                 if (dlBtn) {
                     dlBtn.href = res.local_download_url || res.download_url || "#";
-                    dlBtn.textContent = `Download ${res.file_name || "SNOW-Mobile.apk"} (${res.version || "5.0.0"})`;
+                    dlBtn.textContent = `Download ${res.file_name || "SNOW-Mobile.apk"} (${res.version || "5.1.0"})`;
                     dlBtn.classList.remove("d-none");
                 }
             } else {
@@ -1880,12 +2012,10 @@
     function initFilesView() {
         const tabFiles = document.getElementById("tab-seg-files");
         const tabApps = document.getElementById("tab-seg-apps");
-        const tabCaptures = document.getElementById("tab-seg-captures");
 
-        if (tabFiles && tabApps && tabCaptures) {
+        if (tabFiles && tabApps) {
             tabFiles.onclick = () => focusFilesSegment("files");
             tabApps.onclick = () => focusFilesSegment("apps");
-            tabCaptures.onclick = () => focusFilesSegment("captures");
         }
 
         const filesDevSelect = document.getElementById("files-device-select");
@@ -1896,8 +2026,25 @@
         document.getElementById("files-search-input")?.addEventListener("input", filterFileRows);
         document.getElementById("apps-search-input")?.addEventListener("input", filterAppTiles);
         document.getElementById("chk-hide-hidden")?.addEventListener("change", () => loadFiles(currentSubpath));
+        document.getElementById("btn-open-transfers-folder")?.addEventListener("click", async () => {
+            const res = await apiRequest("/api/files/open-transfers-folder", "POST", {});
+            if (res && res.success) {
+                showNotificationToast(
+                    res.opened ? `Opened ${res.path || "Transfers folder"}` : `Transfers folder: ${res.path}`,
+                    "success"
+                );
+            } else {
+                showNotificationToast(res?.error || "Unable to open transfers folder", "error");
+            }
+        });
 
         document.getElementById("btn-file-up")?.addEventListener("click", () => {
+            if (currentStorageMode === "desktop_remote") {
+                if (currentRemoteParent !== null && currentRemoteParent !== undefined && currentRemoteParent !== currentSubpath) {
+                    loadFiles(currentRemoteParent);
+                }
+                return;
+            }
             if (currentSubpath) {
                 const parts = currentSubpath.replace(/\\/g, "/").split("/").filter(Boolean);
                 parts.pop();
@@ -1962,31 +2109,133 @@
     }
 
     function focusFilesSegment(seg) {
-        currentFilesSegment = seg;
-        document.getElementById("tab-seg-files")?.classList.toggle("active", seg === "files");
-        document.getElementById("tab-seg-apps")?.classList.toggle("active", seg === "apps");
-        document.getElementById("tab-seg-captures")?.classList.toggle("active", seg === "captures");
+        currentFilesSegment = (seg === "apps") ? "apps" : "files";
+        document.getElementById("tab-seg-files")?.classList.toggle("active", currentFilesSegment === "files");
+        document.getElementById("tab-seg-apps")?.classList.toggle("active", currentFilesSegment === "apps");
 
         const subFiles = document.getElementById("subpanel-files");
         const subApps = document.getElementById("subpanel-apps");
-        const subCaptures = document.getElementById("subpanel-captures");
         const layout = document.querySelector(".files-v5-layout");
 
         if (window.innerWidth <= 1100) {
-            subFiles?.classList.toggle("d-none", seg !== "files");
-            subApps?.classList.toggle("d-none", seg !== "apps");
-            subCaptures?.classList.toggle("d-none", seg !== "captures");
+            subFiles?.classList.toggle("d-none", currentFilesSegment !== "files");
+            subApps?.classList.toggle("d-none", currentFilesSegment !== "apps");
         } else {
             subFiles?.classList.remove("d-none");
             subApps?.classList.remove("d-none");
-            subCaptures?.classList.remove("d-none");
-            if (seg === "apps") {
+            if (currentFilesSegment === "apps") {
                 subApps?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-            } else if (seg === "captures") {
-                subCaptures?.scrollIntoView({ behavior: "smooth", block: "nearest" });
             }
         }
-        if (layout) layout.dataset.focus = seg;
+        if (layout) layout.dataset.focus = currentFilesSegment;
+    }
+
+    function getTransferRouteBadgeInfo(devObj) {
+        if (!devObj) return { text: "Wi-Fi • Zero Data", cls: "chip chip-sm chip-cyan" };
+        const raw = String(
+            devObj.active_transport || devObj.transport || devObj.connection_mode || devObj.remote_address || ""
+        ).toLowerCase();
+        if (raw.includes("usb") || raw.includes("adb") || raw.includes("127.0.0.1")) {
+            return { text: "USB • Zero Data", cls: "chip chip-sm chip-emerald" };
+        }
+        if (raw.includes("relay") || raw.includes("remote") || raw.includes("tunnel")) {
+            return { text: "Remote • Uses Data", cls: "chip chip-sm chip-amber" };
+        }
+        return { text: "Wi-Fi • Zero Data", cls: "chip chip-sm chip-cyan" };
+    }
+
+    function updateTransferProgressUi({
+        visible,
+        title = "",
+        loaded = 0,
+        total = 0,
+        pct = 0,
+        speedBps = 0,
+        indeterminate = false,
+        routeBadge = null,
+    }) {
+        const containers = [
+            {
+                card: document.getElementById("active-transfer-container"),
+                name: document.getElementById("active-transfer-name"),
+                badge: document.getElementById("active-transfer-route-badge"),
+                speed: document.getElementById("active-transfer-speed"),
+                bar: document.getElementById("active-transfer-progress"),
+                bytes: document.getElementById("active-transfer-bytes"),
+                pctEl: document.getElementById("active-transfer-percent"),
+            },
+            {
+                card: document.getElementById("files-active-transfer-card"),
+                name: document.getElementById("files-transfer-name"),
+                badge: document.getElementById("files-transfer-route-badge"),
+                speed: document.getElementById("files-transfer-speed"),
+                bar: document.getElementById("files-transfer-progress"),
+                bytes: document.getElementById("files-transfer-bytes"),
+                pctEl: document.getElementById("files-transfer-percent"),
+            },
+        ];
+        const topbarChip = document.getElementById("topbar-active-transfer-chip");
+        topbarChip?.classList.toggle("d-none", !visible);
+
+        containers.forEach(c => {
+            if (!c.card) return;
+            c.card.classList.toggle("d-none", !visible);
+            if (!visible) {
+                if (c.bar) {
+                    c.bar.classList.remove("indeterminate");
+                    c.bar.style.width = "0%";
+                }
+                return;
+            }
+            if (c.name && title) c.name.textContent = title;
+            if (c.badge && routeBadge) {
+                c.badge.textContent = routeBadge.text;
+                c.badge.className = routeBadge.cls;
+            }
+            if (c.bar) {
+                c.bar.classList.toggle("indeterminate", Boolean(indeterminate));
+                if (!indeterminate) c.bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+            }
+            if (c.pctEl) c.pctEl.textContent = indeterminate ? "In Progress" : `${pct}%`;
+            if (c.bytes) {
+                c.bytes.textContent = total > 0
+                    ? `${formatBytes(loaded)} / ${formatBytes(total)}`
+                    : (loaded > 0 ? formatBytes(loaded) : "Streaming over HTTPS...");
+            }
+            if (c.speed) {
+                c.speed.textContent = speedBps > 0 ? `${formatBytes(speedBps)}/s` : (indeterminate ? "HTTPS :8766" : "0 KB/s");
+            }
+        });
+    }
+
+    async function cancelActiveTransfer() {
+        let didCancel = false;
+        if (activeUploadXhr) {
+            activeUploadXhr.abort();
+            activeUploadXhr = null;
+            didCancel = true;
+        }
+        if (activeDownloadController) {
+            activeDownloadController.abort();
+            activeDownloadController = null;
+            didCancel = true;
+            apiRequest("/api/files/transfer/cancel", "POST", {}).catch(() => {});
+        }
+        updateTransferProgressUi({ visible: false });
+        if (didCancel) {
+            showNotificationToast("File transfer cancelled.", "warning");
+        }
+    }
+
+    async function refreshFileDestinations() {
+        const destEl = document.getElementById("files-destination-path");
+        if (!destEl) return;
+        const res = await apiRequest("/api/files/destinations");
+        if (res && res.success && res.pc_transfers_dir) {
+            pcTransfersDestDir = res.pc_transfers_dir;
+            destEl.textContent = res.pc_transfers_dir;
+            destEl.title = res.pc_transfers_dir;
+        }
     }
 
     function filterFileRows() {
@@ -1999,6 +2248,7 @@
 
     async function loadFiles(subpath = "") {
         currentSubpath = subpath;
+        refreshFileDestinations();
         const breadcrumbEl = document.getElementById("file-breadcrumbs");
         const targetLabel = document.getElementById("files-transfer-target-label");
         const tbody = document.getElementById("file-table-body");
@@ -2008,25 +2258,24 @@
         const dropzone = document.getElementById("file-upload-dropzone");
         const upBtn = document.getElementById("btn-file-up");
 
-        if (breadcrumbEl) breadcrumbEl.textContent = subpath ? `/${subpath}` : "/";
+        if (breadcrumbEl) breadcrumbEl.textContent = subpath ? (subpath.startsWith("/") || subpath.includes(":\\") ? subpath : `/${subpath}`) : "/";
         const devObj = getSelectedDeviceObj();
         const isLocalTarget = !devObj || isLocalNode(devObj);
         const isAndroid = Boolean(devObj && isAndroidDevice(devObj));
         const isTargetOnline = Boolean(devObj && devObj.is_connected);
 
-        if (uploadBtn) uploadBtn.disabled = isLocalTarget || !isTargetOnline;
-        if (upBtn) upBtn.disabled = isLocalTarget || !isTargetOnline || !subpath;
-        if (dropzone) dropzone.classList.toggle("disabled", isLocalTarget || !isTargetOnline);
+        if (uploadBtn) uploadBtn.disabled = isLocalTarget || !isTargetOnline || !isAndroid;
+        if (upBtn) upBtn.disabled = isLocalTarget || !isTargetOnline || (!subpath && !currentRemoteParent);
+        if (dropzone) dropzone.classList.toggle("disabled", isLocalTarget || !isTargetOnline || !isAndroid);
 
         if (targetLabel) {
             if (isLocalTarget) {
-                targetLabel.textContent = "Local Windows Host active — select a connected Android phone above to browse mobile storage or transfer files.";
+                targetLabel.textContent = "Local Windows Host active — select a connected device above to browse remote files or transfer files.";
             } else if (!isTargetOnline) {
-                targetLabel.textContent = `${devObj.device_name || "Device"} is offline — reconnect to transfer files over HTTPS (port 8766).`;
-            } else if (isAndroid) {
-                targetLabel.textContent = `Encrypted HTTPS transfer to ${devObj.device_name || "Phone"} (port 8766)`;
+                targetLabel.textContent = `${devObj.device_name || "Device"} is offline — reconnect to browse or transfer files over HTTPS (port 8766).`;
             } else {
-                targetLabel.textContent = `Peer PC ${devObj.device_name || "Remote"} connected — select an Android device to browse mobile storage.`;
+                const routeInfo = getTransferRouteBadgeInfo(devObj);
+                targetLabel.textContent = `Encrypted HTTPS transfer to ${devObj.device_name || "Device"} (${routeInfo.text})`;
             }
         }
         if (!tbody) return;
@@ -2034,16 +2283,7 @@
         if (isLocalTarget) {
             tbody.innerHTML = "";
             if (emptyMsg) {
-                emptyMsg.textContent = "Local Windows PC mode: Use Quick Launch Apps on the right for desktop tools. Select a paired Android phone in the target selector above to browse phone files or send files.";
-            }
-            emptyState?.classList.remove("d-none");
-            return;
-        }
-
-        if (!isAndroid) {
-            tbody.innerHTML = "";
-            if (emptyMsg) {
-                emptyMsg.textContent = "Remote file explorer supports paired Android phones. Select a phone target to browse storage.";
+                emptyMsg.textContent = "Local Windows PC mode: Use Quick Launch Apps on the right for desktop tools, or select a connected device above to browse remote files.";
             }
             emptyState?.classList.remove("d-none");
             return;
@@ -2052,7 +2292,7 @@
         if (!isTargetOnline) {
             tbody.innerHTML = "";
             if (emptyMsg) {
-                emptyMsg.textContent = `${devObj.device_name || "Phone"} is currently offline. Reconnect to browse remote files.`;
+                emptyMsg.textContent = `${devObj.device_name || "Device"} is currently offline. Reconnect to browse remote files.`;
             }
             emptyState?.classList.remove("d-none");
             return;
@@ -2060,15 +2300,31 @@
 
         const targetId = devObj.device_id;
         const hideHidden = document.getElementById("chk-hide-hidden")?.checked ?? true;
+        const devTypeHint = isAndroid ? "android" : "windows";
         tbody.innerHTML = `<tr><td colspan="4" class="text-muted text-center" style="padding: 20px;">Loading files...</td></tr>`;
         emptyState?.classList.add("d-none");
 
-        const res = await apiRequest(`/api/files?subpath=${encodeURIComponent(subpath)}&hide_hidden=${hideHidden}&device_id=${encodeURIComponent(targetId)}`);
+        const res = await apiRequest(
+            `/api/files?subpath=${encodeURIComponent(subpath)}&hide_hidden=${hideHidden}&device_id=${encodeURIComponent(targetId)}&device_type=${encodeURIComponent(devTypeHint)}`
+        );
         const items = res?.items || res?.files || res?.data?.items || [];
+        currentStorageMode = res?.storage_mode || (isAndroid ? "saf_tree" : "desktop_remote");
+        currentRemoteParent = res?.parent || "";
+        if (res?.destination_dir) {
+            pcTransfersDestDir = res.destination_dir;
+            const destEl = document.getElementById("files-destination-path");
+            if (destEl) destEl.textContent = res.destination_dir;
+        }
+        if (currentStorageMode === "desktop_remote" && res?.directory && breadcrumbEl) {
+            breadcrumbEl.textContent = res.directory;
+        }
+        if (upBtn) {
+            upBtn.disabled = isLocalTarget || !isTargetOnline || (currentStorageMode === "desktop_remote" ? !currentRemoteParent : !subpath);
+        }
 
         if (!res || !res.success) {
             tbody.innerHTML = "";
-            if (emptyMsg) emptyMsg.textContent = res?.error || "Unable to browse files on selected phone.";
+            if (emptyMsg) emptyMsg.textContent = res?.error || "Unable to browse files on selected device.";
             emptyState?.classList.remove("d-none");
             return;
         }
@@ -2081,10 +2337,13 @@
         }
 
         items.forEach(f => {
-            const isDir = Boolean(f.is_dir || f.is_directory);
+            const rawType = String(f.type || "").toLowerCase();
+            const isDir = Boolean(f.is_dir || f.is_directory || rawType === "directory" || rawType === "dir");
+            const rawSize = f.size_bytes ?? f.size ?? f.bytes;
+            const rawMod = f.last_modified ?? f.modified_at ?? f.modified ?? f.modified_time;
+            const modTime = formatTimestamp(rawMod) || "--";
             const row = document.createElement("tr");
             row.setAttribute("data-filename", String(f.name || "").toLowerCase());
-            const modTime = formatTimestamp(f.modified || f.modified_time) || "--";
 
             row.innerHTML = `
                 <td>
@@ -2095,7 +2354,7 @@
                         <span class="${isDir ? "text-primary font-semibold" : "text-secondary"}">${escapeHtml(f.name)}</span>
                     </div>
                 </td>
-                <td class="text-xs text-muted mono">${isDir ? "--" : (f.size_formatted || formatBytes(f.size))}</td>
+                <td class="text-xs text-muted mono">${isDir ? "--" : (f.size_formatted || formatBytes(rawSize))}</td>
                 <td class="text-xs text-muted">${escapeHtml(modTime)}</td>
                 <td style="text-align: right;">
                     ${isDir ? `<button class="btn btn-xs btn-tonal btn-open-dir">Open</button>` : `<button class="btn btn-xs btn-primary btn-dl-file">Download</button>`}
@@ -2103,21 +2362,65 @@
             `;
 
             if (isDir) {
-                const enterDir = () => loadFiles(subpath ? `${subpath}/${f.name}` : f.name);
+                const enterDir = () => {
+                    const nextTarget = currentStorageMode === "desktop_remote"
+                        ? (f.path || (subpath ? `${subpath}/${f.name}` : f.name))
+                        : (subpath ? `${subpath}/${f.name}` : f.name);
+                    loadFiles(nextTarget);
+                };
                 row.querySelector(".btn-open-dir").onclick = enterDir;
                 row.querySelector(".file-row-open").onclick = enterDir;
             } else {
                 row.querySelector(".btn-dl-file").onclick = async () => {
-                    showNotificationToast(`Receiving ${f.name} to PC transfers...`, "info");
-                    const dlRes = await apiRequest("/api/files/download", "POST", {
-                        file_name: f.name,
-                        subpath: currentSubpath,
-                        device_id: targetId,
+                    const routeBadge = getTransferRouteBadgeInfo(devObj);
+                    if (activeDownloadController) activeDownloadController.abort();
+                    activeDownloadController = new AbortController();
+                    updateTransferProgressUi({
+                        visible: true,
+                        title: `Downloading ${f.name}`,
+                        total: Number(rawSize || 0),
+                        indeterminate: true,
+                        routeBadge,
                     });
-                    if (dlRes && dlRes.success) {
-                        showNotificationToast(`Downloaded ${f.name}!`, "success");
-                    } else {
-                        showNotificationToast(dlRes?.error || "Download failed", "error");
+                    showNotificationToast(`Downloading ${f.name} to PC transfers...`, "info");
+                    try {
+                        const headers = { "Content-Type": "application/json" };
+                        if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+                        const resp = await fetch("/api/files/download", {
+                            method: "POST",
+                            headers,
+                            signal: activeDownloadController.signal,
+                            body: JSON.stringify({
+                                file_name: f.name,
+                                subpath: currentSubpath,
+                                device_id: targetId,
+                            }),
+                        });
+                        const dlRes = await resp.json().catch(() => ({}));
+                        if (resp.ok && dlRes && dlRes.success) {
+                            const savedDir = dlRes.destination_dir || pcTransfersDestDir || "PC Transfers";
+                            updateTransferProgressUi({
+                                visible: true,
+                                title: `Downloaded ${f.name}`,
+                                loaded: Number(rawSize || 0),
+                                total: Number(rawSize || 0),
+                                pct: 100,
+                                indeterminate: false,
+                                routeBadge,
+                            });
+                            setTimeout(() => updateTransferProgressUi({ visible: false }), 1800);
+                            showNotificationToast(`Downloaded ${f.name} to ${savedDir}`, "success");
+                        } else {
+                            updateTransferProgressUi({ visible: false });
+                            showNotificationToast(dlRes?.error || "Download failed", "error");
+                        }
+                    } catch (err) {
+                        updateTransferProgressUi({ visible: false });
+                        if (err && err.name !== "AbortError") {
+                            showNotificationToast(err.message || "Download failed", "error");
+                        }
+                    } finally {
+                        activeDownloadController = null;
                     }
                 };
             }
@@ -2133,21 +2436,14 @@
             showNotificationToast("Connect or select an Android phone to send files.", "warning");
             return;
         }
-
-        const transferCard = document.getElementById("active-transfer-container");
-        const topbarChip = document.getElementById("topbar-active-transfer-chip");
-        const nameEl = document.getElementById("active-transfer-name");
-        const speedEl = document.getElementById("active-transfer-speed");
-        const barEl = document.getElementById("active-transfer-progress");
-        const bytesEl = document.getElementById("active-transfer-bytes");
-        const pctEl = document.getElementById("active-transfer-percent");
+        const devObj = registeredDevices.find(d => d.device_id === targetId) || getSelectedDeviceObj();
+        const routeBadge = getTransferRouteBadgeInfo(devObj);
 
         let idx = 0;
         function sendNext() {
             if (idx >= files.length) {
                 activeUploadXhr = null;
-                transferCard?.classList.add("d-none");
-                topbarChip?.classList.add("d-none");
+                updateTransferProgressUi({ visible: false });
                 loadFiles(currentSubpath);
                 return;
             }
@@ -2157,10 +2453,16 @@
             formData.append("device_id", targetId);
             formData.append("file", file);
 
-            transferCard?.classList.remove("d-none");
-            topbarChip?.classList.remove("d-none");
-            if (nameEl) nameEl.textContent = `Sending ${file.name}`;
-            if (barEl) barEl.style.width = "0%";
+            updateTransferProgressUi({
+                visible: true,
+                title: `Sending ${file.name}`,
+                loaded: 0,
+                total: file.size || 0,
+                pct: 0,
+                speedBps: 0,
+                indeterminate: false,
+                routeBadge,
+            });
 
             const startTime = performance.now();
             const xhr = new XMLHttpRequest();
@@ -2173,10 +2475,16 @@
                     const pct = Math.round((e.loaded / e.total) * 100);
                     const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
                     const bps = e.loaded / elapsedSec;
-                    if (barEl) barEl.style.width = `${pct}%`;
-                    if (pctEl) pctEl.textContent = `${pct}%`;
-                    if (bytesEl) bytesEl.textContent = `${formatBytes(e.loaded)} / ${formatBytes(e.total)}`;
-                    if (speedEl) speedEl.textContent = `${formatBytes(bps)}/s`;
+                    updateTransferProgressUi({
+                        visible: true,
+                        title: `Sending ${file.name}`,
+                        loaded: e.loaded,
+                        total: e.total,
+                        pct,
+                        speedBps: bps,
+                        indeterminate: false,
+                        routeBadge,
+                    });
                 }
             };
 
@@ -2184,7 +2492,11 @@
                 try {
                     const data = JSON.parse(xhr.responseText || "{}");
                     if (xhr.status >= 200 && xhr.status < 300 && data.success) {
-                        showNotificationToast(`Sent ${file.name}!`, "success");
+                        const savedPath = data.data?.saved_path || data.saved_path;
+                        showNotificationToast(
+                            savedPath ? `Sent ${file.name} -> ${savedPath}` : `Sent ${file.name}!`,
+                            "success"
+                        );
                     } else {
                         showNotificationToast(data.error || `Failed sending ${file.name}`, "error");
                     }
@@ -2199,6 +2511,11 @@
                 showNotificationToast(`Network error uploading ${file.name}`, "error");
                 idx++;
                 sendNext();
+            };
+
+            xhr.onabort = () => {
+                activeUploadXhr = null;
+                updateTransferProgressUi({ visible: false });
             };
 
             xhr.send(formData);
@@ -2250,7 +2567,7 @@
                     </div>
                     <div class="flex flex-col min-w-0" style="flex:1;">
                         <span class="text-sm font-semibold text-primary truncate">${escapeHtml(displayName)}</span>
-                        <span class="text-xs text-muted truncate">${escapeHtml(app.package_name || (isAndroid ? "Android App" : "Windows Allowlist"))}</span>
+                        <span class="text-xs text-muted truncate">${escapeHtml(isAndroid ? "Android App" : "Windows Allowlist")}</span>
                     </div>
                     <button class="btn btn-xs btn-tonal btn-launch-app">Launch</button>
                 `;
@@ -2455,7 +2772,7 @@
             });
         });
 
-        // Cloudflare MCP Tunnel Controls
+        // Remote MCP Tunnel Controls
         document.getElementById("btn-mcp-tunnel-toggle")?.addEventListener("click", async () => {
             const badge = document.getElementById("mcp-tunnel-status");
             const isOnline = badge && badge.textContent.includes("Active");
@@ -2463,10 +2780,14 @@
                 await apiRequest("/api/mcp/tunnel/stop", "POST", {});
                 showNotificationToast("Remote MCP tunnel stopped.", "info");
             } else {
-                showNotificationToast("Starting Cloudflare MCP tunnel...", "info");
-                const res = await apiRequest("/api/mcp/tunnel/start", "POST", { provider: "cloudflared" });
+                const provider = document.getElementById("mcp-tunnel-provider")?.value || "cloudflared";
+                const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || undefined;
+                showNotificationToast(`Starting Remote MCP tunnel (${provider})...`, "info");
+                const payload = { provider };
+                if (domain) payload.custom_url = domain;
+                const res = await apiRequest("/api/mcp/tunnel/start", "POST", payload);
                 if (res && res.success) {
-                    showNotificationToast("Cloudflare Remote MCP tunnel online!", "success");
+                    showNotificationToast("Remote MCP tunnel online!", "success");
                 } else {
                     showNotificationToast(res?.error || "Failed starting MCP tunnel", "error");
                 }
@@ -2493,7 +2814,11 @@
                 mcp_public_url: domain || null,
             };
             if (rawToken && !rawToken.includes("***") && rawToken !== "[REDACTED]") {
-                payload.mcp_cloudflare_token = rawToken;
+                if (provider === "render") {
+                    payload.relay_ticket = rawToken;
+                } else {
+                    payload.mcp_cloudflare_token = rawToken;
+                }
             }
             const res = await apiRequest("/api/mcp/tunnel/config", "POST", payload);
             if (res && res.success) {
@@ -2509,6 +2834,7 @@
             const res = await apiRequest("/api/mcp/tunnel/config", "POST", {
                 mcp_cloudflare_token: null,
                 cloudflare_token: null,
+                relay_ticket: null,
             });
             if (res && res.success) {
                 const tokenInp = document.getElementById("mcp-tunnel-token-input");
@@ -2568,7 +2894,7 @@
                 pendingUpdateMeta = null;
                 applyBtn?.classList.add("d-none");
                 if (banner) {
-                    banner.textContent = `Current version ${res?.current_version || "5.0.0"} is up to date.`;
+                    banner.textContent = `Current version ${res?.current_version || "5.1.0"} is up to date.`;
                     banner.classList.remove("d-none");
                 }
                 showNotificationToast("SNOW is up to date.", "info");
@@ -2639,7 +2965,7 @@
             permUrlInput.value = cfg.mcp_public_url || cfg.public_url || "";
         }
         if (tokenStatusBadge) {
-            const maskedToken = cfg.mcp_cloudflare_token || cfg.cloudflare_token || "";
+            const maskedToken = cfg.mcp_cloudflare_token || cfg.cloudflare_token || cfg.relay_ticket || "";
             if (maskedToken) {
                 tokenStatusBadge.textContent = `Configured: ${maskedToken}`;
                 tokenStatusBadge.className = "chip chip-sm chip-emerald mono";
@@ -2655,7 +2981,7 @@
                 statusBadge.className = "chip chip-emerald";
             }
             if (btnToggle) btnToggle.textContent = "Stop Tunnel";
-            if (urlInput) urlInput.value = `${statusRes.public_url.replace(/\/$/, "")}/mcp`;
+            if (urlInput) urlInput.value = statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`;
         } else {
             if (statusBadge) {
                 statusBadge.textContent = "Offline";
@@ -2983,8 +3309,25 @@
             }
         });
 
-        document.getElementById("btn-close-media-preview")?.addEventListener("click", () => {
-            document.getElementById("media-preview-modal")?.classList.add("d-none");
+        document.getElementById("btn-close-media-preview")?.addEventListener("click", closeMediaPreview);
+        document.getElementById("btn-lightbox-close")?.addEventListener("click", closeMediaPreview);
+        document.getElementById("btn-lightbox-stop-stream")?.addEventListener("click", async () => {
+            await stopRemoteScreenStream();
+            document.getElementById("btn-lightbox-stop-stream")?.classList.add("d-none");
+            document.getElementById("media-preview-stream-badge")?.classList.add("d-none");
+        });
+        document.getElementById("media-preview-modal")?.addEventListener("click", (e) => {
+            if (e.target && e.target.id === "media-preview-modal") {
+                closeMediaPreview();
+            }
+        });
+        document.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") {
+                const mediaModal = document.getElementById("media-preview-modal");
+                if (mediaModal && !mediaModal.classList.contains("d-none")) {
+                    closeMediaPreview();
+                }
+            }
         });
 
         // Share Link / Add Clipboard Note Modal
@@ -3044,16 +3387,33 @@
         modal?.classList.remove("d-none");
     }
 
-    function openMediaPreview(src, title = "Media Preview") {
+    function closeMediaPreview() {
+        const modal = document.getElementById("media-preview-modal");
+        modal?.classList.add("d-none");
+        if (lastFocusedBeforeLightbox && typeof lastFocusedBeforeLightbox.focus === "function") {
+            try { lastFocusedBeforeLightbox.focus(); } catch (e) {}
+            lastFocusedBeforeLightbox = null;
+        }
+    }
+
+    function openMediaPreview(src, title = "Media Preview", isLiveStream = false) {
         const modal = document.getElementById("media-preview-modal");
         const img = document.getElementById("media-preview-img");
         const titleEl = document.getElementById("media-preview-title");
         const dlBtn = document.getElementById("btn-download-preview");
+        const streamBadge = document.getElementById("media-preview-stream-badge");
+        const stopStreamBtn = document.getElementById("btn-lightbox-stop-stream");
         if (modal && img) {
+            if (!lastFocusedBeforeLightbox) {
+                lastFocusedBeforeLightbox = document.activeElement;
+            }
             img.src = src;
             if (titleEl) titleEl.textContent = title;
             if (dlBtn) dlBtn.href = src;
+            streamBadge?.classList.toggle("d-none", !isLiveStream);
+            stopStreamBtn?.classList.toggle("d-none", !isLiveStream);
             modal.classList.remove("d-none");
+            document.getElementById("btn-close-media-preview")?.focus();
         }
     }
 

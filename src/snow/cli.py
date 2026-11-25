@@ -660,7 +660,7 @@ def run_doctor(
     try:
         import snow
         status = "OK"
-        msg = f"SNOW package importable (v{getattr(snow, '__version__', '5.0.0')})"
+        msg = f"SNOW package importable (v{getattr(snow, '__version__', '5.1.0')})"
         remed = None
     except Exception as exc:
         status = "FAILED"
@@ -923,7 +923,7 @@ def run_status() -> int:
     print("=" * 60)
     print("SNOW — System Status Overview")
     print("=" * 60)
-    print(f"  Version:           5.0.0")
+    print(f"  Version:           5.1.0")
     print(f"  Daemon Running:    {'YES' if status_data['daemon_running'] else 'NO'}")
     print(f"  IPC Endpoint:      {'READY (online)' if status_data['ipc_ready'] else 'OFFLINE'}")
     if status_data.get("pid"):
@@ -979,7 +979,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="SNOW — Headless cross-device AI capability platform CLI",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
-    parser.add_argument("--version", action="version", version="SNOW 5.0.0")
+    parser.add_argument("--version", action="version", version="SNOW 5.1.0")
 
     # 1. setup
     setup_parser = subparsers.add_parser("setup", help="Configure SNOW as an MCP server in AI assistant clients")

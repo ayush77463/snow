@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Lock
@@ -48,12 +49,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.snow.network.DiscoveredPeer
-import org.snow.network.PeerHostState
 import org.snow.ui.SavedDevice
 import org.snow.ui.SnowUiRepository
 import org.snow.ui.components.SnowBadgeType
@@ -77,15 +79,14 @@ enum class DeviceFilter {
  * Devices Management Screen handling:
  * - Filter chips (All, PCs, Phones)
  * - Linked Devices List with Trust Tier profiles
+ * - Connection Control (Auto-Reconnect & Disconnect All)
  * - Nearby Peer Discovery
- * - Phone-to-Phone Host Mode with live PIN
  * - Cross-Network Sharing with 9-digit codes and active grants
  */
 @Composable
 fun DevicesScreen(
     savedDevices: List<SavedDevice>,
     discoveredPeers: List<DiscoveredPeer>,
-    peerHostState: PeerHostState,
     activeHost: String,
     federationGrants: List<Map<String, Any?>>,
     onConnectDevice: (SavedDevice) -> Unit,
@@ -93,8 +94,6 @@ fun DevicesScreen(
     onUnpairDevice: (SavedDevice) -> Unit,
     onUpdateTrustTier: (deviceId: String, tier: String) -> Unit,
     onPairDiscoveredPeer: (DiscoveredPeer) -> Unit,
-    onTogglePeerHost: (Boolean) -> Unit,
-    onShowPeerHostQr: () -> Unit = {},
     onGenerateFederationCode: () -> Unit,
     onAcceptFederationCode: (String) -> Unit,
     onRevokeFederationGrant: (String) -> Unit,
@@ -102,11 +101,16 @@ fun DevicesScreen(
     onOpenConnectSheet: () -> Unit = {},
     generatedFederationInvite: String? = null,
     onDismissFederationInvite: () -> Unit = {},
+    isConnected: Boolean = false,
+    autoConnectNearby: Boolean = true,
+    onToggleAutoConnect: (Boolean) -> Unit = {},
+    onDisconnectAll: () -> Unit = {},
     isRefreshing: Boolean = false,
     onRefresh: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
     val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
     var selectedFilter by remember { mutableStateOf(DeviceFilter.ALL) }
     var showJoinDialog by remember { mutableStateOf(false) }
@@ -211,13 +215,20 @@ fun DevicesScreen(
             }
         }
 
-        // Phone-to-Phone Host Mode Card
+        // Connection Control Card
         item {
-            SnowSectionHeader(title = "Phone-to-Phone Host Mode")
-            PeerHostModeCard(
-                peerHostState = peerHostState,
-                onToggle = onTogglePeerHost,
-                onShowQr = onShowPeerHostQr
+            SnowSectionHeader(title = "Connection Control")
+            ConnectionControlCard(
+                isConnected = isConnected,
+                autoConnectNearby = autoConnectNearby,
+                onToggleAutoConnect = { checked ->
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onToggleAutoConnect(checked)
+                },
+                onDisconnectAll = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onDisconnectAll()
+                }
             )
         }
 
@@ -499,21 +510,31 @@ private fun DeviceListItem(
 
             Spacer(modifier = Modifier.height(10.dp))
 
+            val haptic = LocalHapticFeedback.current
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (isActive) {
-                    SnowOutlinedButton(text = "Disconnect", onClick = onDisconnect)
+                    SnowOutlinedButton(text = "Disconnect", onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onDisconnect()
+                    })
                 } else {
-                    SnowTonalButton(text = "Connect", onClick = onConnect)
+                    SnowTonalButton(text = "Connect", onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onConnect()
+                    })
                 }
                 Surface(
                     modifier = Modifier
                         .size(36.dp)
                         .clip(CircleShape)
-                        .clickable(onClick = onUnpair),
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onUnpair()
+                        },
                     color = colors.surfaceElevated
                 ) {
                     Box(contentAlignment = Alignment.Center) {
@@ -554,10 +575,11 @@ private fun TrustTierPill(
 }
 
 @Composable
-private fun PeerHostModeCard(
-    peerHostState: PeerHostState,
-    onToggle: (Boolean) -> Unit,
-    onShowQr: () -> Unit = {}
+private fun ConnectionControlCard(
+    isConnected: Boolean,
+    autoConnectNearby: Boolean,
+    onToggleAutoConnect: (Boolean) -> Unit,
+    onDisconnectAll: () -> Unit
 ) {
     val colors = LocalSnowColors.current
 
@@ -571,39 +593,24 @@ private fun PeerHostModeCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(38.dp)
-                            .clip(CircleShape)
-                            .background(colors.accentEmerald.copy(alpha = 0.15f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PhoneAndroid,
-                            contentDescription = null,
-                            tint = colors.accentEmerald,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Column {
-                        Text(
-                            text = "Phone Host Server",
-                            style = SnowTypography.titleSmall,
-                            color = colors.textPrimary
-                        )
-                        Text(
-                            text = if (peerHostState.isActive) "Host ready • ${peerHostState.peerCount} linked" else "Accepts direct peer links",
-                            style = SnowTypography.bodySmall,
-                            color = colors.textSecondary
-                        )
-                    }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Auto-Reconnect",
+                        style = SnowTypography.titleSmall,
+                        color = colors.textPrimary
+                    )
+                    Text(
+                        text = "Reconnect automatically on USB or trusted Wi-Fi",
+                        style = SnowTypography.bodySmall,
+                        color = colors.textSecondary
+                    )
                 }
 
+                Spacer(modifier = Modifier.width(12.dp))
+
                 Switch(
-                    checked = peerHostState.isActive,
-                    onCheckedChange = onToggle,
+                    checked = autoConnectNearby,
+                    onCheckedChange = onToggleAutoConnect,
                     colors = SwitchDefaults.colors(
                         checkedThumbColor = Color.White,
                         checkedTrackColor = colors.accentEmerald,
@@ -614,26 +621,27 @@ private fun PeerHostModeCard(
                 )
             }
 
-            if (peerHostState.isActive && !peerHostState.pairingPin.isNullOrBlank()) {
-                Spacer(modifier = Modifier.height(12.dp))
-                Divider(color = colors.borderSubtle)
-                Spacer(modifier = Modifier.height(10.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Divider(color = colors.borderSubtle)
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "PAIRING PIN: ${peerHostState.pairingPin}",
-                        style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
-                        color = colors.accentCyan
-                    )
-                    SnowTonalButton(
-                        text = "Show QR",
-                        icon = Icons.Default.QrCode,
-                        onClick = onShowQr
+                        text = if (isConnected) "Active sessions linked" else "Sessions standing by",
+                        style = SnowTypography.bodySmall,
+                        color = colors.textSecondary
                     )
                 }
+                SnowOutlinedButton(
+                    text = "Disconnect All",
+                    icon = Icons.Default.Close,
+                    onClick = onDisconnectAll
+                )
             }
         }
     }

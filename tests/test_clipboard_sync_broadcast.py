@@ -69,12 +69,13 @@ class TestClipboardSyncBroadcast(unittest.IsolatedAsyncioTestCase):
         # Perform broadcast
         await self.server._broadcast_clipboard_update()
 
-        # Verify client received clipboard_push
-        self.assertEqual(len(client_mock.sent_messages), 1)
-        sent_raw = client_mock.sent_messages[0]
-        parsed = validate_raw_message(sent_raw)
-        self.assertEqual(parsed.payload.get("action"), "clipboard_push")
-        data = parsed.payload.get("data", {})
+        # Verify client received clipboard_buffer_updated and clipboard_push via ConnectionManager
+        parsed_msgs = [validate_raw_message(raw) for raw in client_mock.sent_messages]
+        actions = [m.payload.get("action") for m in parsed_msgs]
+        self.assertIn("clipboard_buffer_updated", actions)
+        push_msgs = [m for m in parsed_msgs if m.payload.get("action") == "clipboard_push"]
+        self.assertEqual(len(push_msgs), 1)
+        data = push_msgs[0].payload.get("data", {})
         self.assertEqual(data.get("type"), "text")
         self.assertEqual(data.get("text"), "Hello Snow Instant Sync")
         self.assertEqual(data.get("sha256"), "abc123hash")

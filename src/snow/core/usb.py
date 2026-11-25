@@ -191,6 +191,169 @@ def setup_usb_reverse(
         return False, f"Exception establishing ADB reverse mappings: {exc}"
 
 
+def unlock_android_permissions(
+    serial: Optional[str] = None,
+    adb_bin: Optional[Path] = None,
+    package_name: str = "org.snow",
+) -> dict[str, Any]:
+    """Best-effort one-click grant of SNOW Android permissions over authorized USB ADB."""
+    bin_path = adb_bin or find_adb_binary()
+    if not bin_path:
+        return {
+            "success": False,
+            "status": "ADB_NOT_FOUND",
+            "error": "ADB executable not found. Install Android platform-tools or ensure adb is in PATH.",
+            "granted": [],
+            "skipped": [],
+            "failed": [],
+        }
+
+    devices = get_connected_adb_devices(bin_path)
+    authorized = [d for d in devices if d.get("status") == "device"]
+    if not authorized:
+        if devices:
+            return {
+                "success": False,
+                "status": "DEVICE_NOT_AUTHORIZED",
+                "error": f"Detected {len(devices)} USB device(s), but none are authorized. Unlock phone and accept USB Debugging.",
+                "granted": [],
+                "skipped": [],
+                "failed": [],
+            }
+        return {
+            "success": False,
+            "status": "NO_DEVICE",
+            "error": "No authorized Android device detected over USB.",
+            "granted": [],
+            "skipped": [],
+            "failed": [],
+        }
+
+    target_device = None
+    if serial:
+        for d in authorized:
+            if d.get("serial") == serial:
+                target_device = d
+                break
+        if not target_device:
+            return {
+                "success": False,
+                "status": "SERIAL_NOT_FOUND",
+                "error": f"Authorized ADB device '{serial}' not found.",
+                "granted": [],
+                "skipped": [],
+                "failed": [],
+            }
+    else:
+        target_device = authorized[0]
+
+    dev_serial = target_device["serial"]
+    dev_model = target_device.get("model", "Android Device")
+
+    commands: list[tuple[str, list[str], bool]] = [
+        (
+            "Notification Listener",
+            [
+                str(bin_path), "-s", dev_serial, "shell", "cmd", "notification",
+                "allow_listener", f"{package_name}/{package_name}.service.SnowNotificationListenerService",
+            ],
+            True,
+        ),
+        (
+            "Camera Permission",
+            [str(bin_path), "-s", dev_serial, "shell", "pm", "grant", package_name, "android.permission.CAMERA"],
+            True,
+        ),
+        (
+            "Post Notifications",
+            [str(bin_path), "-s", dev_serial, "shell", "pm", "grant", package_name, "android.permission.POST_NOTIFICATIONS"],
+            False,
+        ),
+        (
+            "Read Media Images",
+            [str(bin_path), "-s", dev_serial, "shell", "pm", "grant", package_name, "android.permission.READ_MEDIA_IMAGES"],
+            False,
+        ),
+        (
+            "Read External Storage",
+            [str(bin_path), "-s", dev_serial, "shell", "pm", "grant", package_name, "android.permission.READ_EXTERNAL_STORAGE"],
+            False,
+        ),
+        (
+            "Display Over Other Apps",
+            [str(bin_path), "-s", dev_serial, "shell", "appops", "set", package_name, "SYSTEM_ALERT_WINDOW", "allow"],
+            True,
+        ),
+        (
+            "All Files Access",
+            [str(bin_path), "-s", dev_serial, "shell", "appops", "set", package_name, "MANAGE_EXTERNAL_STORAGE", "allow"],
+            False,
+        ),
+        (
+            "Install Unknown Apps",
+            [str(bin_path), "-s", dev_serial, "shell", "appops", "set", package_name, "REQUEST_INSTALL_PACKAGES", "allow"],
+            False,
+        ),
+        (
+            "Run In Background",
+            [str(bin_path), "-s", dev_serial, "shell", "appops", "set", package_name, "RUN_ANY_IN_BACKGROUND", "allow"],
+            False,
+        ),
+        (
+            "Battery Optimization Whitelist",
+            [str(bin_path), "-s", dev_serial, "shell", "dumpsys", "deviceidle", "whitelist", f"+{package_name}"],
+            False,
+        ),
+    ]
+
+    granted: list[str] = []
+    skipped: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+    critical_failed = False
+
+    for label, cmd, is_critical in commands:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+                check=False,
+                **get_no_window_subprocess_kwargs(),
+            )
+            detail = (proc.stderr or proc.stdout or "").strip()
+            if proc.returncode == 0 and "SecurityException" not in detail and "Exception" not in detail:
+                granted.append(label)
+            elif not is_critical or "not a changeable permission type" in detail or "Unknown operation" in detail:
+                skipped.append({"permission": label, "reason": detail or f"exit {proc.returncode}"})
+            else:
+                failed.append({"permission": label, "reason": detail or f"exit {proc.returncode}"})
+                critical_failed = True
+        except Exception as exc:
+            entry = {"permission": label, "reason": str(exc)}
+            if is_critical:
+                failed.append(entry)
+                critical_failed = True
+            else:
+                skipped.append(entry)
+
+    success = len(granted) > 0 and not critical_failed
+    return {
+        "success": success,
+        "status": "SUCCESS" if success else ("PARTIAL" if granted else "FAILED"),
+        "serial": dev_serial,
+        "device_model": dev_model,
+        "granted": granted,
+        "skipped": skipped,
+        "failed": failed,
+        "message": (
+            f"Unlocked {len(granted)} permission(s) on {dev_model} ({dev_serial})"
+            + (f"; {len(skipped)} OEM/OS-gated skipped" if skipped else "")
+            + (f"; {len(failed)} failed" if failed else "")
+        ),
+    }
+
+
 def remove_usb_reverse(
     serial: Optional[str] = None,
     port: int = 8765,

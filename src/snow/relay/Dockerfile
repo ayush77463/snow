@@ -13,9 +13,11 @@ COPY src/ /app/src/
 
 ENV PYTHONPATH="/app/src"
 ENV SNOW_RELAY_HOST="0.0.0.0"
-ENV SNOW_RELAY_PORT="8770"
 
 EXPOSE 8770
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import os, urllib.request; p = os.getenv('PORT') or os.getenv('SNOW_RELAY_PORT', '8770'); urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=3)" || exit 1
 
 USER snow
 

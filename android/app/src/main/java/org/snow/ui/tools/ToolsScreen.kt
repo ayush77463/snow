@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
@@ -43,6 +44,7 @@ import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -58,12 +60,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.snow.ui.ActiveTransferInfo
 import org.snow.ui.PcFileItem
 import org.snow.ui.SnowUiRepository
 import org.snow.ui.TerminalExecutionState
+import org.snow.ui.formatTransferBytes
 import kotlin.math.roundToInt
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
@@ -103,6 +110,9 @@ fun ToolsScreen(
     onUploadFile: () -> Unit,
     isFilesRefreshing: Boolean = false,
     onRefreshFiles: () -> Unit = {},
+    activeTransfer: ActiveTransferInfo? = null,
+    onCancelTransfer: () -> Unit = {},
+    onDismissTransfer: () -> Unit = {},
     // Apps parameters
     allowlistedApps: List<WindowsAppItem>,
     onLaunchApp: (target: String, friendlyName: String) -> Unit,
@@ -175,7 +185,10 @@ fun ToolsScreen(
                     onDownloadFile = onDownloadFile,
                     onUploadFile = onUploadFile,
                     isRefreshing = isFilesRefreshing,
-                    onRefresh = onRefreshFiles
+                    onRefresh = onRefreshFiles,
+                    activeTransfer = activeTransfer,
+                    onCancelTransfer = onCancelTransfer,
+                    onDismissTransfer = onDismissTransfer
                 )
             }
             ToolSubTab.APPS -> {
@@ -222,9 +235,13 @@ private fun FilesToolView(
     onDownloadFile: (PcFileItem) -> Unit,
     onUploadFile: () -> Unit,
     isRefreshing: Boolean = false,
-    onRefresh: () -> Unit = {}
+    onRefresh: () -> Unit = {},
+    activeTransfer: ActiveTransferInfo? = null,
+    onCancelTransfer: () -> Unit = {},
+    onDismissTransfer: () -> Unit = {}
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
     var hideHidden by remember { mutableStateOf(true) }
 
     val displayFiles = remember(filesList, hideHidden) {
@@ -336,7 +353,10 @@ private fun FilesToolView(
                 SnowTonalButton(
                     text = "Upload",
                     icon = Icons.Default.Upload,
-                    onClick = onUploadFile
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onUploadFile()
+                    }
                 )
             }
         }
@@ -351,6 +371,21 @@ private fun FilesToolView(
         )
 
         Spacer(modifier = Modifier.height(10.dp))
+
+        if (activeTransfer != null && activeTransfer.status != "CANCELLED") {
+            ToolsActiveTransferCard(
+                transfer = activeTransfer,
+                onActionClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    if (activeTransfer.status == "IN_PROGRESS" || activeTransfer.status == "STARTING") {
+                        onCancelTransfer()
+                    } else {
+                        onDismissTransfer()
+                    }
+                }
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+        }
 
         // File List with Pull-to-Refresh & Bottom Bar Clearance
         SnowPullToRefreshBox(
@@ -381,6 +416,7 @@ private fun FilesToolView(
                         FileRowItem(
                             item = file,
                             onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 if (file.isDirectory) {
                                     onNavigatePath(file.path)
                                 } else {
@@ -431,7 +467,7 @@ private fun FileRowItem(
                     color = colors.textPrimary,
                     maxLines = 1
                 )
-                val sizeText = if (item.isDirectory) "Directory" else "${(item.size / 1024).coerceAtLeast(1)} KB"
+                val sizeText = if (item.isDirectory) "Directory" else formatTransferBytes(item.size)
                 Text(
                     text = sizeText,
                     style = SnowTypography.bodySmall,
@@ -450,6 +486,119 @@ private fun FileRowItem(
     }
 }
 
+@Composable
+private fun ToolsActiveTransferCard(
+    transfer: ActiveTransferInfo,
+    onActionClick: () -> Unit
+) {
+    val colors = LocalSnowColors.current
+    val pct = if (transfer.totalBytes > 0L) {
+        ((transfer.bytesTransferred * 100L) / transfer.totalBytes).toInt().coerceIn(0, 100)
+    } else 0
+    val isActive = transfer.status == "IN_PROGRESS" || transfer.status == "STARTING"
+    val directionLabel = if (transfer.direction.equals("UPLOAD", ignoreCase = true)) "Uploading" else "Downloading"
+    val statusText = when (transfer.status.uppercase()) {
+        "COMPLETED" -> "Completed"
+        "DUPLICATE" -> "Already on target"
+        "FAILED" -> "Transfer failed"
+        else -> if (transfer.totalBytes > 0L) "$pct%" else "Transferring..."
+    }
+
+    SnowCard(
+        modifier = Modifier.fillMaxWidth(),
+        cornerRadius = 16.dp
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "$directionLabel • ${transfer.fileName}",
+                        style = SnowTypography.titleSmall,
+                        color = colors.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Surface(
+                        shape = RoundedCornerShape(9999.dp),
+                        color = colors.surfaceElevated
+                    ) {
+                        Text(
+                            text = transfer.transportLabel,
+                            style = SnowTypography.labelSmall.copy(fontSize = 10.sp),
+                            color = colors.accentCyan,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(colors.surfaceElevated)
+                        .clickable(onClick = onActionClick),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = if (isActive) "Cancel Transfer" else "Dismiss Transfer",
+                        tint = colors.textSecondary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            if (transfer.totalBytes > 0L) {
+                LinearProgressIndicator(
+                    progress = (transfer.bytesTransferred.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(9999.dp)),
+                    color = if (transfer.status == "FAILED") Color(0xFFEF4444) else colors.accentBlue,
+                    trackColor = colors.surfaceElevated
+                )
+            } else if (isActive) {
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(9999.dp)),
+                    color = colors.accentBlue,
+                    trackColor = colors.surfaceElevated
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val totalLabel = if (transfer.totalBytes > 0L) formatTransferBytes(transfer.totalBytes) else "--"
+                Text(
+                    text = "${formatTransferBytes(transfer.bytesTransferred)} / $totalLabel",
+                    style = SnowTypography.labelSmall,
+                    color = colors.textMuted
+                )
+                Text(
+                    text = statusText,
+                    style = SnowTypography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                    color = if (transfer.status == "FAILED") Color(0xFFEF4444) else colors.textSecondary
+                )
+            }
+        }
+    }
+}
+
 /**
  * Apps Launcher Sub-Screen
  */
@@ -459,6 +608,7 @@ private fun AppsToolView(
     onLaunchApp: (target: String, friendlyName: String) -> Unit
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
     var searchQuery by remember { mutableStateOf("") }
     var customTarget by remember { mutableStateOf("") }
 
@@ -523,7 +673,10 @@ private fun AppsToolView(
                     }
                     SnowTonalButton(
                         text = "Launch",
-                        onClick = { onLaunchApp(app.target, app.friendlyName) }
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onLaunchApp(app.target, app.friendlyName)
+                        }
                     )
                 }
             }
@@ -578,6 +731,7 @@ private fun MediaToolView(
     onDismissCameraDelivery: () -> Unit = {}
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
 
     Column(
         modifier = Modifier.fillMaxSize(),
@@ -598,9 +752,18 @@ private fun MediaToolView(
                     horizontalArrangement = Arrangement.SpaceAround,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    MediaCircleButton(icon = Icons.Default.SkipPrevious, label = "Prev", onClick = { onSendMediaKey("prev_track") })
-                    MediaCircleButton(icon = Icons.Default.PlayArrow, label = "Play/Pause", onClick = { onSendMediaKey("play_pause") }, isPrimary = true)
-                    MediaCircleButton(icon = Icons.Default.SkipNext, label = "Next", onClick = { onSendMediaKey("next_track") })
+                    MediaCircleButton(icon = Icons.Default.SkipPrevious, label = "Prev", onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSendMediaKey("prev_track")
+                    })
+                    MediaCircleButton(icon = Icons.Default.PlayArrow, label = "Play/Pause", onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSendMediaKey("play_pause")
+                    }, isPrimary = true)
+                    MediaCircleButton(icon = Icons.Default.SkipNext, label = "Next", onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSendMediaKey("next_track")
+                    })
                 }
 
                 Spacer(modifier = Modifier.height(18.dp))
@@ -699,9 +862,15 @@ private fun MediaToolView(
                     }
 
                     if (isScreenSharing) {
-                        SnowOutlinedButton(text = "Stop", onClick = { onToggleScreenShare(false) })
+                        SnowOutlinedButton(text = "Stop", onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onToggleScreenShare(false)
+                        })
                     } else {
-                        SnowGradientButton(text = "Start", onClick = { onToggleScreenShare(true) })
+                        SnowGradientButton(text = "Start", onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onToggleScreenShare(true)
+                        })
                     }
                 }
 
@@ -730,7 +899,10 @@ private fun MediaToolView(
 
                     SnowTonalButton(
                         text = "Capture",
-                        onClick = onTriggerCameraCapture,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onTriggerCameraCapture()
+                        },
                         enabled = cameraDelivery.status != SnowUiRepository.CameraDeliveryStatus.UPLOADING
                     )
                 }
@@ -1011,10 +1183,12 @@ private fun TerminalToolView(
                 )
             )
             Spacer(modifier = Modifier.width(8.dp))
+            val terminalHaptic = LocalHapticFeedback.current
             SnowGradientButton(
                 text = "Run",
                 onClick = {
                     if (commandInput.isNotBlank()) {
+                        terminalHaptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onExecuteCommand(commandInput.trim())
                     }
                 },

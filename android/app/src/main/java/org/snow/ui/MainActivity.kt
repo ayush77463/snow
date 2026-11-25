@@ -287,6 +287,14 @@ class MainActivity : AppCompatActivity() {
                 oneTimeScreenCaptureLauncher.launch(captureIntent)
             }
         }
+        if (intent?.getBooleanExtra("request_camera_capture", false) == true) {
+            intent.removeExtra("request_camera_capture")
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                launchRealCameraCapture()
+            } else {
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+        }
     }
 
     override fun onResume() {

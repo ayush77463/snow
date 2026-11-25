@@ -84,10 +84,33 @@ class CapabilityDispatcherTest {
         assertTrue((resHuge["error"] as String).contains("exceeds maximum limit"))
     }
 
+    private fun contextWithInstantSync(enabled: Boolean): android.content.ContextWrapper {
+        val prefs = object : android.content.SharedPreferences {
+            private val values = mutableMapOf<String, Any?>(
+                org.snow.ui.SnowUiRepository.PREF_KEY_INSTANT_SYNC to enabled
+            )
+            override fun getAll(): MutableMap<String, *> = values
+            override fun getString(key: String?, defValue: String?): String? = defValue
+            override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+            override fun getInt(key: String?, defValue: Int): Int = defValue
+            override fun getLong(key: String?, defValue: Long): Long = defValue
+            override fun getFloat(key: String?, defValue: Float): Float = defValue
+            override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+                (values[key] as? Boolean) ?: defValue
+            override fun contains(key: String?): Boolean = values.containsKey(key)
+            override fun edit(): android.content.SharedPreferences.Editor = throw UnsupportedOperationException()
+            override fun registerOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun unregisterOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+        }
+        return object : android.content.ContextWrapper(null) {
+            override fun getSharedPreferences(name: String?, mode: Int) = prefs
+        }
+    }
+
     @Test
     fun testClipboardPullForegroundAndUserIntentRestrictions() = runBlocking {
-        val dummyContext = object : android.content.ContextWrapper(null) {}
-        val handler = ClipboardHandler(dummyContext)
+        val disabledSyncContext = contextWithInstantSync(false)
+        val handler = ClipboardHandler(disabledSyncContext)
 
         // 1. App in background -> FOREGROUND_REQUIRED
         ClipboardHandler.isAppInForeground = false
@@ -96,7 +119,7 @@ class CapabilityDispatcherTest {
         assertEquals("error", resBg["status"])
         assertEquals("FOREGROUND_REQUIRED", resBg["error"])
 
-        // 2. App in foreground but no user confirmation -> USER_CONFIRMATION_REQUIRED
+        // 2. App in foreground with instant sync disabled & no user confirmation -> USER_CONFIRMATION_REQUIRED
         ClipboardHandler.isAppInForeground = true
         ClipboardHandler.isUserIntentGranted = false
         val resNoIntent = handler.pullClipboard()
@@ -106,8 +129,8 @@ class CapabilityDispatcherTest {
 
     @Test
     fun testCapabilityDispatcherDispatchesClipboardPull() = runBlocking {
-        val dummyContext = object : android.content.ContextWrapper(null) {}
-        val dispatcher = AndroidCapabilityDispatcher(dummyContext, transferClientProvider = { null })
+        val disabledSyncContext = contextWithInstantSync(false)
+        val dispatcher = AndroidCapabilityDispatcher(disabledSyncContext, transferClientProvider = { null })
 
         // Backgrounded -> UNAUTHORIZED / FOREGROUND_REQUIRED
         ClipboardHandler.isAppInForeground = false
@@ -123,7 +146,7 @@ class CapabilityDispatcherTest {
         assertEquals(ErrorCode.UNAUTHORIZED, errBg?.code)
         assertTrue(errBg?.message?.contains("FOREGROUND_REQUIRED") == true)
 
-        // Foregrounded but unconfirmed -> UNAUTHORIZED / USER_CONFIRMATION_REQUIRED
+        // Foregrounded with instant sync disabled & unconfirmed -> UNAUTHORIZED / USER_CONFIRMATION_REQUIRED
         ClipboardHandler.isAppInForeground = true
         ClipboardHandler.isUserIntentGranted = false
         val (resNoIntent, errNoIntent) = dispatcher.dispatch(
@@ -136,6 +159,10 @@ class CapabilityDispatcherTest {
         assertNotNull(errNoIntent)
         assertEquals(ErrorCode.UNAUTHORIZED, errNoIntent?.code)
         assertTrue(errNoIntent?.message?.contains("USER_CONFIRMATION_REQUIRED") == true)
+
+        // Default true allows validation check without explicit prompt
+        val defaultDispatcher = AndroidCapabilityDispatcher(object : android.content.ContextWrapper(null) {}, transferClientProvider = { null })
+        assertNull(defaultDispatcher.validateExecutionContract("clipboard_pull", null))
     }
 
     @Test

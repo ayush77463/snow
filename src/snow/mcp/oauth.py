@@ -620,6 +620,7 @@ class OAuthServer:
             "authorization_servers": [self.issuer],
             "scopes_supported": ["snow:mcp", "read", "write"],
             "bearer_methods_supported": ["header"],
+            "logo_uri": f"{self.issuer}/snow_logo.png",
         }
 
     def get_authorization_server_metadata(self) -> dict[str, Any]:
@@ -636,4 +637,5 @@ class OAuthServer:
             "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
             "client_id_metadata_document_supported": True,
             "scopes_supported": ["snow:mcp", "read", "write"],
+            "logo_uri": f"{self.issuer}/snow_logo.png",
         }

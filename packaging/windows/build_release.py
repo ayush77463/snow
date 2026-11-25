@@ -129,6 +129,7 @@ def run_pipeline(
     clean: bool = True,
     skip_installer: bool = False,
     dry_run: bool = False,
+    bundle_cloudflared: bool = False,
 ) -> int:
     """Execute the release build pipeline."""
     repo_root = Path(__file__).resolve().parent.parent.parent
@@ -173,13 +174,16 @@ def run_pipeline(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. Ensure bundled cloudflared binary is verified
-    print("[*] Verifying bundled cloudflared binary...")
-    try:
-        ensure_cloudflared_binary(repo_root)
-    except Exception as exc:
-        print(f"[!] Supply-chain verification error: {exc}", file=sys.stderr)
-        return 1
+    # 2. Optionally verify/bundle cloudflared when explicitly requested
+    if bundle_cloudflared:
+        print("[*] Verifying optional bundled cloudflared binary...")
+        try:
+            ensure_cloudflared_binary(repo_root)
+        except Exception as exc:
+            print(f"[!] Supply-chain verification error: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print("[*] Skipping cloudflared.exe bundling to keep release lean (--bundle-cloudflared not set).")
 
     # 3. Check for PyInstaller
     try:
@@ -199,7 +203,9 @@ def run_pipeline(
         str(spec_file),
     ]
 
-    res = subprocess.run(cmd, cwd=str(repo_root))
+    pyi_env = os.environ.copy()
+    pyi_env["SNOW_BUNDLE_CLOUDFLARED"] = "1" if bundle_cloudflared else "0"
+    res = subprocess.run(cmd, cwd=str(repo_root), env=pyi_env)
     if res.returncode != 0:
         print(f"[!] PyInstaller build failed with exit code {res.returncode}.", file=sys.stderr)
         return res.returncode
@@ -209,45 +215,83 @@ def run_pipeline(
         print(f"[!] Build verification failed: {snow_exe} was not produced.", file=sys.stderr)
         return 1
 
-    # 5. Place verified cloudflared binary into dist/snow/bin/cloudflared.exe
-    target_bin_dir = dist_dir / "snow" / "bin"
-    try:
-        ensure_cloudflared_binary(repo_root, target_dir=target_bin_dir)
-        print(f"[+] Installed verified cloudflared.exe to {target_bin_dir / 'cloudflared.exe'}")
-    except Exception as exc:
-        print(f"[!] Failed staging cloudflared.exe into distribution: {exc}", file=sys.stderr)
-        return 1
+    # 5. Optionally place verified cloudflared binary into dist/snow/bin/cloudflared.exe
+    if bundle_cloudflared:
+        target_bin_dir = dist_dir / "snow" / "bin"
+        try:
+            ensure_cloudflared_binary(repo_root, target_dir=target_bin_dir)
+            print(f"[+] Installed verified cloudflared.exe to {target_bin_dir / 'cloudflared.exe'}")
+        except Exception as exc:
+            print(f"[!] Failed staging cloudflared.exe into distribution: {exc}", file=sys.stderr)
+            return 1
 
-    # 5b. Stage release-signed Android APK into frozen bundle when available
-    staged_apk = output_dir / "SNOW-Mobile-5.0.0.apk"
+    # 5b. Stage release-signed Android APK and OTA manifest into frozen bundle when available
+    sys.path.insert(0, str(repo_root / "src"))
+    try:
+        import snow as _snow_pkg
+        rel_ver = getattr(_snow_pkg, "__version__", "5.1.0")
+    except Exception:
+        rel_ver = "5.1.0"
+
+    staged_apk = output_dir / f"SNOW-Mobile-{rel_ver}.apk"
+    if not staged_apk.is_file():
+        candidates = sorted(output_dir.glob("SNOW-Mobile-*.apk"), reverse=True)
+        staged_apk = candidates[0] if candidates else staged_apk
     if staged_apk.is_file():
         dst_apk_dir = dist_dir / "snow" / "packaging" / "output"
         dst_apk_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(staged_apk, dst_apk_dir / "SNOW-Mobile-5.0.0.apk")
+        shutil.copy2(staged_apk, dst_apk_dir / staged_apk.name)
         print(f"[+] Staged {staged_apk.name} into {dst_apk_dir / staged_apk.name}")
 
-    print(f"[+] Standalone bundle successfully built: {dist_dir / 'snow'}")
+    dist_snow_dir = dist_dir / "snow"
+    total_bytes = sum(f.stat().st_size for f in dist_snow_dir.rglob("*") if f.is_file())
+    total_mb = total_bytes / (1024 * 1024)
+    print(f"[+] Standalone bundle successfully built: {dist_snow_dir} ({total_mb:.2f} MB)")
 
     # 6. Inno Setup installer compilation
-    if skip_installer:
-        print("[*] Skipping Inno Setup installer compilation (--skip-installer).")
-        return 0
+    if not skip_installer:
+        iscc_path = find_inno_setup_compiler()
+        if not iscc_path:
+            print("[!] Note: Inno Setup (ISCC.exe) was not found in PATH or standard directories.")
+            print("    Standalone directory distribution is ready at: dist/snow/")
+            print("    To build the single-file installer, install Inno Setup 6: https://jrsoftware.org/isdl.php")
+        else:
+            print(f"[*] Compiling Windows Installer via Inno Setup ({iscc_path})...")
+            iscc_cmd = [str(iscc_path), str(iss_file)]
+            iscc_res = subprocess.run(iscc_cmd, cwd=str(repo_root / "packaging" / "windows"))
+            if iscc_res.returncode != 0:
+                print(f"[!] Inno Setup compilation failed with exit code {iscc_res.returncode}.", file=sys.stderr)
+                return iscc_res.returncode
+            print(f"[+] SNOW Windows Installer successfully generated in: {output_dir}")
 
-    iscc_path = find_inno_setup_compiler()
-    if not iscc_path:
-        print("[!] Note: Inno Setup (ISCC.exe) was not found in PATH or standard directories.")
-        print("    Standalone directory distribution is ready at: dist/snow/")
-        print("    To build the single-file installer, install Inno Setup 6: https://jrsoftware.org/isdl.php")
-        return 0
-
-    print(f"[*] Compiling Windows Installer via Inno Setup ({iscc_path})...")
-    iscc_cmd = [str(iscc_path), str(iss_file)]
-    iscc_res = subprocess.run(iscc_cmd, cwd=str(repo_root / "packaging" / "windows"))
-    if iscc_res.returncode != 0:
-        print(f"[!] Inno Setup compilation failed with exit code {iscc_res.returncode}.", file=sys.stderr)
-        return iscc_res.returncode
-
-    print(f"[+] SNOW Windows Installer successfully generated in: {output_dir}")
+    # 7. Write/update OTA manifest when release installer or APK are present
+    import json
+    manifest: dict[str, object] = {
+        "version": rel_ver,
+        "release_notes": f"SNOW V{rel_ver} release",
+    }
+    setup_exe = output_dir / f"SNOW-Setup-{rel_ver}.exe"
+    if setup_exe.is_file():
+        manifest["desktop"] = {
+            "url": f"https://github.com/ayush/snow/releases/download/v{rel_ver}/{setup_exe.name}",
+            "filename": setup_exe.name,
+            "sha256": compute_file_sha256(setup_exe),
+            "size_bytes": setup_exe.stat().st_size,
+        }
+    if staged_apk.is_file():
+        manifest["android"] = {
+            "version_code": 3 if rel_ver.startswith("5.1") else 2,
+            "version_name": rel_ver,
+            "apk_name": staged_apk.name,
+            "sha256": compute_file_sha256(staged_apk),
+            "size_bytes": staged_apk.stat().st_size,
+        }
+    if "desktop" in manifest or "android" in manifest:
+        manifest_path = output_dir / "update_manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        print(f"[+] Wrote OTA manifest: {manifest_path}")
+        if (dist_snow_dir / "packaging" / "output").is_dir():
+            shutil.copy2(manifest_path, dist_snow_dir / "packaging" / "output" / "update_manifest.json")
     return 0
 
 
@@ -256,12 +300,14 @@ def main() -> int:
     parser.add_argument("--no-clean", action="store_true", help="Do not clean build/ and dist/ before compiling")
     parser.add_argument("--skip-installer", action="store_true", help="Skip Inno Setup compiler step")
     parser.add_argument("--dry-run", action="store_true", help="Validate build paths and environment without compiling")
+    parser.add_argument("--bundle-cloudflared", action="store_true", help="Include optional cloudflared.exe binary in distribution")
     args = parser.parse_args()
 
     return run_pipeline(
         clean=not args.no_clean,
         skip_installer=args.skip_installer,
         dry_run=args.dry_run,
+        bundle_cloudflared=args.bundle_cloudflared,
     )
 
 

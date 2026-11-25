@@ -220,9 +220,9 @@ class ClipboardHandler(private val context: Context) {
         // 2. Explicit user intent/confirmation check
         val hasIntent = isUserIntentGranted || try {
             val prefs = context.getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
-            prefs?.getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_INSTANT_SYNC, false) ?: false
+            prefs?.getBoolean(org.snow.ui.SnowUiRepository.PREF_KEY_INSTANT_SYNC, true) ?: true
         } catch (_: Exception) {
-            false
+            true
         }
         if (!hasIntent) {
             SafeLog.w(TAG, "Clipboard read rejected: explicit user confirmation has not been granted.")

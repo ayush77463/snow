@@ -32,7 +32,31 @@ ALLOWED_STATIC_EXTENSIONS = {
 }
 REQUIRED_UI_ASSETS = ("index.html", "app.js", "app.css", "tokens.css", "theme-init.js")
 DEFAULT_OVERRIDE_DIR = Path.home() / ".snow" / "web_override"
-CURRENT_VERSION = "5.0.0"
+CURRENT_VERSION = "5.1.0"
+
+
+def find_local_staged_manifest() -> Optional[Path]:
+    """Locate a staged local release manifest if present without making external requests."""
+    candidates: list[Path] = []
+    env_manifest = os.getenv("SNOW_UPDATE_MANIFEST", "").strip()
+    if env_manifest:
+        candidates.append(Path(env_manifest))
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "packaging" / "output" / "update_manifest.json")
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    candidates.append(repo_root / "packaging" / "output" / "update_manifest.json")
+    candidates.append(Path.home() / ".snow" / "updates" / "manifest.json")
+
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            pass
+    return None
 
 
 def parse_version(version_str: str) -> Tuple[int, ...]:
@@ -123,13 +147,27 @@ def check_for_updates(
             with open(path, "r", encoding="utf-8") as f:
                 manifest_data = json.load(f)
     else:
-        # Default: no external network check configured; return up to date
-        return {
-            "available": False,
-            "current_version": current_version,
-            "latest_version": current_version,
-            "update_type": "none",
-        }
+        local_manifest = find_local_staged_manifest()
+        if local_manifest is not None:
+            try:
+                with open(local_manifest, "r", encoding="utf-8") as f:
+                    manifest_data = json.load(f)
+            except Exception as exc:
+                return {
+                    "available": False,
+                    "current_version": current_version,
+                    "latest_version": current_version,
+                    "update_type": "none",
+                    "error": f"Unreadable staged manifest {local_manifest}: {exc}",
+                }
+        else:
+            # Default: no external network check configured; return up to date
+            return {
+                "available": False,
+                "current_version": current_version,
+                "latest_version": current_version,
+                "update_type": "none",
+            }
 
     validated = validate_manifest(manifest_data)
     latest_version_str = validated["version"]

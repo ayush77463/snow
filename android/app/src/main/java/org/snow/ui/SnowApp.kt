@@ -150,8 +150,8 @@ fun SnowApp(
     var pcFilesList by remember { mutableStateOf<List<PcFileItem>>(emptyList()) }
     val safFolderUri = repository.safFolderManager.getDestinationDisplayName()
 
-    // Approvals state
-    var pendingApprovalsList by remember { mutableStateOf<List<PendingApprovalItem>>(emptyList()) }
+    // Approvals state (observed directly from shared repository StateFlow)
+    val pendingApprovalsList by repository.pendingApprovals.collectAsState()
 
     // Federation grants state
     var federationGrantsList by remember { mutableStateOf<List<Map<String, Any?>>>(emptyList()) }
@@ -206,9 +206,7 @@ fun SnowApp(
     // Refresh approvals list when opening approvals sheet
     LaunchedEffect(showApprovalsSheet) {
         if (showApprovalsSheet && connectionState == ConnectionState.CONNECTED) {
-            repository.fetchPendingApprovals { result ->
-                result.onSuccess { pendingApprovalsList = it }
-            }
+            repository.refreshPendingApprovals(force = true)
         }
     }
 
@@ -231,6 +229,7 @@ fun SnowApp(
                 if (connectionState == ConnectionState.CONNECTED) {
                     repository.queryPcStatus()
                     repository.fetchClipboardBuffer()
+                    repository.refreshPendingApprovals()
                     if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.FILES) {
                         repository.listPcDirectory(currentPcPath) { files, _ ->
                             if (files != null) pcFilesList = files
@@ -439,7 +438,6 @@ fun SnowApp(
                         DevicesScreen(
                             savedDevices = savedDevices,
                             discoveredPeers = discoveredPeers,
-                            peerHostState = peerHostState,
                             activeHost = repository.currentTargetHost,
                             federationGrants = federationGrantsList,
                             onConnectDevice = { dev: SavedDevice ->
@@ -467,22 +465,6 @@ fun SnowApp(
                             },
                             onPairDiscoveredPeer = { peer ->
                                 repository.connect(peer.ipAddress, peer.port)
-                            },
-                            onTogglePeerHost = { enabled ->
-                                if (enabled) {
-                                    repository.startPeerHost()
-                                } else {
-                                    repository.stopPeerHost()
-                                }
-                            },
-                            onShowPeerHostQr = {
-                                val qr = repository.generatePeerHostQrJson()
-                                if (qr != null) {
-                                    peerHostQrJson = qr
-                                    showPeerHostQrDialog = true
-                                } else {
-                                    Toast.makeText(context, "Host mode offline", Toast.LENGTH_SHORT).show()
-                                }
                             },
                             onGenerateFederationCode = {
                                 repository.createFederationInvite { success, resMap, msg ->
@@ -519,6 +501,16 @@ fun SnowApp(
                             onOpenConnectSheet = { showConnectSheet = true },
                             generatedFederationInvite = generatedFederationCode,
                             onDismissFederationInvite = { generatedFederationCode = null },
+                            isConnected = connectionState != ConnectionState.DISCONNECTED || peerHostState.isActive,
+                            autoConnectNearby = autoConnectNearby,
+                            onToggleAutoConnect = { checked ->
+                                autoConnectNearby = checked
+                                repository.setAutoReconnectEnabled(checked)
+                            },
+                            onDisconnectAll = {
+                                repository.disconnectAll()
+                                Toast.makeText(context, "All sessions disconnected", Toast.LENGTH_SHORT).show()
+                            },
                             isRefreshing = isDevicesRefreshing,
                             onRefresh = {
                                 isDevicesRefreshing = true
@@ -561,6 +553,9 @@ fun SnowApp(
                                     isFilesRefreshing = false
                                 }
                             },
+                            activeTransfer = activeTransfer,
+                            onCancelTransfer = { repository.cancelActiveTransfer() },
+                            onDismissTransfer = { repository.dismissActiveTransfer() },
                             allowlistedApps = AppLauncherBottomSheet.ALLOWLISTED_WINDOWS_APPS,
                             onLaunchApp = { target, friendlyName ->
                                 repository.launchWindowsApp(target) { success, err ->
@@ -686,7 +681,7 @@ fun SnowApp(
                                 appUpdateStatusText = "Checking..."
                                 repository.checkAppUpdate { info ->
                                     updateInfo = info
-                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v5.0.0 • Up to date"
+                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v5.1.0 • Up to date"
                                 }
                             },
                             updateStatusText = appUpdateStatusText,
@@ -757,11 +752,7 @@ fun SnowApp(
                     pendingApprovals = pendingApprovalsList,
                     logs = logs,
                     onResolveApproval = { reqId, decision ->
-                        repository.resolveApproval(reqId, decision) { res ->
-                            res.onSuccess {
-                                pendingApprovalsList = pendingApprovalsList.filter { it.requestId != reqId }
-                            }
-                        }
+                        repository.resolveApproval(reqId, decision) { }
                     },
                     initialTab = approvalsInitialTab
                 )

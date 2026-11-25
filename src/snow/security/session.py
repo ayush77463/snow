@@ -28,6 +28,7 @@ class SessionRecord:
     connection_id: Optional[str]
     created_at: str
     last_seen: str
+    trust_tier: str = "peer"
 
 
 class SessionManager:
@@ -40,12 +41,16 @@ class SessionManager:
         self._connection_to_session: Dict[str, str] = {}
 
     def create_session(
-        self, device_id: str, connection_id: Optional[str] = None
+        self,
+        device_id: str,
+        connection_id: Optional[str] = None,
+        trust_tier: str = "peer",
     ) -> SessionRecord:
         """Create a new active session for a verified device.
 
         Any existing session for this device is superseded and revoked.
         """
+        normalized_tier = (trust_tier or "peer").strip().lower() or "peer"
         with self._lock:
             # Revoke prior session for this device if present
             prior_sid = self._device_to_session.get(device_id)
@@ -60,6 +65,7 @@ class SessionManager:
                 connection_id=connection_id,
                 created_at=now,
                 last_seen=now,
+                trust_tier=normalized_tier,
             )
 
             self._sessions[sid] = record
@@ -67,7 +73,7 @@ class SessionManager:
             if connection_id:
                 self._connection_to_session[connection_id] = sid
 
-            logger.info("Created active session [%s] for device [%s]", sid, device_id)
+            logger.info("Created active session [%s] for device [%s] (tier=%s)", sid, device_id, normalized_tier)
             return record
 
     def get_session(self, session_id: str) -> Optional[SessionRecord]:
@@ -104,6 +110,7 @@ class SessionManager:
                 connection_id=session.connection_id,
                 created_at=session.created_at,
                 last_seen=current_utc_timestamp(),
+                trust_tier=session.trust_tier,
             )
             self._sessions[session_id] = updated
             return True
@@ -136,6 +143,7 @@ class SessionManager:
                         connection_id=None,
                         created_at=session.created_at,
                         last_seen=session.last_seen,
+                        trust_tier=session.trust_tier,
                     )
                     self._sessions[sid] = updated
                     return updated

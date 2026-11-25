@@ -1188,6 +1188,21 @@ class SnowIpcServer:
                 "error": dev_resp.get("error"),
             }, now_authed
 
+        if op == "approval_oauth_event":
+            event_type = str(payload.get("event_type") or "APPROVAL_REQUESTED")
+            request_data = payload.get("request")
+            if isinstance(request_data, dict) and self.core_server and getattr(self.core_server, "ws_server", None):
+                ws_srv = self.core_server.ws_server
+                if hasattr(ws_srv, "broadcast_approval_event"):
+                    await ws_srv.broadcast_approval_event(event_type, request_data)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "BROADCASTED",
+                "data": {"event_type": event_type},
+            }, now_authed
+
         if op == "approval_list":
             app_engine = getattr(self.capability_engine, "approval_engine", None)
             if app_engine:

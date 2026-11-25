@@ -85,7 +85,7 @@ def redact_tunnel_config(config: dict[str, Any]) -> dict[str, Any]:
     redacted: dict[str, Any] = {}
     for k, v in config.items():
         k_lower = str(k).lower()
-        if any(sec in k_lower for sec in ("token", "secret", "key", "password", "credential")):
+        if any(sec in k_lower for sec in ("token", "secret", "key", "password", "credential", "ticket")):
             if isinstance(v, str) and len(v) > 8:
                 redacted[k] = f"{v[:4]}***{v[-2:]}"
             else:
@@ -181,6 +181,8 @@ class _TunnelInstance:
         self._started_at: float = 0.0
         self._log_buffer: deque[str] = deque(maxlen=50)
         self._lock = asyncio.Lock()
+        self._background_active: bool = False
+        self._mcp_forwarder: Optional[Any] = None
 
     async def _drain_stderr(
         self,
@@ -221,6 +223,35 @@ class _TunnelInstance:
             except (asyncio.CancelledError, Exception):
                 pass
         self._reader_task = None
+
+        # 1b. Close active Render/relay reverse tunnel forwarder if running
+        if self._mcp_forwarder is not None:
+            try:
+                await self._mcp_forwarder.stop()
+            except Exception as exc:
+                logger.warning("[%s tunnel] Error stopping reverse tunnel forwarder: %s", self.purpose, exc)
+            self._mcp_forwarder = None
+
+        # 1c. Disable background Tailscale Funnel if active
+        if self._provider == "tailscale" and self._background_active:
+            ts_bin = find_tailscale_binary()
+            if ts_bin:
+                creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                try:
+                    stop_proc = await asyncio.create_subprocess_exec(
+                        ts_bin,
+                        "funnel",
+                        f"--https=443",
+                        "off",
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        creationflags=creation_flags,
+                    )
+                    await asyncio.wait_for(stop_proc.wait(), timeout=3.0)
+                except Exception as exc:
+                    logger.debug("[%s tunnel] Best-effort Tailscale funnel off returned: %s", self.purpose, exc)
+            self._background_active = False
 
         # 2. Terminate subprocess if active
         pid = None
@@ -346,8 +377,9 @@ class _TunnelInstance:
                         "success": False,
                         "status": "BINARY_NOT_FOUND",
                         "error": (
-                            "cloudflared binary was not found on your system. "
-                            "Download it from: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+                            "cloudflared is optional and not installed yet. Install via "
+                            "'winget install Cloudflare.cloudflared' (or https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/), "
+                            "or switch Tunnel Provider to Tailscale Funnel / SNOW Render Relay."
                         ),
                     }
 
@@ -509,18 +541,43 @@ class _TunnelInstance:
                         "error": "tailscale binary was not found on your system. Install Tailscale: https://tailscale.com",
                     }
 
-                cmd = [ts_bin, "funnel", str(target_port)]
-                creation_flags = 0
-                if sys.platform == "win32":
-                    creation_flags |= subprocess.CREATE_NO_WINDOW
+                creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                combined_output = ""
+                cmd = [ts_bin, "funnel", "--bg", str(target_port)]
 
                 try:
                     proc = await asyncio.create_subprocess_exec(
                         *cmd,
-                        stdout=asyncio.subprocess.DEVNULL,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         creationflags=creation_flags,
                     )
+                    out_bytes, err_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    out_str = out_bytes.decode("utf-8", errors="replace").strip()
+                    err_str = err_bytes.decode("utf-8", errors="replace").strip()
+                    combined_output = "\n".join(part for part in (out_str, err_str) if part)
+                    if combined_output:
+                        for line in combined_output.splitlines()[-10:]:
+                            self._log_buffer.append(line)
+                    if proc.returncode != 0:
+                        return {
+                            "success": False,
+                            "status": "FUNNEL_UNAVAILABLE",
+                            "error": (
+                                f"Tailscale Funnel command failed (code={proc.returncode}): "
+                                f"{combined_output or 'Ensure Tailscale is signed in and Funnel is enabled on your tailnet.'}"
+                            ),
+                        }
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    return {
+                        "success": False,
+                        "status": "FUNNEL_UNAVAILABLE",
+                        "error": (
+                            "Tailscale Funnel did not complete within timeout. "
+                            "Ensure Tailscale is signed in and Funnel is enabled: https://tailscale.com/kb/1223/funnel"
+                        ),
+                    }
                 except Exception as exc:
                     return {
                         "success": False,
@@ -528,37 +585,53 @@ class _TunnelInstance:
                         "error": f"Failed launching tailscale funnel for {self.purpose}: {exc}",
                     }
 
-                self._proc = proc
-                self._provider = "tailscale"
-                self._started_at = time.time()
-
-                url_future = asyncio.get_running_loop().create_future()
-                self._reader_task = asyncio.create_task(
-                    self._drain_stderr(proc, "tailscale", url_future)
-                )
-
+                public_url: Optional[str] = None
                 try:
-                    public_url = await asyncio.wait_for(url_future, timeout=timeout)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    await self._stop_tunnel_unlocked()
+                    status_proc = await asyncio.create_subprocess_exec(
+                        ts_bin,
+                        "status",
+                        "--json",
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        creationflags=creation_flags,
+                    )
+                    st_out, _ = await asyncio.wait_for(status_proc.communicate(), timeout=min(timeout, 6.0))
+                    if status_proc.returncode == 0 and st_out:
+                        st_json = json.loads(st_out.decode("utf-8", errors="replace"))
+                        dns_name = str((st_json.get("Self") or {}).get("DNSName") or "").strip().rstrip(".")
+                        if dns_name:
+                            public_url = f"https://{dns_name}"
+                except Exception as exc:
+                    logger.debug("[%s tunnel] tailscale status --json lookup failed: %s", self.purpose, exc)
+
+                if not public_url and combined_output:
+                    match = TAILSCALE_URL_REGEX.search(combined_output)
+                    if match:
+                        public_url = match.group(0).rstrip("/")
+
+                if not public_url:
                     return {
                         "success": False,
                         "status": "FUNNEL_UNAVAILABLE",
                         "error": (
-                            "Tailscale Funnel failed to produce a valid *.ts.net HTTPS URL within timeout. "
-                            "Ensure Funnel is enabled on your tailnet: https://tailscale.com/kb/1223/funnel"
+                            "Tailscale Funnel enabled but MagicDNS *.ts.net hostname could not be determined "
+                            "from 'tailscale status --json'. Enable MagicDNS & HTTPS in Tailscale admin."
                         ),
                     }
 
+                self._provider = "tailscale"
+                self._background_active = True
                 self._public_url = public_url
+                self._started_at = time.time()
                 logger.info("[%s tunnel] Tailscale funnel established: %s -> :%d", self.purpose, public_url, target_port)
                 res = {
                     "success": True,
                     "status": "STARTED",
                     "purpose": self.purpose,
                     "provider": "tailscale",
+                    "mode": "background",
                     "public_url": public_url,
-                    "pid": proc.pid,
                 }
                 if self.purpose == "mcp":
                     res["mcp_endpoint"] = f"{public_url}/mcp"
@@ -567,11 +640,68 @@ class _TunnelInstance:
                     res["relay_endpoint"] = f"wss://{clean_host}/v1/tunnel"
                 return res
 
+            # Case D: SNOW Render Relay reverse tunnel (permanent /u/{snow_id}/mcp URL)
+            elif provider_lower == "render":
+                if self.purpose != "mcp":
+                    return {
+                        "success": False,
+                        "status": "UNSUPPORTED_PROVIDER",
+                        "error": "Render reverse MCP tunnel is only supported on the MCP gateway port (8771).",
+                    }
+                if not resolved_custom_url or not resolved_custom_url.strip().lower().startswith(("https://", "http://")):
+                    return {
+                        "success": False,
+                        "status": "INVALID_URL",
+                        "error": "Enter your permanent Render Relay https:// URL in Permanent Tunnel Domain first.",
+                    }
+                base_url = resolved_custom_url.strip().rstrip("/")
+                ticket = token or tunnel_cfg.get("relay_ticket") or ""
+                if not ticket:
+                    return {
+                        "success": False,
+                        "status": "MISSING_TICKET",
+                        "error": "A Render relay ticket is required to register the permanent reverse MCP tunnel.",
+                    }
+                from snow.security.identity import load_or_create_device_identity
+                ident = load_or_create_device_identity()
+                snow_id = str(tunnel_cfg.get("snow_id") or ident.snow_id).strip().upper()
+                ws_scheme = "wss://" if base_url.startswith("https://") else "ws://"
+                clean_host = base_url.split("://", 1)[1]
+                relay_ws_url = f"{ws_scheme}{clean_host}/v1/tunnel"
+                from snow.relay.mcp_forwarder import RelayMcpForwarder
+                forwarder = RelayMcpForwarder(
+                    relay_ws_url=relay_ws_url,
+                    snow_id=snow_id,
+                    ticket=ticket,
+                    local_gateway_url=f"http://127.0.0.1:{target_port}",
+                )
+                ok, err = await forwarder.start(timeout=timeout)
+                if not ok:
+                    return {
+                        "success": False,
+                        "status": "RELAY_CONNECT_FAILED",
+                        "error": err or "Failed connecting Render reverse MCP tunnel.",
+                    }
+                self._mcp_forwarder = forwarder
+                self._provider = "render"
+                self._background_active = True
+                self._public_url = f"{base_url}/u/{snow_id}"
+                self._started_at = time.time()
+                return {
+                    "success": True,
+                    "status": "STARTED",
+                    "purpose": self.purpose,
+                    "provider": "render",
+                    "snow_id": snow_id,
+                    "public_url": self._public_url,
+                    "mcp_endpoint": f"{self._public_url}/mcp",
+                }
+
             else:
                 return {
                     "success": False,
                     "status": "UNSUPPORTED_PROVIDER",
-                    "error": f"Unsupported tunnel provider '{provider}'. Supported: cloudflared, tailscale, custom.",
+                    "error": f"Unsupported tunnel provider '{provider}'. Supported: cloudflared, tailscale, render, custom.",
                 }
 
     def get_status(self) -> dict[str, Any]:
@@ -579,6 +709,10 @@ class _TunnelInstance:
         is_active = False
         pid = None
         if self._provider == "custom" and self._public_url:
+            is_active = True
+        elif self._provider == "tailscale" and self._background_active and self._public_url:
+            is_active = True
+        elif self._provider == "render" and self._mcp_forwarder is not None and getattr(self._mcp_forwarder, "is_connected", False) and self._public_url:
             is_active = True
         elif self._proc:
             if self._proc.returncode is None:
@@ -588,8 +722,13 @@ class _TunnelInstance:
                 self._proc = None
                 self._provider = None
                 self._public_url = None
+                self._background_active = False
 
-        mcp_ep = f"{self._public_url.rstrip('/')}/mcp" if (self.purpose == "mcp" and self._public_url) else None
+        if self.purpose == "mcp" and self._public_url:
+            clean_pub = self._public_url.rstrip("/")
+            mcp_ep = clean_pub if clean_pub.endswith("/mcp") else f"{clean_pub}/mcp"
+        else:
+            mcp_ep = None
 
         return {
             "active": is_active,

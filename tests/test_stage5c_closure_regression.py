@@ -390,20 +390,22 @@ class TestStage5CUpdaterMediaAndVersionUnit(unittest.TestCase):
             self.assertEqual(err["status"], "INVALID_VOLUME_LEVEL")
 
     def test_apk_5_0_0_priority_and_version_alignment(self) -> None:
-        self.assertEqual(snow.__version__, "5.0.0")
-        self.assertEqual(CoreConfig().version, "5.0.0")
-        self.assertEqual(CURRENT_VERSION, "5.0.0")
+        self.assertEqual(snow.__version__, "5.1.0")
+        self.assertEqual(CoreConfig().version, "5.1.0")
+        self.assertEqual(CURRENT_VERSION, "5.1.0")
         self.assertEqual(ACTION_TO_CAPABILITY["clipboard_buffer_pin"], CAPABILITY_DESKTOP_CLIPBOARD_WRITE)
 
         with tempfile.TemporaryDirectory() as tmp:
             pkg_out = Path(tmp) / "packaging" / "output"
             pkg_out.mkdir(parents=True)
             apk4 = pkg_out / "SNOW-Mobile-4.1.0.apk"
-            apk5 = pkg_out / "SNOW-Mobile-5.0.0.apk"
+            apk50 = pkg_out / "SNOW-Mobile-5.0.0.apk"
+            apk5 = pkg_out / "SNOW-Mobile-5.1.0.apk"
             apk4.write_bytes(b"PK41")
-            apk5.write_bytes(b"PK50")
+            apk50.write_bytes(b"PK50")
+            apk5.write_bytes(b"PK51")
 
-            cfg = CoreConfig(version="5.0.0")
+            cfg = CoreConfig(version="5.1.0")
             db = DatabaseManager(Path(tmp) / "t.db")
             http_srv = SnowHttpTransferServer(
                 config=cfg,

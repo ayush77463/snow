@@ -9,6 +9,7 @@ Generates universal platform icons and assets from design/snow_logo.png:
 5. Web Dashboard branding assets (snow.png, src/snow/web/static/snow_logo.png, favicon.ico).
 """
 
+import sys
 from pathlib import Path
 from PIL import Image, ImageDraw
 
@@ -140,13 +141,12 @@ def generate_windows_assets(src: Image.Image, trans_logo: Image.Image) -> None:
     pkg_win.mkdir(parents=True, exist_ok=True)
     ico_path = pkg_win / "snow.ico"
 
-    # Create ICO using transparent logo on dark circular badge or full-bleed
+    # Build largest-first explicit per-size frames so Pillow preserves every ICO resolution crisply
     ico_images = []
-    for s in ICO_SIZES:
+    for s in sorted(ICO_SIZES, reverse=True):
         canvas = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         draw = ImageDraw.Draw(canvas)
-        # Rounded badge with #030812
-        r = max(1, int(s * 0.18))
+        r = max(2, int(s * 0.20))
         draw.rounded_rectangle([(0, 0), (s - 1, s - 1)], radius=r, fill=(3, 8, 18, 255))
         logo_size = max(1, int(s * 0.80))
         scaled = trans_logo.resize((logo_size, logo_size), Image.Resampling.LANCZOS)
@@ -154,28 +154,33 @@ def generate_windows_assets(src: Image.Image, trans_logo: Image.Image) -> None:
         canvas.paste(scaled, (off, off), scaled)
         ico_images.append(canvas)
 
-    # Pillow saves ICO with all provided resolutions
     ico_images[0].save(
         ico_path,
         format="ICO",
-        sizes=[(s, s) for s in ICO_SIZES],
         append_images=ico_images[1:],
     )
-    print(f"[+] Generated Windows multi-res ICO: {ico_path} (sizes: {ICO_SIZES})")
+    with Image.open(ico_path) as check_ico:
+        embedded = check_ico.info.get("sizes") or set()
+    expected_sizes = {(s, s) for s in ICO_SIZES}
+    if not expected_sizes.issubset(set(embedded)):
+        raise RuntimeError(f"snow.ico missing expected sizes: got {embedded}, expected {expected_sizes}")
+    print(f"[+] Generated Windows multi-res ICO: {ico_path} (sizes: {sorted(embedded)}, bytes: {ico_path.stat().st_size})")
 
 
 def generate_web_assets(src: Image.Image, trans_logo: Image.Image) -> None:
-    # 1. Root snow.png
-    root_logo = REPO_ROOT / "snow.png"
-    src.save(root_logo, "PNG")
-    print(f"[+] Generated root {root_logo}")
+    clean_png = src.convert("RGBA").resize((512, 512), Image.Resampling.LANCZOS)
 
-    # 2. Web static snow_logo.png
+    # 1. Root snow.png (clean 512x512 optimized PNG)
+    root_logo = REPO_ROOT / "snow.png"
+    clean_png.save(root_logo, "PNG", optimize=True)
+    print(f"[+] Generated root {root_logo} ({root_logo.stat().st_size} bytes)")
+
+    # 2. Web static snow_logo.png (clean 512x512 optimized PNG)
     static_dir = REPO_ROOT / "src" / "snow" / "web" / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
     web_logo = static_dir / "snow_logo.png"
-    src.save(web_logo, "PNG")
-    print(f"[+] Generated static {web_logo}")
+    clean_png.save(web_logo, "PNG", optimize=True)
+    print(f"[+] Generated static {web_logo} ({web_logo.stat().st_size} bytes)")
 
     # 3. Web static favicon.ico
     favicon_path = static_dir / "favicon.ico"
@@ -183,7 +188,7 @@ def generate_web_assets(src: Image.Image, trans_logo: Image.Image) -> None:
     if ico_path.is_file():
         import shutil
         shutil.copy2(ico_path, favicon_path)
-        print(f"[+] Copied favicon: {favicon_path}")
+        print(f"[+] Copied favicon: {favicon_path} ({favicon_path.stat().st_size} bytes)")
 
 
 def main() -> None:

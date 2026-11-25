@@ -15,6 +15,7 @@ def create_relay_ticket(
     group_id: str,
     secret: str,
     ttl_seconds: int = 3600,
+    snow_id: Optional[str] = None,
 ) -> str:
     """Generate a signed, short-lived authentication ticket for relay session registration.
 
@@ -27,6 +28,8 @@ def create_relay_ticket(
         "iat": now,
         "exp": now + ttl_seconds,
     }
+    if snow_id:
+        payload["snow_id"] = str(snow_id).strip().upper()
     payload_raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(payload_raw).decode("ascii").rstrip("=")
 
@@ -38,6 +41,49 @@ def create_relay_ticket(
     sig_b64 = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
 
     return f"{payload_b64}.{sig_b64}"
+
+
+def extract_ticket_claims(
+    ticket: str,
+    secret: str,
+) -> Tuple[bool, dict, Optional[str]]:
+    """Validate and decode all signed claims inside a relay ticket."""
+    if not secret or not ticket or "." not in ticket:
+        return False, {}, "Invalid ticket or relay secret not configured."
+
+    parts = ticket.strip().split(".")
+    if len(parts) != 2:
+        return False, {}, "Invalid ticket component count."
+
+    payload_b64, sig_b64 = parts[0], parts[1]
+    expected_sig = hmac.new(
+        secret.encode("utf-8"),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode("ascii").rstrip("=")
+
+    if not hmac.compare_digest(sig_b64, expected_sig_b64):
+        return False, {}, "Invalid cryptographic signature."
+
+    try:
+        padding = "=" * ((4 - len(payload_b64) % 4) % 4)
+        raw_bytes = base64.urlsafe_b64decode(payload_b64 + padding)
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        return False, {}, f"Failed decoding ticket payload: {exc}"
+
+    now = time.time()
+    exp = payload.get("exp", 0)
+    if now > exp:
+        return False, {}, f"Ticket expired {int(now - exp)}s ago."
+
+    device_id = payload.get("device_id")
+    group_id = payload.get("group_id")
+    if not device_id or not group_id:
+        return False, {}, "Ticket missing required device_id or group_id."
+
+    return True, payload, None
 
 
 def verify_relay_ticket(

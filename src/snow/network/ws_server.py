@@ -175,6 +175,8 @@ class SnowWebSocketServer:
         self.live_notifications: dict[str, list[dict[str, Any]]] = {}
         # Phase 26A: Screen streaming session metadata (control plane only, strictly no image bytes)
         self._screen_stream_sessions: dict[str, dict[str, Any]] = {}
+        # Optional in-process RemoteMcpGateway reference for direct OAuth approval bridge
+        self._oauth_approval_bridge: Any = None
         # Phase 30 / Stage 4A: Cross-Network Federation Manager
         from snow.network.federation import FederationManager
         self.federation_manager = FederationManager(
@@ -395,16 +397,6 @@ class SnowWebSocketServer:
                 cb_task.cancel()
             self._last_synced_clipboard_hash.pop(client.connection_id, None)
             self._active_sync_connections.discard(client.connection_id)
-            if not self._active_sync_connections:
-                if self._clipboard_listener:
-                    try:
-                        self._clipboard_listener.stop()
-                    except Exception:
-                        pass
-                    self._clipboard_listener = None
-                if self._clipboard_watchdog_task and not self._clipboard_watchdog_task.done():
-                    self._clipboard_watchdog_task.cancel()
-                    self._clipboard_watchdog_task = None
             session = self.session_manager.get_session_by_connection(client.connection_id)
             if session and getattr(self, "node_registry", None):
                 self.node_registry.on_session_disconnected(
@@ -1691,6 +1683,146 @@ class SnowWebSocketServer:
 
         return "loopback"
 
+    def _list_pending_oauth_approvals(self) -> list[dict[str, Any]]:
+        """Collect pending OAuth 2.1 authorization requests formatted for companion clients."""
+        items_by_id: dict[str, dict[str, Any]] = {}
+        now = time.time()
+
+        gateway = getattr(self, "_oauth_approval_bridge", None)
+        if gateway and hasattr(gateway, "list_pending_authorizations"):
+            try:
+                for raw in gateway.list_pending_authorizations():
+                    req_id = str(raw.get("request_id", "")).strip()
+                    if not req_id:
+                        continue
+                    client_name = str(raw.get("client_name") or raw.get("client_id") or "Remote AI Client")
+                    scope = str(raw.get("scope") or "snow:mcp")
+                    expires_at = float(raw.get("expires_at") or (now + 600.0))
+                    items_by_id[req_id] = {
+                        "request_id": req_id,
+                        "principal": client_name,
+                        "action": "oauth_authorize",
+                        "target_device": "Remote MCP Gateway",
+                        "risk_level": "HIGH",
+                        "reason": f"Authorize OAuth 2.1 access for {client_name} (scope: {scope})",
+                        "time_remaining_seconds": round(max(0.0, expires_at - now), 1),
+                        "sanitized_params": {
+                            "type": "oauth_2_1",
+                            "client_id": raw.get("client_id", ""),
+                            "client_name": client_name,
+                            "scope": scope,
+                        },
+                        "kind": "oauth",
+                    }
+            except Exception as exc:
+                logger.debug("Error listing in-process gateway OAuth approvals: %s", exc)
+
+        db = getattr(self, "db_manager", None)
+        if db and hasattr(db, "list_settings_prefix"):
+            try:
+                rows = db.list_settings_prefix("oauth_req:")
+                for key, raw_json in rows.items():
+                    req_id = key.removeprefix("oauth_req:")
+                    try:
+                        rec = json.loads(raw_json)
+                    except Exception:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    expires_at = float(rec.get("expires_at", 0.0) or 0.0)
+                    status = str(rec.get("status", "PENDING")).upper()
+                    if expires_at and now > expires_at:
+                        try:
+                            db.delete_setting(key)
+                            db.delete_setting(f"oauth_dec:{req_id}")
+                        except Exception:
+                            pass
+                        continue
+                    if status != "PENDING":
+                        continue
+                    dec_raw = db.get_setting(f"oauth_dec:{req_id}") if hasattr(db, "get_setting") else None
+                    if dec_raw:
+                        continue
+                    if req_id not in items_by_id:
+                        client_name = str(rec.get("client_name") or rec.get("client_id") or "Remote AI Client")
+                        scope = str(rec.get("scope") or "snow:mcp")
+                        items_by_id[req_id] = {
+                            "request_id": req_id,
+                            "principal": client_name,
+                            "action": "oauth_authorize",
+                            "target_device": "Remote MCP Gateway",
+                            "risk_level": "HIGH",
+                            "reason": f"Authorize OAuth 2.1 access for {client_name} (scope: {scope})",
+                            "time_remaining_seconds": round(max(0.0, expires_at - now), 1),
+                            "sanitized_params": {
+                                "type": "oauth_2_1",
+                                "client_id": rec.get("client_id", ""),
+                                "client_name": client_name,
+                                "scope": scope,
+                            },
+                            "kind": "oauth",
+                        }
+            except Exception as exc:
+                logger.debug("Error querying OAuth pending requests from DB: %s", exc)
+
+        return list(items_by_id.values())
+
+    async def _resolve_pending_oauth_approval(
+        self, request_id: str, decision: str
+    ) -> Optional[tuple[bool, str]]:
+        """Resolve a pending OAuth 2.1 request if it belongs to the OAuth queue."""
+        gateway = getattr(self, "_oauth_approval_bridge", None)
+        if gateway and request_id in getattr(gateway, "_pending_authorizations", {}):
+            res = (
+                gateway.approve_authorization(request_id)
+                if decision == "APPROVE"
+                else gateway.reject_authorization(request_id)
+            )
+            ok = bool(res.get("success", False))
+            msg = str(res.get("status") or res.get("error") or decision)
+            if ok:
+                await self.broadcast_approval_event(
+                    "APPROVAL_RESOLVED",
+                    {"request_id": request_id, "decision": decision, "kind": "oauth"},
+                )
+            return ok, msg
+
+        db = getattr(self, "db_manager", None)
+        if db and hasattr(db, "get_setting"):
+            raw_json = db.get_setting(f"oauth_req:{request_id}")
+            if raw_json:
+                try:
+                    rec = json.loads(raw_json)
+                except Exception:
+                    return False, "Corrupt OAuth authorization metadata."
+                now = time.time()
+                if float(rec.get("expires_at", 0.0) or 0.0) < now:
+                    db.delete_setting(f"oauth_req:{request_id}")
+                    db.delete_setting(f"oauth_dec:{request_id}")
+                    return False, "Authorization request expired."
+                existing_dec = db.get_setting(f"oauth_dec:{request_id}")
+                if existing_dec or str(rec.get("status", "PENDING")).upper() != "PENDING":
+                    return False, "Authorization request has already been resolved."
+                new_status = "APPROVED" if decision == "APPROVE" else "REJECTED"
+                db.set_setting(
+                    f"oauth_dec:{request_id}",
+                    json.dumps({
+                        "request_id": request_id,
+                        "status": new_status,
+                        "decided_at": now,
+                        "decided_by": "owner_mobile",
+                    }),
+                )
+                rec["status"] = new_status
+                db.set_setting(f"oauth_req:{request_id}", json.dumps(rec))
+                await self.broadcast_approval_event(
+                    "APPROVAL_RESOLVED",
+                    {"request_id": request_id, "decision": decision, "kind": "oauth"},
+                )
+                return True, new_status
+
+        return None
+
     async def _handle_approval_list(
         self, client: Any, message: SnowMessage, data: dict, session: Any, ctx: ExecutionContext
     ) -> None:
@@ -1716,6 +1848,7 @@ class SnowWebSocketServer:
             return
 
         pending = [r.to_dict() for r in app_engine.list_pending_requests()]
+        pending.extend(self._list_pending_oauth_approvals())
         resp = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
@@ -1763,7 +1896,10 @@ class SnowWebSocketServer:
             await client.websocket.send(err.to_json())
             return
 
-        if decision == "APPROVE":
+        oauth_res = await self._resolve_pending_oauth_approval(request_id, decision)
+        if oauth_res is not None:
+            ok, msg = oauth_res
+        elif decision == "APPROVE":
             ok, msg = app_engine.approve_request(
                 request_id=request_id,
                 approver_principal=ExecutionPrincipal.OWNER_MANUAL,
@@ -1789,12 +1925,13 @@ class SnowWebSocketServer:
 
     async def broadcast_approval_event(self, event_type: str, approval_data: dict) -> None:
         """Broadcast an approval event (REQUESTED, RESOLVED, EXPIRED) to connected OWNER_MANUAL devices."""
-        for conn_id in self.connection_manager.all_connections():
-            client = self.connection_manager.get(conn_id)
-            if not client or not client.websocket or getattr(client.websocket, "state", 1) != 1:
+        for conn_item in self.connection_manager.all_connections():
+            client = self.connection_manager.get(conn_item) if isinstance(conn_item, str) else conn_item
+            if not client or not getattr(client, "websocket", None) or getattr(client.websocket, "state", 1) != 1:
                 continue
+            conn_id = getattr(client, "connection_id", conn_item)
             session = self.session_manager.get_session_by_connection(conn_id)
-            if session is None or session.trust_tier != "owner":
+            if session is None or (getattr(session, "trust_tier", "peer") or "peer").lower() != "owner":
                 continue
 
             push_msg = SnowMessage.create_request(
@@ -1869,6 +2006,7 @@ class SnowWebSocketServer:
         session = self.session_manager.create_session(
             device_id=device_id,
             connection_id=client.connection_id,
+            trust_tier=device_record.trust_tier,
         )
         self.db_manager.update_last_seen(device_id)
         self.db_manager.log_audit_event(
@@ -1911,6 +2049,7 @@ class SnowWebSocketServer:
                 "action": "auth_request",
                 "data": {
                     "device_id": device_id,
+                    "device_name": self.device_identity.device_name,
                     "session_id": session.session_id,
                     "trust_tier": device_record.trust_tier,
                     "manifest": build_windows_manifest().to_dict(),
@@ -1967,6 +2106,7 @@ class SnowWebSocketServer:
                     self.session_manager.create_session(
                         device_id=client_device_id,
                         connection_id=client.connection_id,
+                        trust_tier=assigned_tier,
                     )
 
                     if getattr(self, "node_registry", None):
@@ -2585,6 +2725,59 @@ class SnowWebSocketServer:
         )
         await client.websocket.send(response.to_json())
 
+    def _resolve_session_device_identity(self, session: Any) -> tuple[str, str]:
+        """Resolve authoritative device_id and friendly device_name from paired DB record."""
+        device_id = (getattr(session, "device_id", None) or "").strip() if session else ""
+        if not device_id:
+            return "unknown_device", "Connected Device"
+        device_name = device_id
+        if getattr(self, "db_manager", None) and hasattr(self.db_manager, "get_paired_device"):
+            try:
+                rec = self.db_manager.get_paired_device(device_id)
+                if rec and getattr(rec, "device_name", None):
+                    candidate = str(rec.device_name).strip()
+                    if candidate:
+                        device_name = candidate
+            except Exception as exc:
+                logger.debug("Unable to resolve paired device name for %s: %s", device_id, exc)
+        return device_id, device_name
+
+    async def _persist_and_broadcast_clipboard_buffer(
+        self,
+        *,
+        content_type: str,
+        source_device_id: str,
+        source_device_name: str,
+        text: Optional[str] = None,
+        image_bytes: Optional[bytes] = None,
+        mime_type: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Persist validated clipboard item into shared ring buffer and broadcast event."""
+        cb_buf = getattr(self, "clipboard_buffer", None) or getattr(
+            self.capability_engine, "clipboard_buffer", None
+        )
+        if not cb_buf:
+            return None
+        buf_res: Optional[dict[str, Any]] = None
+        if content_type == "image" and image_bytes is not None:
+            buf_res = cb_buf.add_image(
+                image_bytes=image_bytes,
+                mime_type=mime_type or "image/png",
+                source_device_id=source_device_id,
+                source_device_name=source_device_name,
+            )
+        elif content_type == "text" and text is not None:
+            buf_res = cb_buf.add_text(
+                text=text,
+                source_device_id=source_device_id,
+                source_device_name=source_device_name,
+            )
+        if buf_res and buf_res.get("success") and buf_res.get("item"):
+            item_meta = buf_res["item"]
+            await self.broadcast_clipboard_buffer_event(item_meta)
+            return item_meta
+        return None
+
     async def _handle_desktop_clipboard_set(
         self,
         client,
@@ -2594,6 +2787,8 @@ class SnowWebSocketServer:
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
         """Handle request to write text or image to Windows clipboard."""
+        source_device_id, source_device_name = self._resolve_session_device_identity(session)
+
         # 1. Image clipboard set
         if data.get("type") == "image":
             transfer_id = data.get("transfer_id")
@@ -2620,7 +2815,8 @@ class SnowWebSocketServer:
                 await client.websocket.send(error_response.to_json())
                 return
 
-            computed_sha256 = hashlib.sha256(target_path.read_bytes()).hexdigest()
+            img_bytes = target_path.read_bytes()
+            computed_sha256 = hashlib.sha256(img_bytes).hexdigest()
             if sha256 and computed_sha256.lower() != sha256.lower():
                 error_response = SnowMessage.create_error(
                     code=ErrorCode.INTEGRITY_MISMATCH,
@@ -2630,10 +2826,27 @@ class SnowWebSocketServer:
                 await client.websocket.send(error_response.to_json())
                 return
 
+            detected_mime = data.get("mime_type") or (
+                "image/jpeg" if img_bytes.startswith(b"\xff\xd8\xff") else "image/png"
+            )
             res = await asyncio.to_thread(self.capability_engine.clipboard.set_image_sync, target_path)
             if res.get("success"):
+                if sys.platform == "win32":
+                    try:
+                        import ctypes
+                        self._last_local_write_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+                    except Exception:
+                        pass
+                self._last_processed_clipboard_hash = computed_sha256
                 for cid in self._active_sync_connections:
                     self._last_synced_clipboard_hash[cid] = computed_sha256
+                await self._persist_and_broadcast_clipboard_buffer(
+                    content_type="image",
+                    source_device_id=source_device_id,
+                    source_device_name=source_device_name,
+                    image_bytes=img_bytes,
+                    mime_type=detected_mime,
+                )
             response = SnowMessage.create_response(
                 correlation_id=message.id,
                 payload={
@@ -2676,8 +2889,15 @@ class SnowWebSocketServer:
                 except Exception:
                     pass
             h = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self._last_processed_clipboard_hash = h
             for cid in self._active_sync_connections:
                 self._last_synced_clipboard_hash[cid] = h
+            await self._persist_and_broadcast_clipboard_buffer(
+                content_type="text",
+                source_device_id=source_device_id,
+                source_device_name=source_device_name,
+                text=text,
+            )
 
         response = SnowMessage.create_response(
             correlation_id=message.id,
@@ -2691,11 +2911,19 @@ class SnowWebSocketServer:
         await client.websocket.send(response.to_json())
 
     def start_clipboard_listener(self) -> bool:
-        """Start the Windows clipboard listener and watchdog."""
+        """Start the Windows clipboard listener and watchdog (Core-owned singleton lifecycle)."""
         if sys.platform != "win32":
             return False
         if self._clipboard_listener and getattr(self._clipboard_listener, "_is_running", False):
+            if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
+                self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
             return True
+        if self._clipboard_listener:
+            try:
+                self._clipboard_listener.stop()
+            except Exception:
+                pass
+            self._clipboard_listener = None
         try:
             self._clipboard_listener = WindowsClipboardListener(
                 self._on_windows_clipboard_update_from_thread
@@ -2703,12 +2931,19 @@ class SnowWebSocketServer:
             success = self._clipboard_listener.start()
             if success:
                 logger.info("WindowsClipboardListener successfully attached.")
+            else:
+                try:
+                    self._clipboard_listener.stop()
+                except Exception:
+                    pass
+                self._clipboard_listener = None
             # Unconditional watchdog: always run watchdog task on Windows for detached/headless reliability
             if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
                 self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
             return success
         except Exception as exc:
             logger.warning("Failed starting WindowsClipboardListener: %s", exc)
+            self._clipboard_listener = None
             if not self._clipboard_watchdog_task or self._clipboard_watchdog_task.done():
                 self._clipboard_watchdog_task = asyncio.create_task(self._clipboard_sequence_watchdog())
             return False
@@ -2735,10 +2970,11 @@ class SnowWebSocketServer:
             data={"item": item_metadata},
         )
         payload_str = msg.to_json()
-        for conn_id in self.connection_manager.all_connections():
-            client = self.connection_manager.get(conn_id)
-            if not client or not client.websocket or getattr(client.websocket, "state", 1) != 1:
+        for conn_item in self.connection_manager.all_connections():
+            client = self.connection_manager.get(conn_item) if isinstance(conn_item, str) else conn_item
+            if not client or not getattr(client, "websocket", None) or getattr(client.websocket, "state", 1) != 1:
                 continue
+            conn_id = getattr(client, "connection_id", conn_item)
             session = self.session_manager.get_session_by_connection(conn_id)
             if session is None:
                 continue
@@ -2759,7 +2995,12 @@ class SnowWebSocketServer:
         enabled = bool(data.get("enabled", False))
         if enabled:
             self._active_sync_connections.add(client.connection_id)
-            if sys.platform == "win32" and not self._clipboard_listener:
+            if sys.platform == "win32" and (
+                not self._clipboard_listener
+                or not getattr(self._clipboard_listener, "_is_running", False)
+                or not self._clipboard_watchdog_task
+                or self._clipboard_watchdog_task.done()
+            ):
                 self.start_clipboard_listener()
         else:
             self._active_sync_connections.discard(client.connection_id)

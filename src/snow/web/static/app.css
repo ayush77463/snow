@@ -61,6 +61,9 @@ html, body {
     display: flex;
     width: 100vw;
     height: 100vh;
+    height: 100dvh;
+    max-height: 100vh;
+    max-height: 100dvh;
     overflow: hidden;
     background-color: var(--snow-bg-canvas);
     position: relative;
@@ -122,7 +125,8 @@ html, body {
 .sidebar {
     width: var(--snow-sidebar-width-expanded);
     height: 100%;
-    max-height: 100vh;
+    max-height: 100%;
+    min-height: 0;
     background-color: var(--snow-bg-sidebar);
     border-right: 1px solid var(--snow-border);
     display: flex;
@@ -213,8 +217,8 @@ html, body {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    padding: 0 12px;
-    flex: 1;
+    padding: 0 12px 10px 12px;
+    flex: 0 0 auto;
 }
 
 .nav-item {
@@ -278,11 +282,11 @@ html.theme-light .nav-item.active {
 }
 
 .sidebar-footer {
-    padding: 12px 14px;
+    padding: 10px 12px 14px 12px;
     border-top: 1px solid var(--snow-border);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
     flex-shrink: 0;
 }
 
@@ -294,8 +298,25 @@ html.theme-light .nav-item.active {
         padding: 8px 12px;
     }
     .sidebar-footer {
+        padding: 10px 12px 14px 12px;
+        gap: 6px;
+    }
+}
+
+@media (max-height: 680px) {
+    .sidebar-header {
         padding: 10px 12px;
-        gap: 8px;
+    }
+    .nav-menu {
+        gap: 2px;
+        padding: 0 10px 6px 10px;
+    }
+    .nav-item {
+        padding: 7px 10px;
+    }
+    .sidebar-footer {
+        padding: 8px 10px 12px 10px;
+        gap: 6px;
     }
 }
 
@@ -349,6 +370,8 @@ html.theme-light .nav-item.active {
 
 .main-content {
     flex: 1;
+    min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -1024,6 +1047,19 @@ html.theme-light .file-dropzone {
     flex-direction: column;
     justify-content: space-between;
     gap: 12px;
+    overflow: hidden;
+    min-width: 0;
+}
+
+.clipboard-card img,
+.clipboard-card .clipboard-preview-img {
+    max-width: 100%;
+    max-height: 220px;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    display: block;
+    border-radius: var(--snow-radius-sm);
 }
 
 /* VIEW 5: AI & SETTINGS */
@@ -1107,6 +1143,50 @@ html.theme-light .file-dropzone {
     gap: 16px;
     max-height: 90vh;
     overflow-y: auto;
+}
+
+.lightbox-overlay {
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    background-color: rgba(7, 11, 20, 0.78);
+    z-index: 80;
+}
+
+.lightbox-card {
+    max-width: min(92vw, 1120px);
+    width: auto;
+    min-width: min(520px, 90vw);
+    max-height: 92vh;
+}
+
+.lightbox-media-frame {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px;
+    background-color: var(--snow-bg-nested);
+    border-radius: var(--snow-radius-md);
+    min-height: 200px;
+}
+
+.lightbox-media-frame img {
+    max-width: 86vw;
+    max-height: 70vh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border-radius: var(--snow-radius-sm);
+    display: block;
+}
+
+@keyframes snowProgressIndeterminate {
+    0% { transform: translateX(-60%); width: 45%; }
+    50% { transform: translateX(65%); width: 55%; }
+    100% { transform: translateX(180%); width: 45%; }
+}
+
+.progress-fill.indeterminate {
+    animation: snowProgressIndeterminate 1.2s ease-in-out infinite;
 }
 
 .modal-header-row {
