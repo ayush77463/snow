@@ -1092,3 +1092,29 @@ Phase 18 is the capstone release milestone. It validates all functional, perform
   **Student**: SNOW implements a Dual-Principal Security Model. Autonomous AI assistants operate under the `AI_MCP` principal, which is restricted strictly to read-only and workspace-scoped operations. Destructive or system-wide operations require the `OWNER_MANUAL` principal and a server-validated, single-use confirmation ticket with a 60-second TTL. Caller payloads are sanitized to prevent privilege spoofing.
 - **Examiner**: *How does SNOW perform on resource-constrained hardware?*
   **Student**: SNOW Desktop Core runs completely headless using Python `asyncio` without heavy GUI dependencies. In acceptance testing, the entire stack consumed approximately 8.12 MB idle RAM, well below our 30 MB capstone acceptance limit. SessionRouter pre-flight checks complete in approximately 2.05 ms, failing fast without generating unnecessary network traffic.
+
+---
+
+## Post-V2 Architecture Progression & V7 Pre-Release Roadmap (`v3.0.0` – `v7.0.0`)
+
+Following the Phase 18 (`snow-v2`) baseline, SNOW evolved across four major product generations while preserving the frozen Phase 0 foundations (Python 3.13 `asyncio`, Protocol v1 with `<= 64 KiB` WSS control frames, SQLite persistence, separate HTTPS `:8766` transfer plane, `sys.stderr` logging with pure `stdout` MCP stdio JSON-RPC, and native Kotlin Android with Android Keystore AES-GCM):
+
+### V3 (`3.0.0`, Phases 19–25)
+- Ticket-based file transfer hardening, USB ADB reverse forwarding (`snow usb`), zero-CDN Web Dashboard (`127.0.0.1:8769`), TLS 1.3 MemoryBIO Remote Relay (`8770`), Streamable HTTP Remote MCP Gateway (`8771`) with OAuth 2.1 + PKCE S256, consent-gated Screen/Camera capture workflows, and dynamic 34-tool capability catalog.
+
+### V4 (`4.0.0`, Phases 26–30)
+- Live `MediaProjection` screen streaming and cross-process IPC frame bridge, shared clipboard buffer and allowlisted app launcher, multi-device local network identity (expanding to 42 tools), hybrid Wi-Fi / USB / Relay mesh, Windows installer (`packaging/windows/`) + lightweight Win32 System Tray Companion (`snow-tray.exe`), and non-transitive Cross-Network Federation (9-digit expiring invite codes, scoped ACLs, Emergency Kill Switch).
+
+### V5 (`5.0.0` – `5.2.0`, Stages 4–6C)
+- Windows Web UI and Android Material 3 Jetpack Compose UI (`Home`, `Tools`, `Devices`, `Settings`) with Dark/Light design tokens, canonical `SNW-XXXX-XXXX` identity routing, 5-tier access profiles (`full_control`, `files_and_clipboard`, `files_only`, `clipboard_only`, `not_allowed`), permanent Render Hub remote AI routing, universal any-to-any live screen sharing, SQLite Schema v7, `228/228` bidirectional wire parity fixtures, and 54 FastMCP tools.
+
+### V7 (`7.0.0` Pre-Release Candidate — Milestones 1, 2, and 3A)
+- **Milestone 1 — Pairing, Security, Revocation & Android Trust** (`d46579c`): Authoritative QR pairing with strict Token/PIN separation, authenticated SNOW ID directory resolution, fail-closed relay secret handling, consolidated idempotent device revocation/unpair, Android Share Code authority guards, safe battery settings intents, and fail-closed APK/AAB release signing.
+- **Milestone 2 — Universal Clipboard** (`f361813`): Thread-safe SQLite Schema v7 persistent 15-item clipboard history (max 5 pinned, 100 MiB persisted-media budget) supporting `text`, `image`, `file`, and `file_bundle` (Windows `CF_HDROP`), Core IPC Web image previews (`127.0.0.1:8767`), zero-echo propagation, durable per-device acknowledgements, and resumable SHA-256 HTTPS file delivery (`:8766`) into Android SAF storage.
+- **Milestone 3A — Product Completion, UI/UX Polish, Branding & Pre-Release Packaging** (`7.0.0`, `versionCode = 5`):
+  - Universal branding assets regenerated cleanly from `design/snow.png`.
+  - Windows Web UI navigation (`Home -> Clipboard -> Files & Apps -> Devices -> AI & Settings`), QR surfaces, `8fr 4fr` Files & Apps desktop grid, Universal Clipboard parity, and clean Render Hub Remote AI controls.
+  - Android Compose navigation (`Home`, `Tools`, `Devices`, `Settings`), bidirectional synced `HorizontalPager` across 5 tool tabs, accessible SNOW-token terminal palette, and async action loading/failure guards.
+  - Reference-verified cleanup removing dead Fragment/XML layouts and obsolete temporary files without lowering test coverage.
+  - Aligned version `7.0.0` / `versionCode = 5` and dynamic Android OTA metadata without artificial version ceilings.
+  - **Release Gate Status**: Local pre-release artifacts built for owner physical QA (Lenovo V15 Windows + Realme P4 Android + live Render Hub). Final `v7.0.0` tag and `master_snow` publication await explicit owner hardware verification sign-off.

@@ -148,6 +148,11 @@ fun SnowApp(
     var generatedFederationCode by remember { mutableStateOf<String?>(null) }
     var updateInfo by remember { mutableStateOf<org.snow.transfer.FileTransferClient.AppUpdateInfo?>(null) }
     var updateDownloadProgress by remember { mutableStateOf<Int?>(null) }
+    var isCheckingUpdate by remember { mutableStateOf(false) }
+    var isGeneratingFederationCode by remember { mutableStateOf(false) }
+    var isJoiningFederation by remember { mutableStateOf(false) }
+    var isFederationActionInFlight by remember { mutableStateOf(false) }
+    var busyClipboardItemId by remember { mutableStateOf<String?>(null) }
     var connectErrorMessage by remember { mutableStateOf<String?>(null) }
     var isConnectingByInput by remember { mutableStateOf(false) }
     var showShareDialog by remember { mutableStateOf(false) }
@@ -462,7 +467,10 @@ fun SnowApp(
                             activePermissionProfile = activePermissionProfile,
                             onSelectAccessProfile = { repository.setAccessProfile(it) },
                             onApplyClipboardItem = { item ->
+                                if (busyClipboardItemId == item.itemId) return@HomeScreen
+                                busyClipboardItemId = item.itemId
                                 repository.applyBufferItemToClipboard(item) { success, msg ->
+                                    if (busyClipboardItemId == item.itemId) busyClipboardItemId = null
                                     Toast.makeText(context, if (success) "Applied to clipboard!" else "Failed: $msg", Toast.LENGTH_SHORT).show()
                                 }
                             },
@@ -484,6 +492,7 @@ fun SnowApp(
                             findCachedClipboardImage = { id -> repository.getCachedClipboardImageFile(id) },
                             autoSyncScreenshots = autoSyncScreenshots,
                             isRefreshing = isHomeRefreshing,
+                            busyClipboardItemId = busyClipboardItemId,
                             onRefresh = {
                                 isHomeRefreshing = true
                                 repository.refreshPhoneTelemetry()
@@ -539,8 +548,15 @@ fun SnowApp(
                             },
                             canShareCode = shareCodeAvailability.allowed,
                             shareCodeDisabledReason = shareCodeAvailability.reason,
+                            isConnectionBusy = connectionState == ConnectionState.CONNECTING || connectionState == ConnectionState.RECONNECTING,
+                            isGeneratingFederationCode = isGeneratingFederationCode,
+                            isJoiningFederation = isJoiningFederation,
+                            isFederationActionInFlight = isFederationActionInFlight,
                             onGenerateFederationCode = {
+                                if (isGeneratingFederationCode) return@DevicesScreen
+                                isGeneratingFederationCode = true
                                 repository.createFederationInvite { success, resMap, msg ->
+                                    isGeneratingFederationCode = false
                                     if (success && resMap != null) {
                                         val code = resMap["invite_code"] as? String ?: (resMap["code"] as? String)
                                         if (code != null) {
@@ -552,12 +568,18 @@ fun SnowApp(
                                 }
                             },
                             onAcceptFederationCode = { code ->
+                                if (isJoiningFederation) return@DevicesScreen
+                                isJoiningFederation = true
                                 repository.connectByInput(code) { success, msg, _ ->
+                                    isJoiningFederation = false
                                     Toast.makeText(context, if (success) "Federation connected!" else "Failed: $msg", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             onRevokeFederationGrant = { grantId ->
+                                if (isFederationActionInFlight) return@DevicesScreen
+                                isFederationActionInFlight = true
                                 repository.revokeFederationGrant(grantId) { success, msg ->
+                                    isFederationActionInFlight = false
                                     Toast.makeText(context, if (success) "Grant revoked" else "Failed: $msg", Toast.LENGTH_SHORT).show()
                                     if (success) {
                                         repository.listFederationGrants { _, grants, _ ->
@@ -567,7 +589,10 @@ fun SnowApp(
                                 }
                             },
                             onFederationKillSwitch = {
+                                if (isFederationActionInFlight) return@DevicesScreen
+                                isFederationActionInFlight = true
                                 repository.federationKillSwitch { success, msg ->
+                                    isFederationActionInFlight = false
                                     Toast.makeText(context, if (success) "Federation kill switch triggered" else "Failed: $msg", Toast.LENGTH_SHORT).show()
                                 }
                             },
@@ -762,16 +787,20 @@ fun SnowApp(
                                 }
                             },
                             onCheckAppUpdate = {
+                                if (isCheckingUpdate) return@SettingsScreen
+                                isCheckingUpdate = true
                                 appUpdateStatusText = "Checking..."
                                 repository.checkAppUpdate { info ->
+                                    isCheckingUpdate = false
                                     updateInfo = info
-                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v5.2.0 • Up to date"
+                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v7.0.0 • Up to date"
                                 }
                             },
                             updateStatusText = appUpdateStatusText,
                             isUpdateAvailable = updateInfo?.available == true,
                             updateVersionName = updateInfo?.versionName ?: "",
                             updateDownloadProgress = updateDownloadProgress,
+                            isCheckingUpdate = isCheckingUpdate,
                             onInstallUpdate = {
                                 updateInfo?.let { info ->
                                     updateDownloadProgress = 0

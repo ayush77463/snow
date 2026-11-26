@@ -2,6 +2,7 @@ package org.snow.ui.tools
 
 import android.graphics.BitmapFactory
 import android.widget.Toast
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -21,9 +22,12 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.TextSelectionColors
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -62,7 +66,11 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -79,6 +87,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 import org.snow.ui.ActiveTransferInfo
 import org.snow.ui.PcFileItem
 import org.snow.ui.SnowUiRepository
@@ -110,6 +120,7 @@ enum class ToolSubTab(val title: String) {
 /**
  * Flagship Tools Screen containing 5-pill switcher: Files, Apps, Media, Terminal, Screen.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ToolsScreen(
     currentSubTab: ToolSubTab = ToolSubTab.FILES,
@@ -155,6 +166,29 @@ fun ToolsScreen(
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
+    val pagerScope = rememberCoroutineScope()
+    val tabs = remember { ToolSubTab.values() }
+    val pagerState = rememberPagerState(initialPage = currentSubTab.ordinal) { tabs.size }
+    val latestCurrentSubTab by rememberUpdatedState(currentSubTab)
+    val latestOnSubTabChanged by rememberUpdatedState(onSubTabChanged)
+
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.settledPage }
+            .distinctUntilChanged()
+            .collect { settled ->
+                val settledTab = tabs.getOrNull(settled) ?: return@collect
+                if (settledTab != latestCurrentSubTab) {
+                    latestOnSubTabChanged(settledTab)
+                }
+            }
+    }
+
+    LaunchedEffect(currentSubTab) {
+        if (pagerState.currentPage != currentSubTab.ordinal) {
+            pagerState.animateScrollToPage(currentSubTab.ordinal)
+        }
+    }
 
     Column(
         modifier = modifier
@@ -172,14 +206,22 @@ fun ToolsScreen(
                 .padding(4.dp),
             horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            ToolSubTab.values().forEach { tab ->
+            tabs.forEach { tab ->
                 val selected = currentSubTab == tab
                 Box(
                     modifier = Modifier
                         .weight(1f)
                         .clip(RoundedCornerShape(9999.dp))
                         .background(if (selected) (if (colors.isDark) Color(0xFF282828) else Color.White) else Color.Transparent)
-                        .clickable { onSubTabChanged(tab) }
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSubTabChanged(tab)
+                            pagerScope.launch {
+                                if (pagerState.currentPage != tab.ordinal) {
+                                    pagerState.animateScrollToPage(tab.ordinal)
+                                }
+                            }
+                        }
                         .padding(horizontal = 4.dp, vertical = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
@@ -197,61 +239,69 @@ fun ToolsScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Sub-screen Content
-        when (currentSubTab) {
-            ToolSubTab.FILES -> {
-                FilesToolView(
-                    safFolderUri = safFolderUri,
-                    filesList = filesList,
-                    currentPath = currentPath,
-                    onChangeSafFolder = onChangeSafFolder,
-                    onNavigatePath = onNavigatePath,
-                    onDownloadFile = onDownloadFile,
-                    onUploadFile = onUploadFile,
-                    isRefreshing = isFilesRefreshing,
-                    onRefresh = onRefreshFiles,
-                    activeTransfer = activeTransfer,
-                    onCancelTransfer = onCancelTransfer,
-                    onDismissTransfer = onDismissTransfer
-                )
-            }
-            ToolSubTab.APPS -> {
-                AppsToolView(
-                    allowlistedApps = allowlistedApps,
-                    onLaunchApp = onLaunchApp
-                )
-            }
-            ToolSubTab.MEDIA -> {
-                MediaToolView(
-                    onTriggerCameraCapture = onTriggerCameraCapture,
-                    onSendMediaKey = onSendMediaKey,
-                    onSendMediaVolume = onSendMediaVolume,
-                    cameraDelivery = cameraDelivery,
-                    onRetryCameraUpload = onRetryCameraUpload,
-                    onDismissCameraDelivery = onDismissCameraDelivery
-                )
-            }
-            ToolSubTab.TERMINAL -> {
-                TerminalToolView(
-                    terminalState = terminalState,
-                    onExecuteCommand = onExecuteTerminalCommand,
-                    onConfirmCommand = onConfirmTerminalCommand,
-                    onCancelCommand = onCancelTerminalCommand,
-                    onClearTerminal = onClearTerminal
-                )
-            }
-            ToolSubTab.SCREEN -> {
-                ScreenToolView(
-                    isScreenSharing = isScreenSharing,
-                    onStopScreenShare = { onToggleScreenShare(false) },
-                    incomingStreams = incomingStreams,
-                    selectedIncomingSenderId = selectedIncomingSenderId,
-                    onSelectIncomingSender = onSelectIncomingSender,
-                    onCloseIncomingViewer = onCloseIncomingViewer,
-                    eligibleScreenTargets = eligibleScreenTargets,
-                    onStartScreenShareWithTargets = onStartScreenShareWithTargets,
-                    activePermissionProfile = activePermissionProfile
-                )
+        // Sub-screen Content (swipeable and two-way synced with top pill bar)
+        HorizontalPager(
+            state = pagerState,
+            beyondBoundsPageCount = 1,
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+        ) { page ->
+            when (tabs[page]) {
+                ToolSubTab.FILES -> {
+                    FilesToolView(
+                        safFolderUri = safFolderUri,
+                        filesList = filesList,
+                        currentPath = currentPath,
+                        onChangeSafFolder = onChangeSafFolder,
+                        onNavigatePath = onNavigatePath,
+                        onDownloadFile = onDownloadFile,
+                        onUploadFile = onUploadFile,
+                        isRefreshing = isFilesRefreshing,
+                        onRefresh = onRefreshFiles,
+                        activeTransfer = activeTransfer,
+                        onCancelTransfer = onCancelTransfer,
+                        onDismissTransfer = onDismissTransfer
+                    )
+                }
+                ToolSubTab.APPS -> {
+                    AppsToolView(
+                        allowlistedApps = allowlistedApps,
+                        onLaunchApp = onLaunchApp
+                    )
+                }
+                ToolSubTab.MEDIA -> {
+                    MediaToolView(
+                        onTriggerCameraCapture = onTriggerCameraCapture,
+                        onSendMediaKey = onSendMediaKey,
+                        onSendMediaVolume = onSendMediaVolume,
+                        cameraDelivery = cameraDelivery,
+                        onRetryCameraUpload = onRetryCameraUpload,
+                        onDismissCameraDelivery = onDismissCameraDelivery
+                    )
+                }
+                ToolSubTab.TERMINAL -> {
+                    TerminalToolView(
+                        terminalState = terminalState,
+                        onExecuteCommand = onExecuteTerminalCommand,
+                        onConfirmCommand = onConfirmTerminalCommand,
+                        onCancelCommand = onCancelTerminalCommand,
+                        onClearTerminal = onClearTerminal
+                    )
+                }
+                ToolSubTab.SCREEN -> {
+                    ScreenToolView(
+                        isScreenSharing = isScreenSharing,
+                        onStopScreenShare = { onToggleScreenShare(false) },
+                        incomingStreams = incomingStreams,
+                        selectedIncomingSenderId = selectedIncomingSenderId,
+                        onSelectIncomingSender = onSelectIncomingSender,
+                        onCloseIncomingViewer = onCloseIncomingViewer,
+                        eligibleScreenTargets = eligibleScreenTargets,
+                        onStartScreenShareWithTargets = onStartScreenShareWithTargets,
+                        activePermissionProfile = activePermissionProfile
+                    )
+                }
             }
         }
     }
@@ -644,8 +694,8 @@ private fun AppsToolView(
 ) {
     val colors = LocalSnowColors.current
     val haptic = LocalHapticFeedback.current
-    var searchQuery by remember { mutableStateOf("") }
-    var customTarget by remember { mutableStateOf("") }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var customTarget by rememberSaveable { mutableStateOf("") }
 
     val filtered = remember(allowlistedApps, searchQuery) {
         if (searchQuery.isBlank()) allowlistedApps else allowlistedApps.filter {
@@ -1392,7 +1442,7 @@ private fun MediaCircleButton(
 }
 
 /**
- * Monospace Terminal Console Sub-Screen (#0F172A background)
+ * Monospace Terminal Console Sub-Screen using SNOW theme terminal semantic tokens.
  */
 @Composable
 private fun TerminalToolView(
@@ -1403,7 +1453,7 @@ private fun TerminalToolView(
     onClearTerminal: () -> Unit
 ) {
     val colors = LocalSnowColors.current
-    var commandInput by remember { mutableStateOf("") }
+    var commandInput by rememberSaveable { mutableStateOf("") }
 
     if (!terminalState.pendingTicket.isNullOrBlank() && !terminalState.pendingCommand.isNullOrBlank()) {
         AlertDialog(
@@ -1432,7 +1482,7 @@ private fun TerminalToolView(
                         Text(
                             text = terminalState.pendingCommand,
                             style = SnowTypography.monospaceSmall,
-                            color = colors.accentCyan,
+                            color = colors.terminalHeader,
                             modifier = Modifier.padding(10.dp)
                         )
                     }
@@ -1449,16 +1499,18 @@ private fun TerminalToolView(
                     text = "Approve & Run",
                     onClick = {
                         onConfirmCommand(terminalState.pendingCommand, terminalState.pendingTicket)
-                    }
+                    },
+                    isLoading = terminalState.isRunning
                 )
             },
             dismissButton = {
                 SnowOutlinedButton(
                     text = "Cancel",
-                    onClick = onCancelCommand
+                    onClick = onCancelCommand,
+                    enabled = !terminalState.isRunning
                 )
             },
-            containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+            containerColor = colors.surface
         )
     }
 
@@ -1472,6 +1524,7 @@ private fun TerminalToolView(
                 SnowFilterChip(
                     text = cmd,
                     selected = false,
+                    enabled = !terminalState.isRunning,
                     onClick = {
                         commandInput = cmd
                         onExecuteCommand(cmd)
@@ -1488,8 +1541,8 @@ private fun TerminalToolView(
                 .weight(1f)
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(16.dp))
-                .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(16.dp)),
-            color = Color(0xFF0F172A) // Frozen terminal console background
+                .border(1.dp, colors.terminalBorder, RoundedCornerShape(16.dp)),
+            color = colors.terminalBg
         ) {
             Column(
                 modifier = Modifier
@@ -1504,14 +1557,14 @@ private fun TerminalToolView(
                 ) {
                     Text(
                         text = "SNOW TERMINAL CONSOLE",
-                        style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp, color = Color(0xFF00E5FF))
+                        style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp, color = colors.terminalHeader)
                     )
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (terminalState.exitCode != null) {
                             Text(
                                 text = "Exit: ${terminalState.exitCode}",
                                 style = SnowTypography.monospaceSmall.copy(
-                                    color = if (terminalState.exitCode == 0) Color(0xFF10B981) else Color(0xFFEF4444)
+                                    color = if (terminalState.exitCode == 0) colors.terminalExitSuccess else colors.terminalExitError
                                 )
                             )
                             Spacer(modifier = Modifier.width(8.dp))
@@ -1519,7 +1572,7 @@ private fun TerminalToolView(
                         val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
                         Text(
                             text = "Copy",
-                            style = SnowTypography.labelSmall.copy(color = Color(0xFF38BDF8)),
+                            style = SnowTypography.labelSmall.copy(color = colors.terminalSystem),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(4.dp))
                                 .clickable {
@@ -1531,17 +1584,17 @@ private fun TerminalToolView(
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "Clear",
-                            style = SnowTypography.labelSmall.copy(color = Color(0xFF94A3B8)),
+                            style = SnowTypography.labelSmall.copy(color = colors.terminalPlaceholder),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(4.dp))
-                                .clickable(onClick = onClearTerminal)
+                                .clickable(enabled = !terminalState.isRunning, onClick = onClearTerminal)
                                 .padding(4.dp)
                         )
                     }
                 }
 
                 Spacer(modifier = Modifier.height(8.dp))
-                Divider(color = Color(0x22FFFFFF))
+                Divider(color = colors.terminalDivider)
                 Spacer(modifier = Modifier.height(8.dp))
 
                 // Output lines
@@ -1553,15 +1606,15 @@ private fun TerminalToolView(
                         item {
                             Text(
                                 text = "Ready. Tap a chip above or type a command to execute on desktop.",
-                                style = SnowTypography.monospaceSmall.copy(color = Color(0xFF64748B))
+                                style = SnowTypography.monospaceSmall.copy(color = colors.terminalPlaceholder)
                             )
                         }
                     } else {
                         items(terminalState.outputLines) { line ->
                             val textColor = when {
-                                line.isStderr -> Color(0xFFF87171)
-                                line.isSystem -> Color(0xFF38BDF8)
-                                else -> Color(0xFFF1F5F9)
+                                line.isStderr -> colors.terminalStderr
+                                line.isSystem -> colors.terminalSystem
+                                else -> colors.terminalStdout
                             }
                             Text(
                                 text = line.text,
@@ -1584,27 +1637,33 @@ private fun TerminalToolView(
                 value = commandInput,
                 onValueChange = { commandInput = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Command...", style = SnowTypography.monospaceSmall) },
+                placeholder = { Text("Command...", style = SnowTypography.monospaceSmall, color = colors.terminalPlaceholder) },
                 singleLine = true,
                 shape = RoundedCornerShape(12.dp),
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = colors.accentBlue,
+                    focusedBorderColor = colors.accentCyan,
                     unfocusedBorderColor = colors.border,
                     focusedTextColor = colors.textPrimary,
-                    unfocusedTextColor = colors.textPrimary
+                    unfocusedTextColor = colors.textPrimary,
+                    cursorColor = colors.terminalHeader,
+                    selectionColors = TextSelectionColors(
+                        handleColor = colors.terminalHeader,
+                        backgroundColor = colors.terminalHeader.copy(alpha = 0.25f)
+                    )
                 )
             )
             Spacer(modifier = Modifier.width(8.dp))
             val terminalHaptic = LocalHapticFeedback.current
             SnowGradientButton(
-                text = "Run",
+                text = if (terminalState.isRunning) "Running" else "Run",
                 onClick = {
-                    if (commandInput.isNotBlank()) {
+                    if (commandInput.isNotBlank() && !terminalState.isRunning) {
                         terminalHaptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onExecuteCommand(commandInput.trim())
                     }
                 },
-                enabled = commandInput.isNotBlank() && !terminalState.isRunning
+                enabled = commandInput.isNotBlank() && !terminalState.isRunning,
+                isLoading = terminalState.isRunning
             )
         }
 

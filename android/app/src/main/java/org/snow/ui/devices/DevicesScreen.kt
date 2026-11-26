@@ -110,6 +110,10 @@ fun DevicesScreen(
     onDisconnectAll: () -> Unit = {},
     isRefreshing: Boolean = false,
     onRefresh: () -> Unit = {},
+    isConnectionBusy: Boolean = false,
+    isGeneratingFederationCode: Boolean = false,
+    isJoiningFederation: Boolean = false,
+    isFederationActionInFlight: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
@@ -213,6 +217,7 @@ fun DevicesScreen(
                 DeviceListItem(
                     device = dev,
                     isActive = isActive,
+                    isBusy = isConnectionBusy,
                     onConnect = { onConnectDevice(dev) },
                     onDisconnect = onDisconnectDevice,
                     onUnpair = { onUnpairDevice(dev) },
@@ -258,6 +263,9 @@ fun DevicesScreen(
                 grants = federationGrants,
                 canShareCode = canShareCode,
                 shareCodeDisabledReason = shareCodeDisabledReason,
+                isGeneratingCode = isGeneratingFederationCode,
+                isJoiningCode = isJoiningFederation,
+                isActionInFlight = isFederationActionInFlight,
                 onGenerateCode = onGenerateFederationCode,
                 onJoinCode = { showJoinDialog = true },
                 onRevokeGrant = onRevokeFederationGrant,
@@ -302,7 +310,9 @@ fun DevicesScreen(
             },
             confirmButton = {
                 SnowTonalButton(
-                    text = "Connect",
+                    text = if (isJoiningFederation) "Connecting..." else "Connect",
+                    enabled = joinCodeInput.isNotBlank() && !isJoiningFederation,
+                    isLoading = isJoiningFederation,
                     onClick = {
                         if (joinCodeInput.isNotBlank()) {
                             onAcceptFederationCode(joinCodeInput.trim())
@@ -425,6 +435,7 @@ fun DevicesScreen(
 private fun DeviceListItem(
     device: SavedDevice,
     isActive: Boolean,
+    isBusy: Boolean = false,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onUnpair: () -> Unit,
@@ -544,15 +555,25 @@ private fun DeviceListItem(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (isActive) {
-                    SnowOutlinedButton(text = "Disconnect", onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        onDisconnect()
-                    })
+                    SnowOutlinedButton(
+                        text = "Disconnect",
+                        enabled = !isBusy,
+                        isLoading = isBusy,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onDisconnect()
+                        }
+                    )
                 } else {
-                    SnowTonalButton(text = "Reconnect", onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onConnect()
-                    })
+                    SnowTonalButton(
+                        text = if (isBusy) "Connecting..." else "Reconnect",
+                        enabled = !isBusy,
+                        isLoading = isBusy,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onConnect()
+                        }
+                    )
                 }
                 Surface(
                     modifier = Modifier
@@ -724,6 +745,9 @@ private fun CrossNetworkSharingCard(
     grants: List<Map<String, Any?>>,
     canShareCode: Boolean = true,
     shareCodeDisabledReason: String? = null,
+    isGeneratingCode: Boolean = false,
+    isJoiningCode: Boolean = false,
+    isActionInFlight: Boolean = false,
     onGenerateCode: () -> Unit,
     onJoinCode: () -> Unit,
     onRevokeGrant: (String) -> Unit,
@@ -741,17 +765,20 @@ private fun CrossNetworkSharingCard(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 SnowGradientButton(
-                    text = "Share Code",
+                    text = if (isGeneratingCode) "Generating..." else "Share Code",
                     icon = Icons.Default.Share,
                     onClick = onGenerateCode,
                     modifier = Modifier.weight(1f),
-                    enabled = canShareCode
+                    enabled = canShareCode && !isGeneratingCode && !isActionInFlight,
+                    isLoading = isGeneratingCode
                 )
                 SnowTonalButton(
-                    text = "Join Session",
+                    text = if (isJoiningCode) "Joining..." else "Join Session",
                     icon = Icons.Default.Add,
                     onClick = onJoinCode,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    enabled = !isJoiningCode && !isActionInFlight,
+                    isLoading = isJoiningCode
                 )
             }
 
@@ -770,7 +797,9 @@ private fun CrossNetworkSharingCard(
                 text = "Emergency Kill Switch",
                 icon = Icons.Default.Security,
                 onClick = onKillSwitch,
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isActionInFlight,
+                isLoading = isActionInFlight
             )
 
             if (grants.isNotEmpty()) {
@@ -799,6 +828,7 @@ private fun CrossNetworkSharingCard(
                         )
                         SnowOutlinedButton(
                             text = "Revoke",
+                            enabled = !isActionInFlight,
                             onClick = { onRevokeGrant(grantId) }
                         )
                     }

@@ -419,24 +419,24 @@ class TestV510IconsBundleVersionsAndOta(unittest.TestCase):
         self.assertIn("bundle_cloudflared: bool = False", build_txt)
 
     def test_version_alignment_and_local_ota_manifest_discovery(self) -> None:
-        self.assertEqual(snow.__version__, "5.2.0")
-        self.assertEqual(CURRENT_VERSION, "5.2.0")
-        self.assertEqual(CoreConfig().version, "5.2.0")
+        self.assertEqual(snow.__version__, "7.0.0")
+        self.assertEqual(CURRENT_VERSION, "7.0.0")
+        self.assertEqual(CoreConfig().version, "7.0.0")
         gradle_txt = Path("android/app/build.gradle.kts").read_text(encoding="utf-8")
-        self.assertIn("versionCode = 4", gradle_txt)
-        self.assertIn('versionName = "5.2.0"', gradle_txt)
+        self.assertIn("versionCode = 5", gradle_txt)
+        self.assertIn('versionName = "7.0.0"', gradle_txt)
 
         with tempfile.TemporaryDirectory() as tmp:
             pkg_out = Path(tmp) / "packaging" / "output"
             pkg_out.mkdir(parents=True)
-            installer = pkg_out / "SNOW-Setup-5.3.0.exe"
+            installer = pkg_out / "SNOW-Setup-7.1.0.exe"
             installer.write_bytes(b"MZ" + b"\x00" * 64)
             import hashlib
             sha = hashlib.sha256(installer.read_bytes()).hexdigest()
             manifest_path = pkg_out / "update_manifest.json"
             manifest_path.write_text(
                 json.dumps({
-                    "version": "5.3.0",
+                    "version": "7.1.0",
                     "desktop": {
                         "url": str(installer),
                         "sha256": sha,
@@ -446,26 +446,26 @@ class TestV510IconsBundleVersionsAndOta(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch("snow.updater.find_local_staged_manifest", return_value=manifest_path):
-                res = check_for_updates(None, current_version="5.2.0")
+                res = check_for_updates(None, current_version="7.0.0")
             self.assertTrue(res["available"])
-            self.assertEqual(res["latest_version"], "5.3.0")
+            self.assertEqual(res["latest_version"], "7.1.0")
 
-            apk52 = pkg_out / "SNOW-Mobile-5.2.0.apk"
-            apk52.write_bytes(b"PK52_MOCK")
+            apk70 = pkg_out / "SNOW-Mobile-7.0.0.apk"
+            apk70.write_bytes(b"PK70_MOCK")
             http_srv = SnowHttpTransferServer(
                 config=CoreConfig(),
                 db_manager=DatabaseManager(Path(tmp) / "u.db"),
                 transfer_manager=TransferManager(),
                 storage_manager=TransferStorageManager(tmp),
             )
-            http_srv._get_staged_apk_path = lambda: apk52
+            http_srv._get_staged_apk_path = lambda: apk70
             req = type("Req", (), {"headers": {}, "path": "/api/v1/app/update-info"})()
             resp = asyncio.run(http_srv.handle_app_update_info(req))
             payload = json.loads(resp.text)
             self.assertTrue(payload["available"])
-            self.assertEqual(payload["version_code"], 4)
-            self.assertEqual(payload["version_name"], "5.2.0")
-            self.assertEqual(payload["apk_name"], "SNOW-Mobile-5.2.0.apk")
+            self.assertEqual(payload["version_code"], 5)
+            self.assertEqual(payload["version_name"], "7.0.0")
+            self.assertEqual(payload["apk_name"], "SNOW-Mobile-7.0.0.apk")
 
 
 if __name__ == "__main__":

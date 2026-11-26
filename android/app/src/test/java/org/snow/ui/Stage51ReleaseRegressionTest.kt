@@ -98,12 +98,14 @@ class Stage51ReleaseRegressionTest {
     }
 
     @Test
-    fun testWorkstream12VersionCode3And510() {
+    fun testWorkstream12VersionCodeAnd700() {
         val gradleSrc = resolveModuleFile("build.gradle.kts").readText()
-        assertTrue(gradleSrc.contains("versionCode = 4"))
-        assertTrue(gradleSrc.contains("versionName = \"5.2.0\""))
+        assertTrue(gradleSrc.contains("versionCode = 5"))
+        assertTrue(gradleSrc.contains("versionName = \"7.0.0\""))
 
-        val settingsXml = resolveModuleFile("src/main/res/layout/fragment_settings.xml").readText()
-        assertTrue(settingsXml.contains("5.2.0"))
+        val settingsScreenSrc = resolveModuleFile("src/main/java/org/snow/ui/settings/SettingsScreen.kt").readText()
+        assertTrue(settingsScreenSrc.contains("7.0.0"))
+        val snowAppSrc = resolveModuleFile("src/main/java/org/snow/ui/SnowApp.kt").readText()
+        assertTrue(snowAppSrc.contains("7.0.0"))
     }
 }

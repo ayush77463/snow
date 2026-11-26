@@ -1108,14 +1108,32 @@ class SnowHttpTransferServer:
         sha256 = h.hexdigest()
         size_bytes = apk_path.stat().st_size
 
-        version_name = getattr(self.config, "version", "5.2.0") or "5.2.0"
-        version_code = 4 if version_name.startswith("5.2") else (3 if version_name.startswith("5.1") else 2)
+        def _infer_android_version_code(major: int, minor: int, patch: int) -> int:
+            """Derive monotonically increasing Android versionCode without artificial ceilings."""
+            if (major, minor) >= (7, 0):
+                return 5 + (major - 7) * 100 + minor * 10 + max(0, patch)
+            if (major, minor) >= (5, 2):
+                return 4
+            if (major, minor) == (5, 1):
+                return 3
+            if (major, minor) == (5, 0):
+                return 2
+            return 1
+
+        version_name = getattr(self.config, "version", "7.0.0") or "7.0.0"
+        cfg_match = _re.search(r"(\d+)\.(\d+)\.(\d+)", version_name)
+        if cfg_match:
+            version_code = _infer_android_version_code(
+                int(cfg_match.group(1)), int(cfg_match.group(2)), int(cfg_match.group(3))
+            )
+        else:
+            version_code = 5
 
         name_match = _re.search(r"SNOW-Mobile-(\d+)\.(\d+)\.(\d+)\.apk$", apk_path.name, _re.IGNORECASE)
         if name_match:
             major, minor, patch = (int(name_match.group(1)), int(name_match.group(2)), int(name_match.group(3)))
             version_name = f"{major}.{minor}.{patch}"
-            version_code = 4 if (major, minor) >= (5, 2) else (3 if (major, minor) == (5, 1) else (2 if (major, minor) == (5, 0) else 1))
+            version_code = _infer_android_version_code(major, minor, patch)
 
         manifest_file = apk_path.parent / "update_manifest.json"
         if manifest_file.is_file():

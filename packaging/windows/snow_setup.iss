@@ -2,9 +2,9 @@
 ; Builds a self-contained, user-level or system-wide Windows installer.
 
 #define MyAppName "SNOW"
-#define MyAppVersion "5.2.0"
+#define MyAppVersion "7.0.0"
 #define MyAppPublisher "SNOW Project"
-#define MyAppURL "https://github.com/ayush/snow"
+#define MyAppURL "https://github.com/ayush77463/snow"
 #define MyAppExeName "snow.exe"
 #define MyTrayExeName "snow-tray.exe"
 

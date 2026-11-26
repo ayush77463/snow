@@ -3643,7 +3643,7 @@ class SnowWebServer:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "snow-test-runner", "version": "5.2.0"},
+                    "clientInfo": {"name": "snow-test-runner", "version": "7.0.0"},
                 },
             }
             if proc.stdin is None or proc.stdout is None:
@@ -3726,7 +3726,7 @@ class SnowWebServer:
             body = await request.json()
         except Exception:
             body = {}
-        provider = body.get("provider", "cloudflared")
+        provider = (body.get("provider") or "render").strip().lower()
         custom_url = body.get("custom_url")
 
         # 1. Ensure Remote MCP Gateway is running
@@ -3775,8 +3775,25 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_mcp_tunnel_status(self, request: web.Request) -> web.Response:
-        """Query current tunnel status."""
-        return web.json_response({"success": True, **self.tunnel_manager.get_status()})
+        """Query current tunnel status plus dynamic configured Render Hub endpoint."""
+        status = self.tunnel_manager.get_status()
+        configured_render_url = ""
+        try:
+            from snow.core.config import resolve_default_hub_url
+            from snow.security.identity import load_or_create_network_key_identity
+
+            db_mgr = getattr(self, "db_manager", None) or getattr(
+                getattr(self.bridge, "capability_engine", None), "db_manager", None
+            )
+            hub_url = resolve_default_hub_url(db_manager=db_mgr)
+            key_ident = load_or_create_network_key_identity()
+            if hub_url and key_ident and getattr(key_ident, "network_id", ""):
+                configured_render_url = f"{hub_url.rstrip('/')}/u/{key_ident.network_id}/mcp"
+        except Exception as exc:
+            logger.debug("Unable to resolve configured Render Hub route: %s", exc)
+        return web.json_response(
+            {"success": True, **status, "configured_render_url": configured_render_url}
+        )
 
     async def handle_api_mcp_tunnel_config_get(self, request: web.Request) -> web.Response:
         """Retrieve persistent tunnel configuration with all secrets redacted."""
@@ -4016,12 +4033,29 @@ class SnowWebServer:
             staged_file.unlink(missing_ok=True)
 
     async def handle_api_mcp_tunnel_qr(self, request: web.Request) -> web.Response:
-        """Generate vector SVG QR code encoding the public Remote AI MCP Gateway endpoint."""
+        """Generate vector SVG QR code encoding the active or configured Remote AI MCP endpoint."""
         status = self.tunnel_manager.get_status()
-        public_url = status.get("public_url")
-        if public_url:
-            mcp_url = f"{public_url.rstrip('/')}/mcp"
-        else:
+        is_active = bool(status.get("active"))
+        mcp_url = ""
+        if is_active:
+            mcp_url = str(status.get("mcp_endpoint") or "").strip()
+            if not mcp_url and status.get("public_url"):
+                mcp_url = f"{str(status['public_url']).rstrip('/')}/mcp"
+        if not mcp_url:
+            try:
+                from snow.core.config import resolve_default_hub_url
+                from snow.security.identity import load_or_create_network_key_identity
+
+                db_mgr = getattr(self, "db_manager", None) or getattr(
+                    getattr(self.bridge, "capability_engine", None), "db_manager", None
+                )
+                hub_url = resolve_default_hub_url(db_manager=db_mgr)
+                key_ident = load_or_create_network_key_identity()
+                if hub_url and key_ident and getattr(key_ident, "network_id", ""):
+                    mcp_url = f"{hub_url.rstrip('/')}/u/{key_ident.network_id}/mcp"
+            except Exception:
+                mcp_url = ""
+        if not mcp_url:
             mcp_url = "http://127.0.0.1:8771/mcp"
 
         svg_content = ""
@@ -4036,7 +4070,7 @@ class SnowWebServer:
         return web.json_response({
             "success": True,
             "url": mcp_url,
-            "active": bool(public_url),
+            "active": is_active,
             "svg": svg_content,
         })
 

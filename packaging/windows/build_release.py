@@ -39,6 +39,8 @@ def _read_android_version_code(repo_root: Path, rel_ver: str) -> int:
         m = re.search(r"\bversionCode\s*=\s*(\d+)", gradle_file.read_text(encoding="utf-8"))
         if m:
             return int(m.group(1))
+    if rel_ver.startswith("7."):
+        return 5
     if rel_ver.startswith("5.2"):
         return 4
     if rel_ver.startswith("5.1"):
@@ -283,9 +285,9 @@ def run_pipeline(
     sys.path.insert(0, str(repo_root / "src"))
     try:
         import snow as _snow_pkg
-        rel_ver = getattr(_snow_pkg, "__version__", "5.2.0")
+        rel_ver = getattr(_snow_pkg, "__version__", "7.0.0")
     except Exception:
-        rel_ver = "5.2.0"
+        rel_ver = "7.0.0"
 
     staged_apk = output_dir / f"SNOW-Mobile-{rel_ver}.apk"
     if not staged_apk.is_file():

@@ -37,45 +37,42 @@ _EMOJI_RE = re.compile(
 
 
 class TestStage6CWS4VersionAndFrozenInvariants(unittest.TestCase):
-    """Verify V5.2.0 version alignment across Python, Windows installer, Web UI, Android, and frozen invariants."""
+    """Verify V7.0.0 version alignment across Python, Windows installer, Web UI, Android, and frozen invariants."""
 
-    def test_v520_version_alignment_across_all_surfaces(self) -> None:
-        self.assertEqual(snow.__version__, "5.2.0")
-        self.assertEqual(CURRENT_VERSION, "5.2.0")
-        self.assertEqual(CoreConfig().version, "5.2.0")
+    def test_v700_version_alignment_across_all_surfaces(self) -> None:
+        self.assertEqual(snow.__version__, "7.0.0")
+        self.assertEqual(CURRENT_VERSION, "7.0.0")
+        self.assertEqual(CoreConfig().version, "7.0.0")
+        self.assertEqual(CoreConfig.from_env().version, "7.0.0")
 
         pyproject_txt = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('version = "5.2.0"', pyproject_txt)
+        self.assertIn('version = "7.0.0"', pyproject_txt)
 
         iss_txt = (REPO_ROOT / "packaging" / "windows" / "snow_setup.iss").read_text(encoding="utf-8")
-        self.assertIn('#define MyAppVersion "5.2.0"', iss_txt)
+        self.assertIn('#define MyAppVersion "7.0.0"', iss_txt)
+        self.assertIn('#define MyAppURL "https://github.com/ayush77463/snow"', iss_txt)
 
         gradle_txt = (REPO_ROOT / "android" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
-        self.assertIn("versionCode = 4", gradle_txt)
-        self.assertIn('versionName = "5.2.0"', gradle_txt)
+        self.assertIn("versionCode = 5", gradle_txt)
+        self.assertIn('versionName = "7.0.0"', gradle_txt)
 
         index_html = (REPO_ROOT / "src" / "snow" / "web" / "static" / "index.html").read_text(encoding="utf-8")
-        self.assertIn("v5.2.0", index_html)
-        self.assertNotIn("v5.1.0", index_html)
+        self.assertIn("v7.0.0", index_html)
+        self.assertNotIn("v5.2.0", index_html)
 
         app_js = (REPO_ROOT / "src" / "snow" / "web" / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn('"5.2.0"', app_js)
-        self.assertNotIn('"5.1.0"', app_js)
+        self.assertIn('"7.0.0"', app_js)
+        self.assertNotIn('"5.2.0"', app_js)
 
         settings_kt = (
             REPO_ROOT / "android" / "app" / "src" / "main" / "java" / "org" / "snow" / "ui" / "settings" / "SettingsScreen.kt"
         ).read_text(encoding="utf-8")
-        self.assertIn("5.2.0", settings_kt)
+        self.assertIn("7.0.0", settings_kt)
 
         snow_app_kt = (
             REPO_ROOT / "android" / "app" / "src" / "main" / "java" / "org" / "snow" / "ui" / "SnowApp.kt"
         ).read_text(encoding="utf-8")
-        self.assertIn("5.2.0", snow_app_kt)
-
-        frag_settings = (
-            REPO_ROOT / "android" / "app" / "src" / "main" / "res" / "layout" / "fragment_settings.xml"
-        ).read_text(encoding="utf-8")
-        self.assertIn("5.2.0", frag_settings)
+        self.assertIn("7.0.0", snow_app_kt)
 
     def test_frozen_protocol_schema_and_54_fastmcp_tools(self) -> None:
         self.assertEqual(PROTOCOL_VERSION, 1)
@@ -119,9 +116,42 @@ class TestStage6CWS4UpdaterAndWebUiArchive(unittest.TestCase):
     """Verify semver comparison, build_web_ui_archive packaging, and manifest validation."""
 
     def test_numeric_semver_ordering(self) -> None:
-        self.assertGreater(parse_version("5.2.0"), parse_version("5.1.0"))
+        self.assertGreater(parse_version("7.0.0"), parse_version("5.2.0"))
         self.assertGreater(parse_version("5.10.0"), parse_version("5.2.0"))
-        self.assertGreater(parse_version("v10.0.0"), parse_version("5.2.0"))
+        self.assertGreater(parse_version("v10.0.0"), parse_version("7.0.0"))
+
+    def test_dynamic_apk_version_code_without_ceiling(self) -> None:
+        import asyncio
+        import json
+        from snow.core.config import CoreConfig
+        from snow.security.db import DatabaseManager
+        from snow.transfer.http_server import SnowHttpTransferServer
+        from snow.transfer.manager import TransferManager
+        from snow.transfer.storage import TransferStorageManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            srv = SnowHttpTransferServer(
+                config=CoreConfig(),
+                db_manager=DatabaseManager(tmp_path / "ver.db"),
+                transfer_manager=TransferManager(),
+                storage_manager=TransferStorageManager(tmp),
+            )
+            req = type("Req", (), {"headers": {}, "path": "/api/v1/app/update-info"})()
+
+            apk_70 = tmp_path / "SNOW-Mobile-7.0.0.apk"
+            apk_70.write_bytes(b"PK70")
+            srv._get_staged_apk_path = lambda: apk_70
+            meta_70 = json.loads(asyncio.run(srv.handle_app_update_info(req)).text)
+            self.assertEqual(meta_70["version_name"], "7.0.0")
+            self.assertEqual(meta_70["version_code"], 5)
+
+            apk_71 = tmp_path / "SNOW-Mobile-7.1.0.apk"
+            apk_71.write_bytes(b"PK71")
+            srv._get_staged_apk_path = lambda: apk_71
+            meta_71 = json.loads(asyncio.run(srv.handle_app_update_info(req)).text)
+            self.assertEqual(meta_71["version_name"], "7.1.0")
+            self.assertGreater(meta_71["version_code"], meta_70["version_code"])
 
     def test_build_web_ui_archive_and_atomic_updater_apply(self) -> None:
         build_spec = importlib.util.spec_from_file_location(
@@ -133,7 +163,7 @@ class TestStage6CWS4UpdaterAndWebUiArchive(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            zip_out = tmp_path / "snow-web-ui-5.2.0.zip"
+            zip_out = tmp_path / "snow-web-ui-7.0.0.zip"
             build_mod.build_web_ui_archive(REPO_ROOT / "src" / "snow" / "web" / "static", zip_out)
             self.assertTrue(zip_out.is_file())
             self.assertGreater(zip_out.stat().st_size, 10_000)
@@ -151,30 +181,30 @@ class TestStage6CWS4UpdaterAndWebUiArchive(unittest.TestCase):
                 self.assertTrue((override_dir / req).is_file())
 
             manifest = validate_manifest({
-                "version": "5.2.0",
-                "release_notes": "SNOW V5.2.0 release",
+                "version": "7.0.0",
+                "release_notes": "SNOW V7.0.0 release",
                 "web_ui": {
-                    "url": f"https://github.com/ayush77463/snow/releases/download/v5.2.0/{zip_out.name}",
+                    "url": f"https://github.com/ayush77463/snow/releases/download/v7.0.0/{zip_out.name}",
                     "filename": zip_out.name,
                     "sha256": sha_zip,
                     "size_bytes": zip_out.stat().st_size,
                 },
                 "desktop": {
-                    "url": "https://github.com/ayush77463/snow/releases/download/v5.2.0/SNOW-Setup-5.2.0.exe",
-                    "filename": "SNOW-Setup-5.2.0.exe",
+                    "url": "https://github.com/ayush77463/snow/releases/download/v7.0.0/SNOW-Setup-7.0.0.exe",
+                    "filename": "SNOW-Setup-7.0.0.exe",
                     "sha256": "a" * 64,
                     "size_bytes": 123456,
                 },
                 "android": {
-                    "version_code": 4,
-                    "version_name": "5.2.0",
-                    "apk_name": "SNOW-Mobile-5.2.0.apk",
+                    "version_code": 5,
+                    "version_name": "7.0.0",
+                    "apk_name": "SNOW-Mobile-7.0.0.apk",
                     "sha256": "b" * 64,
                     "size_bytes": 15700000,
                 },
             })
-            self.assertEqual(manifest["version"], "5.2.0")
-            self.assertEqual(manifest["android"]["version_code"], 4)
+            self.assertEqual(manifest["version"], "7.0.0")
+            self.assertEqual(manifest["android"]["version_code"], 5)
 
 
 if __name__ == "__main__":

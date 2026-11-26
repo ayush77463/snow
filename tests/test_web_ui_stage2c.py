@@ -32,15 +32,15 @@ class TestWebUiStage2C(unittest.TestCase):
         self.js_content = self.js_path.read_text("utf-8")
 
     def test_five_view_navigation_structure(self):
-        """Web navigation must have exactly 5 primary views."""
-        nav_pattern = re.compile(r'<nav class="nav-menu">(.*?)</nav>', re.DOTALL)
+        """Web navigation must have exactly 5 primary views in SNOW V7 order."""
+        nav_pattern = re.compile(r'<nav class="nav-menu"[^>]*>(.*?)</nav>', re.DOTALL)
         match = nav_pattern.search(self.html_content)
         self.assertIsNotNone(match, "nav-menu not found in index.html")
 
         nav_body = match.group(1)
-        buttons = re.findall(r'<button class="nav-item[^"]*" data-tab="([^"]+)">', nav_body)
+        buttons = re.findall(r'<button class="nav-item[^"]*" data-tab="([^"]+)"[^>]*>', nav_body)
         self.assertEqual(len(buttons), 5, f"Expected exactly 5 nav items, found {len(buttons)}: {buttons}")
-        self.assertEqual(buttons, ["overview", "devices", "files", "clipboard", "settings"])
+        self.assertEqual(buttons, ["overview", "clipboard", "files", "devices", "settings"])
 
     def test_theme_options_labels(self):
         """Theme options must be exactly System, Light Mode, Dark Mode without legacy names."""

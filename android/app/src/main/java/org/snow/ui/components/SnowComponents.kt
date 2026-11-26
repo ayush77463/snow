@@ -36,6 +36,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -95,16 +96,19 @@ fun SnowGradientButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    isLoading: Boolean = false
 ) {
     val colors = LocalSnowColors.current
     val shape = RoundedCornerShape(9999.dp)
+    val interactive = enabled && !isLoading
 
     Box(
         modifier = modifier
             .clip(shape)
-            .background(if (enabled) colors.brandGradient else Brush.linearGradient(listOf(Color.Gray, Color.DarkGray)))
-            .clickable(enabled = enabled, onClick = onClick)
+            .alpha(if (interactive) 1f else 0.55f)
+            .background(if (interactive) colors.brandGradient else Brush.linearGradient(listOf(Color.Gray, Color.DarkGray)))
+            .clickable(enabled = interactive, onClick = onClick)
             .padding(horizontal = 20.dp, vertical = 12.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -112,7 +116,14 @@ fun SnowGradientButton(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
-            if (icon != null) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            } else if (icon != null) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
@@ -140,15 +151,18 @@ fun SnowTonalButton(
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
     enabled: Boolean = true,
-    contentPadding: PaddingValues = PaddingValues(horizontal = 16.dp, vertical = 10.dp)
+    contentPadding: PaddingValues = PaddingValues(horizontal = 16.dp, vertical = 10.dp),
+    isLoading: Boolean = false
 ) {
     val colors = LocalSnowColors.current
     val shape = RoundedCornerShape(9999.dp)
+    val interactive = enabled && !isLoading
 
     Surface(
         modifier = modifier
             .clip(shape)
-            .clickable(enabled = enabled, onClick = onClick),
+            .alpha(if (interactive) 1f else 0.52f)
+            .clickable(enabled = interactive, onClick = onClick),
         shape = shape,
         color = colors.surfaceElevated
     ) {
@@ -157,7 +171,14 @@ fun SnowTonalButton(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
-            if (icon != null) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = colors.accentCyan
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            } else if (icon != null) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
@@ -184,16 +205,19 @@ fun SnowOutlinedButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    isLoading: Boolean = false
 ) {
     val colors = LocalSnowColors.current
     val shape = RoundedCornerShape(9999.dp)
+    val interactive = enabled && !isLoading
 
     Surface(
         modifier = modifier
             .clip(shape)
+            .alpha(if (interactive) 1f else 0.52f)
             .border(1.dp, colors.border, shape)
-            .clickable(enabled = enabled, onClick = onClick),
+            .clickable(enabled = interactive, onClick = onClick),
         shape = shape,
         color = Color.Transparent
     ) {
@@ -202,7 +226,14 @@ fun SnowOutlinedButton(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
-            if (icon != null) {
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = colors.accentCyan
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            } else if (icon != null) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
@@ -422,7 +453,8 @@ fun SnowFilterChip(
     selected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    count: Int? = null
+    count: Int? = null,
+    enabled: Boolean = true
 ) {
     val colors = LocalSnowColors.current
     val shape = RoundedCornerShape(9999.dp)
@@ -450,8 +482,9 @@ fun SnowFilterChip(
     Surface(
         modifier = modifier
             .clip(shape)
+            .alpha(if (enabled) 1f else 0.5f)
             .border(borderStroke, shape)
-            .clickable(onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick),
         shape = shape,
         color = bg
     ) {

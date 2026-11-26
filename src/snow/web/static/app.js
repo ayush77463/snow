@@ -137,6 +137,34 @@
     let lastFocusedBeforeLightbox = null;
     let revealedIpcSecret = "";
     let lastPairingSnapshotHasActivePin = false;
+    let lastStatusSnapshot = null;
+
+    async function withButtonLoading(btn, loadingLabel, asyncFn) {
+        if (!btn) {
+            return await asyncFn();
+        }
+        if (btn.dataset.loading === "1") {
+            return null;
+        }
+        const originalHtml = btn.innerHTML;
+        const originalDisabled = btn.disabled;
+        btn.dataset.loading = "1";
+        btn.disabled = true;
+        btn.classList.add("btn-loading");
+        btn.setAttribute("aria-busy", "true");
+        if (loadingLabel) {
+            btn.textContent = loadingLabel;
+        }
+        try {
+            return await asyncFn();
+        } finally {
+            delete btn.dataset.loading;
+            btn.classList.remove("btn-loading");
+            btn.removeAttribute("aria-busy");
+            btn.innerHTML = originalHtml;
+            btn.disabled = originalDisabled;
+        }
+    }
 
     function clearRevealedIpcSecret() {
         revealedIpcSecret = "";
@@ -496,7 +524,9 @@
         }
 
         document.querySelectorAll(".nav-item").forEach(item => {
-            item.classList.toggle("active", item.getAttribute("data-tab") === tabId);
+            const isMatch = item.getAttribute("data-tab") === tabId;
+            item.classList.toggle("active", isMatch);
+            item.setAttribute("aria-selected", isMatch ? "true" : "false");
         });
 
         document.querySelectorAll(".tab-pane").forEach(pane => {
@@ -741,22 +771,23 @@
             });
         }
 
-        document.getElementById("btn-hero-lock-pc")?.addEventListener("click", async () => {
-            showNotificationToast("Locking Windows PC session...", "info");
-            const res = await apiRequest("/api/desktop/lock", "POST", {});
-            if (res && res.success) {
-                showNotificationToast("Windows workstation locked.", "success");
-            } else {
-                showNotificationToast(res?.error || "Failed locking workstation", "error");
-            }
+        document.getElementById("btn-hero-lock-pc")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Locking...", async () => {
+                const res = await apiRequest("/api/desktop/lock", "POST", {});
+                if (res && res.success) {
+                    showNotificationToast("Windows workstation locked.", "success");
+                } else {
+                    showNotificationToast(res?.error || "Failed locking workstation", "error");
+                }
+            });
         });
 
         const fileInput = document.getElementById("file-upload-input");
         document.getElementById("btn-hero-send-file")?.addEventListener("click", () => {
             if (fileInput) fileInput.click();
         });
-        document.getElementById("btn-hero-ring-phone")?.addEventListener("click", triggerRingPhone);
-        document.getElementById("btn-hero-capture-screen")?.addEventListener("click", triggerScreenCapture);
+        document.getElementById("btn-hero-ring-phone")?.addEventListener("click", (e) => triggerRingPhone(e.currentTarget));
+        document.getElementById("btn-hero-capture-screen")?.addEventListener("click", (e) => triggerScreenCapture(e.currentTarget));
         document.getElementById("btn-hero-retry-link")?.addEventListener("click", () => {
             refreshAllData();
             showNotificationToast("Checking device connection...", "info");
@@ -766,9 +797,9 @@
         });
 
         // Quick Actions 2x3 Grid
-        document.getElementById("btn-qa-ring")?.addEventListener("click", triggerRingPhone);
-        document.getElementById("btn-qa-screen")?.addEventListener("click", triggerScreenCapture);
-        document.getElementById("btn-qa-camera")?.addEventListener("click", triggerCameraCapture);
+        document.getElementById("btn-qa-ring")?.addEventListener("click", (e) => triggerRingPhone(e.currentTarget));
+        document.getElementById("btn-qa-screen")?.addEventListener("click", (e) => triggerScreenCapture(e.currentTarget));
+        document.getElementById("btn-qa-camera")?.addEventListener("click", (e) => triggerCameraCapture(e.currentTarget));
         document.getElementById("btn-qa-media")?.addEventListener("click", () => triggerMediaAction("play_pause"));
         document.getElementById("btn-qa-send-files")?.addEventListener("click", () => {
             if (fileInput) fileInput.click();
@@ -859,22 +890,23 @@
         return firstPhone ? firstPhone.device_id : "";
     }
 
-    async function triggerRingPhone() {
+    async function triggerRingPhone(triggerBtn = null) {
         const targetId = resolveTargetDeviceId();
         if (!targetId) {
             showNotificationToast("Select or connect an online Android phone first.", "warning");
             return;
         }
-        showNotificationToast("Ringing connected phone...", "info");
-        const res = await apiRequest("/api/devices/ring", "POST", { device_id: targetId, duration_seconds: 5 });
-        if (res && res.success) {
-            showNotificationToast("Phone ringer triggered!", "success");
-        } else {
-            showNotificationToast(res?.error || "Failed triggering ringer", "error");
-        }
+        await withButtonLoading(triggerBtn instanceof Element ? triggerBtn : null, "", async () => {
+            const res = await apiRequest("/api/devices/ring", "POST", { device_id: targetId, duration_seconds: 5 });
+            if (res && res.success) {
+                showNotificationToast("Phone ringer triggered!", "success");
+            } else {
+                showNotificationToast(res?.error || "Failed triggering ringer", "error");
+            }
+        });
     }
 
-    async function triggerScreenCapture() {
+    async function triggerScreenCapture(triggerBtn = null) {
         const targetId = resolveTargetDeviceId();
         if (!targetId) {
             showNotificationToast("Select or connect an online phone for screen capture.", "warning");
@@ -882,7 +914,6 @@
         }
         const statusText = document.getElementById("latest-capture-status-text");
         if (statusText) statusText.textContent = "Awaiting phone consent for one-time screen capture...";
-        showNotificationToast("Requesting phone screen capture (awaiting consent)...", "info");
 
         let baselineFilename = "";
         try {
@@ -890,7 +921,9 @@
             if (preResp.status === 200) baselineFilename = preResp.headers.get("X-Snow-Filename") || "";
         } catch (e) {}
 
-        const res = await apiRequest("/api/screen/capture-phone", "POST", { device_id: targetId });
+        const res = await withButtonLoading(triggerBtn instanceof Element ? triggerBtn : null, "", () =>
+            apiRequest("/api/screen/capture-phone", "POST", { device_id: targetId })
+        );
         if (res && res.success) {
             const fileName = res.file_name || res.data?.file_name;
             if (fileName) {
@@ -1645,14 +1678,31 @@
                         }, { once: true });
                     }
 
-                    row.querySelector(".btn-copy-clip").onclick = async () => {
-                        if (navigator.clipboard && text) navigator.clipboard.writeText(text).catch(() => {});
-                        await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id });
-                        showNotificationToast("Copied to active clipboard!", "success");
+                    row.querySelector(".btn-copy-clip").onclick = async (e) => {
+                        await withButtonLoading(e.currentTarget, "", async () => {
+                            const res = await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: "pc" });
+                            if (res && res.success) {
+                                if (navigator.clipboard && text) navigator.clipboard.writeText(text).catch(() => {});
+                                showNotificationToast("Applied to PC clipboard!", "success");
+                            } else {
+                                showNotificationToast(res?.error || "Failed applying clipboard entry", "error");
+                            }
+                        });
                     };
-                    row.querySelector(".btn-share-clip").onclick = async () => {
-                        await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: resolveTargetDeviceId() || "pc" });
-                        showNotificationToast("Pushed clipboard entry to target.", "info");
+                    row.querySelector(".btn-share-clip").onclick = async (e) => {
+                        const targetDev = resolveTargetDeviceId();
+                        if (!targetDev) {
+                            showNotificationToast("Connect an eligible remote device first.", "warning");
+                            return;
+                        }
+                        await withButtonLoading(e.currentTarget, "", async () => {
+                            const res = await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: targetDev });
+                            if (res && res.success) {
+                                showNotificationToast("Pushed clipboard entry to target.", "success");
+                            } else {
+                                showNotificationToast(res?.error || "Failed pushing clipboard entry", "error");
+                            }
+                        });
                     };
                     clipContainer.appendChild(row);
                 });
@@ -1896,59 +1946,69 @@
             };
         }
 
-        document.getElementById("btn-pairing-refresh-qr")?.addEventListener("click", async () => {
-            await loadPairingQR();
-            showNotificationToast("Generated 60s pairing QR & PIN.", "info");
+        document.getElementById("btn-pairing-refresh-qr")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Generating...", async () => {
+                const ok = await loadPairingQR();
+                if (ok) showNotificationToast("Generated 60s pairing QR & PIN.", "info");
+            });
         });
-        document.getElementById("btn-modal-generate-pin")?.addEventListener("click", async () => {
-            await loadPairingQR();
-            showNotificationToast("Generated 60s pairing QR & PIN.", "info");
+        document.getElementById("btn-modal-generate-pin")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Generating...", async () => {
+                const ok = await loadPairingQR();
+                if (ok) showNotificationToast("Generated 60s pairing QR & PIN.", "info");
+            });
         });
-        document.getElementById("btn-pairing-cancel-pin")?.addEventListener("click", cancelPairingPin);
+        document.getElementById("btn-pairing-cancel-pin")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Cancelling...", cancelPairingPin);
+        });
 
         const btnPairConnect = document.getElementById("btn-pairing-connect");
         const inputPair = document.getElementById("pairing-input");
         if (btnPairConnect && inputPair) {
             btnPairConnect.onclick = async () => {
-                await handleUnifiedConnectInput(inputPair.value.trim());
+                await withButtonLoading(btnPairConnect, "Connecting...", async () => {
+                    await handleUnifiedConnectInput(inputPair.value.trim());
+                });
             };
         }
 
         // Federation Controls
-        document.getElementById("btn-federation-gen-invite")?.addEventListener("click", async () => {
-            showNotificationToast("Generating 9-digit federation invite...", "info");
-            const permTier = document.getElementById("federation-invite-tier")?.value || "files_and_clipboard";
-            const res = await apiRequest("/api/federation/invite", "POST", {
-                ttl_seconds: 600,
-                permission_tier: permTier,
+        document.getElementById("btn-federation-gen-invite")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Generating...", async () => {
+                const permTier = document.getElementById("federation-invite-tier")?.value || "files_and_clipboard";
+                const res = await apiRequest("/api/federation/invite", "POST", {
+                    ttl_seconds: 600,
+                    permission_tier: permTier,
+                });
+                const displayInvite = document.getElementById("federation-invite-display");
+                const code = res?.code || res?.invite_code;
+                if (res && res.success && code && displayInvite) {
+                    displayInvite.textContent = code;
+                    displayInvite.classList.remove("d-none");
+                    showNotificationToast(`Generated 9-digit code: ${code}`, "success");
+                } else {
+                    showNotificationToast(res?.error || "Could not generate federation invite", "error");
+                }
             });
-            const displayInvite = document.getElementById("federation-invite-display");
-            const code = res?.code || res?.invite_code;
-            if (res && res.success && code && displayInvite) {
-                displayInvite.textContent = code;
-                displayInvite.classList.remove("d-none");
-                showNotificationToast(`Generated 9-digit code: ${code}`, "success");
-            } else {
-                showNotificationToast(res?.error || "Could not generate federation invite", "error");
-            }
         });
 
-        document.getElementById("btn-federation-join")?.addEventListener("click", async () => {
+        document.getElementById("btn-federation-join")?.addEventListener("click", async (e) => {
             const inp = document.getElementById("federation-input-code");
             const code = inp ? inp.value.trim() : "";
             if (!code) {
                 showNotificationToast("Enter a 9-digit federation invite code.", "warning");
                 return;
             }
-            showNotificationToast("Joining federated network...", "info");
-            const res = await apiRequest("/api/federation/accept", "POST", { code });
-            if (res && res.success) {
-                showNotificationToast("Joined federated network!", "success");
-                if (inp) inp.value = "";
-                refreshAllData();
-            } else {
-                showNotificationToast(res?.error || "Failed joining federation", "error");
-            }
+            await withButtonLoading(e.currentTarget, "Joining...", async () => {
+                const res = await apiRequest("/api/federation/accept", "POST", { code });
+                if (res && res.success) {
+                    showNotificationToast("Joined federated network!", "success");
+                    if (inp) inp.value = "";
+                    refreshAllData();
+                } else {
+                    showNotificationToast(res?.error || "Failed joining federation", "error");
+                }
+            });
         });
 
         // Kill Switch Modal
@@ -1959,45 +2019,51 @@
         document.getElementById("btn-killswitch-cancel")?.addEventListener("click", () => {
             killModal?.classList.add("d-none");
         });
-        document.getElementById("btn-killswitch-confirm")?.addEventListener("click", async () => {
-            await apiRequest("/api/federation/kill-switch", "POST", { reason: "Emergency Kill Switch via Web Dashboard" });
-            showNotificationToast("Emergency Kill Switch activated: All federation grants severed.", "warning");
-            killModal?.classList.add("d-none");
-            refreshAllData();
+        document.getElementById("btn-killswitch-confirm")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Revoking...", async () => {
+                const res = await apiRequest("/api/federation/kill-switch", "POST", { reason: "Emergency Kill Switch via Web Dashboard" });
+                if (res && res.success) {
+                    showNotificationToast("Emergency Kill Switch activated: All federation grants severed.", "warning");
+                } else {
+                    showNotificationToast(res?.error || "Failed activating kill switch.", "error");
+                }
+                killModal?.classList.add("d-none");
+                refreshAllData();
+            });
         });
 
-        // Remote Access Relay Tunnel Toggle
+        // Remote Access Toggle (now in AI & Settings)
         const chkRelay = document.getElementById("chk-relay-tunnel-toggle");
         if (chkRelay) {
             chkRelay.addEventListener("change", async () => {
-                if (chkRelay.checked) {
-                    showNotificationToast("Starting Remote Device Relay tunnel (port 8770)...", "info");
-                    const res = await apiRequest("/api/relay/tunnel/start", "POST", { provider: "cloudflared" });
-                    if (res && res.success) {
-                        showNotificationToast("Remote Access tunnel active!", "success");
+                chkRelay.disabled = true;
+                try {
+                    if (chkRelay.checked) {
+                        const res = await apiRequest("/api/relay/tunnel/start", "POST", { provider: "cloudflared" });
+                        if (res && res.success && res.public_url) {
+                            showNotificationToast("Remote Access tunnel active!", "success");
+                            if (lastPairingSnapshotHasActivePin) loadPairingQR();
+                            else refreshPairingState();
+                        } else {
+                            chkRelay.checked = false;
+                            showNotificationToast(res?.error || "Remote Access unavailable", "error");
+                        }
+                    } else {
+                        const res = await apiRequest("/api/relay/tunnel/stop", "POST", {});
+                        if (res && res.success) {
+                            showNotificationToast("Remote Access stopped.", "info");
+                        } else {
+                            showNotificationToast(res?.error || "Failed stopping Remote Access", "error");
+                        }
                         if (lastPairingSnapshotHasActivePin) loadPairingQR();
                         else refreshPairingState();
-                    } else {
-                        showNotificationToast(res?.error || "Failed starting relay tunnel", "error");
-                        chkRelay.checked = false;
                     }
-                } else {
-                    await apiRequest("/api/relay/tunnel/stop", "POST", {});
-                    showNotificationToast("Remote Access tunnel stopped.", "info");
-                    if (lastPairingSnapshotHasActivePin) loadPairingQR();
-                    else refreshPairingState();
+                    await loadRelayTunnelStatus();
+                } finally {
+                    chkRelay.disabled = false;
                 }
-                loadRelayTunnelStatus();
             });
         }
-
-        document.getElementById("btn-relay-copy-link")?.addEventListener("click", () => {
-            const inp = document.getElementById("relay-tunnel-url-pill");
-            if (inp && inp.value && !inp.value.includes("Local Network Only")) {
-                navigator.clipboard?.writeText(inp.value).catch(() => {});
-                showNotificationToast("Copied Relay URL!", "success");
-            }
-        });
 
         document.getElementById("btn-usb-unlock-permissions")?.addEventListener("click", async () => {
             const btn = document.getElementById("btn-usb-unlock-permissions");
@@ -2254,6 +2320,19 @@
             container.appendChild(card);
         });
 
+        const netIdEl = document.getElementById("devices-net-id");
+        const netIpsEl = document.getElementById("devices-net-ips");
+        const netStatusEl = document.getElementById("devices-net-status");
+        if (netIdEl) netIdEl.textContent = canonicalSnowId;
+        if (netIpsEl) {
+            const ips = Array.isArray(lastStatusSnapshot?.lan_ips) ? lastStatusSnapshot.lan_ips : [];
+            netIpsEl.textContent = ips.length > 0 ? ips.join(", ") : "127.0.0.1 (Loopback)";
+        }
+        if (netStatusEl) {
+            const usbOk = Boolean(lastStatusSnapshot?.usb_connected);
+            netStatusEl.textContent = `${isCoreOnline ? "Core Online" : "Core Offline"} • ${usbOk ? "USB Connected" : "USB Idle"}`;
+        }
+
         refreshPairingState();
         loadRelayTunnelStatus();
         loadFederationGrants();
@@ -2273,8 +2352,14 @@
         const cancelBtn = document.getElementById("btn-pairing-cancel-pin");
 
         const idleMsg = `<span class="text-xs text-muted text-center">Click Generate Pairing QR &amp; PIN when ready</span>`;
-        if (qrBox) qrBox.innerHTML = idleMsg;
-        if (modalQrBox) modalQrBox.innerHTML = idleMsg;
+        if (qrBox) {
+            qrBox.classList.remove("qr-active");
+            qrBox.innerHTML = idleMsg;
+        }
+        if (modalQrBox) {
+            modalQrBox.classList.remove("qr-active");
+            modalQrBox.innerHTML = idleMsg;
+        }
         if (pinEl) pinEl.textContent = label;
         if (modalPinEl) modalPinEl.textContent = label;
         if (countdownEl) countdownEl.textContent = countdownText;
@@ -2315,7 +2400,12 @@
 
         if (!hasActivePin) {
             if (res && res.success === false && qrBox) {
+                qrBox.classList.remove("qr-active");
                 qrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
+                if (modalQrBox) {
+                    modalQrBox.classList.remove("qr-active");
+                    modalQrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
+                }
                 if (pinEl) pinEl.textContent = "Unavailable";
                 if (countdownEl) countdownEl.textContent = "--";
                 cancelBtn?.classList.add("d-none");
@@ -2328,8 +2418,17 @@
         lastPairingSnapshotHasActivePin = true;
         const svgMarkup = res?.svg || res?.qr_svg || res?.data?.svg;
         if (svgMarkup) {
-            if (qrBox) qrBox.innerHTML = svgMarkup;
-            if (modalQrBox) modalQrBox.innerHTML = svgMarkup;
+            if (qrBox) {
+                qrBox.classList.add("qr-active");
+                qrBox.innerHTML = svgMarkup;
+            }
+            if (modalQrBox) {
+                modalQrBox.classList.add("qr-active");
+                modalQrBox.innerHTML = svgMarkup;
+            }
+        } else {
+            qrBox?.classList.remove("qr-active");
+            modalQrBox?.classList.remove("qr-active");
         }
 
         const fmtPin = pinVal.length === 6 ? `${pinVal.slice(0, 3)} ${pinVal.slice(3)}` : pinVal;
@@ -2378,9 +2477,11 @@
         const fpVal = res?.data?.fp || res?.data?.cert_fingerprint || res?.fp || res?.cert_fingerprint;
         if (res && res.success && (svgMarkup || pinVal || fpVal)) {
             applyPairingState(res, true);
-        } else {
-            applyPairingState(res, false);
+            return true;
         }
+        applyPairingState(res, false);
+        showNotificationToast(res?.error || "Failed generating pairing QR & PIN", "error");
+        return false;
     }
 
     async function loadApkQr() {
@@ -2391,16 +2492,22 @@
         const svgMarkup = res?.svg || res?.qr_svg;
 
         if (res && res.success) {
-            if (svgMarkup && apkBox) apkBox.innerHTML = svgMarkup;
+            if (svgMarkup && apkBox) {
+                apkBox.classList.add("qr-active");
+                apkBox.innerHTML = svgMarkup;
+            } else if (apkBox) {
+                apkBox.classList.remove("qr-active");
+                apkBox.innerHTML = `<span class="text-xs text-muted text-center">QR unavailable</span>`;
+            }
             if (res.apk_available) {
                 if (apkUrlEl) apkUrlEl.textContent = res.download_url || "Ready for LAN download";
                 if (dlBtn) {
                     dlBtn.href = res.local_download_url || res.download_url || "#";
-                    dlBtn.textContent = `Download ${res.file_name || "SNOW-Mobile.apk"} (${res.version || "5.2.0"})`;
+                    dlBtn.textContent = `Download ${res.file_name || "SNOW-Mobile.apk"} (${res.version || "7.0.0"})`;
                     dlBtn.classList.remove("d-none");
                 }
             } else {
-                if (apkUrlEl) apkUrlEl.textContent = "APK binary not yet built (run gradlew assembleDebug)";
+                if (apkUrlEl) apkUrlEl.textContent = "APK binary not yet built (run gradlew assembleRelease)";
                 dlBtn?.classList.add("d-none");
             }
         }
@@ -2408,24 +2515,36 @@
 
     async function loadRelayTunnelStatus() {
         const badge = document.getElementById("relay-tunnel-badge");
-        const urlPill = document.getElementById("relay-tunnel-url-pill");
+        const detail = document.getElementById("relay-tunnel-detail");
         const chkRelay = document.getElementById("chk-relay-tunnel-toggle");
         const res = await apiRequest("/api/relay/tunnel/status");
 
-        if (res && res.active && res.public_url) {
+        const isVerifiedActive = Boolean(
+            isCoreOnline &&
+            res &&
+            res.success &&
+            res.active &&
+            res.public_url
+        );
+        if (chkRelay) chkRelay.checked = isVerifiedActive;
+        if (isVerifiedActive) {
             if (badge) {
-                badge.textContent = "Relay Active • Port 8770";
+                badge.textContent = "Active";
                 badge.className = "chip chip-sm chip-emerald";
             }
-            if (urlPill) urlPill.value = res.public_url;
-            if (chkRelay) chkRelay.checked = true;
+            if (detail) {
+                detail.textContent = "Remote relay access is active and authenticated.";
+            }
         } else {
             if (badge) {
-                badge.textContent = "Relay Inactive";
+                badge.textContent = isCoreOnline ? "Offline" : "Unavailable";
                 badge.className = "chip chip-sm chip-neutral";
             }
-            if (urlPill) urlPill.value = "Local Network Only";
-            if (chkRelay) chkRelay.checked = false;
+            if (detail) {
+                detail.textContent = isCoreOnline
+                    ? "Off-network relay is stopped."
+                    : "Core offline — Remote Access disabled.";
+            }
         }
     }
 
@@ -2599,7 +2718,7 @@
         const subApps = document.getElementById("subpanel-apps");
         const layout = document.querySelector(".files-v5-layout");
 
-        if (window.innerWidth <= 1100) {
+        if (window.innerWidth <= 1024) {
             subFiles?.classList.toggle("d-none", currentFilesSegment !== "files");
             subApps?.classList.toggle("d-none", currentFilesSegment !== "apps");
         } else {
@@ -3083,23 +3202,53 @@
     // 9. View 4: Shared Clipboard
     // =========================================================================
 
+    function getClipboardTargetEligibility() {
+        const targetId = resolveTargetDeviceId();
+        if (!targetId) {
+            return { eligible: false, targetId: "", reason: "Connect a target device to send clipboard items" };
+        }
+        const dev = registeredDevices.find(d => d.device_id === targetId);
+        if (!dev || !dev.is_connected) {
+            return { eligible: false, targetId: "", reason: "Selected target device is offline" };
+        }
+        const prof = String(dev.permission_profile || "full_control").toLowerCase();
+        if (prof === "not_allowed" || prof === "files_only") {
+            return {
+                eligible: false,
+                targetId,
+                reason: `Target permission profile (${prof.replace(/_/g, " ")}) blocks clipboard push`,
+            };
+        }
+        return { eligible: true, targetId, reason: `Send to ${dev.device_name || targetId}` };
+    }
+
     function initClipboardView() {
         const clipSyncToggle = document.getElementById("clipview-instant-sync-toggle");
         if (clipSyncToggle) {
             clipSyncToggle.addEventListener("change", async () => {
                 const homeToggle = document.getElementById("clipboard-instant-sync-toggle");
                 if (homeToggle) homeToggle.checked = clipSyncToggle.checked;
-                await apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: resolveTargetDeviceId() });
-                showNotificationToast("Clipboard synchronized.", "info");
+                const res = await apiRequest("/api/clipboard/sync", "POST", { direction: "both", device_id: resolveTargetDeviceId() });
+                if (res && res.success) {
+                    showNotificationToast("Clipboard synchronized.", "success");
+                } else {
+                    showNotificationToast(res?.error || "Clipboard sync unavailable", "warning");
+                }
             });
         }
 
         document.getElementById("btn-clip-add-note")?.addEventListener("click", () => openTextModal("clipboard"));
 
-        document.getElementById("btn-clipboard-clear-unpinned")?.addEventListener("click", async () => {
-            const res = await apiRequest("/api/clipboard/buffer/clear", "POST", { keep_pinned: true });
-            if (res && res.success) showNotificationToast("Cleared unpinned clipboard entries.", "info");
-            loadClipboardItems();
+        document.getElementById("btn-clipboard-clear-unpinned")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Clearing...", async () => {
+                const res = await apiRequest("/api/clipboard/buffer/clear", "POST", { unpinned_only: true });
+                if (res && res.success) {
+                    showNotificationToast("Cleared unpinned clipboard entries.", "info");
+                    await loadClipboardItems();
+                } else {
+                    showNotificationToast(res?.error || "Failed clearing clipboard entries", "error");
+                }
+            });
         });
 
         document.getElementById("clipview-search-input")?.addEventListener("input", () => loadClipboardItems());
@@ -3111,7 +3260,7 @@
         const badge = document.getElementById("clipview-count-badge");
         if (!container) return;
 
-        const res = await apiRequest("/api/clipboard/buffer");
+        const res = await apiRequest("/api/clipboard/buffer?limit=15");
         const rawItems = (res && Array.isArray(res.items)) ? res.items : (res?.data?.items || []);
         container.innerHTML = "";
 
@@ -3119,7 +3268,10 @@
         const q = document.getElementById("clipview-search-input")?.value?.trim().toLowerCase();
         if (q) {
             items = items.filter(it => {
-                const t = `${it.text_content || ""} ${it.text || ""} ${it.preview || ""} ${it.preview_text || ""} ${it.source_device_name || ""}`;
+                const manifestNames = Array.isArray(it.file_manifest)
+                    ? it.file_manifest.map(f => `${f.name || f.file_name || ""} ${f.mime_type || ""}`).join(" ")
+                    : "";
+                const t = `${it.text_content || ""} ${it.text || ""} ${it.preview || ""} ${it.preview_text || ""} ${it.source_device_name || ""} ${manifestNames}`;
                 return t.toLowerCase().includes(q);
             });
         }
@@ -3131,28 +3283,112 @@
         }
         emptyState?.classList.add("d-none");
 
+        const targetElig = getClipboardTargetEligibility();
+
         items.forEach(it => {
             const id = it.item_id || it.id || "";
-            const type = it.content_type || it.type || "text";
+            const rawType = String(it.content_type || it.type || "text").toLowerCase();
+            const type = (rawType === "image" || rawType === "file" || rawType === "file_bundle") ? rawType : "text";
             const text = it.text_content || it.text || it.preview || it.preview_text || "";
             const source = it.source_device_name || it.source_device || "Device";
             const pinned = it.is_pinned !== undefined ? Boolean(it.is_pinned) : Boolean(it.pinned);
-            const isImg = type === "image";
+            const manifest = Array.isArray(it.file_manifest) ? it.file_manifest : [];
+            const seqLabel = (it.seq !== undefined && it.seq !== null) ? `#${it.seq}` : "";
+            const sizeLabel = formatBytes(it.size_bytes);
+            const isExplicitUnavailable = it.available === false || it.is_available === false || it.complete === false;
+            const isIncompleteFile = (type === "file" || type === "file_bundle") && (isExplicitUnavailable || manifest.length === 0);
+            const isItemActionable = Boolean(id) && !isIncompleteFile;
 
             const card = document.createElement("div");
             card.className = "clipboard-card";
+            card.dataset.itemType = type;
+            card.dataset.itemId = id;
 
-            const bodyHtml = isImg
-                ? `<div class="clipboard-image-wrap flex items-center justify-center p-2" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md); overflow: hidden; min-height: 96px;">
-                       <img class="clipboard-preview-img" src="/api/clipboard/image/${encodeURIComponent(id)}" alt="Clipboard Preview" style="max-height: 150px; max-width: 100%; object-fit: contain; border-radius: var(--snow-radius-sm);" />
-                   </div>`
-                : `<p class="text-xs text-secondary mono" style="white-space: pre-wrap; word-break: break-word; max-height: 140px; overflow-y: auto;">${escapeHtml(text)}</p>`;
+            let typeBadgeText = "Text";
+            let typeBadgeCls = "chip-cyan";
+            let bodyHtml = "";
+
+            if (type === "image") {
+                typeBadgeText = "Image";
+                const dimInfo = (it.width && it.height) ? `${it.width}×${it.height}` : "";
+                const mimeLabel = it.mime_type || "image/png";
+                bodyHtml = `
+                    <div class="clipboard-image-wrap flex items-center justify-center p-2" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md); overflow: hidden; min-height: 96px;">
+                        <img class="clipboard-preview-img" loading="lazy" src="/api/clipboard/image/${encodeURIComponent(id)}" alt="Clipboard Image Preview" style="max-height: 150px; max-width: 100%; object-fit: contain; border-radius: var(--snow-radius-sm);" />
+                    </div>
+                    <div class="clipboard-meta-row">
+                        <span class="mono">${escapeHtml(mimeLabel)}</span>
+                        ${dimInfo ? `<span>• ${escapeHtml(dimInfo)}</span>` : ""}
+                        ${sizeLabel !== "--" ? `<span>• ${escapeHtml(sizeLabel)}</span>` : ""}
+                    </div>
+                `;
+            } else if (type === "file") {
+                typeBadgeText = "File";
+                typeBadgeCls = "chip-emerald";
+                const f0 = manifest[0] || {};
+                const fname = f0.name || f0.file_name || text || "Unnamed file";
+                const fmime = f0.mime_type || it.mime_type || "application/octet-stream";
+                const fsize = formatBytes(f0.size_bytes ?? it.size_bytes);
+                bodyHtml = `
+                    <div class="clipboard-manifest-list">
+                        <div class="clipboard-file-row">
+                            <div class="flex items-center gap-2 min-w-0">
+                                <svg class="svg-icon svg-icon-sm text-emerald" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+                                <span class="clipboard-file-name" title="${escapeHtml(fname)}">${escapeHtml(fname)}</span>
+                            </div>
+                            <span class="chip chip-sm ${isIncompleteFile ? "chip-rose" : "chip-neutral"}">${isIncompleteFile ? "Unavailable" : escapeHtml(fsize)}</span>
+                        </div>
+                        <div class="clipboard-meta-row">
+                            <span class="mono">${escapeHtml(fmime)}</span>
+                            ${f0.sha256 ? `<span class="chip chip-sm chip-emerald">SHA-256 Verified</span>` : ""}
+                        </div>
+                    </div>
+                `;
+            } else if (type === "file_bundle") {
+                const fileCount = Number(it.file_count || manifest.length || 0);
+                typeBadgeText = `Bundle • ${fileCount} Files`;
+                typeBadgeCls = isIncompleteFile ? "chip-amber" : "chip-emerald";
+                const rowsHtml = manifest.slice(0, 5).map(entry => {
+                    const en = entry.name || entry.file_name || "file";
+                    const em = entry.mime_type || "file";
+                    const es = formatBytes(entry.size_bytes);
+                    return `
+                        <div class="clipboard-file-row">
+                            <div class="flex items-center gap-2 min-w-0">
+                                <svg class="svg-icon svg-icon-sm text-cyan" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path></svg>
+                                <span class="clipboard-file-name" title="${escapeHtml(en)}">${escapeHtml(en)}</span>
+                            </div>
+                            <span class="text-muted mono" style="flex-shrink:0;">${escapeHtml(em)} • ${escapeHtml(es)}</span>
+                        </div>
+                    `;
+                }).join("");
+                bodyHtml = `
+                    <div class="clipboard-manifest-list">
+                        ${rowsHtml || `<span class="text-xs text-rose">Bundle manifest unavailable or incomplete</span>`}
+                        <div class="clipboard-meta-row">
+                            <span>Total: ${escapeHtml(sizeLabel)}</span>
+                            <span>• ${fileCount} file${fileCount === 1 ? "" : "s"}</span>
+                            ${isIncompleteFile ? `<span class="chip chip-sm chip-rose">Incomplete</span>` : `<span class="chip chip-sm chip-emerald">SHA-256 Verified</span>`}
+                        </div>
+                    </div>
+                `;
+            } else {
+                bodyHtml = `
+                    <p class="text-xs text-secondary mono" style="white-space: pre-wrap; word-break: break-word; max-height: 140px; overflow-y: auto;">${escapeHtml(text)}</p>
+                    <div class="clipboard-meta-row">
+                        <span class="mono">${escapeHtml(it.mime_type || "text/plain")}</span>
+                        ${sizeLabel !== "--" ? `<span>• ${escapeHtml(sizeLabel)}</span>` : ""}
+                    </div>
+                `;
+            }
+
+            const applyLabel = (type === "file" || type === "file_bundle") ? "Apply to PC" : "Apply / Copy";
 
             card.innerHTML = `
                 <div class="flex items-center justify-between gap-2">
                     <div class="flex items-center gap-2 min-w-0">
-                        <span class="chip chip-sm chip-cyan">${isImg ? "Image" : "Text"}</span>
-                        <span class="text-xs text-muted truncate">${escapeHtml(source)} • ${formatTimestamp(it.timestamp)}</span>
+                        <span class="chip chip-sm ${typeBadgeCls}">${escapeHtml(typeBadgeText)}</span>
+                        <span class="text-xs text-muted truncate">${seqLabel ? `${escapeHtml(seqLabel)} • ` : ""}${escapeHtml(source)} • ${formatTimestamp(it.timestamp)}</span>
                     </div>
                     <div class="flex items-center gap-1">
                         ${pinned ? `<span class="chip chip-sm chip-emerald">Pinned</span>` : ""}
@@ -3166,8 +3402,8 @@
                 </div>
                 ${bodyHtml}
                 <div class="flex items-center justify-between gap-2 pt-2" style="border-top: 1px solid var(--snow-border);">
-                    <button class="btn btn-xs btn-primary btn-copy-act">Copy</button>
-                    <button class="btn btn-xs btn-tonal btn-share-act">Send to Target</button>
+                    <button class="btn btn-xs btn-primary btn-radius-md btn-copy-act" ${isItemActionable ? "" : "disabled"}>${applyLabel}</button>
+                    <button class="btn btn-xs btn-tonal btn-radius-md btn-share-act" ${(isItemActionable && targetElig.eligible) ? "" : "disabled"} title="${escapeHtml(targetElig.reason)}">Send to Target</button>
                 </div>
             `;
             const previewImg = card.querySelector("img.clipboard-preview-img");
@@ -3180,23 +3416,60 @@
                 }, { once: true });
             }
 
-            card.querySelector(".btn-copy-act").onclick = async () => {
-                if (navigator.clipboard && text) navigator.clipboard.writeText(text).catch(() => {});
-                await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: "pc" });
-                showNotificationToast("Applied to clipboard!", "success");
+            card.querySelector(".btn-copy-act").onclick = async (e) => {
+                if (!isItemActionable) return;
+                await withButtonLoading(e.currentTarget, "Applying...", async () => {
+                    const applyRes = await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: "pc" });
+                    if (applyRes && applyRes.success) {
+                        if (type === "text" && navigator.clipboard && text) {
+                            navigator.clipboard.writeText(text).catch(() => {});
+                        }
+                        showNotificationToast(
+                            type === "file" || type === "file_bundle"
+                                ? "Files committed and copied to PC clipboard!"
+                                : "Applied to PC clipboard!",
+                            "success"
+                        );
+                    } else {
+                        showNotificationToast(applyRes?.error || "Failed applying item to PC", "error");
+                    }
+                });
             };
-            card.querySelector(".btn-share-act").onclick = async () => {
-                await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: resolveTargetDeviceId() || "pc" });
-                showNotificationToast("Sent clipboard entry to active device.", "info");
+            card.querySelector(".btn-share-act").onclick = async (e) => {
+                const elig = getClipboardTargetEligibility();
+                if (!elig.eligible) {
+                    showNotificationToast(elig.reason, "warning");
+                    return;
+                }
+                await withButtonLoading(e.currentTarget, "Sending...", async () => {
+                    const pushRes = await apiRequest("/api/clipboard/buffer/apply", "POST", { item_id: id, target: elig.targetId });
+                    if (pushRes && pushRes.success) {
+                        showNotificationToast("Delivered clipboard entry to target device!", "success");
+                    } else {
+                        showNotificationToast(pushRes?.error || "Failed sending clipboard entry to target", "error");
+                    }
+                });
             };
-            card.querySelector(".btn-pin-clip").onclick = async () => {
-                const action = pinned ? "/api/clipboard/buffer/unpin" : "/api/clipboard/buffer/pin";
-                await apiRequest(action, "POST", { item_id: id });
-                loadClipboardItems();
+            card.querySelector(".btn-pin-clip").onclick = async (e) => {
+                await withButtonLoading(e.currentTarget, "", async () => {
+                    const action = pinned ? "/api/clipboard/buffer/unpin" : "/api/clipboard/buffer/pin";
+                    const pRes = await apiRequest(action, "POST", { item_id: id });
+                    if (pRes && pRes.success) {
+                        await loadClipboardItems();
+                    } else {
+                        showNotificationToast(pRes?.error || "Unable to update pin state", "error");
+                    }
+                });
             };
-            card.querySelector(".btn-del-clip").onclick = async () => {
-                await apiRequest("/api/clipboard/buffer/delete", "POST", { item_id: id });
-                loadClipboardItems();
+            card.querySelector(".btn-del-clip").onclick = async (e) => {
+                await withButtonLoading(e.currentTarget, "", async () => {
+                    const dRes = await apiRequest("/api/clipboard/buffer/delete", "POST", { item_id: id });
+                    if (dRes && dRes.success) {
+                        await loadClipboardItems();
+                    } else {
+                        showNotificationToast(dRes?.error || "Unable to delete clipboard item", "error");
+                    }
+                });
             };
 
             container.appendChild(card);
@@ -3208,27 +3481,15 @@
     // =========================================================================
 
     function initAiSettingsView() {
-        document.getElementById("btn-mcp-test-local")?.addEventListener("click", async () => {
-            showNotificationToast("Testing 54 local FastMCP tools...", "info");
-            const res = await apiRequest("/api/mcp/test-local", "POST", {});
-            if (res && res.success) {
-                showNotificationToast(`All ${res.tools_count || 54} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
-            } else {
-                showNotificationToast(res?.error || "MCP self-test failed", "error");
-            }
-        });
-
-        document.getElementById("btn-save-default-hub-url")?.addEventListener("click", async () => {
-            const inp = document.getElementById("setting-default-hub-url");
-            const val = inp ? inp.value.trim() : "";
-            const res = await apiRequest("/api/settings/hub", "POST", { default_hub_url: val });
-            if (res && res.success) {
-                showNotificationToast(val ? "Default Hub URL saved." : "Default Hub URL cleared.", "success");
-                loadHubSettings();
-                loadAiTunnelStatus();
-            } else {
-                showNotificationToast(res?.error || "Invalid Hub URL", "error");
-            }
+        document.getElementById("btn-mcp-test-local")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Testing...", async () => {
+                const res = await apiRequest("/api/mcp/test-local", "POST", {});
+                if (res && res.success) {
+                    showNotificationToast(`All ${res.tools_count || 54} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
+                } else {
+                    showNotificationToast(res?.error || "MCP self-test failed", "error");
+                }
+            });
         });
 
         const hostMappings = [
@@ -3239,102 +3500,135 @@
             { id: "btn-setup-cursor", host: "cursor" },
         ];
         hostMappings.forEach(({ id, host }) => {
-            document.getElementById(id)?.addEventListener("click", async () => {
-                showNotificationToast(`Configuring MCP host: ${host}...`, "info");
-                const res = await apiRequest("/api/mcp/setup", "POST", { host });
-                if (res && res.success) {
-                    showNotificationToast(`Configured ${host} successfully!`, "success");
-                } else {
-                    showNotificationToast(res?.error || `Setup completed for ${host}.`, "info");
-                }
-                loadAiHostStatus();
+            document.getElementById(id)?.addEventListener("click", async (e) => {
+                await withButtonLoading(e.currentTarget, "Configuring...", async () => {
+                    const res = await apiRequest("/api/mcp/setup", "POST", { host });
+                    if (res && res.success) {
+                        showNotificationToast(`Configured ${host} successfully!`, "success");
+                    } else {
+                        showNotificationToast(res?.error || `Failed configuring ${host}.`, "error");
+                    }
+                    await loadAiHostStatus();
+                });
             });
         });
 
-        // Remote MCP Tunnel Controls
-        document.getElementById("btn-mcp-tunnel-toggle")?.addEventListener("click", async () => {
-            const badge = document.getElementById("mcp-tunnel-status");
-            const isOnline = badge && badge.textContent.includes("Active");
-            if (isOnline) {
-                await apiRequest("/api/mcp/tunnel/stop", "POST", {});
-                showNotificationToast("Remote MCP tunnel stopped.", "info");
-            } else {
-                const provider = document.getElementById("mcp-tunnel-provider")?.value || "cloudflared";
+        // Remote AI Link Start / Stop / Copy Link / Show QR
+        document.getElementById("btn-mcp-tunnel-start")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Starting...", async () => {
+                const provider = document.getElementById("mcp-tunnel-provider")?.value || "render";
                 const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || undefined;
-                showNotificationToast(`Starting Remote MCP tunnel (${provider})...`, "info");
                 const payload = { provider };
                 if (domain) payload.custom_url = domain;
                 const res = await apiRequest("/api/mcp/tunnel/start", "POST", payload);
                 if (res && res.success) {
-                    showNotificationToast("Remote MCP tunnel online!", "success");
+                    showNotificationToast("Remote AI Link online!", "success");
                 } else {
-                    showNotificationToast(res?.error || "Failed starting MCP tunnel", "error");
+                    showNotificationToast(res?.error || "Failed starting Remote AI Link", "error");
                 }
-            }
-            loadAiSettingsView();
+                await loadAiTunnelStatus();
+            });
+        });
+
+        document.getElementById("btn-mcp-tunnel-stop")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Stopping...", async () => {
+                const res = await apiRequest("/api/mcp/tunnel/stop", "POST", {});
+                if (res && res.success) {
+                    showNotificationToast("Remote AI Link stopped.", "info");
+                } else {
+                    showNotificationToast(res?.error || "Failed stopping Remote AI Link", "error");
+                }
+                await loadAiTunnelStatus();
+            });
         });
 
         document.getElementById("btn-mcp-copy-url")?.addEventListener("click", () => {
             const inp = document.getElementById("mcp-tunnel-url-display");
-            if (inp && inp.value) {
-                navigator.clipboard?.writeText(inp.value).catch(() => {});
-                showNotificationToast("Copied MCP URL to clipboard!", "success");
-            }
-        });
-
-        document.getElementById("btn-mcp-tunnel-save")?.addEventListener("click", async () => {
-            const provider = document.getElementById("mcp-tunnel-provider")?.value || "cloudflared";
-            const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || "";
-            const tokenInp = document.getElementById("mcp-tunnel-token-input");
-            const rawToken = tokenInp ? tokenInp.value.trim() : "";
-
-            const payload = {
-                provider,
-                mcp_public_url: domain || null,
-            };
-            if (rawToken && !rawToken.includes("***") && rawToken !== "[REDACTED]") {
-                if (provider === "render") {
-                    payload.relay_ticket = rawToken;
-                } else {
-                    payload.mcp_cloudflare_token = rawToken;
-                }
-            }
-            const res = await apiRequest("/api/mcp/tunnel/config", "POST", payload);
-            if (res && res.success) {
-                if (tokenInp) tokenInp.value = "";
-                showNotificationToast("Saved permanent tunnel configuration.", "success");
-                loadAiTunnelStatus();
+            const activeUrl = inp ? inp.value.trim() : "";
+            if (activeUrl) {
+                navigator.clipboard?.writeText(activeUrl).catch(() => {});
+                showNotificationToast("Copied active Remote AI Link!", "success");
             } else {
-                showNotificationToast(res?.error || "Failed saving tunnel configuration", "error");
+                showNotificationToast("Start Remote AI Link first.", "warning");
             }
         });
 
-        document.getElementById("btn-mcp-tunnel-token-clear")?.addEventListener("click", async () => {
-            const res = await apiRequest("/api/mcp/tunnel/config", "POST", {
-                mcp_cloudflare_token: null,
-                cloudflare_token: null,
-                relay_ticket: null,
-            });
-            if (res && res.success) {
+        document.getElementById("btn-mcp-tunnel-save")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Saving...", async () => {
+                const provider = document.getElementById("mcp-tunnel-provider")?.value || "render";
+                const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || "";
                 const tokenInp = document.getElementById("mcp-tunnel-token-input");
-                if (tokenInp) tokenInp.value = "";
-                showNotificationToast("Cleared persisted Cloudflare tunnel token.", "info");
-                loadAiTunnelStatus();
-            } else {
-                showNotificationToast(res?.error || "Failed clearing tunnel token", "error");
-            }
+                const rawToken = tokenInp ? tokenInp.value.trim() : "";
+
+                if (provider === "render") {
+                    const hubRes = await apiRequest("/api/settings/hub", "POST", { default_hub_url: domain });
+                    if (!hubRes || !hubRes.success) {
+                        showNotificationToast(hubRes?.error || "Invalid Hub URL", "error");
+                        return;
+                    }
+                }
+
+                const payload = {
+                    provider,
+                    mcp_public_url: provider === "render" ? null : (domain || null),
+                    default_hub_url: provider === "render" ? (domain || null) : undefined,
+                };
+                if (rawToken && !rawToken.includes("***") && rawToken !== "[REDACTED]") {
+                    if (provider === "render") {
+                        payload.relay_ticket = rawToken;
+                    } else {
+                        payload.mcp_cloudflare_token = rawToken;
+                    }
+                }
+                const res = await apiRequest("/api/mcp/tunnel/config", "POST", payload);
+                if (res && res.success) {
+                    if (tokenInp) tokenInp.value = "";
+                    showNotificationToast("Saved tunnel override configuration.", "success");
+                    await loadAiTunnelStatus();
+                } else {
+                    showNotificationToast(res?.error || "Failed saving tunnel configuration", "error");
+                }
+            });
+        });
+
+        document.getElementById("btn-mcp-tunnel-token-clear")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Clearing...", async () => {
+                const res = await apiRequest("/api/mcp/tunnel/config", "POST", {
+                    mcp_cloudflare_token: null,
+                    cloudflare_token: null,
+                    relay_ticket: null,
+                });
+                if (res && res.success) {
+                    const tokenInp = document.getElementById("mcp-tunnel-token-input");
+                    if (tokenInp) tokenInp.value = "";
+                    showNotificationToast("Cleared persisted tunnel token.", "info");
+                    await loadAiTunnelStatus();
+                } else {
+                    showNotificationToast(res?.error || "Failed clearing tunnel token", "error");
+                }
+            });
         });
 
         const qrModal = document.getElementById("mcp-qr-modal");
-        document.getElementById("btn-mcp-tunnel-show-qr")?.addEventListener("click", async () => {
-            const res = await apiRequest("/api/mcp/tunnel/qr");
-            if (res && res.success && res.svg && qrModal) {
-                document.getElementById("mcp-qr-svg-container").innerHTML = res.svg;
-                document.getElementById("mcp-qr-link-input").value = res.url || "";
-                qrModal.classList.remove("d-none");
-            } else {
-                showNotificationToast("QR code unavailable.", "warning");
-            }
+        document.getElementById("btn-mcp-tunnel-show-qr")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Loading...", async () => {
+                const res = await apiRequest("/api/mcp/tunnel/qr");
+                const container = document.getElementById("mcp-qr-svg-container");
+                if (res && res.success && res.active && res.svg && qrModal) {
+                    if (container) {
+                        container.classList.add("qr-active");
+                        container.innerHTML = res.svg;
+                    }
+                    document.getElementById("mcp-qr-link-input").value = res.url || "";
+                    qrModal.classList.remove("d-none");
+                } else {
+                    if (container) {
+                        container.classList.remove("qr-active");
+                        container.innerHTML = `<span class="text-xs text-muted text-center">No active QR</span>`;
+                    }
+                    showNotificationToast("Start Remote AI Link to display active QR.", "warning");
+                }
+            });
         });
         document.getElementById("btn-close-mcp-qr")?.addEventListener("click", () => qrModal?.classList.add("d-none"));
         document.getElementById("btn-mcp-modal-copy")?.addEventListener("click", () => {
@@ -3389,51 +3683,58 @@
         });
         window.addEventListener("beforeunload", clearRevealedIpcSecret);
 
-        document.getElementById("btn-diag-update-check")?.addEventListener("click", async () => {
-            const banner = document.getElementById("update-status-banner");
-            const applyBtn = document.getElementById("btn-diag-update-apply");
-            showNotificationToast("Checking release manifest...", "info");
-            const res = await apiRequest("/api/system/update-check");
-            if (res && res.success && (res.available || res.update_available)) {
-                pendingUpdateMeta = res;
-                if (banner) {
-                    banner.textContent = `Update v${res.latest_version} available (${res.update_type})`;
-                    banner.classList.remove("d-none");
+        document.getElementById("btn-diag-update-check")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Checking...", async () => {
+                const banner = document.getElementById("update-status-banner");
+                const applyBtn = document.getElementById("btn-diag-update-apply");
+                const res = await apiRequest("/api/system/update-check");
+                if (res && res.success && (res.available || res.update_available)) {
+                    pendingUpdateMeta = res;
+                    if (banner) {
+                        banner.textContent = `Update v${res.latest_version} available (${res.update_type})`;
+                        banner.classList.remove("d-none");
+                    }
+                    applyBtn?.classList.remove("d-none");
+                    showNotificationToast(`Update v${res.latest_version} available!`, "success");
+                } else {
+                    pendingUpdateMeta = null;
+                    applyBtn?.classList.add("d-none");
+                    if (banner) {
+                        banner.textContent = res && res.success
+                            ? `Current version ${res?.current_version || "7.0.0"} is up to date.`
+                            : (res?.error || "Update check failed.");
+                        banner.classList.remove("d-none");
+                    }
+                    showNotificationToast(res && res.success ? "SNOW is up to date." : (res?.error || "Update check failed"), res && res.success ? "info" : "error");
                 }
-                applyBtn?.classList.remove("d-none");
-                showNotificationToast(`Update v${res.latest_version} available!`, "success");
-            } else {
-                pendingUpdateMeta = null;
-                applyBtn?.classList.add("d-none");
-                if (banner) {
-                    banner.textContent = `Current version ${res?.current_version || "5.2.0"} is up to date.`;
-                    banner.classList.remove("d-none");
-                }
-                showNotificationToast("SNOW is up to date.", "info");
-            }
-        });
-        document.getElementById("btn-diag-update-apply")?.addEventListener("click", async () => {
-            if (!pendingUpdateMeta) return;
-            const res = await apiRequest("/api/system/update-apply", "POST", {
-                update_type: pendingUpdateMeta.update_type,
-                url: pendingUpdateMeta.url,
-                sha256: pendingUpdateMeta.sha256,
             });
-            if (res && res.success) {
-                showNotificationToast(res.message || "Update applied!", "success");
-                setTimeout(() => window.location.reload(), 1200);
-            } else {
-                showNotificationToast(res?.error || "Update failed", "error");
-            }
         });
-        document.getElementById("btn-diag-reset-override")?.addEventListener("click", async () => {
-            const res = await apiRequest("/api/web-ui/reset-override", "POST", {});
-            if (res && res.success) {
-                showNotificationToast("Reset to bundled Web UI. Reloading...", "info");
-                setTimeout(() => window.location.reload(), 900);
-            } else {
-                showNotificationToast(res?.error || "Reset failed", "error");
-            }
+        document.getElementById("btn-diag-update-apply")?.addEventListener("click", async (e) => {
+            if (!pendingUpdateMeta) return;
+            await withButtonLoading(e.currentTarget, "Applying...", async () => {
+                const res = await apiRequest("/api/system/update-apply", "POST", {
+                    update_type: pendingUpdateMeta.update_type,
+                    url: pendingUpdateMeta.url,
+                    sha256: pendingUpdateMeta.sha256,
+                });
+                if (res && res.success) {
+                    showNotificationToast(res.message || "Update applied!", "success");
+                    setTimeout(() => window.location.reload(), 1200);
+                } else {
+                    showNotificationToast(res?.error || "Update failed", "error");
+                }
+            });
+        });
+        document.getElementById("btn-diag-reset-override")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Resetting...", async () => {
+                const res = await apiRequest("/api/web-ui/reset-override", "POST", {});
+                if (res && res.success) {
+                    showNotificationToast("Reset to bundled Web UI. Reloading...", "info");
+                    setTimeout(() => window.location.reload(), 900);
+                } else {
+                    showNotificationToast(res?.error || "Reset failed", "error");
+                }
+            });
         });
     }
 
@@ -3441,23 +3742,10 @@
         await Promise.all([
             loadAiHostStatus(),
             loadAiTunnelStatus(),
-            loadHubSettings(),
+            loadRelayTunnelStatus(),
             loadApprovals(),
             loadActivityTimeline(),
         ]);
-    }
-
-    async function loadHubSettings() {
-        const res = await apiRequest("/api/settings/hub");
-        if (!res || !res.success) return;
-        const hubInp = document.getElementById("setting-default-hub-url");
-        const netBadge = document.getElementById("diag-network-key-id");
-        const mcpRouteEl = document.getElementById("diag-hub-permanent-mcp");
-        if (hubInp && document.activeElement !== hubInp) {
-            hubInp.value = res.default_hub_url || "";
-        }
-        if (netBadge) netBadge.textContent = res.network_id || "--";
-        if (mcpRouteEl) mcpRouteEl.textContent = res.permanent_mcp_url || "Configure Default Hub URL";
     }
 
     async function loadAiHostStatus() {
@@ -3474,21 +3762,28 @@
     }
 
     async function loadAiTunnelStatus() {
-        const [statusRes, cfgRes] = await Promise.all([
+        const [statusRes, cfgRes, hubRes] = await Promise.all([
             apiRequest("/api/mcp/tunnel/status"),
             apiRequest("/api/mcp/tunnel/config"),
+            apiRequest("/api/settings/hub"),
         ]);
         const statusBadge = document.getElementById("mcp-tunnel-status");
-        const btnToggle = document.getElementById("btn-mcp-tunnel-toggle");
+        const btnStart = document.getElementById("btn-mcp-tunnel-start");
+        const btnStop = document.getElementById("btn-mcp-tunnel-stop");
+        const btnCopy = document.getElementById("btn-mcp-copy-url");
+        const btnShowQr = document.getElementById("btn-mcp-tunnel-show-qr");
         const urlInput = document.getElementById("mcp-tunnel-url-display");
         const providerSel = document.getElementById("mcp-tunnel-provider");
         const permUrlInput = document.getElementById("mcp-tunnel-permanent-input");
         const tokenStatusBadge = document.getElementById("mcp-tunnel-token-status");
+        const netBadge = document.getElementById("diag-network-key-id");
 
         const cfg = cfgRes?.config || {};
-        if (providerSel && cfg.provider) providerSel.value = cfg.provider;
+        const selectedProvider = cfg.provider || "render";
+        if (providerSel) providerSel.value = selectedProvider;
+        if (netBadge && hubRes?.network_id) netBadge.textContent = hubRes.network_id;
         if (permUrlInput && document.activeElement !== permUrlInput) {
-            permUrlInput.value = cfg.mcp_public_url || cfg.public_url || "";
+            permUrlInput.value = cfg.default_hub_url || cfg.mcp_public_url || cfg.public_url || "";
         }
         if (tokenStatusBadge) {
             const maskedToken = cfg.mcp_cloudflare_token || cfg.cloudflare_token || cfg.relay_ticket || "";
@@ -3501,20 +3796,36 @@
             }
         }
 
-        if (statusRes && statusRes.active && statusRes.public_url) {
+        const configuredRenderRoute = statusRes?.configured_render_url || hubRes?.permanent_mcp_url || "";
+        const isActive = Boolean(statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url));
+
+        if (isActive) {
+            const activeEndpoint = statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`;
             if (statusBadge) {
                 statusBadge.textContent = "Active • 54 Tools Ready";
                 statusBadge.className = "chip chip-emerald";
             }
-            if (btnToggle) btnToggle.textContent = "Stop Tunnel";
-            if (urlInput) urlInput.value = statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`;
+            if (btnStart) btnStart.disabled = true;
+            if (btnStop) btnStop.disabled = false;
+            if (btnCopy) btnCopy.disabled = false;
+            if (btnShowQr) btnShowQr.disabled = false;
+            if (urlInput) {
+                urlInput.value = activeEndpoint;
+                urlInput.placeholder = configuredRenderRoute || activeEndpoint;
+            }
         } else {
             if (statusBadge) {
                 statusBadge.textContent = "Offline";
                 statusBadge.className = "chip chip-neutral";
             }
-            if (btnToggle) btnToggle.textContent = "Start Tunnel";
-            if (urlInput) urlInput.value = "http://127.0.0.1:8771/mcp";
+            if (btnStart) btnStart.disabled = false;
+            if (btnStop) btnStop.disabled = true;
+            if (btnCopy) btnCopy.disabled = true;
+            if (btnShowQr) btnShowQr.disabled = true;
+            if (urlInput) {
+                urlInput.value = "";
+                urlInput.placeholder = configuredRenderRoute || "Start Remote AI Link to activate your Render Hub endpoint";
+            }
         }
     }
 
@@ -3953,6 +4264,7 @@
             ]);
 
             if (statusRes && statusRes.success) {
+                lastStatusSnapshot = statusRes;
                 isCoreOnline = Boolean(statusRes.daemon_online ?? true);
                 if (statusRes.snow_id) canonicalSnowId = statusRes.snow_id;
                 if (statusRes.device_id) localHostDeviceId = statusRes.device_id;

@@ -1,187 +1,119 @@
-# SNOW V4 — AI-Native Multi-Device Capability & Federation Platform
+# SNOW — Synthesized Node Orchestration Wireless (`v7.0.0` Pre-Release)
 
-[![Version](https://img.shields.io/badge/version-4.0.0-blue.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-7.0.0-blue.svg)](pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.13-brightgreen.svg)](https://python.org)
 [![Android](https://img.shields.io/badge/android-14--17-green.svg)](android/)
-[![Architecture](https://img.shields.io/badge/architecture-Local--First%204--Layer-orange.svg)](docs/ARCHITECTURE_V4.md)
+[![Architecture](https://img.shields.io/badge/architecture-Local--First%204--Layer-orange.svg)](ARCHITECTURE.md)
 
-**SNOW** (Synthesized Node Orchestration Wireless) is an AI-native cross-device capability bridge and local federation platform. It allows compatible AI assistants (Claude Desktop, Google Antigravity, Cursor, ChatGPT Desktop) to perform explicitly authorized operations across Windows desktop workstations, Android mobile devices, and trusted peer networks through the standardized [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
-
----
-
-## Architecture Overview
-
-SNOW preserves a strict 4-layer architecture with non-negotiable security boundaries:
-
-```
-+-------------------------------------------------------------------------+
-| Layer 1: AI Integration                                                 |
-| - MCP stdio Server (JSON-RPC 2.0 over standard I/O)                    |
-| - Remote MCP Gateway (Port 8771, OAuth 2.1 + PKCE S256, CIMD)          |
-| - Zero-Port-Forwarding Public Exposure via `snow expose`                |
-| - Web Dashboard (Port 8769, Loopback only, Zero CDN dependencies)       |
-| - Win32 System Tray Companion (`snow-tray.exe`, pure ctypes, RSS < 35MB)|
-| - Unified CLI (`snow setup`, `snow devices`, `snow doctor`, etc.)       |
-+-------------------------------------------------------------------------+
-                                    |
-+-------------------------------------------------------------------------+
-| Layer 2: Capability Engine & Policy Authority                           |
-| - Dynamic 42-Tool Capability Catalog                                    |
-| - ApprovalPolicyEngine (Security Principals: AI_MCP vs OWNER_MANUAL)    |
-| - Cross-Network Federation Engine (9-Digit PINs, ACLs, Kill Switch)     |
-| - Cryptographic one-time approval tokens & timeout enforcement          |
-| - Multi-step workflow orchestration with partial failure handling       |
-+-------------------------------------------------------------------------+
-                                    |
-+-------------------------------------------------------------------------+
-| Layer 3: Device Networking & Transport                                  |
-| - Local-First Discovery & Transport Hierarchy (LAN -> USB ADB -> Relay) |
-| - Encrypted WSS Control Plane (Port 8765, 64 KiB strict frame limit)    |
-| - Authenticated HTTPS Out-of-Band Transfer (Port 8766, zero image Base64) |
-| - NodeRegistry, SessionRouter, TLS 1.3 certificate pinning             |
-+-------------------------------------------------------------------------+
-                                    |
-+-------------------------------------------------------------------------+
-| Layer 4: Device Runtime                                                 |
-| - Windows Python Runtime (Desktop status, clipboard, screen capture)    |
-| - Android Kotlin Runtime (Foreground Service, MediaProjection capture)  |
-+-------------------------------------------------------------------------+
-```
-                                    |
-+-------------------------------------------------------------------------+
-| Layer 3: Device Networking & Transport                                  |
-| - Local-First Discovery & Transport Hierarchy (LAN -> USB ADB -> Relay) |
-| - Encrypted WSS Control Plane (Port 8765, 64 KiB strict frame limit)    |
-| - Authenticated HTTPS Out-of-Band Transfer (Port 8766, zero image Base64) |
-| - NodeRegistry, SessionRouter, TLS 1.3 certificate pinning             |
-+-------------------------------------------------------------------------+
-                                    |
-+-------------------------------------------------------------------------+
-| Layer 4: Device Runtime                                                 |
-| - Windows Python Runtime (Desktop status, clipboard, screen capture)    |
-| - Android Kotlin Runtime (Foreground Service, MediaProjection capture)  |
-+-------------------------------------------------------------------------+
-```
+**SNOW** (*Synthesized Node Orchestration Wireless*) is a headless, local-first, cross-device AI capability bridge. It enables compatible AI assistants (Claude Desktop, Google Antigravity, Cursor, ChatGPT Desktop) to perform explicitly authorized operations across a Windows laptop, Android smartphones, and consented federated peers through a standardized [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) interface.
 
 ---
 
-## Consumer Quickstart
+## What's New in SNOW V7 (`7.0.0`)
 
-### 1. Prerequisites & Virtual Environment
+- **Hardened Pairing, Revocation & Android Trust (Milestone 1):** Authoritative QR pairing with strict Token/PIN separation, authenticated SNOW ID directory resolution, fail-closed relay secret handling, consolidated idempotent unpair/revocation, Share Code authority guards, safe battery optimization settings routing, and fail-closed Android release signing (`versionCode = 5`).
+- **Universal Clipboard (Milestone 2):** Thread-safe persistent **15-item** multi-format queue (max **5 pinned**, **100 MiB** persisted media budget) supporting `text`, `image`, `file`, and `file_bundle` (Windows `CF_HDROP`), cross-process Core IPC image previews, zero-echo propagation, durable per-device acknowledgements, and resumable SHA-256 HTTPS file delivery (`:8766`) into Android SAF storage.
+- **Refined Cross-Platform UX & Branding (Milestone 3A):**
+  - Unified snowflake emblem regenerated from `design/snow.png` across Windows `.ico`, Web UI `.png`/`.ico`, and Android mipmap/adaptive icons.
+  - Polished Windows Web UI (`Home`, `Clipboard`, `Files & Apps` with `8fr 4fr` desktop split, `Devices`, `AI & Settings`) with offline QR framing and streamlined Render Hub Remote AI controls.
+  - Polished Android Jetpack Compose Material 3 app (`Home`, `Tools`, `Devices`, `Settings`) with bidirectional `HorizontalPager` tool tabs, WCAG AA light/dark terminal tokens, and async action loading/recovery guards.
+  - Removed obsolete legacy Fragment/XML UI artifacts after reference verification.
 
-SNOW requires Python 3.13 on the host laptop and Android 14+ on the mobile client.
+---
+
+## Four-Layer Architecture
+
+SNOW preserves a strict four-layer architecture with frozen security and transport boundaries:
+
+```text
++-----------------------------------------------------------------------------+
+| Layer 1: AI Integration                                                     |
+| - FastMCP stdio Server (54 tools, JSON-RPC 2.0 on pure stdout; stderr logs) |
+| - Remote MCP Streamable HTTP Gateway (:8771, OAuth 2.1 + PKCE S256, CIMD)   |
+| - Render Hub / Cloudflared Remote AI Link (`snow expose` / Web UI toggle)   |
+| - Headless Companion Web Dashboard (`127.0.0.1:8769`, zero external CDNs)   |
+| - Win32 System Tray Companion (`snow-tray.exe`, lightweight ctypes)          |
+| - Unified CLI (`snow setup`, `snow doctor`, `snow daemon`, `snow devices`)  |
++-----------------------------------------------------------------------------+
+                                      |
++-----------------------------------------------------------------------------+
+| Layer 2: Capability Engine & Policy Authority                               |
+| - 54-Tool FastMCP Capability Catalog (`src/snow/mcp/registry.py`)           |
+| - Dual-Principal Enforcement (`AI_MCP` restricted vs `OWNER_MANUAL`)        |
+| - 5-Tier Access Profiles (`full_control`, `files_and_clipboard`,            |
+|   `files_only`, `clipboard_only`, `not_allowed`) — fail-closed default      |
+| - Cross-Network Federation (9-digit single-use codes, ACLs, Kill Switch)    |
+| - Universal Clipboard Engine (15-item ring buffer, Schema v7 SQLite)        |
++-----------------------------------------------------------------------------+
+                                      |
++-----------------------------------------------------------------------------+
+| Layer 3: Device Networking & Transport                                      |
+| - SNOW Device Protocol v1 (`228/228` bidirectional wire fixtures)           |
+| - Priority Routing: Wi-Fi/LAN mDNS+WSS (:8765) -> USB ADB -> Relay (:8770)  |
+| - WSS Control Plane (:8765): metadata only, strict <= 64 KiB frame limit    |
+| - HTTPS Transfer Plane (:8766): resumable SHA-256 chunks & clipboard media  |
+| - Core Loopback IPC (:8767) & UDP Discovery (:8768)                         |
++-----------------------------------------------------------------------------+
+                                      |
++-----------------------------------------------------------------------------+
+| Layer 4: Device Runtimes                                                    |
+| - Windows Python 3.13 Core (`asyncio`, SQLite Schema v7, CF_HDROP, Win32)   |
+| - Android Kotlin + Jetpack Compose app (`minSdk 26`, `targetSdk 34`,        |
+|   Keystore AES-GCM tokens, SAF/MediaStore downloads, MediaProjection)       |
++-----------------------------------------------------------------------------+
+```
+
+---
+
+## Quickstart (Windows + Android)
+
+### 1. Environment Setup (Python 3.13 Required)
 
 ```powershell
-# Clone repository and navigate to directory
 cd "D:\Codes 2\Snow"
-
-# Create and activate Python 3.13 virtual environment
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-
-# Install SNOW in editable development mode
 pip install -e .
 ```
 
-### 2. Starting SNOW Core Services
+### 2. Start Core & Companion Web UI
 
-SNOW runs as a headless desktop core daemon with an accompanying local-only web dashboard.
-
-**Terminal 1 — Start the Core Daemon:**
 ```powershell
+# Start headless background Core daemon
 .\.venv\Scripts\python.exe -m snow daemon start
-```
-*(Alternatively, run directly in foreground mode with live console diagnostics: `python -m snow`)*
 
-**Terminal 2 — Launch the Web Dashboard:**
-```powershell
+# Open companion Web Dashboard (http://127.0.0.1:8769)
 .\.venv\Scripts\python.exe -m snow web
 ```
-The Web Dashboard opens automatically at `http://127.0.0.1:8769`.
 
-### 3. Pairing an Android Device
+*(Alternatively launch `snow-tray.exe` from the local pre-release bundle in `dist\snow\` or install via `packaging\output\SNOW-Setup-7.0.0.exe`.)*
 
-1. In PowerShell, generate a pairing session:
-   ```powershell
-   .\.venv\Scripts\python.exe -m snow pair
-   ```
-   Or navigate to the **Devices** tab in the Web Dashboard (`http://127.0.0.1:8769`).
-2. Scan the QR code or enter the 6-digit PIN in the SNOW Android application.
-3. Upon mutual PIN verification, self-signed TLS certificates are pinned and trust tiers (`OWNER` vs `PEER`) are persisted in local SQLite storage.
-
-### 4. Configuring MCP AI Hosts
-
-To link your AI assistants directly to SNOW:
+### 3. Configure AI MCP Hosts & Run Diagnostics
 
 ```powershell
-# Configure specific hosts or all supported hosts (gemini, claude, cursor, chatgpt)
-.\.venv\Scripts\python.exe -m snow setup --host gemini
+# Configure Gemini CLI / Antigravity / Claude Desktop / Cursor / ChatGPT
 .\.venv\Scripts\python.exe -m snow setup --host all
 
-# Verify system readiness and configuration
-.\.venv\Scripts\python.exe -m snow doctor
+# Verify 54-tool FastMCP catalog, schema, runtime, and readiness
+.\.venv\Scripts\python.exe -m snow doctor --json
 ```
 
----
+### 4. Local Pre-Release Packaging (Owner QA)
 
-## Pre-Packaged Multi-Step Workflows
+```powershell
+# Build signed release Android APK (requires android/keystore.properties or SNOW_KEYSTORE_* env)
+Push-Location android; .\gradlew.bat assembleRelease --no-daemon; Pop-Location
 
-Available directly from the Web Dashboard (`http://127.0.0.1:8769`) or programmatically via the `snow_workflow_run` MCP tool:
+# Build PyInstaller bundle, Inno Setup installer, Web UI ZIP, and OTA manifest
+.\.venv\Scripts\python.exe packaging\windows\build_release.py
+```
 
-1. **Device Health Snapshot (`device_health_snapshot`):**
-   - Queries Windows laptop and paired Android phone simultaneously.
-   - Summarizes CPU utilization, RAM usage, storage utilization, phone battery percentage, charging state, and active transport in side-by-side consumer cards.
-
-2. **Capture PC Screen (`pc_screenshot`):**
-   - Interactive consent-gated desktop capture.
-   - Exposes an authenticated local preview URL (`/api/captures/<file_name>`).
-   - Image bytes are transferred via out-of-band HTTPS (Port 8766) — never as Base64 over the WebSocket control channel.
-
-3. **Capture PC → Phone (`capture_pc_to_phone`):**
-   - Captures Windows desktop screenshot and stages it into the local encrypted transfer spool.
-   - Initiates an out-of-band HTTPS push to the paired Android device storage.
-   - Verifies SHA-256 integrity upon arrival.
-
-4. **Sync Clipboard & Notify (`share_clipboard_and_notify`):**
-   - Reads the current Windows clipboard content.
-   - If non-empty, securely dispatches the text to the Android device clipboard (`clipboard_push`) and triggers a native Android notification.
-   - Safely warns if the desktop clipboard is empty without failing or sending blank messages.
+Outputs land locally in `packaging\output\` (`SNOW-Setup-7.0.0.exe`, `SNOW-Mobile-7.0.0.apk`, `snow-web-ui-7.0.0.zip`, `update_manifest.json`) for physical device verification on Lenovo V15 & Realme P4 before public `v7.0.0` release tagging.
 
 ---
 
-## Android 14–17 Platform & Privacy Architecture
+## Android 14–17 Platform & Security Invariants
 
-Modern Android operating systems enforce strict sandboxing and user privacy boundaries:
-
-| OS Reality | Platform Constraint | SNOW Architecture Solution |
-| :--- | :--- | :--- |
-| **Screen Capture** | Prohibits silent or headless screen capture without user consent. | Requires Android `MediaProjectionManager` permission token granted via interactive user prompt. Captures run via an active Foreground Service. |
-| **Camera Access** | Background camera access is blocked by Android 11+. | Camera capture is restricted to an active foreground UI session with clear on-screen preview. |
-| **Background Clipboard** | Background clipboard access is restricted on Android 10+. | Inbound clipboard sync is delivered via standard notification intents; push writes are applied when active. |
-| **Doze Mode & Sleeping** | Battery management suspends background sockets on OEM builds. | SNOW implements a Foreground Service with persistent notification, automatic keepalive pinging, and exponential backoff reconnection. |
-| **Zero-Data Transport** | Wi-Fi networks frequently isolate clients (AP isolation). | SNOW supports zero-data local USB mesh via ADB reverse port forwarding (`snow usb`). |
-
----
-
-## Empirical Benchmark Results (Lenovo V15, Intel Core i5-1235U)
-
-Empirical testing on real capstone target hardware (Lenovo V15, Intel Core i5-1235U, ~7.9 GB RAM, Windows 11) measuring full runtime process trees and verified operational readiness:
-
-| Component | Startup Latency | Aggregate RSS | Idle CPU % | Verified Readiness Mechanism |
-| :--- | :---: | :---: | :---: | :--- |
-| **Core Daemon** | 0.776 s | 58.3 MB | 0.0 % | WSS socket connect (Port 8765) |
-| **Web Dashboard** | 1.047 s | 81.2 MB | 0.0 % | HTTP loopback connect (Port 8779) |
-| **MCP stdio** | 0.700 s | 72.1 MB | 0.0 % | Full JSON-RPC `initialize` protocol exchange |
-| **MCP Gateway** | 1.062 s | 82.1 MB | 0.0 % | Streamable HTTP socket connect (Port 8781) |
-| **Relay Server** | 0.536 s | 44.7 MB | 0.0 % | TLS 1.3 MemoryBIO socket connect (Port 8770) |
-
-*Methodology: Script `scripts/benchmark_phase25_v3.py` launches each component, confirms operational readiness via real protocol handshakes/socket connects, samples CPU over a 1.5s window across `[proc] + proc.children(recursive=True)`, aggregates RSS without double-counting, and cleanly terminates all process trees. All components operate within the < 85 MB aggregate RSS budget on the Lenovo V15 test hardware.*
-
----
-
-## Security Invariants
-
-- **No Arbitrary Execution:** SNOW does not provide arbitrary bash/shell or raw command execution capabilities.
-- **Strict Approval Separation:** Actions initiated by `AI_MCP` require interactive human confirmation. Only `OWNER_MANUAL` is authorized to approve or deny requests.
-- **64 KiB WSS Limit:** All WebSocket messages are strictly capped at 64 KiB. Binary files and captured images must use authenticated HTTPS transfer on port 8766.
-- **Loopback Enforcement:** IPC (8767) and Web Dashboard (8769) strictly bind to `127.0.0.1`.
+- **Strict Protocol & Port Boundaries:** Control traffic stays under 64 KiB on WSS `:8765`; all files, screenshots, camera photos, and clipboard binaries transfer over authenticated HTTPS `:8766`. Core IPC (`:8767`) and Web UI (`:8769`) bind strictly to loopback `127.0.0.1`.
+- **Android Storage & Hardware Reality:** Uses hardware-backed Android Keystore AES-GCM (never deprecated `EncryptedSharedPreferences`), SAF/MediaStore scoped storage (`READ_MEDIA_IMAGES` / user-picked folder), interactive `MediaProjection` consent for screen capture, and honest Foreground Service reconnect backoff without claiming permanent Doze immunity.
+- **No Arbitrary Shell & No Credential Leaks:** Application launching uses explicit allowlists, file operations stay path-contained, and `stdout` is strictly reserved for MCP JSON-RPC frames (`sys.stderr` logging only).

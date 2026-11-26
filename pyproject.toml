@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snow"
-version = "5.2.0"
+version = "7.0.0"
 description = "SNOW — Headless cross-device AI capability bridge"
 requires-python = ">=3.13,<3.14"
 dependencies = [

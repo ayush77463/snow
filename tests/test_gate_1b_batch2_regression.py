@@ -88,41 +88,43 @@ class TestF3PrincipalAwareAppLaunching(unittest.IsolatedAsyncioTestCase):
 class TestF10OSIdentityAndVersionConsistency(unittest.TestCase):
     """Test F10: OS identity, peer platform detection, and version unification."""
 
-    def test_version_unification_to_4_1_0(self):
+    def test_version_unification_to_7_0_0(self):
         repo_root = Path(__file__).parent.parent
 
         # 1. src/snow/__init__.py
         init_file = repo_root / "src" / "snow" / "__init__.py"
-        self.assertIn('__version__ = "5.2.0"', init_file.read_text(encoding="utf-8"))
+        self.assertIn('__version__ = "7.0.0"', init_file.read_text(encoding="utf-8"))
 
         # 2. pyproject.toml
         pyproject_file = repo_root / "pyproject.toml"
-        self.assertIn('version = "5.2.0"', pyproject_file.read_text(encoding="utf-8"))
+        self.assertIn('version = "7.0.0"', pyproject_file.read_text(encoding="utf-8"))
 
         # 3. src/snow/core/config.py
         config_file = repo_root / "src" / "snow" / "core" / "config.py"
-        self.assertIn('version: str = "5.2.0"', config_file.read_text(encoding="utf-8"))
+        self.assertIn('version: str = "7.0.0"', config_file.read_text(encoding="utf-8"))
 
         # 4. src/snow/cli.py
         cli_file = repo_root / "src" / "snow" / "cli.py"
         cli_text = cli_file.read_text(encoding="utf-8")
-        self.assertIn("Version:           5.2.0", cli_text)
-        self.assertIn("5.2.0", cli_text)
+        self.assertIn("Version:           7.0.0", cli_text)
+        self.assertIn("7.0.0", cli_text)
 
         # 5. src/snow/mcp/remote_gateway.py
         gw_file = repo_root / "src" / "snow" / "mcp" / "remote_gateway.py"
         gw_text = gw_file.read_text(encoding="utf-8")
-        self.assertTrue('"version": "5.2.0"' in gw_text or '"version": SNOW_VERSION' in gw_text)
+        self.assertTrue('"version": "7.0.0"' in gw_text or '"version": SNOW_VERSION' in gw_text)
 
         # 6. android/app/build.gradle.kts
         gradle_file = repo_root / "android" / "app" / "build.gradle.kts"
         gradle_text = gradle_file.read_text(encoding="utf-8")
-        self.assertIn('versionName = "5.2.0"', gradle_text)
-        self.assertIn('versionCode = 4', gradle_text)
+        self.assertIn('versionName = "7.0.0"', gradle_text)
+        self.assertIn('versionCode = 5', gradle_text)
 
         # 7. packaging/windows/snow_setup.iss
         iss_file = repo_root / "packaging" / "windows" / "snow_setup.iss"
-        self.assertIn('#define MyAppVersion "5.2.0"', iss_file.read_text(encoding="utf-8"))
+        iss_text = iss_file.read_text(encoding="utf-8")
+        self.assertIn('#define MyAppVersion "7.0.0"', iss_text)
+        self.assertIn('#define MyAppURL "https://github.com/ayush77463/snow"', iss_text)
 
     def test_peer_platform_detection_in_server(self):
         from snow.core.server import SnowCoreServer

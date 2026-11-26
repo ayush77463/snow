@@ -113,7 +113,7 @@ class CoreConfig:
     """
 
     app_name: str = "SNOW Desktop Core"
-    version: str = "5.2.0"
+    version: str = "7.0.0"
     bind_host: str = "0.0.0.0"
     port: int = 8765
     log_level: str = "INFO"
@@ -554,7 +554,7 @@ class CoreConfig:
 
         return cls(
             app_name=app_name,
-            version="0.1.0",
+            version="7.0.0",
             bind_host=bind_host,
             port=port,
             log_level=log_level,

@@ -501,19 +501,26 @@ class TestStage4CDirectUpdater(AioHTTPTestCase):
             "1 peer linked",
         ]
 
-        # Scan fragment_dashboard.xml, fragment_devices.xml, fragment_settings.xml
+        # Scan active Jetpack Compose screens and any remaining XML layouts
         res_dir = Path("android/app/src/main/res/layout")
         if res_dir.is_dir():
-            for xml_file in ("fragment_dashboard.xml", "fragment_devices.xml", "fragment_settings.xml"):
-                target = res_dir / xml_file
-                if target.is_file():
-                    content = target.read_text(encoding="utf-8")
-                    for mock in mock_strings:
-                        self.assertNotIn(
-                            mock,
-                            content,
-                            f"Audited mock string '{mock}' found in {xml_file}!",
-                        )
+            for xml_file in res_dir.glob("*.xml"):
+                content = xml_file.read_text(encoding="utf-8")
+                for mock in mock_strings:
+                    self.assertNotIn(
+                        mock,
+                        content,
+                        f"Audited mock string '{mock}' found in {xml_file.name}!",
+                    )
+        compose_dir = Path("android/app/src/main/java/org/snow/ui")
+        for kt_file in compose_dir.rglob("*.kt"):
+            content = kt_file.read_text(encoding="utf-8")
+            for mock in mock_strings:
+                self.assertNotIn(
+                    mock,
+                    content,
+                    f"Audited mock string '{mock}' found in {kt_file.name}!",
+                )
 
 
 if __name__ == "__main__":

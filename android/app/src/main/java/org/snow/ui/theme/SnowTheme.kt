@@ -32,7 +32,16 @@ data class SnowColors(
     val accentEmerald: Color,
     val brandGradient: Brush,
     val terminalBg: Color,
-    val isDark: Boolean
+    val isDark: Boolean,
+    val terminalBorder: Color = border,
+    val terminalDivider: Color = borderSubtle,
+    val terminalHeader: Color = accentCyan,
+    val terminalStdout: Color = textPrimary,
+    val terminalStderr: Color = Color(0xFFF87171),
+    val terminalSystem: Color = accentBlue,
+    val terminalPlaceholder: Color = textSecondary,
+    val terminalExitSuccess: Color = accentEmerald,
+    val terminalExitError: Color = Color(0xFFF87171)
 )
 
 val DarkSnowColors = SnowColors(
@@ -52,8 +61,17 @@ val DarkSnowColors = SnowColors(
     brandGradient = Brush.linearGradient(
         listOf(Color(0xFF2563EB), Color(0xFF00E5FF), Color(0xFF10B981))
     ),
-    terminalBg = Color(0xFF0F172A),
-    isDark = true
+    terminalBg = Color(0xFF121212),
+    isDark = true,
+    terminalBorder = Color(0x1FFFFFFF),
+    terminalDivider = Color(0x14FFFFFF),
+    terminalHeader = Color(0xFF00E5FF),
+    terminalStdout = Color(0xFFF1F5F9),
+    terminalStderr = Color(0xFFF87171),
+    terminalSystem = Color(0xFF38BDF8),
+    terminalPlaceholder = Color(0xFF94A3B8),
+    terminalExitSuccess = Color(0xFF10B981),
+    terminalExitError = Color(0xFFF87171)
 )
 
 val LightSnowColors = SnowColors(
@@ -73,8 +91,17 @@ val LightSnowColors = SnowColors(
     brandGradient = Brush.linearGradient(
         listOf(Color(0xFF2563EB), Color(0xFF06B6D4), Color(0xFF10B981))
     ),
-    terminalBg = Color(0xFF0F172A),
-    isDark = false
+    terminalBg = Color(0xFFF1F5F9),
+    isDark = false,
+    terminalBorder = Color(0xFFE2E8F0),
+    terminalDivider = Color(0xFFCBD5E1),
+    terminalHeader = Color(0xFF1D4ED8),
+    terminalStdout = Color(0xFF0F172A),
+    terminalStderr = Color(0xFFB91C1C),
+    terminalSystem = Color(0xFF0369A1),
+    terminalPlaceholder = Color(0xFF475569),
+    terminalExitSuccess = Color(0xFF047857),
+    terminalExitError = Color(0xFFB91C1C)
 )
 
 val LocalSnowColors = staticCompositionLocalOf { DarkSnowColors }

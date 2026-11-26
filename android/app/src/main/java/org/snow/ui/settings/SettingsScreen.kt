@@ -118,6 +118,7 @@ fun SettingsScreen(
     updateVersionName: String = "",
     updateDownloadProgress: Int? = null,
     onInstallUpdate: () -> Unit = {},
+    isCheckingUpdate: Boolean = false,
     logs: List<org.snow.ui.UiLogEntry> = emptyList(),
     onConnectManualIp: (String) -> Unit = {},
     onResetTrust: () -> Unit,
@@ -409,7 +410,7 @@ fun SettingsScreen(
                                 color = colors.textPrimary
                             )
                             Text(
-                                text = updateStatusText.ifBlank { "v5.2.0 • Up to date" },
+                                text = updateStatusText.ifBlank { "v7.0.0 • Up to date" },
                                 style = SnowTypography.bodySmall,
                                 color = colors.textSecondary
                             )
@@ -423,9 +424,11 @@ fun SettingsScreen(
                             )
                         } else {
                             SnowTonalButton(
-                                text = "Check",
+                                text = if (isCheckingUpdate) "Checking..." else "Check",
                                 icon = Icons.Default.SystemUpdate,
-                                onClick = onCheckAppUpdate
+                                onClick = onCheckAppUpdate,
+                                enabled = !isCheckingUpdate,
+                                isLoading = isCheckingUpdate
                             )
                         }
                     }
@@ -623,8 +626,7 @@ fun SettingsScreen(
                 SnowOutlinedButton(
                     text = "Notification Settings",
                     onClick = {
-                        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-                        context.startActivity(intent)
+                        context.startActivity(createNotificationListenerSettingsIntent())
                         showNotificationGuide = false
                     }
                 )
@@ -666,6 +668,9 @@ fun SettingsScreen(
         )
     }
 }
+
+fun createNotificationListenerSettingsIntent(): Intent =
+    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
 
 @Composable
 private fun ThemeOptionPill(

@@ -54,6 +54,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Widgets
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -140,6 +141,7 @@ fun HomeScreen(
     autoSyncScreenshots: Boolean = false,
     isRefreshing: Boolean = false,
     onRefresh: () -> Unit = {},
+    busyClipboardItemId: String? = null,
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
@@ -312,6 +314,7 @@ fun HomeScreen(
                                 item = item,
                                 thumbnailVersion = clipboardThumbnailVersion,
                                 findCachedImageFile = findCachedClipboardImage,
+                                isBusy = busyClipboardItemId == item.itemId,
                                 onCopy = { onApplyClipboardItem(item) },
                                 onShare = { onShareClipboardItem(item) },
                                 onTogglePin = { onPinClipboardItem(item.itemId, !item.isPinned) }
@@ -999,6 +1002,7 @@ private fun UnifiedClipboardItemRow(
     item: ClipboardItemDto,
     thumbnailVersion: Int,
     findCachedImageFile: (String) -> File?,
+    isBusy: Boolean = false,
     onCopy: () -> Unit,
     onShare: () -> Unit,
     onTogglePin: () -> Unit
@@ -1152,15 +1156,23 @@ private fun UnifiedClipboardItemRow(
                 modifier = Modifier
                     .size(32.dp)
                     .clip(CircleShape)
-                    .clickable(onClick = onCopy),
+                    .clickable(enabled = !isBusy, onClick = onCopy),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = if (isFileOrBundle) Icons.Default.FileDownload else Icons.Default.ContentCopy,
-                    contentDescription = if (isFileOrBundle) "Save" else "Copy",
-                    tint = colors.textSecondary,
-                    modifier = Modifier.size(16.dp)
-                )
+                if (isBusy) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = colors.accentCyan
+                    )
+                } else {
+                    Icon(
+                        imageVector = if (isFileOrBundle) Icons.Default.FileDownload else Icons.Default.ContentCopy,
+                        contentDescription = if (isFileOrBundle) "Save" else "Copy",
+                        tint = colors.textSecondary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
             }
         }
     }

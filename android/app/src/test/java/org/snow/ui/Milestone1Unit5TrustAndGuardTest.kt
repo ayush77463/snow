@@ -239,11 +239,9 @@ class Milestone1Unit5TrustAndGuardTest {
         assertTrue(intentSpecs.none { it.action == Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS })
 
         val settingsScreenSrc = resolveModuleFile("src/main/java/org/snow/ui/settings/SettingsScreen.kt").readText()
-        val settingsFragSrc = resolveModuleFile("src/main/java/org/snow/ui/settings/SettingsFragment.kt").readText()
         val manifestSrc = resolveModuleFile("src/main/AndroidManifest.xml").readText()
 
         assertFalse(settingsScreenSrc.contains("ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"))
-        assertFalse(settingsFragSrc.contains("ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"))
         assertFalse(manifestSrc.contains("REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"))
     }
 

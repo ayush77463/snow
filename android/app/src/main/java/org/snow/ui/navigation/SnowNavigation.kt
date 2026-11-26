@@ -26,6 +26,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import org.snow.ui.theme.LocalSnowColors
 import org.snow.ui.theme.SnowTypography
@@ -35,8 +41,8 @@ enum class SnowTab(
     val icon: ImageVector
 ) {
     HOME("Home", Icons.Default.Home),
-    DEVICES("Devices", Icons.Default.Devices),
     TOOLS("Tools", Icons.Default.Build),
+    DEVICES("Devices", Icons.Default.Devices),
     SETTINGS("Settings", Icons.Default.Settings)
 }
 
@@ -51,6 +57,7 @@ fun SnowBottomNavigationBar(
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
+    val haptic = LocalHapticFeedback.current
 
     Surface(
         modifier = modifier
@@ -76,7 +83,14 @@ fun SnowBottomNavigationBar(
                     modifier = Modifier
                         .weight(1f)
                         .clip(RoundedCornerShape(16.dp))
-                        .clickable { onTabSelected(tab) }
+                        .semantics(mergeDescendants = true) {
+                            this.selected = selected
+                            contentDescription = "${tab.title} tab"
+                        }
+                        .clickable(role = Role.Tab) {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onTabSelected(tab)
+                        }
                         .padding(vertical = 4.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center
@@ -90,7 +104,7 @@ fun SnowBottomNavigationBar(
                     ) {
                         Icon(
                             imageVector = tab.icon,
-                            contentDescription = tab.title,
+                            contentDescription = null,
                             tint = if (selected) activeIconTint else inactiveTint,
                             modifier = Modifier.size(24.dp)
                         )

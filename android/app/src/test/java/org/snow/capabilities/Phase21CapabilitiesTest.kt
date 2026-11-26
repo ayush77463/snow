@@ -241,7 +241,7 @@ class Phase21CapabilitiesTest {
 
     @Test
     fun testNotificationListenerSettingsIntent() {
-        val intent = org.snow.ui.settings.SettingsFragment.createNotificationListenerSettingsIntent()
+        val intent = org.snow.ui.settings.createNotificationListenerSettingsIntent()
         assertNotNull(intent)
     }
 }

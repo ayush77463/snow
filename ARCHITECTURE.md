@@ -1,10 +1,25 @@
-# SNOW — Architecture Specification (Frozen)
+# SNOW — Architecture Specification (`v7.0.0` Current Baseline)
 
 > [!IMPORTANT]
-> **V1 Architecture Frozen Baseline**: This document represents the frozen V1 baseline specification as of Phases 0–7 (snow-v1 / v1.0.0, commit `f37626c`).
-> For the active V4.0.0 multi-device network, public remote MCP platform, and cross-network federation architecture, see [docs/ARCHITECTURE_V4.md](file:///d:/Codes%202/Snow/docs/ARCHITECTURE_V4.md). For V2/V3 historical milestones, see [docs/ARCHITECTURE_V2.md](file:///d:/Codes%202/Snow/docs/ARCHITECTURE_V2.md) and [docs/ARCHITECTURE_V3.md](file:///d:/Codes%202/Snow/docs/ARCHITECTURE_V3.md).
+> **Frozen Architectural Foundations & V7 Evolution**: SNOW V7 (`7.0.0`) preserves all frozen Phase 0 invariants (Python 3.13 `asyncio`, Headless Desktop Core, `SNOW Device Protocol v1`, official Python FastMCP SDK with pure `stdout` JSON-RPC / `sys.stderr` logging, native Kotlin Android client with Android Keystore AES-GCM, and SQLite persistence — now at Schema v7).
+> Historical stage specifications remain preserved unchanged in [ARCHITECTURE_V2.md](file:///d:/Codes%202/Snow/docs/ARCHITECTURE_V2.md), [ARCHITECTURE_V3.md](file:///d:/Codes%202/Snow/docs/ARCHITECTURE_V3.md), and [ARCHITECTURE_V4.md](file:///d:/Codes%202/Snow/docs/ARCHITECTURE_V4.md).
 
-> This architecture is frozen as of Phase 0 completion. Future changes require deliberate, documented architectural decisions rather than silent implementation changes.
+## 0. Current Production Surface Summary (V7 / `7.0.0`)
+
+- **Control & Transport Planes:**
+  - `8765` (`WSS`): Encrypted control channel (`SNOW Device Protocol v1`, `228/228` cross-language parity, metadata-only strict `<= 64 KiB` limit).
+  - `8766` (`HTTPS`): Authenticated out-of-band file, camera, screenshot, APK update, and Universal Clipboard media/bundle chunked streaming (SHA-256 verified, resumable).
+  - `8767` (`TCP Loopback 127.0.0.1`): Secret-authenticated Core IPC bridge serving `snow-mcp`, `snow web` (including clipboard image previews), and daemon control.
+  - `8768` (`UDP`): Local beacon/discovery alongside mDNS/DNS-SD and canonical `SNW-XXXX-XXXX` directory resolution.
+  - `8769` (`HTTP Loopback 127.0.0.1`): Zero-CDN companion Web UI (`Home`, `Clipboard`, `Files & Apps`, `Devices`, `AI & Settings`).
+  - `8770` (`WSS Relay`) & `8771` (`HTTP MCP Gateway`): TLS 1.3 E2E relay tunnel + Streamable HTTP MCP gateway (OAuth 2.1 + PKCE S256, `54` FastMCP tools).
+- **V7 Capabilities & Security Hardening:**
+  - Authoritative QR pairing with strict Token vs PIN separation and consolidated idempotent unpair/revocation.
+  - 5-tier fail-closed Android access profiles (`full_control`, `files_and_clipboard`, `files_only`, `clipboard_only`, `not_allowed`) + Share Code owner/capability guards.
+  - Universal Clipboard (`15`-item SQLite Schema v7 queue, max `5` pinned, `100 MiB` media budget, `text`/`image`/`file`/`file_bundle` / `CF_HDROP`, zero-echo & durable acks, Android SAF delivery).
+  - Native Jetpack Compose Material 3 Android UI (`Home`, `Tools` with bidirectional 5-tab `HorizontalPager`, `Devices`, `Settings`) with fail-closed APK release signing (`versionCode = 5`, `versionName = "7.0.0"`).
+
+---
 
 ## 1. Project Identity and Goals
 

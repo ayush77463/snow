@@ -389,10 +389,11 @@ class TestStage5CUpdaterMediaAndVersionUnit(unittest.TestCase):
             self.assertFalse(err["success"])
             self.assertEqual(err["status"], "INVALID_VOLUME_LEVEL")
 
-    def test_apk_5_0_0_priority_and_version_alignment(self) -> None:
-        self.assertEqual(snow.__version__, "5.2.0")
-        self.assertEqual(CoreConfig().version, "5.2.0")
-        self.assertEqual(CURRENT_VERSION, "5.2.0")
+    def test_apk_7_0_0_priority_and_version_alignment(self) -> None:
+        self.assertEqual(snow.__version__, "7.0.0")
+        self.assertEqual(CoreConfig().version, "7.0.0")
+        self.assertEqual(CoreConfig.from_env().version, "7.0.0")
+        self.assertEqual(CURRENT_VERSION, "7.0.0")
         self.assertEqual(ACTION_TO_CAPABILITY["clipboard_buffer_pin"], CAPABILITY_DESKTOP_CLIPBOARD_WRITE)
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,12 +403,14 @@ class TestStage5CUpdaterMediaAndVersionUnit(unittest.TestCase):
             apk50 = pkg_out / "SNOW-Mobile-5.0.0.apk"
             apk5 = pkg_out / "SNOW-Mobile-5.1.0.apk"
             apk52 = pkg_out / "SNOW-Mobile-5.2.0.apk"
+            apk70 = pkg_out / "SNOW-Mobile-7.0.0.apk"
             apk4.write_bytes(b"PK41")
             apk50.write_bytes(b"PK50")
             apk5.write_bytes(b"PK51")
             apk52.write_bytes(b"PK52")
+            apk70.write_bytes(b"PK70")
 
-            cfg = CoreConfig(version="5.2.0")
+            cfg = CoreConfig(version="7.0.0")
             db = DatabaseManager(Path(tmp) / "t.db")
             http_srv = SnowHttpTransferServer(
                 config=cfg,
@@ -422,9 +425,9 @@ class TestStage5CUpdaterMediaAndVersionUnit(unittest.TestCase):
             import snow.transfer.http_server as http_mod
             with patch("sys.executable", str(fake_exe)), \
                  patch.object(http_mod, "__file__", str(fake_http_mod)):
-                self.assertEqual(http_srv._get_staged_apk_path().resolve(), apk52.resolve())
+                self.assertEqual(http_srv._get_staged_apk_path().resolve(), apk70.resolve())
                 web_srv = SnowWebServer(host="127.0.0.1", port=8769, auto_open_browser=False)
-                self.assertEqual(web_srv._find_candidate_apk().resolve(), apk52.resolve())
+                self.assertEqual(web_srv._find_candidate_apk().resolve(), apk70.resolve())
 
     def test_core_ipc_dispatches_status_and_get_device_status(self) -> None:
         ipc = SnowIpcServer(core_server=MagicMock(), config=CoreConfig(port=8765, ipc_port=0))

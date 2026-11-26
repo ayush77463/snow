@@ -271,10 +271,10 @@ class Stage4CAndroidUiTest {
     @Test
     fun testCriterion10_NoDeadMajorControls() {
         val primaryNavigationTargets = mapOf(
-            "Home" to "DashboardFragment",
-            "Devices" to "DevicesFragment",
-            "Files & Tools" to "FilesFragment",
-            "Settings" to "SettingsFragment"
+            "Home" to "HomeScreen",
+            "Tools" to "ToolsScreen",
+            "Devices" to "DevicesScreen",
+            "Settings" to "SettingsScreen"
         )
 
         assertEquals(4, primaryNavigationTargets.size)

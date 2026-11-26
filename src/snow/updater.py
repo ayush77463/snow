@@ -32,7 +32,7 @@ ALLOWED_STATIC_EXTENSIONS = {
 }
 REQUIRED_UI_ASSETS = ("index.html", "app.js", "app.css", "tokens.css", "theme-init.js")
 DEFAULT_OVERRIDE_DIR = Path.home() / ".snow" / "web_override"
-CURRENT_VERSION = "5.2.0"
+CURRENT_VERSION = "7.0.0"
 
 
 def find_local_staged_manifest() -> Optional[Path]:

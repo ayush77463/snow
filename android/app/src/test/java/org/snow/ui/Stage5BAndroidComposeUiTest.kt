@@ -36,13 +36,13 @@ class Stage5BAndroidComposeUiTest {
         val tabs = SnowTab.values()
         assertEquals(4, tabs.size)
         assertEquals(SnowTab.HOME, tabs[0])
-        assertEquals(SnowTab.DEVICES, tabs[1])
-        assertEquals(SnowTab.TOOLS, tabs[2])
+        assertEquals(SnowTab.TOOLS, tabs[1])
+        assertEquals(SnowTab.DEVICES, tabs[2])
         assertEquals(SnowTab.SETTINGS, tabs[3])
 
         assertEquals("Home", SnowTab.HOME.title)
-        assertEquals("Devices", SnowTab.DEVICES.title)
         assertEquals("Tools", SnowTab.TOOLS.title)
+        assertEquals("Devices", SnowTab.DEVICES.title)
         assertEquals("Settings", SnowTab.SETTINGS.title)
     }
 
@@ -75,7 +75,7 @@ class Stage5BAndroidComposeUiTest {
         assertEquals(Color(0xFF000000), DarkSnowColors.bars)
         assertEquals(Color(0xFF181818), DarkSnowColors.surface)
         assertEquals(Color(0xFF242424), DarkSnowColors.surfaceElevated)
-        assertEquals(Color(0xFF0F172A), DarkSnowColors.terminalBg)
+        assertEquals(Color(0xFF121212), DarkSnowColors.terminalBg)
 
         // Light theme tokens
         assertFalse(LightSnowColors.isDark)
@@ -83,7 +83,7 @@ class Stage5BAndroidComposeUiTest {
         assertEquals(Color(0xFFFFFFFF), LightSnowColors.bars)
         assertEquals(Color(0xFFFFFFFF), LightSnowColors.surface)
         assertEquals(Color(0xFFF1F5F9), LightSnowColors.surfaceElevated)
-        assertEquals(Color(0xFF0F172A), LightSnowColors.terminalBg)
+        assertEquals(Color(0xFFF1F5F9), LightSnowColors.terminalBg)
     }
 
     @Test

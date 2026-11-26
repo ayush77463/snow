@@ -37,24 +37,24 @@
                     </div>
                 </div>
 
-                <nav class="nav-menu">
-                    <button class="nav-item active" data-tab="overview">
+                <nav class="nav-menu" role="tablist" aria-label="Primary Navigation">
+                    <button class="nav-item active" data-tab="overview" role="tab" aria-selected="true">
                         <svg class="svg-icon" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
                         <span class="nav-label">Home</span>
                     </button>
-                    <button class="nav-item" data-tab="devices">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><rect height="14" rx="2" width="18" x="3" y="4"></rect><line x1="12" x2="12" y1="18" y2="21"></line><line x1="8" x2="16" y1="21" y2="21"></line></svg>
-                        <span class="nav-label">Devices</span>
-                    </button>
-                    <button class="nav-item" data-tab="files">
-                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                        <span class="nav-label">Files &amp; Apps</span>
-                    </button>
-                    <button class="nav-item" data-tab="clipboard">
+                    <button class="nav-item" data-tab="clipboard" role="tab" aria-selected="false">
                         <svg class="svg-icon" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect height="4" rx="1" ry="1" width="8" x="8" y="2"></rect></svg>
                         <span class="nav-label">Clipboard</span>
                     </button>
-                    <button class="nav-item" data-tab="settings">
+                    <button class="nav-item" data-tab="files" role="tab" aria-selected="false">
+                        <svg class="svg-icon" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                        <span class="nav-label">Files &amp; Apps</span>
+                    </button>
+                    <button class="nav-item" data-tab="devices" role="tab" aria-selected="false">
+                        <svg class="svg-icon" viewBox="0 0 24 24"><rect height="14" rx="2" width="18" x="3" y="4"></rect><line x1="12" x2="12" y1="18" y2="21"></line><line x1="8" x2="16" y1="21" y2="21"></line></svg>
+                        <span class="nav-label">Devices</span>
+                    </button>
+                    <button class="nav-item" data-tab="settings" role="tab" aria-selected="false">
                         <svg class="svg-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
                         <span class="nav-label">AI &amp; Settings</span>
                     </button>
@@ -442,48 +442,35 @@
                     </div>
 
                     <div class="devices-v5-layout">
-                        <!-- Left Column: Devices List + Cross-Network Federation -->
+                        <!-- Left Column: Devices List + Network Information -->
                         <div class="flex flex-col gap-4">
                             <div class="island-section-header"><span>MY NETWORK DEVICES</span></div>
                             <div id="devices-list-container" class="flex flex-col gap-3"></div>
 
-                            <!-- Cross-Network Federation & Sharing -->
-                            <div class="card flex flex-col gap-3 mt-2">
-                                <div class="card-header-row" style="margin-bottom: 4px;">
-                                    <div class="flex items-center gap-2">
-                                        <h3 class="card-title">Cross-Network Federation</h3>
-                                        <span class="chip chip-sm chip-cyan">Anti-transitive</span>
-                                    </div>
-                                    <div class="flex items-center gap-2">
-                                        <select id="federation-invite-tier" class="form-input text-xs" style="width: auto; padding: 4px 8px;" title="Default Tier for New Network Invite">
-                                            <option value="files_and_clipboard" selected>Files &amp; Clipboard</option>
-                                            <option value="full_control">Full Control</option>
-                                            <option value="files_only">Files Only</option>
-                                            <option value="clipboard_only">Clipboard Only</option>
-                                        </select>
-                                        <button id="btn-federation-kill-switch" class="btn btn-xs btn-danger">Kill Switch</button>
-                                    </div>
+                            <!-- View Network Information -->
+                            <div id="devices-network-info-card" class="card flex flex-col gap-3">
+                                <div class="card-header-row" style="margin-bottom: 2px;">
+                                    <h3 class="card-title">Network Information</h3>
+                                    <span id="devices-net-id" class="chip chip-sm chip-cyan mono">SNW-LOCAL</span>
                                 </div>
-                                <p class="text-xs text-muted">9-digit mutual invites with explicit capability and TTL scoping. Zero privilege inheritance.</p>
-                                <div class="flex items-center gap-2 flex-wrap">
-                                    <button id="btn-federation-gen-invite" class="btn btn-sm btn-tonal">Generate 9-Digit Code</button>
-                                    <span id="federation-invite-display" class="chip chip-emerald mono d-none">--- --- ---</span>
-                                </div>
-                                <div class="form-group">
-                                    <label class="form-label">Join Peer Network with 9-Digit Code</label>
-                                    <div class="flex gap-2">
-                                        <input type="text" id="federation-input-code" class="form-input mono" placeholder="XXX-XXX-XXX">
-                                        <button id="btn-federation-join" class="btn btn-sm btn-primary">Join</button>
+                                <div class="flex flex-col gap-2 text-xs text-muted">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span>Local LAN Addresses</span>
+                                        <strong id="devices-net-ips" class="mono text-primary truncate">Scanning...</strong>
                                     </div>
-                                </div>
-                                <div class="flex flex-col gap-2">
-                                    <span class="text-xs font-semibold text-secondary">Active Grants</span>
-                                    <div id="federation-grants-container" class="flex flex-col gap-2"></div>
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span>Transport Endpoints</span>
+                                        <strong id="devices-net-ports" class="mono text-primary">WSS :8765 • HTTPS :8766</strong>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-2">
+                                        <span>USB / Core Link</span>
+                                        <strong id="devices-net-status" class="text-primary">Checking...</strong>
+                                    </div>
                                 </div>
                             </div>
                         </div>
 
-                        <!-- Right Column: Connect & Pair + Remote Access Toggle -->
+                        <!-- Right Column: Connect & Pair + Cross-Network Federation -->
                         <div class="flex flex-col gap-4">
                             <div class="card">
                                 <div class="card-header-row">
@@ -497,7 +484,7 @@
                                 <!-- Tab 1: Pairing QR & Code -->
                                 <div id="pair-pane-qr" class="flex flex-col gap-3">
                                     <div class="flex gap-4 items-center">
-                                        <div id="pairing-qr-box" class="flex items-center justify-center p-2" style="background: #FFFFFF; width: 136px; height: 136px; border-radius: var(--snow-radius-md); flex-shrink: 0;">
+                                        <div id="pairing-qr-box" class="qr-surface" style="width: 136px; height: 136px; flex-shrink: 0;">
                                             <span class="text-xs text-muted text-center">Click Generate Pairing QR &amp; PIN when ready</span>
                                         </div>
                                         <div class="flex flex-col gap-2 flex-1 min-w-0">
@@ -517,48 +504,64 @@
                                     <div class="text-xs text-muted truncate">Fingerprint: <span id="pairing-device-fp" class="mono">--</span></div>
                                     <div class="flex gap-2">
                                         <input type="text" id="pairing-input" class="form-input" placeholder="Enter SNOW ID (SNW-...) or 9-digit network code">
-                                        <button id="btn-pairing-connect" class="btn btn-primary btn-sm">Connect</button>
+                                        <button id="btn-pairing-connect" class="btn btn-primary btn-sm btn-radius-md">Connect</button>
                                     </div>
                                     <div class="flex gap-2">
-                                        <button id="btn-pairing-refresh-qr" class="btn btn-xs btn-tonal w-full">Generate Pairing QR &amp; PIN</button>
-                                        <button id="btn-pairing-cancel-pin" class="btn btn-xs btn-tonal d-none" style="flex-shrink: 0;">Cancel PIN</button>
+                                        <button id="btn-pairing-refresh-qr" class="btn btn-xs btn-tonal btn-radius-md w-full">Generate Pairing QR &amp; PIN</button>
+                                        <button id="btn-pairing-cancel-pin" class="btn btn-xs btn-tonal btn-radius-md d-none" style="flex-shrink: 0;">Cancel PIN</button>
                                     </div>
                                 </div>
 
                                 <!-- Tab 2: Install APK -->
                                 <div id="pair-pane-apk" class="flex flex-col gap-3 d-none">
                                     <div id="apk-status-banner" class="text-xs text-muted">LAN APK distribution server</div>
-                                    <div id="apk-qr-box" class="flex items-center justify-center p-3" style="background: #FFFFFF; width: fit-content; margin: 0 auto; min-height: 140px; border-radius: var(--snow-radius-md);"></div>
+                                    <div id="apk-qr-box" class="qr-surface" style="width: 152px; height: 152px; margin: 0 auto;"></div>
                                     <div class="text-xs text-secondary text-center truncate" id="apk-download-url">Scan QR from phone camera to download APK</div>
-                                    <a id="btn-devices-download-apk" href="#" class="btn btn-sm btn-primary w-full d-none" target="_blank">Download Android APK</a>
+                                    <a id="btn-devices-download-apk" href="#" class="btn btn-sm btn-primary btn-radius-md w-full d-none" target="_blank">Download Android APK</a>
                                 </div>
 
                                 <!-- One-Click USB Permission Unlock -->
                                 <div class="flex flex-col gap-2 pt-3 mt-2" style="border-top: 1px solid var(--snow-border-subtle);">
                                     <div class="flex items-center justify-between gap-2 flex-wrap">
                                         <span class="text-xs text-muted">USB Debugging Connected?</span>
-                                        <button id="btn-usb-unlock-permissions" class="btn btn-xs btn-tonal">Unlock Phone Permissions (USB)</button>
+                                        <button id="btn-usb-unlock-permissions" class="btn btn-xs btn-tonal btn-radius-md">Unlock Phone Permissions (USB)</button>
                                     </div>
                                     <div id="usb-unlock-status" class="text-xs text-muted d-none"></div>
                                 </div>
                             </div>
 
-                            <!-- Remote Device Access (Relay Port 8770) -->
-                            <div class="card flex flex-col gap-3">
+                            <!-- Cross-Network Federation directly underneath Connect & Pair -->
+                            <div id="cross-network-federation-card" class="card flex flex-col gap-3">
                                 <div class="card-header-row" style="margin-bottom: 4px;">
                                     <div class="flex items-center gap-2">
-                                        <h3 class="card-title">Remote Access</h3>
-                                        <span id="relay-tunnel-badge" class="chip chip-sm chip-neutral">Relay Inactive</span>
+                                        <h3 class="card-title">Cross-Network Federation</h3>
+                                        <span class="chip chip-sm chip-cyan">Anti-transitive</span>
                                     </div>
-                                    <label class="snow-switch">
-                                        <input type="checkbox" id="chk-relay-tunnel-toggle" title="Toggle Cloudflare Relay Tunnel">
-                                        <span class="snow-switch-slider"></span>
-                                    </label>
+                                    <div class="flex items-center gap-2">
+                                        <select id="federation-invite-tier" class="form-input text-xs" style="width: auto; padding: 4px 8px;" title="Default Tier for New Network Invite">
+                                            <option value="files_and_clipboard" selected>Files &amp; Clipboard</option>
+                                            <option value="full_control">Full Control</option>
+                                            <option value="files_only">Files Only</option>
+                                            <option value="clipboard_only">Clipboard Only</option>
+                                        </select>
+                                        <button id="btn-federation-kill-switch" class="btn btn-xs btn-danger btn-radius-md">Kill Switch</button>
+                                    </div>
                                 </div>
-                                <p class="text-xs text-muted">Allows paired Android devices outside your LAN to connect securely via encrypted tunnel (Port 8770).</p>
-                                <div class="flex gap-2">
-                                    <input type="text" id="relay-tunnel-url-pill" class="form-input text-xs mono" readonly value="Local Network Only">
-                                    <button id="btn-relay-copy-link" class="btn btn-sm btn-tonal">Copy</button>
+                                <p class="text-xs text-muted">9-digit mutual invites with explicit capability and TTL scoping. Zero privilege inheritance.</p>
+                                <div class="flex items-center gap-2 flex-wrap">
+                                    <button id="btn-federation-gen-invite" class="btn btn-sm btn-tonal btn-radius-md">Generate 9-Digit Code</button>
+                                    <span id="federation-invite-display" class="chip chip-emerald mono d-none">--- --- ---</span>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Join Peer Network with 9-Digit Code</label>
+                                    <div class="flex gap-2">
+                                        <input type="text" id="federation-input-code" class="form-input mono" placeholder="XXX-XXX-XXX">
+                                        <button id="btn-federation-join" class="btn btn-sm btn-primary btn-radius-md">Join</button>
+                                    </div>
+                                </div>
+                                <div class="flex flex-col gap-2">
+                                    <span class="text-xs font-semibold text-secondary">Active Grants</span>
+                                    <div id="federation-grants-container" class="flex flex-col gap-2"></div>
                                 </div>
                             </div>
                         </div>
@@ -776,59 +779,28 @@
                         </div>
                     </div>
 
-                    <!-- Remote AI Link & Permanent URL Setup -->
-                    <div class="card flex flex-col gap-3">
+                    <!-- Remote AI Link Card (Render Hub Default) -->
+                    <div id="remote-ai-link-card" class="card flex flex-col gap-3">
                         <div class="card-header-row" style="margin-bottom: 4px;">
                             <div class="flex items-center gap-2">
                                 <h3 class="card-title">Remote AI Link</h3>
                                 <span id="mcp-tunnel-status" class="chip chip-neutral">Offline</span>
                             </div>
-                            <button id="btn-mcp-tunnel-toggle" class="btn btn-sm btn-primary">Start Tunnel</button>
-                        </div>
-                        <p class="text-xs text-muted">Exposes the 54-tool MCP gateway with OAuth 2.1 human-in-the-loop approval.</p>
-                        <div class="flex gap-2">
-                            <input type="text" id="mcp-tunnel-url-display" class="form-input text-xs mono" readonly value="http://127.0.0.1:8771/mcp">
-                            <button id="btn-mcp-copy-url" class="btn btn-sm btn-tonal">Copy Link</button>
-                            <button id="btn-mcp-tunnel-show-qr" class="btn btn-sm btn-tonal">Show QR</button>
-                        </div>
-                        <details id="mcp-permanent-accordion" class="peer-connect-accordion">
-                            <summary>
-                                <span>Setup Permanent URL (Never Changes)</span>
-                                <span class="text-xs text-cyan">Tailscale / Render / Cloudflare</span>
-                            </summary>
-                            <div class="flex flex-col gap-3 mt-2">
-                                <div class="grid-cols-2" style="gap: 10px;">
-                                    <div class="form-group">
-                                        <label class="form-label" for="mcp-tunnel-provider">Tunnel Provider</label>
-                                        <select id="mcp-tunnel-provider" class="form-input text-xs">
-                                            <option value="cloudflared">Cloudflare Tunnel (cloudflared)</option>
-                                            <option value="tailscale">Tailscale Funnel (--bg permanent *.ts.net)</option>
-                                            <option value="render">SNOW Render Relay (/u/SNW-ID/mcp)</option>
-                                            <option value="custom">Custom HTTPS Endpoint</option>
-                                        </select>
-                                    </div>
-                                    <div class="form-group">
-                                        <label class="form-label" for="mcp-tunnel-permanent-input">Permanent Tunnel Domain / Relay URL</label>
-                                        <input type="text" id="mcp-tunnel-permanent-input" class="form-input" placeholder="e.g. https://snow-relay.onrender.com">
-                                    </div>
-                                </div>
-                                <div class="form-group">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <label class="form-label" for="mcp-tunnel-token-input">Tunnel Token / Relay Ticket (Write-Only)</label>
-                                        <span id="mcp-tunnel-token-status" class="chip chip-sm chip-neutral">No Token Saved</span>
-                                    </div>
-                                    <div class="flex gap-2">
-                                        <input type="password" id="mcp-tunnel-token-input" class="form-input text-xs mono" autocomplete="off" placeholder="Enter Cloudflare token or Render relay ticket">
-                                        <button id="btn-mcp-tunnel-token-clear" class="btn btn-sm btn-danger" title="Clear persisted tunnel credential">Clear</button>
-                                        <button id="btn-mcp-tunnel-save" class="btn btn-sm btn-primary">Save Config</button>
-                                    </div>
-                                </div>
+                            <div class="flex items-center gap-2">
+                                <button id="btn-mcp-tunnel-start" class="btn btn-sm btn-primary btn-radius-md">Start</button>
+                                <button id="btn-mcp-tunnel-stop" class="btn btn-sm btn-danger btn-radius-md" disabled>Stop</button>
                             </div>
-                        </details>
+                        </div>
+                        <p class="text-xs text-muted">Authenticated permanent Render Hub route for remote MCP assistants with OAuth 2.1 human-in-the-loop approval.</p>
+                        <div class="flex gap-2 flex-wrap">
+                            <input type="text" id="mcp-tunnel-url-display" class="form-input text-xs mono" style="flex: 1; min-width: 240px;" readonly value="" placeholder="Start Remote AI Link to activate your Render Hub endpoint">
+                            <button id="btn-mcp-copy-url" class="btn btn-sm btn-tonal btn-radius-md" disabled>Copy Link</button>
+                            <button id="btn-mcp-tunnel-show-qr" class="btn btn-sm btn-tonal btn-radius-md" disabled>Show QR</button>
+                        </div>
                     </div>
 
                     <div class="ai-settings-layout">
-                        <!-- Left Column: Appearance + Advanced Diagnostics -->
+                        <!-- Left Column: Appearance + Remote Access + Advanced & Diagnostics -->
                         <div class="flex flex-col gap-4">
                             <!-- Appearance Theme Selector -->
                             <div class="card">
@@ -852,16 +824,34 @@
                                 </div>
                             </div>
 
+                            <!-- Remote Access Card (Moved from Devices) -->
+                            <div id="remote-access-settings-card" class="card flex flex-col gap-2">
+                                <div class="card-header-row" style="margin-bottom: 0;">
+                                    <div class="flex flex-col gap-1">
+                                        <div class="flex items-center gap-2">
+                                            <h3 class="card-title">Remote Access</h3>
+                                            <span id="relay-tunnel-badge" class="chip chip-sm chip-neutral">Offline</span>
+                                        </div>
+                                        <span class="text-xs text-muted">Handled automatically</span>
+                                    </div>
+                                    <label class="snow-switch" aria-label="Toggle Remote Access">
+                                        <input type="checkbox" id="chk-relay-tunnel-toggle" title="Toggle Remote Access">
+                                        <span class="snow-switch-slider"></span>
+                                    </label>
+                                </div>
+                                <span id="relay-tunnel-detail" class="text-xs text-muted">Off-network relay is inactive until enabled and verified.</span>
+                            </div>
+
                             <!-- Advanced & Diagnostics -->
-                            <div class="card flex flex-col gap-3">
+                            <div id="advanced-diagnostics-card" class="card flex flex-col gap-3">
                                 <div class="card-header-row" style="margin-bottom: 4px;">
                                     <h3 class="card-title">Advanced &amp; Diagnostics</h3>
-                                    <span id="diag-version" class="chip chip-sm chip-cyan mono">SNOW v5.2.0</span>
+                                    <span id="diag-version" class="chip chip-sm chip-cyan mono">SNOW v7.0.0</span>
                                 </div>
                                 <div class="flex items-center gap-2 flex-wrap">
-                                    <button id="btn-diag-update-check" class="btn btn-xs btn-tonal">Check Updates</button>
-                                    <button id="btn-diag-update-apply" class="btn btn-xs btn-primary d-none">Apply Update</button>
-                                    <button id="btn-diag-reset-override" class="btn btn-xs btn-danger" style="margin-left: auto;">Reset to Bundled UI</button>
+                                    <button id="btn-diag-update-check" class="btn btn-xs btn-tonal btn-radius-md">Check Updates</button>
+                                    <button id="btn-diag-update-apply" class="btn btn-xs btn-primary btn-radius-md d-none">Apply Update</button>
+                                    <button id="btn-diag-reset-override" class="btn btn-xs btn-danger btn-radius-md" style="margin-left: auto;">Reset to Bundled UI</button>
                                 </div>
                                 <div id="update-status-banner" class="text-xs text-muted d-none"></div>
 
@@ -872,30 +862,19 @@
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <input type="password" id="diag-ipc-secret-value" class="form-input text-xs mono" value="••••••••••••••••" readonly aria-label="Core IPC Secret">
-                                        <button id="btn-ipc-secret-toggle" class="btn btn-xs btn-tonal" style="flex-shrink: 0;">Reveal</button>
-                                        <button id="btn-ipc-secret-copy" class="btn btn-xs btn-tonal" style="flex-shrink: 0;">Copy</button>
+                                        <button id="btn-ipc-secret-toggle" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Reveal</button>
+                                        <button id="btn-ipc-secret-copy" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
                                     </div>
                                 </div>
 
-                                <!-- Collapsed Accordion for Technical Ports & Default Hub URL -->
+                                <!-- Collapsed Accordion for Technical Ports & Optional Self-Hosted / Custom Overrides -->
                                 <details class="advanced-accordion">
                                     <summary>
-                                        <span>Technical Ports &amp; Loopback Architecture &amp; Default Cloud Hub</span>
+                                        <span>Technical Ports &amp; Loopback Architecture</span>
                                         <span class="chip chip-sm chip-neutral">Advanced</span>
                                     </summary>
                                     <div class="flex flex-col gap-3 mt-2 text-xs text-muted">
-                                        <div class="form-group">
-                                            <div class="flex items-center justify-between gap-2">
-                                                <label class="form-label" for="setting-default-hub-url">Default SNOW Hub URL (Zero-Setup Relay)</label>
-                                                <span id="diag-network-key-id" class="chip chip-sm chip-cyan mono">--</span>
-                                            </div>
-                                            <div class="flex gap-2">
-                                                <input type="text" id="setting-default-hub-url" class="form-input text-xs mono" placeholder="https://snow-relay.onrender.com">
-                                                <button id="btn-save-default-hub-url" class="btn btn-xs btn-primary">Save Hub</button>
-                                            </div>
-                                            <div class="text-xs text-muted truncate mt-1">Permanent MCP Route: <span id="diag-hub-permanent-mcp" class="mono text-primary">--</span></div>
-                                        </div>
-                                        <div>Web Dashboard Binding: <strong id="diag-port" class="mono text-primary">127.0.0.1:8769</strong></div>
+                                        <div>Web Dashboard Binding: <strong id="diag-port" class="mono text-primary">127.0.0.1:8769</strong> &bull; Network ID: <strong id="diag-network-key-id" class="mono text-cyan">--</strong></div>
                                         <div class="flex gap-1 flex-wrap mono">
                                             <span class="chip chip-sm chip-cyan">:8765 Control WSS</span>
                                             <span class="chip chip-sm chip-emerald">:8766 Transfer HTTPS</span>
@@ -905,6 +884,41 @@
                                             <span class="chip chip-sm chip-neutral">:8770 Relay</span>
                                             <span class="chip chip-sm chip-neutral">:8771 Remote MCP</span>
                                         </div>
+
+                                        <details id="mcp-permanent-accordion" class="peer-connect-accordion">
+                                            <summary>
+                                                <span>Optional Self-Hosted Hub / Custom Tunnel Provider</span>
+                                                <span class="text-xs text-cyan">Opt-in Override</span>
+                                            </summary>
+                                            <div class="flex flex-col gap-3 mt-2">
+                                                <div class="grid-cols-2" style="gap: 10px;">
+                                                    <div class="form-group">
+                                                        <label class="form-label" for="mcp-tunnel-provider">Tunnel Provider</label>
+                                                        <select id="mcp-tunnel-provider" class="form-input text-xs">
+                                                            <option value="render" selected>SNOW Render Hub (Default)</option>
+                                                            <option value="tailscale">Tailscale Funnel</option>
+                                                            <option value="cloudflared">Cloudflare Tunnel</option>
+                                                            <option value="custom">Custom HTTPS Hub</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="form-group">
+                                                        <label class="form-label" for="mcp-tunnel-permanent-input">Self-Hosted Hub / Override URL (Optional)</label>
+                                                        <input type="text" id="mcp-tunnel-permanent-input" class="form-input text-xs mono" placeholder="Leave blank for default Render Hub">
+                                                    </div>
+                                                </div>
+                                                <div class="form-group">
+                                                    <div class="flex items-center justify-between gap-2">
+                                                        <label class="form-label" for="mcp-tunnel-token-input">Provider Token / Relay Ticket (Write-Only)</label>
+                                                        <span id="mcp-tunnel-token-status" class="chip chip-sm chip-neutral">No Token Saved</span>
+                                                    </div>
+                                                    <div class="flex gap-2">
+                                                        <input type="password" id="mcp-tunnel-token-input" class="form-input text-xs mono" autocomplete="off" placeholder="Optional override token or ticket">
+                                                        <button id="btn-mcp-tunnel-token-clear" class="btn btn-xs btn-danger btn-radius-md" title="Clear persisted tunnel credential">Clear</button>
+                                                        <button id="btn-mcp-tunnel-save" class="btn btn-xs btn-primary btn-radius-md">Save Override</button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </details>
                                     </div>
                                 </details>
                             </div>
@@ -945,20 +959,22 @@
             </div>
             <p class="text-xs text-muted">Scan QR with SNOW Mobile (zero-PIN handshake), or connect using a SNOW ID or 9-digit network invite code.</p>
             <div class="flex gap-4 items-center">
-                <div id="modal-qr-container" class="flex items-center justify-center p-2" style="background: #FFF; width: 140px; height: 140px; border-radius: var(--snow-radius-md); flex-shrink: 0;"></div>
+                <div id="modal-qr-container" class="qr-surface" style="width: 140px; height: 140px; flex-shrink: 0;">
+                    <span class="text-xs text-muted text-center">No active QR</span>
+                </div>
                 <div class="flex flex-col gap-2 flex-1 min-w-0">
                     <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
                         <span class="text-xs text-muted" style="display: block;">Network ID</span>
                         <div class="flex items-center justify-between gap-2">
                             <span id="modal-network-id" class="text-xs font-bold text-cyan mono truncate">SNW-LOCAL</span>
-                            <button id="btn-copy-modal-netid" class="btn btn-xs btn-tonal">Copy</button>
+                            <button id="btn-copy-modal-netid" class="btn btn-xs btn-tonal btn-radius-md">Copy</button>
                         </div>
                     </div>
                     <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
                         <span class="text-xs text-muted" style="display: block;">Pairing PIN</span>
                         <div class="flex items-center justify-between gap-2">
                             <span id="modal-pairing-pin" class="text-xs font-bold text-primary mono">No active PIN</span>
-                            <button id="btn-modal-generate-pin" class="btn btn-xs btn-tonal">Generate PIN</button>
+                            <button id="btn-modal-generate-pin" class="btn btn-xs btn-tonal btn-radius-md">Generate Pairing QR &amp; PIN</button>
                         </div>
                     </div>
                 </div>
@@ -1006,17 +1022,17 @@
                     <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
                     <span>Home Hub</span>
                 </div>
-                <div class="palette-item" data-action="nav-devices">
-                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="14" rx="2" width="18" x="3" y="4"></rect><line x1="12" x2="12" y1="18" y2="21"></line></svg>
-                    <span>Devices &amp; Network</span>
+                <div class="palette-item" data-action="nav-clipboard">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path></svg>
+                    <span>Shared Clipboard</span>
                 </div>
                 <div class="palette-item" data-action="nav-files">
                     <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
                     <span>Files &amp; Apps</span>
                 </div>
-                <div class="palette-item" data-action="nav-clipboard">
-                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path></svg>
-                    <span>Shared Clipboard</span>
+                <div class="palette-item" data-action="nav-devices">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="14" rx="2" width="18" x="3" y="4"></rect><line x1="12" x2="12" y1="18" y2="21"></line></svg>
+                    <span>Devices &amp; Network</span>
                 </div>
                 <div class="palette-item" data-action="nav-settings">
                     <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle></svg>
@@ -1069,9 +1085,11 @@
                 </button>
             </div>
             <p class="text-xs text-muted">Scan from your remote assistant configuration to pair with this MCP endpoint:</p>
-            <div id="mcp-qr-svg-container" class="flex items-center justify-center p-3" style="background: #FFF; width: fit-content; margin: 0 auto; min-height: 160px; border-radius: var(--snow-radius-md);"></div>
+            <div id="mcp-qr-svg-container" class="qr-surface" style="width: 180px; height: 180px; margin: 0 auto;">
+                <span class="text-xs text-muted text-center">No active QR</span>
+            </div>
             <input type="text" id="mcp-qr-link-input" class="form-input text-xs mono" readonly>
-            <button id="btn-mcp-modal-copy" class="btn btn-primary btn-sm w-full">Copy Link</button>
+            <button id="btn-mcp-modal-copy" class="btn btn-primary btn-sm btn-radius-md w-full">Copy Link</button>
         </div>
     </div>
 

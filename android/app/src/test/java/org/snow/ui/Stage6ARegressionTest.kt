@@ -188,8 +188,8 @@ class Stage6ARegressionTest {
         assertTrue(discoverySrc.contains("onWakeTargetMatched"))
 
         val gradleSrc = resolveModuleFile("build.gradle.kts").readText()
-        assertTrue(gradleSrc.contains("versionCode = 4"))
-        assertTrue(gradleSrc.contains("versionName = \"5.2.0\""))
+        assertTrue(gradleSrc.contains("versionCode = 5"))
+        assertTrue(gradleSrc.contains("versionName = \"7.0.0\""))
 
         val settingsSrc = resolveModuleFile("src/main/java/org/snow/ui/settings/SettingsScreen.kt").readText()
         assertTrue(settingsSrc.contains("ColorOS") || settingsSrc.contains("Restricted"))
