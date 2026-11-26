@@ -803,6 +803,9 @@ class SnowHttpTransferServer:
             return True
         if not device_id or device_id in ("local_dashboard_proxy", "local_dashboard", "anonymous"):
             return True
+        if callable(getattr(self.db_manager, "get_paired_device", None)):
+            if self.db_manager.get_paired_device(device_id) is None:
+                return False
         if not hasattr(self.db_manager, "get_setting"):
             return True
         saved = self.db_manager.get_setting(f"device_profile:{device_id}")

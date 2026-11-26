@@ -168,4 +168,70 @@ class PairingFlowTest {
         assertTrue(storage.hasToken())
         assertEquals(authToken, storage.getToken())
     }
+
+    @Test
+    fun testQrHandshakeTokenSubmissionExcludesPinAndIncludesNetworkId() {
+        val sentPayloads = mutableListOf<String>()
+        val fakeWs = object : okhttp3.WebSocket {
+            override fun request(): okhttp3.Request = okhttp3.Request.Builder().url("https://192.168.1.50:8765").build()
+            override fun queueSize(): Long = 0L
+            override fun send(text: String): Boolean {
+                sentPayloads.add(text)
+                return true
+            }
+            override fun send(bytes: okio.ByteString): Boolean = true
+            override fun close(code: Int, reason: String?): Boolean = true
+            override fun cancel() {}
+        }
+
+        val client = org.snow.network.SnowWebSocketClient(useTls = true)
+        client.autoReconnectEnabled = false
+        val wsField = client.javaClass.getDeclaredField("webSocket").apply { isAccessible = true }
+        wsField.set(client, fakeWs)
+        val hostField = client.javaClass.getDeclaredField("targetHost").apply { isAccessible = true }
+        hostField.set(client, "192.168.1.50")
+        val connStateField = client.javaClass.getDeclaredField("_connectionState").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val connStateFlow = connStateField.get(client) as kotlinx.coroutines.flow.MutableStateFlow<org.snow.network.ConnectionState>
+        connStateFlow.value = org.snow.network.ConnectionState.CONNECTED
+
+        val dispatched = flow.submitHandshakeToken(
+            handshakeToken = "htok_valid_0123456789abcdef",
+            networkId = "snw-net-1122aabb",
+            client = client
+        )
+        assertTrue(dispatched)
+        assertEquals(1, sentPayloads.size)
+
+        val msgJson = org.json.JSONObject(sentPayloads[0])
+        val dataJson = msgJson.getJSONObject("payload").getJSONObject("data")
+        assertEquals("pair_request", msgJson.getJSONObject("payload").getString("action"))
+        assertEquals("htok_valid_0123456789abcdef", dataJson.getString("handshake_token"))
+        assertEquals("SNW-NET-1122AABB", dataJson.getString("network_id"))
+        assertFalse("QR handshake token request must not include PIN", dataJson.has("pin"))
+
+        // Reset lock and verify manual PIN submission omits handshake_token
+        flow.resetSubmitting()
+        val pinDispatched = flow.submitPin(pin = "654321", client = client)
+        assertTrue(pinDispatched)
+        assertEquals(2, sentPayloads.size)
+        val pinDataJson = org.json.JSONObject(sentPayloads[1]).getJSONObject("payload").getJSONObject("data")
+        assertEquals("654321", pinDataJson.getString("pin"))
+        assertFalse("Manual PIN request must not include handshake_token", pinDataJson.has("handshake_token"))
+
+        client.teardown()
+    }
+
+    @Test
+    fun testQrHandshakeRejectsMalformedShortTokenWithoutConnecting() {
+        val client = org.snow.network.SnowWebSocketClient(useTls = true)
+        var captured: PairingState? = null
+        val ok = flow.submitHandshakeToken("short", "SNW-NET-1122AABB", client) { st ->
+            captured = st
+        }
+        assertFalse(ok)
+        assertTrue(captured is PairingState.Error)
+        assertTrue((captured as PairingState.Error).message.contains("Invalid QR handshake token"))
+        client.teardown()
+    }
 }

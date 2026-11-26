@@ -85,7 +85,7 @@ class PairingManager:
         self.max_attempts = max_attempts
         self.time_provider = time_provider
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._active_pin: Optional[str] = None
         self._owner_pin: Optional[str] = None
         self._peer_pin: Optional[str] = None
@@ -288,13 +288,14 @@ class PairingManager:
                     remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
                 )
 
-            bound_net = str(matched_entry.get("network_id", ""))
-            if bound_net and clean_net and not hmac.compare_digest(bound_net, clean_net):
-                return VerificationResult(
-                    outcome=PairingOutcome.INVALID_PIN,
-                    message="QR handshake token is bound to a different SNOW network.",
-                    remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
-                )
+            bound_net = str(matched_entry.get("network_id", "")).strip().upper()
+            if bound_net:
+                if not clean_net or not hmac.compare_digest(bound_net, clean_net):
+                    return VerificationResult(
+                        outcome=PairingOutcome.INVALID_PIN,
+                        message="QR handshake token is bound to a different or unspecified SNOW network.",
+                        remaining_attempts=max(0, self.max_attempts - self._failed_attempts),
+                    )
 
             # Consume atomically (single-use)
             matched_entry["used"] = True
@@ -332,21 +333,37 @@ class PairingManager:
         with self._lock:
             return self._handshake_tokens.pop(digest, None) is not None
 
-    def cancel_pin(self) -> dict[str, Any]:
-        """Immediately cancel and invalidate any currently active pairing PIN."""
+    def revoke_all_handshake_tokens(self) -> int:
+        """Invalidate every currently active QR handshake token safely."""
         with self._lock:
-            was_active = bool(self._active_pin or self._owner_pin or self._peer_pin)
+            revoked = len(self._handshake_tokens)
+            self._handshake_tokens.clear()
+        if revoked:
+            logger.info("Revoked %d active QR handshake token(s).", revoked)
+        return revoked
+
+    def cancel_pin(self) -> dict[str, Any]:
+        """Immediately cancel and invalidate any active pairing PIN and QR handshake tokens."""
+        with self._lock:
+            has_tokens = bool(self._handshake_tokens)
+            was_active = bool(self._active_pin or self._owner_pin or self._peer_pin or has_tokens)
             self._active_pin = None
             self._owner_pin = None
             self._peer_pin = None
             self._pin_generated_at = 0.0
             self._pending_device_id = None
             self._pending_device_name = None
-            logger.info("Cancelled active pairing PIN (was_active=%s).", was_active)
+            revoked_tokens = self.revoke_all_handshake_tokens()
+            logger.info(
+                "Cancelled active pairing PIN (was_active=%s, revoked_handshake_tokens=%d).",
+                was_active,
+                revoked_tokens,
+            )
             return {
                 "cancelled": was_active,
                 "has_active_pin": False,
                 "remaining_seconds": 0,
+                "revoked_handshake_tokens": revoked_tokens,
             }
 
     def generate_pin(self, display_to_stderr: bool = True, trust_tier: str = "owner") -> str:

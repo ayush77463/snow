@@ -429,7 +429,7 @@ class AndroidCapabilityDispatcher(
             }
             "notifications_list" -> {
                 val isOpted = org.snow.service.SnowNotificationListenerService.isOptedIn(context)
-                val isGranted = org.snow.ui.settings.SettingsFragment.isNotificationServiceEnabled(context)
+                val isGranted = org.snow.service.SnowNotificationListenerService.isNotificationServiceEnabled(context)
                 if (!isGranted) {
                     Pair(mapOf("status" to "PERMISSION_NOT_GRANTED", "error" to "Notification access not granted in Android system settings.", "notifications" to emptyList<Any>(), "count" to 0), null)
                 } else if (!isOpted) {

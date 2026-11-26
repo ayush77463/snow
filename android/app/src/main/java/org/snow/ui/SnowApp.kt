@@ -500,6 +500,9 @@ fun SnowApp(
                         )
                     }
                     SnowTab.DEVICES -> {
+                        val shareCodeAvailability = remember(connectionState, authState) {
+                            SnowUiRepository.evaluateShareCodeEligibility(connectionState, authState)
+                        }
                         DevicesScreen(
                             savedDevices = savedDevices,
                             discoveredPeers = discoveredPeers,
@@ -516,8 +519,11 @@ fun SnowApp(
                                 Toast.makeText(context, "Unpaired ${dev.deviceName}", Toast.LENGTH_SHORT).show()
                             },
                             onUpdateTrustTier = { deviceId, tier ->
-                                val canonical = SnowUiRepository.normalizeAccessProfile(tier)
-                                repository.updateDeviceTrustTier(deviceId, canonical)
+                                repository.updateDeviceTrustTier(deviceId, tier)
+                            },
+                            onUpdatePermissionProfile = { deviceId, profile ->
+                                val canonical = SnowUiRepository.normalizeAccessProfile(profile)
+                                repository.updateDevicePermissionProfile(deviceId, canonical)
                                 val targetDev = savedDevices.find { it.deviceId == deviceId }
                                 val isActiveDevice = targetDev != null && SnowUiRepository.isSessionTrulyConnected(connectionState, authState) && (
                                     (activeAuth?.peerSnowId != null && targetDev.snowId == activeAuth.peerSnowId) ||
@@ -531,6 +537,8 @@ fun SnowApp(
                             onPairDiscoveredPeer = { peer ->
                                 repository.connect(peer.ipAddress, peer.port)
                             },
+                            canShareCode = shareCodeAvailability.allowed,
+                            shareCodeDisabledReason = shareCodeAvailability.reason,
                             onGenerateFederationCode = {
                                 repository.createFederationInvite { success, resMap, msg ->
                                     if (success && resMap != null) {

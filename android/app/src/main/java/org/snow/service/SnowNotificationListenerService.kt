@@ -70,6 +70,23 @@ class SnowNotificationListenerService : NotificationListenerService() {
             return prefs.getBoolean(KEY_OPT_IN, true)
         }
 
+        fun isNotificationServiceEnabled(context: Context): Boolean {
+            val packageName = context.packageName
+            val flat = android.provider.Settings.Secure.getString(
+                context.contentResolver,
+                "enabled_notification_listeners"
+            )
+            if (!flat.isNullOrEmpty()) {
+                for (name in flat.split(":")) {
+                    val cn = android.content.ComponentName.unflattenFromString(name)
+                    if (cn != null && cn.packageName == packageName) {
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+
         fun setOptedIn(context: Context, enabled: Boolean) {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             prefs.edit().putBoolean(KEY_OPT_IN, enabled).apply()

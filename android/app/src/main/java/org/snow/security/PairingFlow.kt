@@ -383,7 +383,9 @@ class PairingFlow(
                         PairingState.WrongPin(message = errorMsg, remainingAttempts = remaining)
                     }
 
-                    ErrorCode.PIN_EXPIRED -> PairingState.Expired(message = errorMsg)
+                    ErrorCode.PIN_EXPIRED -> PairingState.Expired(
+                        message = if (errorMsg.isNotBlank()) errorMsg else "Pairing credential expired. Generate a fresh QR code or PIN."
+                    )
 
                     ErrorCode.PAIRING_LOCKED -> PairingState.Locked(message = errorMsg)
 

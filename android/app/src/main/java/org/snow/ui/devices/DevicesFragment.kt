@@ -475,26 +475,32 @@ class DevicesFragment : Fragment() {
 
             val sub = TextView(requireContext()).apply {
                 val connType = if (isPhone) "Peer Phone • Wi-Fi" else "Connected • Wi-Fi"
-                text = "$connType • Tier: ${device.trustTier}"
+                val normTier = SnowUiRepository.normalizeTrustTier(device.trustTier).uppercase()
+                val normProfile = SnowUiRepository.normalizeAccessProfile(device.permissionProfile)
+                text = "$connType • Trust: $normTier • Profile: $normProfile"
                 textSize = 12f
                 setTextColor(ContextCompat.getColor(requireContext(), R.color.secondary_text))
             }
 
             val profileBtn = MaterialButton(requireContext(), null, com.google.android.material.R.attr.materialButtonOutlinedStyle).apply {
-                text = "👤 ${device.trustTier}"
+                val currentProfile = SnowUiRepository.normalizeAccessProfile(device.permissionProfile)
+                val profileLabel = when (currentProfile) {
+                    "full_control" -> "Full Control"
+                    "files_and_clipboard" -> "Files & Clipboard"
+                    "files_only" -> "Files Only"
+                    "clipboard_only" -> "Clipboard Only"
+                    else -> "Not Allowed"
+                }
+                text = "👤 $profileLabel"
                 textSize = 11f
                 setOnClickListener {
-                    val profiles = arrayOf("Full Control", "Files & Clipboard", "Clipboard Only")
+                    val profiles = arrayOf("Full Control", "Files & Clipboard", "Files Only", "Clipboard Only", "Not Allowed")
                     AlertDialog.Builder(requireContext())
                         .setTitle("Access Profile: ${device.deviceName}")
                         .setItems(profiles) { _, which ->
                             val selected = profiles[which]
-                            val canonical = when (selected) {
-                                "Files & Clipboard" -> "files_and_clipboard"
-                                "Clipboard Only" -> "clipboard_only"
-                                else -> "full_control"
-                            }
-                            viewModel.updateDeviceTrustTier(device.deviceId, selected)
+                            val canonical = SnowUiRepository.normalizeAccessProfile(selected)
+                            viewModel.updateDevicePermissionProfile(device.deviceId, canonical)
                             SnowUiRepository.getInstance(requireContext()).activePermissionProfile = canonical
                             renderFilteredDevices()
                             Toast.makeText(requireContext(), "Profile updated to $selected", Toast.LENGTH_SHORT).show()

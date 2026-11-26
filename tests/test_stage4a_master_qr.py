@@ -178,18 +178,35 @@ class TestMasterQrWebEndpoints(unittest.TestCase):
             self.assertNotIn("relay_ticket", parsed_qr1)
             self.assertNotIn("group_id", parsed_qr1)
 
-        # Case 2: Relay tunnel is ACTIVE
+        # Case 2a: Relay tunnel is ACTIVE WITHOUT SNOW_RELAY_SECRET -> omits bogus legacy ticket
         fake_relay_status = {
             "active": True,
             "public_url": "https://snow-relay-stage4a.trycloudflare.com",
             "relay_endpoint": "wss://snow-relay-stage4a.trycloudflare.com/v1/tunnel",
         }
-        with patch.object(server.tunnel_manager, "get_status", return_value=fake_relay_status):
+        with patch.dict("os.environ", {"SNOW_RELAY_SECRET": ""}, clear=False), \
+             patch.object(server.tunnel_manager, "get_status", return_value=fake_relay_status):
+            req2a = make_mocked_request("GET", "/api/pair/qr")
+            resp2a = asyncio.run(server.handle_api_pair_qr(req2a))
+            self.assertEqual(resp2a.status, 200)
+            data2a = json.loads(resp2a.text)
+            self.assertTrue(data2a["success"])
+            self.assertFalse(data2a.get("legacy_relay_available", True))
+            parsed_qr2a = data2a["data"]
+            self.assertEqual(parsed_qr2a["pin"], "654321")
+            self.assertNotIn("relay_ticket", parsed_qr2a)
+            self.assertIn("hub_url", parsed_qr2a)
+            self.assertIn("network_id", parsed_qr2a)
+
+        # Case 2b: Relay tunnel is ACTIVE WITH explicit SNOW_RELAY_SECRET -> mints genuine legacy ticket
+        with patch.dict("os.environ", {"SNOW_RELAY_SECRET": "explicit-stage4a-relay-secret"}, clear=False), \
+             patch.object(server.tunnel_manager, "get_status", return_value=fake_relay_status):
             req2 = make_mocked_request("GET", "/api/pair/qr")
             resp2 = asyncio.run(server.handle_api_pair_qr(req2))
             self.assertEqual(resp2.status, 200)
             data2 = json.loads(resp2.text)
             self.assertTrue(data2["success"])
+            self.assertTrue(data2.get("legacy_relay_available"))
             parsed_qr2 = data2["data"]
             self.assertEqual(parsed_qr2["pin"], "654321")
             self.assertEqual(parsed_qr2["relay_url"], "wss://snow-relay-stage4a.trycloudflare.com/v1/tunnel")

@@ -88,6 +88,10 @@ class DevicesViewModel(application: Application) : AndroidViewModel(application)
         repository.updateDeviceTrustTier(deviceId, tier)
     }
 
+    fun updateDevicePermissionProfile(deviceId: String, profile: String) {
+        repository.updateDevicePermissionProfile(deviceId, profile)
+    }
+
     fun isPeerHostEnabled(): Boolean = repository.isPeerHostEnabled()
     fun isPeerHostActive(): Boolean = repository.isPeerHostActive()
     fun startPeerHost() = repository.startPeerHost()

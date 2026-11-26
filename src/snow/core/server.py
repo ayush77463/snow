@@ -376,6 +376,460 @@ class SnowCoreServer:
                     target_device_ids=[device_id],
                 )
 
+    @staticmethod
+    async def execute_device_removal(
+        *,
+        device_id: str,
+        reason: str = "Revoked by desktop owner",
+        notify_client: bool = True,
+        exclude_connection_id: Optional[str] = None,
+        db_manager: Any = None,
+        session_manager: Any = None,
+        connection_manager: Any = None,
+        node_registry: Any = None,
+        ws_server: Any = None,
+        core_server: Any = None,
+        discovery_service: Any = None,
+        relay_client: Any = None,
+        session_router: Any = None,
+        peer_clients: Optional[dict[str, Any]] = None,
+        http_transfer_server: Any = None,
+        screen_stream_manager: Any = None,
+        audit_event_type: Optional[str] = "DEVICE_REVOKED",
+        audit_details: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Consolidated, idempotent, fail-closed device removal across persistence and runtime state.
+
+        Ordering invariant:
+          1. Snapshot active targets for best-effort revocation notifications and check runtime presence.
+          2. First revoke persistent DB credentials, permission profiles, and active sessions so a
+             failing secondary cleanup step can never leave a revoked device authorized.
+          3. Independently execute each secondary runtime cleanup step in isolation.
+        """
+        import inspect
+
+        clean_id = (device_id or "").strip()
+        if not clean_id:
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "device_id": clean_id,
+                "removed": False,
+                "already_removed": True,
+                "revoked": False,
+                "error": "Missing 'device_id'.",
+                "cleanup_errors": [],
+            }
+
+        local_ident = getattr(core_server, "device_identity", None) or getattr(ws_server, "device_identity", None)
+        local_dev_id = getattr(local_ident, "device_id", None)
+        if isinstance(local_dev_id, str) and clean_id == local_dev_id:
+            return {
+                "success": False,
+                "status": "FORBIDDEN",
+                "device_id": clean_id,
+                "removed": False,
+                "already_removed": False,
+                "revoked": False,
+                "error": "Cannot remove the local desktop host identity.",
+                "cleanup_errors": [],
+            }
+
+        cleanup_errors: list[str] = []
+
+        # Collect active sessions and WebSocket connections for clean shutdown before invalidation
+        matched_sessions: list[Any] = []
+        seen_session_ids: set[str] = set()
+        if session_manager is not None:
+            try:
+                primary_sess = session_manager.get_session_by_device(clean_id)
+                # Treat single-session lookup carefully for MagicMock compatibility in unit tests
+                if primary_sess is not None:
+                    sid = getattr(primary_sess, "session_id", None)
+                    if sid is not None:
+                        matched_sessions.append(primary_sess)
+                        if isinstance(sid, str):
+                            seen_session_ids.add(sid)
+            except Exception as exc:
+                cleanup_errors.append(f"snapshot_primary_session: {exc}")
+                logger.warning("Device removal snapshot failed for [%s] (primary_session): %s", clean_id, exc)
+            try:
+                list_fn = getattr(session_manager, "list_active_sessions", None)
+                if callable(list_fn):
+                    all_sess = list_fn()
+                    if isinstance(all_sess, (list, tuple, set)):
+                        for s in all_sess:
+                            if getattr(s, "device_id", None) == clean_id:
+                                sid = getattr(s, "session_id", None)
+                                if not isinstance(sid, str) or sid not in seen_session_ids:
+                                    matched_sessions.append(s)
+                                    if isinstance(sid, str):
+                                        seen_session_ids.add(sid)
+            except Exception as exc:
+                cleanup_errors.append(f"snapshot_sessions: {exc}")
+                logger.warning("Device removal snapshot failed for [%s] (list_active_sessions): %s", clean_id, exc)
+
+        target_conn_ids: list[str] = []
+        for s in matched_sessions:
+            cid = getattr(s, "connection_id", None)
+            if isinstance(cid, str) and cid and cid not in target_conn_ids:
+                target_conn_ids.append(cid)
+
+        # Detect orphan runtime state cleanly (preserving MagicMock test safety)
+        ws_manual_set = getattr(ws_server, "manually_disconnected_devices", None)
+        ws_notifs = getattr(ws_server, "live_notifications", None)
+        ws_pairing = getattr(ws_server, "_pairing_in_progress", None)
+        router_outbound = getattr(session_router, "_outbound_clients", None)
+        router_tokens = getattr(session_router, "_peer_tokens", None)
+
+        relay_clients: list[Any] = []
+        seen_relay_ids: set[int] = set()
+        for rc in (relay_client, getattr(session_router, "relay_client", None)):
+            if rc is not None and id(rc) not in seen_relay_ids:
+                close_fn = getattr(rc, "close_tunnel", None)
+                # Guard against unconfigured bare MagicMock child attributes while supporting explicit AsyncMock/RelayTunnelClient
+                has_real_tunnels = isinstance(getattr(rc, "_tunnels", None), dict)
+                has_explicit_close = callable(close_fn) and (
+                    inspect.iscoroutinefunction(close_fn) or has_real_tunnels
+                )
+                if has_explicit_close:
+                    relay_clients.append(rc)
+                    seen_relay_ids.add(id(rc))
+
+        registries: list[Any] = []
+        seen_reg_ids: set[int] = set()
+        for reg in (node_registry, getattr(ws_server, "node_registry", None)):
+            if reg is not None and id(reg) not in seen_reg_ids and callable(getattr(reg, "remove_node", None)):
+                registries.append(reg)
+                seen_reg_ids.add(id(reg))
+
+        discoveries: list[Any] = []
+        seen_disc_ids: set[int] = set()
+        candidates_disc = [
+            discovery_service,
+            getattr(ws_server, "udp_discovery", None),
+            *(getattr(r, "discovery_service", None) for r in registries),
+        ]
+        for ds in candidates_disc:
+            if ds is not None and id(ds) not in seen_disc_ids and isinstance(getattr(ds, "_discovered_peers", None), dict):
+                discoveries.append(ds)
+                seen_disc_ids.add(id(ds))
+
+        had_runtime = bool(matched_sessions)
+        if isinstance(peer_clients, dict) and clean_id in peer_clients:
+            had_runtime = True
+        if isinstance(ws_manual_set, set) and clean_id in ws_manual_set:
+            had_runtime = True
+        if isinstance(ws_notifs, dict) and clean_id in ws_notifs:
+            had_runtime = True
+        if isinstance(router_outbound, dict) and clean_id in router_outbound:
+            had_runtime = True
+        if isinstance(router_tokens, dict) and clean_id in router_tokens:
+            had_runtime = True
+        for rc in relay_clients:
+            if any(
+                isinstance(getattr(rc, attr, None), dict) and clean_id in getattr(rc, attr)
+                for attr in ("_tunnels", "_pinned_fingerprints", "_peer_cert_paths", "_incoming_queues", "_handshake_events")
+            ):
+                had_runtime = True
+        for reg in registries:
+            if any(
+                isinstance(getattr(reg, attr, None), dict) and clean_id in getattr(reg, attr)
+                for attr in ("_registered_nodes", "_active_sessions", "_discovered_candidates", "_manifest_cache", "_permission_profiles")
+            ):
+                had_runtime = True
+        for ds in discoveries:
+            if clean_id in ds._discovered_peers:
+                had_runtime = True
+        if screen_stream_manager is not None:
+            t_ids = getattr(screen_stream_manager, "target_device_ids", None)
+            s_viewers = getattr(screen_stream_manager, "subscribed_viewers", None)
+            if (isinstance(t_ids, (list, set, tuple)) and clean_id in t_ids) or (
+                isinstance(s_viewers, (list, set, tuple)) and clean_id in s_viewers
+            ):
+                had_runtime = True
+
+        # Check HTTP transfer stream registry cleanly
+        try:
+            from snow.transfer.http_server import SnowHttpTransferServer
+
+            http_streams = getattr(SnowHttpTransferServer, "_screen_sessions", None)
+            if isinstance(http_streams, dict):
+                if clean_id in http_streams or any(
+                    isinstance(sess, dict) and clean_id in (sess.get("target_device_ids") or [])
+                    for sess in http_streams.values()
+                ):
+                    had_runtime = True
+            had_db_profile = False
+            if db_manager is not None and callable(getattr(db_manager, "get_setting", None)):
+                prof_val = db_manager.get_setting(f"device_profile:{clean_id}")
+                if isinstance(prof_val, str) and prof_val:
+                    had_db_profile = True
+                    had_runtime = True
+        except Exception as exc:
+            logger.debug("Runtime presence check note for [%s]: %s", clean_id, exc)
+
+        # Snapshot inbound WebSocket client objects before unregistering connections
+        ws_clients_to_close: list[tuple[Optional[str], Any]] = []
+        if connection_manager is not None:
+            for cid in target_conn_ids:
+                if exclude_connection_id and cid == exclude_connection_id:
+                    continue
+                try:
+                    cli = connection_manager.get(cid)
+                    ws_clients_to_close.append((cid, cli))
+                except Exception as exc:
+                    cleanup_errors.append(f"lookup_ws_client: {exc}")
+                    ws_clients_to_close.append((cid, None))
+
+        # =====================================================================
+        # PHASE 1: Revoke authorization FIRST (DB credentials, profile, sessions)
+        # =====================================================================
+        db_deleted = False
+        if db_manager is not None:
+            try:
+                db_deleted = bool(db_manager.delete_paired_device(clean_id))
+            except Exception as exc:
+                cleanup_errors.append(f"db_delete_paired_device: {exc}")
+                logger.error("Failed deleting DB record during device removal for [%s]: %s", clean_id, exc)
+            try:
+                del_setting = getattr(db_manager, "delete_setting", None)
+                if callable(del_setting):
+                    del_setting(f"device_profile:{clean_id}")
+            except Exception as exc:
+                cleanup_errors.append(f"db_delete_device_profile: {exc}")
+                logger.warning("Failed deleting permission profile for [%s]: %s", clean_id, exc)
+
+        if session_manager is not None:
+            for s in matched_sessions:
+                sid = getattr(s, "session_id", None)
+                if sid:
+                    try:
+                        session_manager.revoke_session(sid)
+                    except Exception as exc:
+                        cleanup_errors.append(f"revoke_session: {exc}")
+                        logger.warning("Failed revoking session for [%s]: %s", clean_id, exc)
+            try:
+                rev_dev = getattr(session_manager, "revoke_device_sessions", None)
+                if callable(rev_dev):
+                    rev_dev(clean_id)
+            except Exception as exc:
+                cleanup_errors.append(f"revoke_device_sessions: {exc}")
+                logger.warning("Failed revoking device sessions for [%s]: %s", clean_id, exc)
+
+        # =====================================================================
+        # PHASE 2: Isolated best-effort runtime & transport cleanup
+        # =====================================================================
+        # 1. Best-effort device_revoked notification
+        if notify_client and ws_clients_to_close:
+            try:
+                from snow.protocol.models import SnowMessage
+                revoke_msg_json = SnowMessage.create_request(
+                    action="device_revoked",
+                    data={"device_id": clean_id, "reason": reason},
+                ).to_json()
+            except Exception as exc:
+                revoke_msg_json = None
+                cleanup_errors.append(f"build_device_revoked_msg: {exc}")
+            if revoke_msg_json:
+                for cid, cli in ws_clients_to_close:
+                    ws_obj = getattr(cli, "websocket", None) if cli is not None else None
+                    if ws_obj is None:
+                        continue
+                    try:
+                        send_res = ws_obj.send(revoke_msg_json)
+                        if inspect.isawaitable(send_res):
+                            await asyncio.wait_for(send_res, timeout=1.5)
+                    except Exception as exc:
+                        cleanup_errors.append(f"notify_client: {exc}")
+                        logger.warning("Best-effort device_revoked notify failed for [%s]: %s", clean_id, exc)
+
+        # 3. Revoke active PC screen-sharing authorization
+        try:
+            revoke_screen_fn = getattr(core_server, "revoke_screen_target", None)
+            if callable(revoke_screen_fn):
+                r_res = revoke_screen_fn(clean_id)
+                if inspect.isawaitable(r_res):
+                    await r_res
+            elif screen_stream_manager is not None and callable(getattr(screen_stream_manager, "revoke_target", None)):
+                screen_stream_manager.revoke_target(clean_id)
+        except Exception as exc:
+            cleanup_errors.append(f"revoke_screen_target: {exc}")
+            logger.warning("Failed revoking screen-sharing target [%s]: %s", clean_id, exc)
+
+        # 4. Revoke active HTTP transfer screen/file stream targets
+        try:
+            from snow.transfer.http_server import SnowHttpTransferServer
+
+            SnowHttpTransferServer.revoke_target_from_streams(clean_id)
+        except Exception as exc:
+            cleanup_errors.append(f"revoke_http_streams: {exc}")
+            logger.warning("Failed revoking HTTP stream state for [%s]: %s", clean_id, exc)
+
+        # 5 & 6. Unregister from connection_manager & close active WebSocket connection(s)
+        if connection_manager is not None:
+            for cid, cli in ws_clients_to_close:
+                if not cid:
+                    continue
+                unreg_client = None
+                try:
+                    unreg_client = connection_manager.unregister(cid)
+                except Exception as exc:
+                    cleanup_errors.append(f"unregister_connection: {exc}")
+                    logger.warning("Failed unregistering connection [%s] for [%s]: %s", cid, clean_id, exc)
+                close_target = unreg_client or cli
+                ws_obj = getattr(close_target, "websocket", None) if close_target is not None else None
+                if ws_obj is not None:
+                    try:
+                        close_res = ws_obj.close(code=1000, reason=reason)
+                        if inspect.isawaitable(close_res):
+                            await close_res
+                    except Exception as exc:
+                        cleanup_errors.append(f"close_websocket: {exc}")
+                        logger.warning("Failed closing WebSocket [%s] for [%s]: %s", cid, clean_id, exc)
+
+        # 7. Close outbound peer_clients (on CoreServer & SessionRouter) & drop cached peer tokens
+        if isinstance(peer_clients, dict) and clean_id in peer_clients:
+            p_cli = peer_clients.pop(clean_id, None)
+            if p_cli is not None:
+                try:
+                    c_res = p_cli.close()
+                    if inspect.isawaitable(c_res):
+                        await c_res
+                except Exception as exc:
+                    cleanup_errors.append(f"close_peer_client: {exc}")
+                    logger.warning("Failed closing peer_client for [%s]: %s", clean_id, exc)
+
+        if isinstance(router_tokens, dict):
+            try:
+                router_tokens.pop(clean_id, None)
+            except Exception as exc:
+                cleanup_errors.append(f"clear_router_token: {exc}")
+        if isinstance(router_outbound, dict) and clean_id in router_outbound:
+            r_cli = router_outbound.pop(clean_id, None)
+            if r_cli is not None:
+                try:
+                    c_res = r_cli.close()
+                    if inspect.isawaitable(c_res):
+                        await c_res
+                except Exception as exc:
+                    cleanup_errors.append(f"close_router_outbound: {exc}")
+                    logger.warning("Failed closing SessionRouter outbound client for [%s]: %s", clean_id, exc)
+
+        # 8. Close relay tunnel via relay_client.close_tunnel(clean_id)
+        for rc in relay_clients:
+            try:
+                c_res = rc.close_tunnel(clean_id)
+                if inspect.isawaitable(c_res):
+                    await c_res
+            except Exception as exc:
+                cleanup_errors.append(f"close_relay_tunnel: {exc}")
+                logger.warning("Failed closing relay tunnel for [%s]: %s", clean_id, exc)
+
+        # 9. Remove device from NodeRegistry(s)
+        for reg in registries:
+            try:
+                reg.remove_node(clean_id)
+            except Exception as exc:
+                cleanup_errors.append(f"remove_node_registry: {exc}")
+                logger.warning("Failed removing [%s] from NodeRegistry: %s", clean_id, exc)
+
+        # 10. Remove from manually_disconnected_devices
+        if isinstance(ws_manual_set, set):
+            try:
+                ws_manual_set.discard(clean_id)
+            except Exception as exc:
+                cleanup_errors.append(f"clear_manual_disconnect: {exc}")
+
+        # 11. Remove device-specific entries from live_notifications
+        if isinstance(ws_notifs, dict):
+            try:
+                ws_notifs.pop(clean_id, None)
+            except Exception as exc:
+                cleanup_errors.append(f"clear_live_notifications: {exc}")
+
+        # 12 & 13. Purge discovery service cache & remaining orphan runtime state
+        for ds in discoveries:
+            try:
+                if callable(getattr(ds, "remove_peer", None)):
+                    ds.remove_peer(clean_id)
+                elif isinstance(getattr(ds, "_discovered_peers", None), dict):
+                    ds._discovered_peers.pop(clean_id, None)
+            except Exception as exc:
+                cleanup_errors.append(f"purge_discovery_cache: {exc}")
+                logger.warning("Failed purging discovery cache for [%s]: %s", clean_id, exc)
+
+        if isinstance(ws_pairing, set) and target_conn_ids:
+            for cid in target_conn_ids:
+                if cid != exclude_connection_id:
+                    ws_pairing.discard(cid)
+
+        removed = bool(db_deleted or had_runtime)
+        already_removed = not removed
+
+        if removed and audit_event_type and db_manager is not None:
+            try:
+                details_payload = dict(audit_details or {})
+                details_payload.setdefault("reason", reason)
+                details_payload["db_deleted"] = db_deleted
+                details_payload["runtime_cleaned"] = had_runtime
+                if cleanup_errors:
+                    details_payload["cleanup_error_count"] = len(cleanup_errors)
+                db_manager.log_audit_event(
+                    event_type=audit_event_type,
+                    device_id=clean_id,
+                    details=details_payload,
+                )
+            except Exception as exc:
+                cleanup_errors.append(f"log_audit_event: {exc}")
+                logger.warning("Failed logging revocation audit event for [%s]: %s", clean_id, exc)
+
+        return {
+            "success": removed,
+            "status": "SUCCESS" if removed else "DEVICE_NOT_FOUND",
+            "device_id": clean_id,
+            "removed": removed,
+            "already_removed": already_removed,
+            "revoked": removed,
+            "db_deleted": db_deleted,
+            "runtime_cleaned": had_runtime,
+            "cleanup_errors": cleanup_errors,
+            "error": None if removed else f"Device [{clean_id}] not found in paired database or runtime state.",
+        }
+
+    async def remove_device_everywhere(
+        self,
+        device_id: str,
+        reason: str = "Revoked by desktop owner",
+        notify_client: bool = True,
+        *,
+        exclude_connection_id: Optional[str] = None,
+        audit_event_type: Optional[str] = "DEVICE_REVOKED",
+        audit_details: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Remove a device across SQLite persistence, auth/session state, transports, and discovery caches."""
+        ws = getattr(self, "ws_server", None)
+        return await SnowCoreServer.execute_device_removal(
+            device_id=device_id,
+            reason=reason,
+            notify_client=notify_client,
+            exclude_connection_id=exclude_connection_id,
+            db_manager=self.db_manager,
+            session_manager=self.session_manager,
+            connection_manager=getattr(self, "connection_manager", None) or getattr(ws, "connection_manager", None),
+            node_registry=getattr(self, "node_registry", None),
+            ws_server=ws,
+            core_server=self,
+            discovery_service=getattr(self, "discovery_service", None),
+            relay_client=getattr(self, "relay_client", None),
+            session_router=getattr(self, "session_router", None),
+            peer_clients=getattr(self, "peer_clients", None),
+            http_transfer_server=getattr(self, "http_transfer_server", None),
+            screen_stream_manager=getattr(self, "screen_stream_manager", None),
+            audit_event_type=audit_event_type,
+            audit_details=audit_details,
+        )
+
     async def _on_pc_screen_state_change(self, status_meta: dict[str, Any]) -> None:
         """Broadcast metadata-only PC screen stream start/stop events across WSS and E2E Relay."""
         ev_type = "STREAM_AVAILABLE" if status_meta.get("state") == "STREAMING" else "STREAM_STOPPED"

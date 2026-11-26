@@ -97,6 +97,9 @@ fun DevicesScreen(
     onGenerateFederationCode: () -> Unit,
     onAcceptFederationCode: (String) -> Unit,
     onRevokeFederationGrant: (String) -> Unit,
+    onUpdatePermissionProfile: (deviceId: String, profile: String) -> Unit = onUpdateTrustTier,
+    canShareCode: Boolean = true,
+    shareCodeDisabledReason: String? = null,
     onFederationKillSwitch: () -> Unit = {},
     onOpenConnectSheet: () -> Unit = {},
     generatedFederationInvite: String? = null,
@@ -213,7 +216,7 @@ fun DevicesScreen(
                     onConnect = { onConnectDevice(dev) },
                     onDisconnect = onDisconnectDevice,
                     onUnpair = { onUnpairDevice(dev) },
-                    onUpdateTier = { tier -> onUpdateTrustTier(dev.deviceId, tier) }
+                    onUpdateTier = { profile -> onUpdatePermissionProfile(dev.deviceId, profile) }
                 )
             }
         }
@@ -253,6 +256,8 @@ fun DevicesScreen(
             SnowSectionHeader(title = "Cross-Network Sharing")
             CrossNetworkSharingCard(
                 grants = federationGrants,
+                canShareCode = canShareCode,
+                shareCodeDisabledReason = shareCodeDisabledReason,
                 onGenerateCode = onGenerateFederationCode,
                 onJoinCode = { showJoinDialog = true },
                 onRevokeGrant = onRevokeFederationGrant,
@@ -468,8 +473,9 @@ private fun DeviceListItem(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        val trustLabel = if (SnowUiRepository.normalizeTrustTier(device.trustTier) == "owner") "Owner" else "Peer"
                         Text(
-                            text = "${if (isPhone) "Phone" else "PC"} • $transportLabel",
+                            text = "${if (isPhone) "Phone" else "PC"} • $transportLabel • $trustLabel",
                             style = SnowTypography.bodySmall,
                             color = colors.textSecondary
                         )
@@ -487,8 +493,8 @@ private fun DeviceListItem(
             Divider(color = colors.borderSubtle)
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Canonical 5-Tier Access Profile Pills
-            val currentProfile = SnowUiRepository.normalizeAccessProfile(device.trustTier)
+            // Canonical 5-Tier Access Profile Pills (separated from device trustTier)
+            val currentProfile = SnowUiRepository.normalizeAccessProfile(device.permissionProfile)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -716,6 +722,8 @@ private fun DiscoveredPeerCard(
 @Composable
 private fun CrossNetworkSharingCard(
     grants: List<Map<String, Any?>>,
+    canShareCode: Boolean = true,
+    shareCodeDisabledReason: String? = null,
     onGenerateCode: () -> Unit,
     onJoinCode: () -> Unit,
     onRevokeGrant: (String) -> Unit,
@@ -736,13 +744,23 @@ private fun CrossNetworkSharingCard(
                     text = "Share Code",
                     icon = Icons.Default.Share,
                     onClick = onGenerateCode,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    enabled = canShareCode
                 )
                 SnowTonalButton(
                     text = "Join Session",
                     icon = Icons.Default.Add,
                     onClick = onJoinCode,
                     modifier = Modifier.weight(1f)
+                )
+            }
+
+            if (!canShareCode && !shareCodeDisabledReason.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = shareCodeDisabledReason,
+                    style = SnowTypography.bodySmall,
+                    color = colors.textMuted
                 )
             }
 

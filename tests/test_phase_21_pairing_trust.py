@@ -19,6 +19,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+import uuid
 
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase
@@ -223,6 +224,7 @@ class TestWebSocketPairingPreservation(unittest.IsolatedAsyncioTestCase):
 
     async def test_successful_pairing_returns_assigned_trust_tier(self) -> None:
         active_pin = self.ws_server.pairing_manager.generate_pin(display_to_stderr=False, trust_tier="owner")
+        client_uuid = str(uuid.uuid4())
 
         mock_client = MagicMock()
         mock_client.connection_id = "test-conn-2"
@@ -235,7 +237,7 @@ class TestWebSocketPairingPreservation(unittest.IsolatedAsyncioTestCase):
         mock_client.websocket.send = capture_send
 
         req_msg = SnowMessage.create_request(action="pair_request", data={
-            "device_id": "phone-rmx-2",
+            "device_id": client_uuid,
             "device_name": "realme RMX5110",
             "pin": active_pin,
         })
@@ -244,7 +246,7 @@ class TestWebSocketPairingPreservation(unittest.IsolatedAsyncioTestCase):
             client=mock_client,
             message=req_msg,
             action="pair_request",
-            data={"device_id": "phone-rmx-2", "device_name": "realme RMX5110", "pin": active_pin},
+            data={"device_id": client_uuid, "device_name": "realme RMX5110", "pin": active_pin},
         )
 
         self.assertEqual(len(sent_messages), 1)
@@ -253,7 +255,7 @@ class TestWebSocketPairingPreservation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp["payload"]["data"]["trust_tier"], "owner")
 
         # Stored in SQLite as owner
-        record = self.db.get_paired_device("phone-rmx-2")
+        record = self.db.get_paired_device(client_uuid)
         self.assertIsNotNone(record)
         self.assertEqual(record.trust_tier, "owner")
 

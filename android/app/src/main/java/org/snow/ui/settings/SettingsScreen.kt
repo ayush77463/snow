@@ -304,16 +304,7 @@ fun SettingsScreen(
                         statusText = if (isBatteryOptIgnored) "GRANTED" else "ALLOW",
                         isGranted = isBatteryOptIgnored,
                         onClick = {
-                            try {
-                                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                                    data = Uri.parse("package:${context.packageName}")
-                                }
-                                context.startActivity(intent)
-                            } catch (_: Exception) {
-                                try {
-                                    context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                                } catch (_: Exception) { }
-                            }
+                            org.snow.ui.SnowUiRepository.openBatteryOptimizationSettings(context)
                         }
                     )
 

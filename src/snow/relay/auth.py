@@ -128,6 +128,10 @@ def create_relay_ticket(
 
     Ticket format: base64(payload_json).base64(hmac_sha256)
     """
+    if not isinstance(secret, str) or not secret.strip():
+        raise ValueError("Relay shared secret must be non-empty to sign a relay ticket.")
+    if not str(device_id or "").strip() or not str(group_id or "").strip():
+        raise ValueError("device_id and group_id are required to sign a relay ticket.")
     now = int(time.time())
     payload = {
         "device_id": device_id,
@@ -202,6 +206,8 @@ def verify_relay_ticket(
     Returns:
         (is_valid, device_id, group_id, error_message)
     """
+    if not isinstance(secret, str) or not secret.strip():
+        return False, None, None, "Relay secret not configured."
     if not ticket or "." not in ticket:
         return False, None, None, "Malformed ticket format."
 

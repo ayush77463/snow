@@ -5,6 +5,58 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val releaseKeystorePropertiesFile = rootProject.file("keystore.properties")
+val releaseKeystoreProperties = Properties()
+if (releaseKeystorePropertiesFile.exists()) {
+    releaseKeystorePropertiesFile.inputStream().use { releaseKeystoreProperties.load(it) }
+}
+
+val releaseKeystorePath = (System.getenv("SNOW_KEYSTORE_PATH")
+    ?: (project.findProperty("SNOW_KEYSTORE_PATH") as String?)
+    ?: releaseKeystoreProperties.getProperty("storeFile"))?.trim()
+val releaseKeystorePassword = System.getenv("SNOW_KEYSTORE_PASSWORD")
+    ?: (project.findProperty("SNOW_KEYSTORE_PASSWORD") as String?)
+    ?: releaseKeystoreProperties.getProperty("storePassword")
+val releaseKeyAlias = System.getenv("SNOW_KEYSTORE_ALIAS")
+    ?: System.getenv("SNOW_KEY_ALIAS")
+    ?: (project.findProperty("SNOW_KEYSTORE_ALIAS") as String?)
+    ?: (project.findProperty("SNOW_KEY_ALIAS") as String?)
+    ?: releaseKeystoreProperties.getProperty("keyAlias")
+val releaseKeyPassword = System.getenv("SNOW_KEY_PASSWORD")
+    ?: (project.findProperty("SNOW_KEY_PASSWORD") as String?)
+    ?: releaseKeystoreProperties.getProperty("keyPassword")
+
+val releaseStoreFile = releaseKeystorePath?.takeIf { it.isNotBlank() }?.let { file(it) }
+val releaseSigningValidationError: String? = when {
+    releaseStoreFile == null || !releaseStoreFile.isFile ->
+        "Fail-closed release signing check failed: release keystore file is missing or not found. Configure SNOW_KEYSTORE_PATH or android/keystore.properties."
+    releaseKeystorePassword.isNullOrBlank() ->
+        "Fail-closed release signing check failed: SNOW_KEYSTORE_PASSWORD (or storePassword) is missing."
+    releaseKeyAlias.isNullOrBlank() ->
+        "Fail-closed release signing check failed: SNOW_KEYSTORE_ALIAS (or keyAlias) is missing."
+    releaseKeyPassword.isNullOrBlank() ->
+        "Fail-closed release signing check failed: SNOW_KEY_PASSWORD (or keyPassword) is missing."
+    else -> null
+}
+
+val releaseSigningTasks = setOf(
+    "validateSigningRelease",
+    "packageRelease",
+    "assembleRelease",
+    "signReleaseBundle",
+    "packageReleaseBundle",
+    "bundleRelease"
+)
+tasks.configureEach {
+    if (name in releaseSigningTasks) {
+        doFirst {
+            if (releaseSigningValidationError != null) {
+                throw org.gradle.api.GradleException(releaseSigningValidationError)
+            }
+        }
+    }
+}
+
 android {
     namespace = "org.snow"
     compileSdk = 34
@@ -21,30 +73,11 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystorePropertiesFile = rootProject.file("keystore.properties")
-            val keystoreProperties = Properties()
-            if (keystorePropertiesFile.exists()) {
-                keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
-            }
-
-            val keystorePath = System.getenv("SNOW_KEYSTORE_PATH")
-                ?: (project.findProperty("SNOW_KEYSTORE_PATH") as String?)
-                ?: keystoreProperties.getProperty("storeFile")
-            val keystorePassword = System.getenv("SNOW_KEYSTORE_PASSWORD")
-                ?: (project.findProperty("SNOW_KEYSTORE_PASSWORD") as String?)
-                ?: keystoreProperties.getProperty("storePassword")
-            val keyAlias = System.getenv("SNOW_KEY_ALIAS")
-                ?: (project.findProperty("SNOW_KEY_ALIAS") as String?)
-                ?: keystoreProperties.getProperty("keyAlias")
-            val keyPassword = System.getenv("SNOW_KEY_PASSWORD")
-                ?: (project.findProperty("SNOW_KEY_PASSWORD") as String?)
-                ?: keystoreProperties.getProperty("keyPassword")
-
-            if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
-                storeFile = file(keystorePath)
-                storePassword = keystorePassword
-                this.keyAlias = keyAlias
-                this.keyPassword = keyPassword
+            if (releaseSigningValidationError == null && releaseStoreFile != null) {
+                storeFile = releaseStoreFile
+                storePassword = releaseKeystorePassword
+                this.keyAlias = releaseKeyAlias
+                this.keyPassword = releaseKeyPassword
             }
         }
     }
@@ -56,9 +89,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            val releaseSigning = signingConfigs.getByName("release")
-            if (releaseSigning.storeFile != null) {
-                signingConfig = releaseSigning
+            signingConfig = if (releaseSigningValidationError == null) {
+                signingConfigs.getByName("release")
+            } else {
+                null
             }
         }
         debug {

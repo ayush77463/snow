@@ -41,7 +41,7 @@ from snow.protocol.models import SnowMessage
 from snow.protocol.validator import ProtocolValidationError, validate_raw_message
 from snow.security.context import ExecutionContext, ExecutionPrincipal
 from snow.security.db import DatabaseManager, hash_token
-from snow.security.identity import DeviceIdentity, load_or_create_device_identity
+from snow.security.identity import DeviceIdentity, is_valid_uuidv4, load_or_create_device_identity
 from snow.security.pairing import PairingManager, PairingOutcome
 from snow.security.policy import ACTION_TO_CAPABILITY, PeerCapabilityPolicy
 from snow.security.session import SessionManager
@@ -2318,11 +2318,31 @@ class SnowWebSocketServer:
         """Handle pairing verification or PIN generation request."""
         pin = data.get("pin")
         handshake_token = data.get("handshake_token")
-        client_device_id = data.get("device_id")
+        raw_client_id = data.get("device_id")
+        client_device_id = raw_client_id.strip() if isinstance(raw_client_id, str) else raw_client_id
 
         # Never auto-trust based on USB cable attachment alone: require explicit PIN or owner-issued QR handshake token.
         if pin is not None or handshake_token is not None:
-            if handshake_token is not None and (pin is None or str(pin).strip() == ""):
+            if not is_valid_uuidv4(client_device_id):
+                self.db_manager.log_audit_event(
+                    event_type="PAIR_FAILED",
+                    device_id=str(client_device_id)[:64] if client_device_id is not None else None,
+                    details={"reason": "Missing or invalid client device_id (UUIDv4 required)."},
+                )
+                logger.warning(
+                    "Rejected pairing request from [%s]: missing or non-UUIDv4 client device_id.",
+                    client.connection_id,
+                )
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD,
+                    message="Valid UUIDv4 client device_id is required to complete pairing.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+
+            # Mutual exclusion: when handshake_token is supplied, verify ONLY the QR token; never fall back to PIN.
+            if handshake_token is not None:
                 net_id = str(data.get("network_id") or "")
                 result = self.pairing_manager.verify_handshake_token(
                     token=str(handshake_token),
@@ -2331,65 +2351,95 @@ class SnowWebSocketServer:
                     network_id=net_id,
                 )
             else:
-                # PIN verification attempt
+                # Manual PIN verification attempt (only when no handshake_token was supplied)
                 result = self.pairing_manager.verify_pin(str(pin), client_device_id=client_device_id)
             if result.is_success:
+                # Defense-in-depth before token issuance, DB insertion, trust assignment, and node registration
+                if not is_valid_uuidv4(client_device_id):
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.INVALID_PAYLOAD,
+                        message="Valid UUIDv4 client device_id is required to complete pairing.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+
                 logger.info("Successfully paired with device [%s] from client [%s]",
                             client_device_id, client.connection_id)
                 auth_token = secrets.token_urlsafe(32)
                 token_hash = hash_token(auth_token)
                 client_device_name = data.get(
                     "device_name",
-                    f"Android-{client_device_id[:8]}" if client_device_id else "Android-Device",
+                    f"Android-{client_device_id[:8]}",
                 )
 
-                if client_device_id:
-                    self.manually_disconnected_devices.discard(client_device_id)
-                    # Clean up prior records / sessions if re-pairing
-                    existing = self.db_manager.get_paired_device(client_device_id)
-                    if existing:
-                        self.db_manager.delete_paired_device(client_device_id)
-                        self.session_manager.revoke_device_sessions(client_device_id)
-
-                    configured_owner = getattr(self.config, "primary_owner_device_id", None)
-                    if configured_owner is not None:
-                        is_primary_owner = (client_device_id == configured_owner)
-                        assigned_tier = "owner" if is_primary_owner else "peer"
-                    else:
-                        assigned_tier = getattr(result, "assigned_trust_tier", "peer")
-
-                    self.db_manager.insert_paired_device(
+                # Re-pair pre-cleanup: invalidate any previous DB/runtime state for client_device_id before
+                # inserting new credentials, while preserving the active pairing WebSocket connection.
+                self.manually_disconnected_devices.discard(client_device_id)
+                cs = getattr(self, "core_server", None)
+                from snow.core.server import SnowCoreServer
+                if cs is not None and callable(getattr(cs, "remove_device_everywhere", None)):
+                    await cs.remove_device_everywhere(
                         device_id=client_device_id,
-                        device_name=client_device_name,
-                        auth_token_hash=token_hash,
-                        trust_tier=assigned_tier,
+                        reason="Re-pairing existing device identity",
+                        notify_client=False,
+                        exclude_connection_id=client.connection_id,
+                        audit_event_type=None,
                     )
-                    self.db_manager.log_audit_event(
-                        event_type="PAIR_SUCCESS",
+                else:
+                    await SnowCoreServer.execute_device_removal(
                         device_id=client_device_id,
-                        details={"device_name": client_device_name, "connection_id": client.connection_id},
-                    )
-                    self.session_manager.create_session(
-                        device_id=client_device_id,
-                        connection_id=client.connection_id,
-                        trust_tier=assigned_tier,
+                        reason="Re-pairing existing device identity",
+                        notify_client=False,
+                        exclude_connection_id=client.connection_id,
+                        db_manager=self.db_manager,
+                        session_manager=self.session_manager,
+                        connection_manager=self.connection_manager,
+                        node_registry=getattr(self, "node_registry", None),
+                        ws_server=self,
+                        discovery_service=getattr(self, "udp_discovery", None),
+                        audit_event_type=None,
                     )
 
-                    if getattr(self, "node_registry", None):
-                        client_host, client_port = parse_remote_address(client.remote_address)
-                        client_decl = data.get("connection_mode") or data.get("transport_mode") or data.get("transport")
-                        transport = self._determine_transport(client_host, client_decl)
-                        try:
-                            self.node_registry.on_session_authenticated(
-                                device_id=client_device_id,
-                                connection_id=client.connection_id,
-                                host=client_host,
-                                port=client_port,
-                                manifest_data=data.get("manifest") or data.get("capabilities"),
-                                transport=transport,
-                            )
-                        except Exception as reg_err:
-                            logger.debug("Failed notifying node registry of pairing auth: %s", reg_err)
+                configured_owner = getattr(self.config, "primary_owner_device_id", None)
+                if configured_owner is not None:
+                    is_primary_owner = (client_device_id == configured_owner)
+                    assigned_tier = "owner" if is_primary_owner else "peer"
+                else:
+                    assigned_tier = getattr(result, "assigned_trust_tier", "peer")
+
+                self.db_manager.insert_paired_device(
+                    device_id=client_device_id,
+                    device_name=client_device_name,
+                    auth_token_hash=token_hash,
+                    trust_tier=assigned_tier,
+                )
+                self.db_manager.log_audit_event(
+                    event_type="PAIR_SUCCESS",
+                    device_id=client_device_id,
+                    details={"device_name": client_device_name, "connection_id": client.connection_id},
+                )
+                self.session_manager.create_session(
+                    device_id=client_device_id,
+                    connection_id=client.connection_id,
+                    trust_tier=assigned_tier,
+                )
+
+                if getattr(self, "node_registry", None):
+                    client_host, client_port = parse_remote_address(client.remote_address)
+                    client_decl = data.get("connection_mode") or data.get("transport_mode") or data.get("transport")
+                    transport = self._determine_transport(client_host, client_decl)
+                    try:
+                        self.node_registry.on_session_authenticated(
+                            device_id=client_device_id,
+                            connection_id=client.connection_id,
+                            host=client_host,
+                            port=client_port,
+                            manifest_data=data.get("manifest") or data.get("capabilities"),
+                            transport=transport,
+                        )
+                    except Exception as reg_err:
+                        logger.debug("Failed notifying node registry of pairing auth: %s", reg_err)
 
                 # Successful pairing: clear pairing in-progress state and cancel handshake timer
                 self._pairing_in_progress.discard(client.connection_id)
@@ -2538,19 +2588,33 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
-        # Successfully verified: remove device, revoke active sessions, record audit trail
-        self.db_manager.delete_paired_device(device_id)
-        self.session_manager.revoke_device_sessions(device_id)
-        self.db_manager.log_audit_event(
-            event_type="UNPAIR",
-            device_id=device_id,
-            details={"initiated_by": "client", "connection_id": client.connection_id},
-        )
-        self.db_manager.log_audit_event(
-            event_type="SESSION_REVOKED",
-            device_id=device_id,
-            details={"reason": "Device unpaired via client unpair_request"},
-        )
+        # Successfully verified: revoke DB, sessions, and all runtime state FIRST via shared cleanup
+        cs = getattr(self, "core_server", None)
+        from snow.core.server import SnowCoreServer
+        if cs is not None and callable(getattr(cs, "remove_device_everywhere", None)):
+            await cs.remove_device_everywhere(
+                device_id=device_id,
+                reason="Device unpaired via client unpair_request",
+                notify_client=False,
+                exclude_connection_id=client.connection_id,
+                audit_event_type="UNPAIR",
+                audit_details={"initiated_by": "client", "connection_id": client.connection_id},
+            )
+        else:
+            await SnowCoreServer.execute_device_removal(
+                device_id=device_id,
+                reason="Device unpaired via client unpair_request",
+                notify_client=False,
+                exclude_connection_id=client.connection_id,
+                db_manager=self.db_manager,
+                session_manager=self.session_manager,
+                connection_manager=self.connection_manager,
+                node_registry=getattr(self, "node_registry", None),
+                ws_server=self,
+                discovery_service=getattr(self, "udp_discovery", None),
+                audit_event_type="UNPAIR",
+                audit_details={"initiated_by": "client", "connection_id": client.connection_id},
+            )
 
         logger.info("Successfully unpaired device [%s] via client [%s]",
                     device_id, client.connection_id)
@@ -2566,6 +2630,23 @@ class SnowWebSocketServer:
             },
         )
         await client.websocket.send(response.to_json())
+
+        # Unregister and close the unpairing WebSocket connection cleanly after delivering ACK
+        unreg = None
+        if getattr(self, "connection_manager", None):
+            try:
+                unreg = self.connection_manager.unregister(client.connection_id)
+            except Exception as exc:
+                logger.warning("Failed unregistering unpairing connection [%s]: %s", client.connection_id, exc)
+        ws_to_close = getattr(unreg, "websocket", None) or getattr(client, "websocket", None)
+        if ws_to_close is not None and hasattr(ws_to_close, "close"):
+            try:
+                import inspect
+                close_res = ws_to_close.close(code=1000, reason="Device unpaired")
+                if inspect.isawaitable(close_res):
+                    await close_res
+            except Exception as exc:
+                logger.debug("Error closing client websocket after unpair_request: %s", exc)
 
     def authorize_request(self, device_id: str, auth_token: str) -> bool:
         """Authorize an incoming request using persistent token verification.
@@ -2583,26 +2664,75 @@ class SnowWebSocketServer:
         return is_valid
 
     def unpair_device(self, device_id: str) -> bool:
-        """Desktop-initiated unpairing of a registered device.
+        """Desktop-initiated synchronous unpairing routed through unified device removal.
 
-        Deletes SQLite record, revokes active session, and logs audit events.
+        Deletes SQLite record, permission profile, active sessions, and schedules/runs runtime cleanup.
         """
-        existing = self.db_manager.get_paired_device(device_id)
-        if not existing:
+        clean_id = (device_id or "").strip()
+        if not clean_id:
             return False
-        self.db_manager.delete_paired_device(device_id)
-        self.session_manager.revoke_device_sessions(device_id)
-        self.db_manager.log_audit_event(
-            event_type="UNPAIR",
-            device_id=device_id,
-            details={"initiated_by": "desktop"},
-        )
-        self.db_manager.log_audit_event(
-            event_type="SESSION_REVOKED",
-            device_id=device_id,
-            details={"reason": "Desktop unpair_device invoked"},
-        )
-        return True
+
+        from snow.core.server import SnowCoreServer
+        cs = getattr(self, "core_server", None)
+
+        async def _run_removal() -> dict[str, Any]:
+            if cs is not None and callable(getattr(cs, "remove_device_everywhere", None)):
+                return await cs.remove_device_everywhere(
+                    device_id=clean_id,
+                    reason="Desktop unpair_device invoked",
+                    notify_client=True,
+                    audit_event_type="UNPAIR",
+                    audit_details={"initiated_by": "desktop"},
+                )
+            return await SnowCoreServer.execute_device_removal(
+                device_id=clean_id,
+                reason="Desktop unpair_device invoked",
+                notify_client=True,
+                db_manager=self.db_manager,
+                session_manager=self.session_manager,
+                connection_manager=self.connection_manager,
+                node_registry=getattr(self, "node_registry", None),
+                ws_server=self,
+                discovery_service=getattr(self, "udp_discovery", None),
+                audit_event_type="UNPAIR",
+                audit_details={"initiated_by": "desktop"},
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is None:
+            res = asyncio.run(_run_removal())
+            return bool(res.get("removed", False))
+
+        # Already inside an event loop: revoke authorization synchronously FIRST, then finish async cleanup
+        had_db = self.db_manager.get_paired_device(clean_id) is not None if self.db_manager else False
+        db_deleted = self.db_manager.delete_paired_device(clean_id) if self.db_manager else False
+        try:
+            if self.db_manager and hasattr(self.db_manager, "delete_setting"):
+                self.db_manager.delete_setting(f"device_profile:{clean_id}")
+        except Exception:
+            pass
+        if self.session_manager:
+            self.session_manager.revoke_device_sessions(clean_id)
+        if getattr(self, "node_registry", None):
+            try:
+                self.node_registry.remove_node(clean_id)
+            except Exception:
+                pass
+        self.manually_disconnected_devices.discard(clean_id)
+        self.live_notifications.pop(clean_id, None)
+        if db_deleted or had_db:
+            self.db_manager.log_audit_event(
+                event_type="UNPAIR",
+                device_id=clean_id,
+                details={"initiated_by": "desktop"},
+            )
+        task = loop.create_task(_run_removal())
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+        return bool(db_deleted or had_db)
 
     async def _handle_file_transfer_offer(
         self, client, message: SnowMessage, data: dict[str, Any], session

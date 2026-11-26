@@ -555,7 +555,9 @@ class SnowWebServer:
         from snow.security.identity import generate_snow_id, load_or_create_device_identity
         local_ident = load_or_create_device_identity()
         deduped: list[dict[str, Any]] = []
+        discovered_peers: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        seen_discovered_ids: set[str] = set()
         seen_local = False
 
         for raw_dev in devices:
@@ -574,6 +576,23 @@ class SnowWebServer:
                     continue
                 seen_local = True
             else:
+                # Filter unpaired UDP discovery candidates & "Unknown Node" ghosts out of MY NETWORK DEVICES
+                is_explicitly_unpaired = (
+                    dev.get("is_paired") is False
+                    or bool(dev.get("is_discovered"))
+                    or (
+                        str(dev.get("device_name") or "").strip() == "Unknown Node"
+                        and dev.get("is_paired") is not True
+                    )
+                )
+                if is_explicitly_unpaired:
+                    if dev_id and dev_id not in seen_discovered_ids:
+                        seen_discovered_ids.add(dev_id)
+                        if not dev.get("snow_id"):
+                            dev["snow_id"] = generate_snow_id(seed=dev_id)
+                        discovered_peers.append(dev)
+                    continue
+
                 if dev_id and dev_id in seen_ids:
                     continue
                 if dev_id:
@@ -607,10 +626,27 @@ class SnowWebServer:
             deduped.append(dev)
         devices = deduped
 
+        # Optionally include live LAN discovery candidates in separate 'discovered_peers' view
+        bridge_cls = type(self.bridge) if self.bridge is not None else None
+        if self.bridge is not None and inspect.iscoroutinefunction(getattr(bridge_cls, "list_discovered_peers", None)):
+            try:
+                disc_res = await asyncio.wait_for(self.bridge.list_discovered_peers(), timeout=2.0)
+                if isinstance(disc_res, dict) and disc_res.get("success"):
+                    for peer in (disc_res.get("data") or {}).get("peers", []) or []:
+                        if not isinstance(peer, dict):
+                            continue
+                        pid = str(peer.get("device_id") or "").strip()
+                        if pid and pid not in seen_ids and pid not in seen_discovered_ids and not peer.get("is_paired"):
+                            seen_discovered_ids.add(pid)
+                            discovered_peers.append(peer)
+            except Exception as disc_err:
+                logger.debug("Non-fatal discovery list enrichment skipped: %s", disc_err)
+
         return web.json_response({
             "success": res.get("success", False),
             "status": res.get("status", "SUCCESS"),
             "devices": devices,
+            "discovered_peers": discovered_peers,
             "data": res.get("data", {}),
             "error": res.get("error"),
         })
@@ -699,16 +735,30 @@ class SnowWebServer:
         if not host and snow_id_query:
             resolved_entry = await self._resolve_snow_id_directory(snow_id_query)
             if not resolved_entry.get("found"):
+                err_status = str(resolved_entry.get("status") or "SNOW_ID_NOT_FOUND")
+                http_code = {
+                    "INVALID_SNOW_ID": 400,
+                    "HUB_AUTH_FAILED": 401,
+                    "FORBIDDEN": 403,
+                    "INVALID_ENDPOINT": 502,
+                    "HUB_UNAVAILABLE": 503,
+                }.get(err_status, 404)
                 return web.json_response({
                     "success": False,
-                    "status": "SNOW_ID_NOT_FOUND",
+                    "status": err_status,
                     "error": resolved_entry.get("error") or f"Could not resolve SNOW ID '{snow_id_query}'.",
-                }, status=404)
+                }, status=http_code)
             host = str(resolved_entry.get("host") or "").strip()
             if resolved_entry.get("port"):
                 port_raw = resolved_entry.get("port")
             if not expected_fingerprint and resolved_entry.get("cert_fingerprint"):
                 expected_fingerprint = str(resolved_entry.get("cert_fingerprint"))
+            if not host:
+                return web.json_response({
+                    "success": False,
+                    "status": "NO_DIRECT_LAN_ENDPOINT",
+                    "error": f"Resolved '{snow_id_query}' without a direct LAN host endpoint; use relay or QR onboarding.",
+                }, status=400)
 
         if not host:
             return web.json_response({"success": False, "error": "Missing required field 'host' or resolvable 'snow_id'."}, status=400)
@@ -963,15 +1013,30 @@ class SnowWebServer:
     async def handle_api_pair_qr(self, request: web.Request) -> web.Response:
         """Generate temporary pairing PIN, QR code metadata, and vector SVG."""
         trust_tier = "owner"
+        require_legacy_ticket = False
         if request.method == "POST":
             try:
                 body = await request.json()
                 if isinstance(body, dict):
                     trust_tier = body.get("trust_tier") or body.get("tier", "owner")
+                    require_legacy_ticket = bool(
+                        body.get("require_relay_ticket")
+                        or body.get("include_relay_ticket")
+                        or body.get("legacy_relay_ticket")
+                    )
             except Exception:
                 pass
         elif request.method == "GET":
             trust_tier = request.query.get("trust_tier") or request.query.get("tier", "owner")
+            require_legacy_ticket = (
+                str(
+                    request.query.get("require_relay_ticket")
+                    or request.query.get("include_relay_ticket")
+                    or request.query.get("legacy_relay_ticket")
+                    or ""
+                ).strip().lower()
+                in ("1", "true", "yes")
+            )
 
         res = await self.bridge.call("generate_pairing_qr", {"trust_tier": trust_tier})
         if not res.get("success"):
@@ -987,41 +1052,100 @@ class SnowWebServer:
         try:
             from snow.core.config import resolve_default_hub_url
             from snow.security.identity import load_or_create_network_key_identity
-            db_mgr = getattr(self, "db_manager", None) or getattr(self.bridge.capability_engine, "db_manager", None)
+            cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+            db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
             hub_url = resolve_default_hub_url(db_manager=db_mgr)
             key_ident = load_or_create_network_key_identity()
             if key_ident and key_ident.network_id:
                 payload.setdefault("network_id", key_ident.network_id)
             if hub_url:
                 payload.setdefault("hub_url", hub_url)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not enrich QR with default hub/network identity: %s", exc)
 
-        # Master QR: If Remote Device Relay tunnel is active, enrich payload with relay credentials
+        cfg = getattr(self, "config", None)
+        group_id = (
+            os.getenv("SNOW_RELAY_GROUP_ID")
+            or (getattr(cfg, "relay_group_id", None) if cfg else None)
+            or "default_group"
+        )
+        raw_relay_secret = os.getenv("SNOW_RELAY_SECRET") or (getattr(cfg, "relay_secret", None) if cfg else None)
+        relay_secret = raw_relay_secret.strip() if isinstance(raw_relay_secret, str) else ""
+
+        if require_legacy_ticket and not relay_secret:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "RELAY_SECRET_MISSING",
+                    "error": "Cannot mint legacy relay_ticket without an explicit SNOW_RELAY_SECRET.",
+                    "legacy_relay_available": False,
+                },
+                status=400,
+            )
+
+        legacy_relay_available = False
+        # Master QR: Only mint legacy relay_ticket when an explicit non-empty SNOW_RELAY_SECRET is configured.
         if hasattr(self, "tunnel_manager"):
             relay_stat = self.tunnel_manager.get_status(port=8770)
             if relay_stat.get("active") and relay_stat.get("public_url"):
                 pub_url = relay_stat["public_url"]
                 relay_ws_url = pub_url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/") + "/v1/tunnel"
-                from snow.relay.auth import create_relay_ticket
-                cfg = getattr(self, "config", None)
-                group_id = os.getenv("SNOW_RELAY_GROUP_ID") or (getattr(cfg, "relay_group_id", None) if cfg else None) or "default_group"
-                relay_secret = os.getenv("SNOW_RELAY_SECRET") or (getattr(cfg, "relay_secret", None) if cfg else None) or "snow_relay_default_key"
+                if relay_secret:
+                    from snow.relay.auth import create_relay_ticket
+                    try:
+                        fresh_ticket = create_relay_ticket(
+                            device_id="mobile-pairing-client",
+                            group_id=group_id,
+                            secret=relay_secret,
+                            ttl_seconds=3600,
+                        )
+                        payload["relay_url"] = relay_ws_url
+                        payload["relay_ticket"] = fresh_ticket
+                        payload["group_id"] = group_id
+                        legacy_relay_available = True
+                    except ValueError as exc:
+                        logger.warning("Failed signing legacy relay ticket for QR payload: %s", exc)
+                        return web.json_response(
+                            {
+                                "success": False,
+                                "status": "RELAY_SECRET_INVALID",
+                                "error": f"Cannot sign legacy relay_ticket: {exc}",
+                                "legacy_relay_available": False,
+                            },
+                            status=400,
+                        )
+                else:
+                    payload.pop("relay_ticket", None)
+                    payload.pop("group_id", None)
+        elif require_legacy_ticket and relay_secret:
+            from snow.relay.auth import create_relay_ticket
+            try:
                 fresh_ticket = create_relay_ticket(
                     device_id="mobile-pairing-client",
                     group_id=group_id,
                     secret=relay_secret,
                     ttl_seconds=3600,
                 )
-                payload["relay_url"] = relay_ws_url
                 payload["relay_ticket"] = fresh_ticket
                 payload["group_id"] = group_id
+                legacy_relay_available = True
+            except ValueError as exc:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "status": "RELAY_SECRET_INVALID",
+                        "error": f"Cannot sign legacy relay_ticket: {exc}",
+                        "legacy_relay_available": False,
+                    },
+                    status=400,
+                )
 
         svg_content = self._render_qr_svg(payload)
 
         return web.json_response({
             "success": True,
             "status": "SUCCESS",
+            "legacy_relay_available": legacy_relay_available,
             "data": payload,
             "svg": svg_content,
         })
@@ -2600,17 +2724,147 @@ class SnowWebServer:
             failed_attempts_store=self._federation_failed_attempts,
         )
 
+    async def _authenticate_hub_session(
+        self, session: Any, hub_url: str
+    ) -> tuple[bool, str, str, str]:
+        """Acquire a short-lived Ed25519 hub-session Bearer token via /v1/hub/challenge & /v1/hub/session."""
+        from snow.security.identity import load_or_create_device_identity, load_or_create_network_key_identity
+
+        try:
+            net_ident = load_or_create_network_key_identity()
+            dev_ident = load_or_create_device_identity()
+        except Exception as exc:
+            return False, "", "HUB_AUTH_FAILED", f"Failed loading local hub Ed25519 identity: {exc}"
+
+        if not net_ident or not dev_ident:
+            return False, "", "HUB_AUTH_FAILED", "Local hub Ed25519 identity is unavailable."
+
+        base = hub_url.rstrip("/")
+        try:
+            async with session.post(
+                f"{base}/v1/hub/challenge",
+                json={
+                    "network_id": net_ident.network_id,
+                    "public_key": net_ident.public_key_b64,
+                    "device_id": dev_ident.device_id,
+                    "snow_id": dev_ident.snow_id,
+                },
+            ) as ch_resp:
+                try:
+                    ch_data = await ch_resp.json(content_type=None)
+                except Exception:
+                    ch_data = {}
+                if ch_resp.status in (401, 403):
+                    return False, "", "HUB_AUTH_FAILED", str(
+                        ch_data.get("error") or "Hub rejected challenge authentication."
+                    )
+                if ch_resp.status >= 500:
+                    return False, "", "HUB_UNAVAILABLE", str(
+                        ch_data.get("error") or f"Hub challenge returned HTTP {ch_resp.status}."
+                    )
+                if ch_resp.status != 200 or not isinstance(ch_data, dict) or not ch_data.get("challenge_id"):
+                    return False, "", "HUB_AUTH_FAILED", str(
+                        ch_data.get("error") or f"Hub challenge failed (HTTP {ch_resp.status})."
+                    )
+
+            sig_b64 = net_ident.sign_hub_challenge(ch_data, device_id=dev_ident.device_id)
+            async with session.post(
+                f"{base}/v1/hub/session",
+                json={
+                    "challenge_id": ch_data["challenge_id"],
+                    "network_id": net_ident.network_id,
+                    "public_key": net_ident.public_key_b64,
+                    "signature": sig_b64,
+                    "device_id": dev_ident.device_id,
+                    "snow_id": dev_ident.snow_id,
+                },
+            ) as sess_resp:
+                try:
+                    sess_data = await sess_resp.json(content_type=None)
+                except Exception:
+                    sess_data = {}
+                if sess_resp.status in (401, 403):
+                    return False, "", "HUB_AUTH_FAILED", str(
+                        sess_data.get("error") or "Hub rejected Ed25519 session signature."
+                    )
+                if sess_resp.status >= 500:
+                    return False, "", "HUB_UNAVAILABLE", str(
+                        sess_data.get("error") or f"Hub session returned HTTP {sess_resp.status}."
+                    )
+                token = str((sess_data or {}).get("token") or "").strip()
+                if sess_resp.status != 200 or not (sess_data or {}).get("success") or not token:
+                    return False, "", "HUB_AUTH_FAILED", str(
+                        (sess_data or {}).get("error") or "Hub did not issue a valid session token."
+                    )
+                return True, token, "OK", ""
+        except asyncio.TimeoutError:
+            return False, "", "HUB_UNAVAILABLE", "Cloud hub directory request timed out."
+        except Exception as exc:
+            return False, "", "HUB_UNAVAILABLE", f"Cloud hub directory is unreachable: {exc}"
+
+    @staticmethod
+    def _extract_valid_hub_endpoints(hub_data: dict[str, Any]) -> tuple[bool, str, int, str]:
+        """Validate hub directory endpoint fields; fail closed on missing or invalid endpoints."""
+        import urllib.parse
+
+        raw_lan = hub_data.get("lan_endpoints")
+        resolved_host = ""
+        resolved_port = 8765
+        has_valid_lan = False
+        if isinstance(raw_lan, list):
+            for entry in raw_lan:
+                if not isinstance(entry, str) or not entry.strip():
+                    continue
+                cand = entry.strip()
+                if ":" in cand:
+                    h_part, p_part = cand.rsplit(":", 1)
+                    h_part = h_part.strip("[] ")
+                    try:
+                        p_num = int(p_part)
+                        if h_part and 1 <= p_num <= 65535:
+                            resolved_host, resolved_port, has_valid_lan = h_part, p_num, True
+                            break
+                    except ValueError:
+                        continue
+                elif cand:
+                    resolved_host, resolved_port, has_valid_lan = cand, 8765, True
+                    break
+
+        direct_host = str(hub_data.get("host") or "").strip()
+        if not resolved_host and direct_host:
+            try:
+                p_num = int(hub_data.get("port") or 8765)
+                if 1 <= p_num <= 65535:
+                    resolved_host, resolved_port, has_valid_lan = direct_host, p_num, True
+            except (TypeError, ValueError):
+                pass
+
+        relay_ws_url = str(hub_data.get("relay_ws_url") or "").strip()
+        has_valid_relay = False
+        if relay_ws_url:
+            parsed = urllib.parse.urlparse(relay_ws_url)
+            if parsed.scheme in ("wss", "ws") and bool(parsed.hostname):
+                has_valid_relay = True
+            else:
+                return False, "", 8765, "Invalid relay_ws_url returned by hub directory."
+
+        if not has_valid_lan and not has_valid_relay:
+            return False, "", 8765, "Hub directory response did not include a valid LAN or relay endpoint."
+        return True, resolved_host, resolved_port, ""
+
     async def _resolve_snow_id_directory(self, snow_id: str) -> dict[str, Any]:
-        """Resolve a SNOW Device ID or Network ID across local registry, LAN discovery, and Default Hub."""
+        """Resolve a SNOW ID: validate -> local paired DB -> Core IPC LAN discovery -> authenticated Cloud Hub."""
         from snow.core.config import resolve_default_hub_url
         from snow.relay.auth import is_valid_network_id, is_valid_snow_id
         from snow.security.identity import generate_snow_id, load_or_create_device_identity
 
+        # 1. Validate & normalize requested SNOW ID
         clean_id = (snow_id or "").strip().upper()
         if not (is_valid_snow_id(clean_id) or is_valid_network_id(clean_id)):
             return {"success": False, "found": False, "status": "INVALID_SNOW_ID", "error": "Invalid SNOW ID format."}
 
-        db_mgr = getattr(self, "db_manager", None) or getattr(self.bridge.capability_engine, "db_manager", None)
+        cap_engine = getattr(getattr(self, "bridge", None), "capability_engine", None)
+        db_mgr = getattr(self, "db_manager", None) or getattr(cap_engine, "db_manager", None)
         local_ident = load_or_create_device_identity()
         if local_ident.snow_id.upper() == clean_id:
             return {
@@ -2623,53 +2877,233 @@ class SnowWebServer:
                 "port": 8765,
             }
 
-        # 1. Paired DB & NodeRegistry lookup
+        # 2. Check existing local paired-device database first
+        paired_match: Optional[Any] = None
         if db_mgr and hasattr(db_mgr, "list_paired_devices"):
             for p in db_mgr.list_paired_devices():
-                cand_snow = generate_snow_id(seed=p.device_id).upper()
+                cand_snow = (getattr(p, "snow_id", None) or generate_snow_id(seed=p.device_id)).upper()
                 if cand_snow == clean_id or str(p.device_id).upper() == clean_id:
-                    return {
-                        "success": True,
-                        "found": True,
-                        "source": "paired_db",
-                        "snow_id": clean_id,
-                        "device_id": p.device_id,
-                        "device_name": p.device_name,
-                        "host": p.last_known_host or "",
-                        "port": p.last_known_port or 8765,
-                        "cert_fingerprint": p.cert_fingerprint or "",
-                    }
+                    paired_match = p
+                    break
+        if paired_match is not None and str(paired_match.last_known_host or "").strip():
+            return {
+                "success": True,
+                "found": True,
+                "source": "paired_db",
+                "snow_id": clean_id,
+                "device_id": paired_match.device_id,
+                "device_name": paired_match.device_name,
+                "host": str(paired_match.last_known_host).strip(),
+                "port": paired_match.last_known_port or 8765,
+                "cert_fingerprint": paired_match.cert_fingerprint or "",
+                "is_paired": True,
+            }
 
-        # 2. Query Default Hub Directory when configured
+        # 3 & 4. Query Core LAN discovery service via bounded Core IPC operation
+        discovery_status = "OK"
+        discovery_error: Optional[str] = None
+        if getattr(self, "bridge", None) and hasattr(self.bridge, "call"):
+            try:
+                ipc_res = await self.bridge.call("list_discovered_peers", {"snow_id": clean_id}, timeout=2.0)
+                if isinstance(ipc_res, dict) and ipc_res.get("success"):
+                    data_obj = ipc_res.get("data") if isinstance(ipc_res.get("data"), dict) else {}
+                    raw_peers = data_obj.get("peers")
+                    if raw_peers is None:
+                        raw_peers = ipc_res.get("peers")
+                    for peer in raw_peers or []:
+                        if not isinstance(peer, dict):
+                            continue
+                        p_id = str(peer.get("device_id") or "").strip()
+                        p_snow = str(
+                            peer.get("snow_id") or (generate_snow_id(seed=p_id) if p_id else "")
+                        ).strip().upper()
+                        if p_snow == clean_id or (p_id and p_id.upper() == clean_id):
+                            p_host = str(peer.get("host") or peer.get("ip_address") or "").strip()
+                            try:
+                                p_port = int(peer.get("port") or 8765)
+                            except (TypeError, ValueError):
+                                p_port = 8765
+                            if p_host:
+                                return {
+                                    "success": True,
+                                    "found": True,
+                                    "source": "lan_discovery",
+                                    "snow_id": clean_id,
+                                    "device_id": p_id,
+                                    "device_name": str(peer.get("device_name") or "LAN Peer"),
+                                    "device_type": str(peer.get("device_type") or "unknown"),
+                                    "host": p_host,
+                                    "port": p_port,
+                                    "cert_fingerprint": str(peer.get("cert_fingerprint") or ""),
+                                    "is_paired": bool(paired_match is not None or peer.get("is_paired")),
+                                }
+                elif isinstance(ipc_res, dict) and not ipc_res.get("success"):
+                    discovery_status = "DISCOVERY_UNAVAILABLE"
+                    discovery_error = str(
+                        ipc_res.get("error") or ipc_res.get("status") or "Core LAN discovery unavailable."
+                    )
+            except Exception as exc:
+                discovery_status = "DISCOVERY_UNAVAILABLE"
+                discovery_error = f"Local LAN discovery query failed: {exc}"
+                logger.debug("Local discovery IPC error resolving %s: %s", clean_id, exc)
+        else:
+            discovery_status = "DISCOVERY_UNAVAILABLE"
+            discovery_error = "Core IPC bridge is unavailable for local discovery."
+
+        # 5. Authenticated cloud directory resolution only if local resolution found no usable target
         hub_url = resolve_default_hub_url(db_manager=db_mgr)
         if hub_url:
             import aiohttp
+
             target_url = f"{hub_url.rstrip('/')}/v1/directory/resolve/{clean_id}"
             try:
                 timeout = aiohttp.ClientTimeout(total=4.0)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(target_url) as resp:
-                        if resp.status == 200:
-                            hub_data = await resp.json()
-                            if isinstance(hub_data, dict) and (hub_data.get("online") or hub_data.get("found") or hub_data.get("snow_id")):
-                                return {
-                                    "success": True,
-                                    "found": True,
-                                    "source": "hub_directory",
-                                    "snow_id": clean_id,
-                                    "hub_url": hub_url,
-                                    **hub_data,
-                                }
+                    ok_auth, hub_token, auth_status, auth_err = await self._authenticate_hub_session(session, hub_url)
+                    if not ok_auth or not hub_token:
+                        return {
+                            "success": False,
+                            "found": False,
+                            "status": auth_status,
+                            "error": auth_err or "Cloud hub authentication failed.",
+                            "snow_id": clean_id,
+                            "source": "hub_directory",
+                            **({"discovery_error": discovery_error} if discovery_error else {}),
+                        }
+
+                    async with session.get(
+                        target_url,
+                        headers={"Authorization": f"Bearer {hub_token}"},
+                    ) as resp:
+                        try:
+                            hub_data = await resp.json(content_type=None)
+                        except Exception:
+                            hub_data = {}
+
+                        if resp.status == 401:
+                            return {
+                                "success": False,
+                                "found": False,
+                                "status": "HUB_AUTH_FAILED",
+                                "error": str((hub_data or {}).get("error") or "Hub directory authentication failed."),
+                                "snow_id": clean_id,
+                                "source": "hub_directory",
+                            }
+                        if resp.status == 403:
+                            return {
+                                "success": False,
+                                "found": False,
+                                "status": "FORBIDDEN",
+                                "error": str((hub_data or {}).get("error") or "Cross-network directory lookup denied."),
+                                "snow_id": clean_id,
+                                "source": "hub_directory",
+                            }
+                        if resp.status == 404:
+                            return {
+                                "success": False,
+                                "found": False,
+                                "status": "REMOTE_DEVICE_NOT_FOUND",
+                                "error": str((hub_data or {}).get("error") or f"Remote device '{clean_id}' not found."),
+                                "snow_id": clean_id,
+                                "source": "hub_directory",
+                            }
+                        if resp.status >= 500 or resp.status != 200 or not isinstance(hub_data, dict):
+                            return {
+                                "success": False,
+                                "found": False,
+                                "status": "HUB_UNAVAILABLE",
+                                "error": str((hub_data or {}).get("error") or f"Cloud hub returned HTTP {resp.status}."),
+                                "snow_id": clean_id,
+                                "source": "hub_directory",
+                            }
+
+                        if "online" in hub_data and not hub_data.get("online"):
+                            return {
+                                "success": False,
+                                "found": False,
+                                "status": "REMOTE_DEVICE_OFFLINE",
+                                "error": f"Remote device '{clean_id}' is currently offline.",
+                                "snow_id": clean_id,
+                                "source": "hub_directory",
+                            }
+
+                        ep_ok, ep_host, ep_port, ep_err = self._extract_valid_hub_endpoints(hub_data)
+                        if not ep_ok:
+                            return {
+                                "success": False,
+                                "found": False,
+                                "status": "INVALID_ENDPOINT",
+                                "error": ep_err,
+                                "snow_id": clean_id,
+                                "source": "hub_directory",
+                            }
+
+                        result: dict[str, Any] = {
+                            "success": True,
+                            "found": True,
+                            "source": "hub_directory",
+                            "snow_id": clean_id,
+                            "hub_url": hub_url,
+                            **hub_data,
+                        }
+                        if ep_host:
+                            result["host"] = ep_host
+                            result["port"] = ep_port
+                        return result
+            except asyncio.TimeoutError:
+                return {
+                    "success": False,
+                    "found": False,
+                    "status": "HUB_UNAVAILABLE",
+                    "error": f"Cloud hub directory timed out resolving '{clean_id}'.",
+                    "snow_id": clean_id,
+                    "source": "hub_directory",
+                    **({"discovery_error": discovery_error} if discovery_error else {}),
+                }
             except Exception as exc:
                 logger.debug("Hub directory lookup failed for %s: %s", clean_id, exc)
+                return {
+                    "success": False,
+                    "found": False,
+                    "status": "HUB_UNAVAILABLE",
+                    "error": f"Cloud hub directory unavailable: {exc}",
+                    "snow_id": clean_id,
+                    "source": "hub_directory",
+                    **({"discovery_error": discovery_error} if discovery_error else {}),
+                }
 
-        return {"success": False, "found": False, "status": "NOT_FOUND", "error": f"No reachable peer found for '{clean_id}'."}
+        if discovery_status == "DISCOVERY_UNAVAILABLE":
+            return {
+                "success": False,
+                "found": False,
+                "status": "DISCOVERY_UNAVAILABLE",
+                "error": discovery_error or f"Local discovery unavailable resolving '{clean_id}'.",
+                "snow_id": clean_id,
+            }
+        return {
+            "success": False,
+            "found": False,
+            "status": "LOCAL_DEVICE_NOT_FOUND",
+            "error": f"No reachable local or remote peer found for '{clean_id}'.",
+            "snow_id": clean_id,
+        }
 
     async def handle_api_directory_resolve(self, request: web.Request) -> web.Response:
-        """Resolve a SNOW ID or Network ID across local mesh and default cloud hub."""
+        """Resolve a SNOW ID or Network ID across local mesh and authenticated cloud hub."""
         snow_id = request.match_info.get("snow_id", "").strip()
         res = await self._resolve_snow_id_directory(snow_id)
-        status = 200 if res.get("found") else (400 if res.get("status") == "INVALID_SNOW_ID" else 404)
+        if res.get("found"):
+            status = 200
+        else:
+            code = str(res.get("status") or "NOT_FOUND")
+            status = {
+                "INVALID_SNOW_ID": 400,
+                "HUB_AUTH_FAILED": 401,
+                "FORBIDDEN": 403,
+                "INVALID_ENDPOINT": 502,
+                "HUB_UNAVAILABLE": 503,
+                "DISCOVERY_UNAVAILABLE": 503,
+            }.get(code, 404)
         return web.json_response(res, status=status)
 
     async def handle_api_federation_grants(self, request: web.Request) -> web.Response:

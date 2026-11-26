@@ -479,6 +479,63 @@ class SnowIpcServer:
                 "data": {"devices": devices_data},
             }, now_authed
 
+        if op == "list_discovered_peers":
+            payload_data = payload if isinstance(payload, dict) else {}
+            snow_id_filter = str(payload_data.get("snow_id") or "").strip().upper()
+            cs = getattr(self, "core_server", None)
+            disc = getattr(cs, "discovery_service", None) if cs else None
+            if not disc or not hasattr(disc, "list_discovered_peers"):
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "DISCOVERY_UNAVAILABLE",
+                    "error": "Core LAN discovery service is not active.",
+                    "data": {"peers": []},
+                }, now_authed
+            try:
+                from snow.security.identity import generate_snow_id
+
+                raw_peers = disc.list_discovered_peers(include_stale=False)
+                peers_out: list[dict[str, Any]] = []
+                for peer in list(raw_peers)[:64]:
+                    p_id = str(getattr(peer, "device_id", "") or "").strip()
+                    if not p_id:
+                        continue
+                    p_snow = str(
+                        getattr(peer, "snow_id", None) or generate_snow_id(seed=p_id)
+                    ).strip().upper()
+                    if snow_id_filter and p_snow != snow_id_filter and p_id.upper() != snow_id_filter:
+                        continue
+                    peers_out.append({
+                        "device_id": p_id,
+                        "device_name": str(getattr(peer, "device_name", "") or "LAN Peer"),
+                        "device_type": str(getattr(peer, "device_type", "") or "unknown"),
+                        "snow_id": p_snow,
+                        "host": str(getattr(peer, "ip_address", "") or ""),
+                        "port": int(getattr(peer, "port", 8765) or 8765),
+                        "transfer_port": int(getattr(peer, "transfer_port", 8766) or 8766),
+                        "cert_fingerprint": str(getattr(peer, "cert_fingerprint", "") or ""),
+                        "is_paired": bool(getattr(peer, "is_paired", False)),
+                    })
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"peers": peers_out},
+                }, now_authed
+            except Exception as exc:
+                logger.warning("Failed querying LAN discovery service via IPC: %s", exc)
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "DISCOVERY_UNAVAILABLE",
+                    "error": f"Core LAN discovery query failed: {exc}",
+                    "data": {"peers": []},
+                }, now_authed
+
         if op == "mesh_topology":
             principal = ctx.principal
             network_mgr = getattr(self.core_server, "network_manager", None)
@@ -1616,7 +1673,7 @@ class SnowIpcServer:
                 }, now_authed
 
             payload_data = payload if isinstance(payload, dict) else {}
-            device_id = payload_data.get("device_id")
+            device_id = str(payload_data.get("device_id") or "").strip()
             if not device_id:
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -1626,75 +1683,60 @@ class SnowIpcServer:
                     "error": "Missing 'device_id'.",
                 }, now_authed
 
-            # 1. Notify active client cleanly before terminating its session and socket
-            session = self.core_server.session_manager.get_session_by_device(device_id)
-            if session:
-                if session.connection_id and hasattr(self.core_server, "connection_manager"):
-                    client = self.core_server.connection_manager.get(session.connection_id)
-                    if client and hasattr(client, "websocket") and client.websocket is not None:
-                        try:
-                            from snow.protocol.models import SnowMessage
-                            revoke_msg = SnowMessage.create_request(
-                                action="device_revoked",
-                                data={
-                                    "device_id": device_id,
-                                    "reason": "Revoked by desktop owner",
-                                },
-                            )
-                            send_res = client.websocket.send(revoke_msg.to_json())
-                            if inspect.isawaitable(send_res):
-                                await asyncio.wait_for(send_res, timeout=1.5)
-                        except Exception as notify_err:
-                            logger.debug("Best-effort device_revoked delivery failed: %s", notify_err)
-                    unreg_client = self.core_server.connection_manager.unregister(session.connection_id)
-                    close_target = unreg_client or client
-                    if close_target and hasattr(close_target, "websocket") and close_target.websocket is not None:
-                        try:
-                            close_res = close_target.websocket.close(code=1000, reason="Device revoked")
-                            if inspect.isawaitable(close_res):
-                                await close_res
-                        except Exception as close_err:
-                            logger.debug("Error closing revoked client websocket: %s", close_err)
-                self.core_server.session_manager.revoke_session(session.session_id)
-                logger.info("Revoked active session [%s] for device [%s]", session.session_id, device_id)
-            from snow.transfer.http_server import SnowHttpTransferServer
-            SnowHttpTransferServer.revoke_target_from_streams(device_id)
-            revoke_fn = getattr(self.core_server, "revoke_screen_target", None)
-            if callable(revoke_fn):
-                revoke_res = revoke_fn(device_id)
-                if inspect.isawaitable(revoke_res):
-                    await revoke_res
+            cs = self.core_server
+            reason = str(payload_data.get("reason") or "Revoked by desktop owner")
+            from snow.core.server import SnowCoreServer
 
-            if hasattr(self.core_server, "peer_clients") and device_id in self.core_server.peer_clients:
-                peer_client = self.core_server.peer_clients.pop(device_id, None)
-                if peer_client:
-                    try:
-                        await peer_client.close()
-                    except Exception as close_err:
-                        logger.debug("Error closing revoked peer client: %s", close_err)
-
-            # 2. Delete paired credentials from SQLite database
-            deleted = self.core_server.db_manager.delete_paired_device(device_id)
-            if getattr(self, "node_registry", None):
-                try:
-                    self.node_registry.remove_node(device_id)
-                except Exception as reg_err:
-                    logger.debug("Failed removing node from registry: %s", reg_err)
-
-            if deleted:
-                self.core_server.db_manager.log_audit_event(
-                    event_type="DEVICE_REVOKED",
+            # Invoke instance method on real Core/custom subclasses, or shared executor for bare mocks
+            core_cls = type(cs) if cs is not None else None
+            has_real_method = (
+                cs is not None
+                and inspect.iscoroutinefunction(getattr(core_cls, "remove_device_everywhere", None))
+            )
+            if has_real_method:
+                res = await cs.remove_device_everywhere(
                     device_id=device_id,
-                    details={"revoked_by": "cli_ipc"},
+                    reason=reason,
+                    notify_client=True,
+                    audit_event_type="DEVICE_REVOKED",
+                    audit_details={"revoked_by": "cli_ipc"},
+                )
+            else:
+                ws = getattr(cs, "ws_server", None) if cs else None
+                peer_clients = getattr(cs, "peer_clients", None) if cs else None
+                res = await SnowCoreServer.execute_device_removal(
+                    device_id=device_id,
+                    reason=reason,
+                    notify_client=True,
+                    db_manager=getattr(cs, "db_manager", None) if cs else None,
+                    session_manager=getattr(cs, "session_manager", None) if cs else None,
+                    connection_manager=getattr(cs, "connection_manager", None) if cs else None,
+                    node_registry=getattr(self, "node_registry", None) or (getattr(cs, "node_registry", None) if cs else None),
+                    ws_server=ws,
+                    core_server=cs,
+                    discovery_service=getattr(cs, "discovery_service", None) if cs else None,
+                    relay_client=getattr(cs, "relay_client", None) if cs else None,
+                    session_router=getattr(cs, "session_router", None) if cs else None,
+                    peer_clients=peer_clients if isinstance(peer_clients, dict) else None,
+                    http_transfer_server=getattr(cs, "http_transfer_server", None) if cs else None,
+                    screen_stream_manager=getattr(cs, "screen_stream_manager", None) if cs else None,
+                    audit_event_type="DEVICE_REVOKED",
+                    audit_details={"revoked_by": "cli_ipc"},
                 )
 
+            removed = bool(res.get("removed", res.get("success", False)))
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
-                "success": deleted,
-                "status": "SUCCESS" if deleted else "DEVICE_NOT_FOUND",
-                "data": {"device_id": device_id, "revoked": deleted},
-                "error": None if deleted else f"Device [{device_id}] not found in paired database.",
+                "success": removed,
+                "status": res.get("status", "SUCCESS" if removed else "DEVICE_NOT_FOUND"),
+                "data": {
+                    "device_id": device_id,
+                    "revoked": removed,
+                    "removed": removed,
+                    "already_removed": bool(res.get("already_removed", not removed)),
+                },
+                "error": res.get("error"),
             }, now_authed
 
         if op == "device_disconnect":
@@ -1846,9 +1888,19 @@ class SnowIpcServer:
             from snow.security.identity import generate_snow_id
             from snow.security.pairing import create_qr_pairing_payload
 
+            local_ident = getattr(cs, "device_identity", None)
+            host_device_id = str(getattr(local_ident, "device_id", "") or "").strip()
+            if not host_device_id:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "NOT_AVAILABLE",
+                    "error": "Authoritative desktop host device_id is unavailable.",
+                }, now_authed
+
             candidate_ips = get_active_ip_addresses()
             cfg = getattr(cs, "config", None)
-            node_id = getattr(cfg, "node_id", "desktop-core")
             port = getattr(cfg, "port", 8765)
 
             cert_info = getattr(ws, "certificate_info", None)
@@ -1865,15 +1917,14 @@ class SnowIpcServer:
                     active_ips=candidate_ips,
                 )
             fp = cert_info.fingerprint_sha256 if cert_info else ""
-            local_ident = getattr(cs, "device_identity", None)
-            snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=node_id)
+            snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=host_device_id)
 
             pin_state = pm.get_active_pin_state(include_pin=True)
             qr_payload = None
             if pin_state.get("has_active_pin") and pin_state.get("pin") and fp:
                 try:
                     qr_payload = create_qr_pairing_payload(
-                        node_id=node_id,
+                        node_id=host_device_id,
                         candidate_ips=candidate_ips,
                         port=port,
                         cert_fingerprint=fp,
@@ -1887,7 +1938,7 @@ class SnowIpcServer:
             state_data: dict[str, Any] = {
                 "ips": candidate_ips,
                 "port": port,
-                "node_id": node_id,
+                "node_id": host_device_id,
                 "snow_id": snow_id,
                 "fp": fp,
                 "cert_fingerprint": fp,
@@ -1948,6 +1999,17 @@ class SnowIpcServer:
                     "error": "Core WebSocket server or pairing manager is not active.",
                 }, now_authed
 
+            local_ident = getattr(cs, "device_identity", None)
+            host_device_id = str(getattr(local_ident, "device_id", "") or "").strip()
+            if not host_device_id:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "NOT_AVAILABLE",
+                    "error": "Authoritative desktop host device_id is unavailable.",
+                }, now_authed
+
             payload_data = payload if isinstance(payload, dict) else {}
             trust_tier = payload_data.get("trust_tier", "owner")
             pin = pm.generate_pin(display_to_stderr=False, trust_tier=trust_tier)
@@ -1955,7 +2017,6 @@ class SnowIpcServer:
             candidate_ips = get_active_ip_addresses()
 
             cfg = getattr(cs, "config", None)
-            node_id = getattr(cfg, "node_id", "desktop-core")
             port = getattr(cfg, "port", 8765)
 
             cert_info = getattr(ws, "certificate_info", None)
@@ -1974,7 +2035,7 @@ class SnowIpcServer:
 
             fp = cert_info.fingerprint_sha256 if cert_info else ""
             from snow.core.config import resolve_default_hub_url
-            from snow.security.identity import load_or_create_network_key_identity
+            from snow.security.identity import generate_snow_id, load_or_create_network_key_identity
             from snow.security.pairing import create_qr_pairing_payload
 
             try:
@@ -1983,8 +2044,9 @@ class SnowIpcServer:
             except Exception:
                 network_key_id = ""
             hub_url = resolve_default_hub_url(db_manager=getattr(cs, "db_manager", None)) or None
+            snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=host_device_id)
             handshake_token = pm.issue_handshake_token(
-                host_device_id=node_id,
+                host_device_id=host_device_id,
                 network_id=network_key_id,
                 trust_tier=trust_tier,
                 ttl_seconds=pm.pin_lifetime or 120.0,
@@ -1992,12 +2054,13 @@ class SnowIpcServer:
 
             try:
                 qr_payload = create_qr_pairing_payload(
-                    node_id=node_id,
+                    node_id=host_device_id,
                     candidate_ips=candidate_ips,
                     port=port,
                     cert_fingerprint=fp,
                     pin=pin,
                     trust_tier=trust_tier,
+                    snow_id=snow_id,
                     handshake_token=handshake_token,
                     network_id=network_key_id or None,
                     hub_url=hub_url,
@@ -2078,22 +2141,24 @@ class SnowIpcServer:
         }
 
     def _handle_list_devices(self) -> list[dict]:
-        """Compile detailed, secret-redacted paired and connected device records."""
+        """Compile detailed, secret-redacted paired and connected device records (excludes unpaired discovery ghosts)."""
         if getattr(self, "node_registry", None):
-            nodes = self.node_registry.list_nodes()
-            return [node.to_summary_dict() for node in nodes]
+            nodes = self.node_registry.list_nodes(filter_paired=True)
+            return [
+                node.to_summary_dict()
+                for node in nodes
+                if getattr(node, "is_paired", False) or getattr(node, "transport", None) == "local"
+            ]
 
         cs = self.core_server
         paired = cs.db_manager.list_paired_devices()
         results = []
 
-        paired_ids = set()
         for p in paired:
             session = cs.session_manager.get_session_by_device(p.device_id)
             is_connected = False
             remote_addr = None
             session_id = None
-            paired_ids.add(p.device_id)
 
             if session:
                 session_id = session.session_id
@@ -2114,22 +2179,6 @@ class SnowIpcServer:
                 "last_seen": p.last_seen_timestamp,
                 "permission_profile": cs.db_manager.get_setting(f"device_profile:{p.device_id}", "full_control"),
             })
-
-        # Append discovered LAN candidates if discovery service is active
-        if getattr(cs, "discovery_service", None) and cs.discovery_service.is_running:
-            for peer in cs.discovery_service.list_discovered_peers():
-                if peer.device_id not in paired_ids:
-                    results.append({
-                        "device_id": peer.device_id,
-                        "device_name": peer.device_name,
-                        "is_paired": False,
-                        "is_connected": False,
-                        "is_discovered": True,
-                        "remote_address": f"{peer.ip_address}:{peer.port}",
-                        "device_type": peer.device_type,
-                        "cert_fingerprint": peer.cert_fingerprint,
-                        "last_seen": peer.last_seen_timestamp,
-                    })
 
         return results
 

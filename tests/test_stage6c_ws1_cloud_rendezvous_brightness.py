@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import uuid
 
 from aiohttp.test_utils import AioHTTPTestCase
 
@@ -321,6 +322,7 @@ class TestStage6CWS1RendezvousEndToEndPairing(unittest.IsolatedAsyncioTestCase):
 
         net_id_obj = load_or_create_network_key_identity(data_dir=host_dir)
         host_ident = load_or_create_device_identity(data_dir=host_dir)
+        client_uuid = str(uuid.uuid4())
         host_db = DatabaseManager(db_path=host_dir / "host.db")
         cfg = CoreConfig(
             bind_host="127.0.0.1",
@@ -369,10 +371,10 @@ class TestStage6CWS1RendezvousEndToEndPairing(unittest.IsolatedAsyncioTestCase):
             # Joining phone is NOT in host_db yet!
             join_res = await (await http.post(
                 f"{self.hub_url}/v1/rendezvous/join",
-                json={"snow_id": host_ident.snow_id, "pin": real_pin, "client_device_id": "phone-join-1"},
+                json={"snow_id": host_ident.snow_id, "pin": real_pin, "client_device_id": client_uuid},
             )).json()
             self.assertTrue(join_res["success"])
-            self.assertIsNone(host_db.get_paired_device("phone-join-1"))
+            self.assertIsNone(host_db.get_paired_device(client_uuid))
 
         host_tunnel = RelayTunnelClient(
             relay_url=self.ws_url,
@@ -384,12 +386,12 @@ class TestStage6CWS1RendezvousEndToEndPairing(unittest.IsolatedAsyncioTestCase):
             hub_token=hub_token,
             network_id=net_id_obj.network_id,
         )
-        host_tunnel.set_peer_pinned_fingerprint("phone-join-1", client_tls.fingerprint_sha256)
+        host_tunnel.set_peer_pinned_fingerprint(client_uuid, client_tls.fingerprint_sha256)
         host_tunnel.request_dispatcher = core._handle_incoming_relay_request
 
         phone_tunnel = RelayTunnelClient(
             relay_url=self.ws_url,
-            device_id="phone-join-1",
+            device_id=client_uuid,
             group_id=net_id_obj.network_id,
             ticket="",
             cert_path=str(client_tls.cert_path),
@@ -420,14 +422,14 @@ class TestStage6CWS1RendezvousEndToEndPairing(unittest.IsolatedAsyncioTestCase):
             denied = await phone_tunnel.receive_message(host_ident.device_id, timeout=5.0)
             self.assertIsNotNone(denied)
             self.assertEqual((denied.error or {}).get("code"), "UNAUTHORIZED")
-            self.assertIsNone(host_db.get_paired_device("phone-join-1"))
+            self.assertIsNone(host_db.get_paired_device(client_uuid))
 
             # Real pair_request via E2E tunnel verifies real PIN via PairingManager & pairs device!
             await phone_tunnel.send_message(
                 host_ident.device_id,
                 SnowMessage.create_request(
                     "pair_request",
-                    {"device_id": "phone-join-1", "device_name": "Remote Phone", "pin": real_pin},
+                    {"device_id": client_uuid, "device_name": "Remote Phone", "pin": real_pin},
                 ),
             )
             paired_resp = await phone_tunnel.receive_message(host_ident.device_id, timeout=5.0)
@@ -435,7 +437,7 @@ class TestStage6CWS1RendezvousEndToEndPairing(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(paired_resp.payload.get("status"), "success")
             auth_tok = paired_resp.payload["data"]["auth_token"]
             self.assertTrue(len(auth_tok) >= 16)
-            self.assertIsNotNone(host_db.get_paired_device("phone-join-1"))
+            self.assertIsNotNone(host_db.get_paired_device(client_uuid))
         finally:
             await phone_tunnel.disconnect()
             await host_tunnel.disconnect()

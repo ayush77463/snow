@@ -405,6 +405,11 @@ class SnowMcpBridge:
         """Query all known paired devices and their connection states."""
         return await self.call_cross_device("list_devices", timeout=5.0)
 
+    async def list_discovered_peers(self, snow_id: str = "") -> dict[str, Any]:
+        """Query active LAN UDP discovery candidates from the Core discovery service."""
+        payload = {"snow_id": snow_id} if snow_id else {}
+        return await self.call("list_discovered_peers", payload=payload, timeout=2.0)
+
     async def send_device_request(
         self,
         device_id: str,

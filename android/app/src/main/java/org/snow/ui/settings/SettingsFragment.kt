@@ -257,16 +257,7 @@ class SettingsFragment : Fragment() {
 
     private fun openBatteryOptimizationSettings() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:${requireContext().packageName}")
-            }
-            try {
-                startActivity(intent)
-            } catch (_: Exception) {
-                try {
-                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                } catch (_: Exception) {}
-            }
+            org.snow.ui.SnowUiRepository.openBatteryOptimizationSettings(requireContext())
         }
     }
 
@@ -331,21 +322,7 @@ class SettingsFragment : Fragment() {
         }
 
         fun isNotificationServiceEnabled(ctx: Context): Boolean {
-            val packageName = ctx.packageName
-            val flat = Settings.Secure.getString(
-                ctx.contentResolver,
-                "enabled_notification_listeners"
-            )
-            if (!flat.isNullOrEmpty()) {
-                val names = flat.split(":")
-                for (name in names) {
-                    val cn = ComponentName.unflattenFromString(name)
-                    if (cn != null && cn.packageName == packageName) {
-                        return true
-                    }
-                }
-            }
-            return false
+            return org.snow.service.SnowNotificationListenerService.isNotificationServiceEnabled(ctx)
         }
     }
 

@@ -237,6 +237,14 @@ class SnowDiscoveryService:
             return peer
         return None
 
+    def remove_peer(self, device_id: str) -> bool:
+        """Purge a cached discovery peer entry by device_id."""
+        clean_id = (device_id or "").strip()
+        if not clean_id:
+            return False
+        removed = self._discovered_peers.pop(clean_id, None) is not None
+        return removed
+
     def _create_beacon(self, wake_target: Optional[str] = None) -> DiscoveryBeacon:
         """Build a new signed discovery beacon for this instance."""
         return DiscoveryBeacon(
