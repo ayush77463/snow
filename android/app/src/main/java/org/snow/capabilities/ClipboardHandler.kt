@@ -3,9 +3,11 @@ package org.snow.capabilities
 import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -17,17 +19,53 @@ import java.io.File
  *
  * Implements bidirectional clipboard support:
  * - pushClipboard: Pushes text to the Android clipboard on the Main thread (max 64 KiB UTF-8).
- * - pushImageClipboard: Stages image file in bounded 10-file FileProvider cache, assigns Content URI,
+ * - pushImageClipboard: Stages image file in bounded 15-file FileProvider cache, assigns Content URI,
  *   grants IME read permissions, and provides visible Share/Save fallback.
  * - pullClipboard: Reads plain-text clipboard content strictly subject to Android foreground
  *   and explicit user confirmation/intent checks. Never logs clipboard content.
  */
-class ClipboardHandler(private val context: Context) {
+class ClipboardHandler(
+    private val context: Context,
+    private val textClipSetterOverride: ((String) -> Unit)? = null
+) {
 
     companion object {
         private const val TAG = "ClipboardHandler"
         const val MAX_TEXT_BYTES = 64 * 1024 // 64 KiB
         const val MAX_IMAGE_CACHE_FILES = 10
+        const val MAX_IMAGE_BYTES = 15L * 1024L * 1024L // 15 MiB
+        const val MAX_FILE_BYTES = 15L * 1024L * 1024L // 15 MiB
+        const val MAX_BUNDLE_BYTES = 15L * 1024L * 1024L // 15 MiB
+        const val MAX_BUNDLE_FILES = 5
+
+        private val RESERVED_NAMES = setOf(
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+            "LPT1", "LPT2", "LPT3", "LPT4"
+        )
+
+        @JvmStatic
+        fun sanitizeClipboardFileName(rawName: String?): String {
+            val clean = rawName?.trim()
+                ?: throw IllegalArgumentException("Clipboard filename cannot be null.")
+            if (clean.isEmpty() || clean.length > 255) {
+                throw IllegalArgumentException("Clipboard filename length must be between 1 and 255 characters.")
+            }
+            if (clean == "." || clean == ".." || clean.contains("..")) {
+                throw IllegalArgumentException("Clipboard filename contains disallowed traversal sequence.")
+            }
+            if (clean.any { it.code < 32 || it == '/' || it == '\\' || it == ':' || it == '\u0000' }) {
+                throw IllegalArgumentException("Clipboard filename contains disallowed path characters.")
+            }
+            if (clean.uppercase() in RESERVED_NAMES) {
+                throw IllegalArgumentException("Clipboard filename uses a reserved OS device name.")
+            }
+            return clean
+        }
+
+        @JvmStatic
+        fun isTextWithinLimit(text: String?): Boolean {
+            return text != null && text.toByteArray(Charsets.UTF_8).size <= MAX_TEXT_BYTES
+        }
 
         private val activeActivities = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
@@ -110,20 +148,28 @@ class ClipboardHandler(private val context: Context) {
          */
         @JvmStatic
         fun grantImeUriPermission(ctx: Context, uri: Uri) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+                return
+            }
             try {
                 val imeSetting = android.provider.Settings.Secure.getString(
                     ctx.contentResolver,
                     android.provider.Settings.Secure.DEFAULT_INPUT_METHOD
                 )
                 if (!imeSetting.isNullOrBlank()) {
-                    val imePackage = imeSetting.substringBefore('/')
-                    ctx.grantUriPermission(
-                        imePackage,
-                        uri,
-                        Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
-                    SafeLog.i(TAG, "Granted URI read permission to active IME: $imePackage")
+                    val imePackage = ComponentName.unflattenFromString(imeSetting)?.packageName
+                        ?: imeSetting.substringBefore('/')
+                    if (imePackage.isNotBlank()) {
+                        ctx.grantUriPermission(
+                            imePackage,
+                            uri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        )
+                        SafeLog.i(TAG, "Granted URI read permission to active IME: $imePackage")
+                    }
                 }
+            } catch (sec: SecurityException) {
+                SafeLog.i(TAG, "IME URI permission grant restricted by OS: ${sec.message}")
             } catch (e: Exception) {
                 SafeLog.i(TAG, "Could not resolve default IME for URI grant: ${e.message}")
             }
@@ -180,16 +226,18 @@ class ClipboardHandler(private val context: Context) {
         }
 
         try {
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            if (clipboard == null) {
-                return@withContext mapOf(
-                    "status" to "error",
-                    "error" to "ClipboardManager service unavailable."
-                )
+            val overrideSetter = textClipSetterOverride
+            if (overrideSetter != null) {
+                overrideSetter(text)
+            } else {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    ?: return@withContext mapOf(
+                        "status" to "error",
+                        "error" to "ClipboardManager service unavailable."
+                    )
+                val clip = ClipData.newPlainText("SNOW", text)
+                clipboard.setPrimaryClip(clip)
             }
-
-            val clip = ClipData.newPlainText("SNOW", text)
-            clipboard.setPrimaryClip(clip)
 
             SafeLog.i(TAG, "Successfully pushed ${rawBytes.size} bytes to Android clipboard.")
             return@withContext mapOf(

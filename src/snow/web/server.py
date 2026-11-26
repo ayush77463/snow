@@ -2201,7 +2201,7 @@ class SnowWebServer:
 
     async def handle_api_clipboard_buffer_list(self, request: web.Request) -> web.Response:
         """List metadata for the latest items in the shared clipboard buffer."""
-        limit = int(request.query.get("limit", 10))
+        limit = min(max(int(request.query.get("limit", 15)), 1), 15)
         res = await self.bridge.call("clipboard_buffer_list", {"limit": limit})
         return web.json_response(res)
 
@@ -2285,76 +2285,263 @@ class SnowWebServer:
     }
 
     async def handle_api_clipboard_image(self, request: web.Request) -> web.Response:
-        """Serve authenticated clipboard thumbnail / full image from contained buffer storage."""
-        item_id = request.match_info.get("item_id", "").strip()
-        import re
-        if not item_id or not re.match(r"^cb_[0-9a-f]{12}_[0-9a-f]{6}$", item_id):
-            return web.Response(status=400, text="Invalid item ID format. Expected format: cb_<12hex>_<6hex>.")
+        """Serve authenticated clipboard thumbnail / full image from contained buffer storage.
 
-        from snow.capabilities.clipboard_buffer import ClipboardRingBuffer, get_default_clipboard_storage_dir
+        Prefers authoritative Core IPC (`clipboard_buffer_get`) whenever Core is reachable,
+        falling back to an in-process buffer only when Core IPC is unavailable/offline.
+        """
+        import re
+        item_id = request.match_info.get("item_id", "").strip()
+        if not item_id or not re.match(r"^cb_[0-9a-f]{12}_[0-9a-f]{6}$", item_id):
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Invalid item ID format. Expected format: cb_<12hex>_<6hex>.",
+                },
+                status=400,
+            )
+
+        from snow.capabilities.clipboard_buffer import (
+            ClipboardRingBuffer,
+            JPEG_SIGNATURE,
+            MAX_IMAGE_BYTES,
+            PNG_SIGNATURE,
+            get_default_clipboard_storage_dir,
+        )
+
+        def _is_contained_non_symlink(candidate: Path, root: Path) -> bool:
+            try:
+                if candidate.is_symlink():
+                    return False
+                resolved_root = root.resolve()
+                resolved_cand = candidate.resolve()
+                if not resolved_cand.is_relative_to(resolved_root):
+                    return False
+                real_root = Path(os.path.realpath(resolved_root))
+                real_cand = Path(os.path.realpath(resolved_cand))
+                return real_cand.is_relative_to(real_root)
+            except (OSError, ValueError, RuntimeError):
+                return False
+
+        OFFLINE_IPC_STATUSES = {
+            "CORE_OFFLINE",
+            "DAEMON_OFFLINE",
+            "IPC_UNAVAILABLE",
+            "CONNECTION_ERROR",
+            "CONNECTION_RESET",
+            "REQUEST_TIMEOUT",
+            "UNAVAILABLE",
+            "ENGINE_UNAVAILABLE",
+        }
 
         in_proc_engine = getattr(self.bridge, "capability_engine", None)
         in_proc_buf = getattr(in_proc_engine, "clipboard_buffer", None) if in_proc_engine else None
         target_file: Optional[Path] = None
-        mime_hint: Optional[str] = None
+        storage_dir: Optional[Path] = None
+        mime_hint = ""
+        ipc_unavailable = False
 
-        if isinstance(in_proc_buf, ClipboardRingBuffer):
-            item = in_proc_buf.get_item(item_id, include_content=False)
-            if not item or (item.get("type") != "image" and item.get("content_type") != "image"):
-                return web.Response(status=404, text="Clipboard image not found.")
-            target_file = in_proc_buf.get_image_path(item_id)
-            mime_hint = item.get("mime_type")
-            storage_dir = in_proc_buf.storage_dir.resolve()
-        else:
-            # Metadata-only IPC query to resolve contained filename cleanly across process boundary
-            res = await self.bridge.call("clipboard_buffer_get", {"item_id": item_id})
-            if not res.get("success", False):
-                return web.Response(status=404, text="Clipboard image not found.")
+        bridge_call = getattr(self.bridge, "call", None)
+        if callable(bridge_call):
+            try:
+                res = await bridge_call("clipboard_buffer_get", {"item_id": item_id})
+            except (ConnectionError, TimeoutError, OSError) as exc:
+                logger.warning("Core IPC unreachable during clipboard image fetch [%s]: %s", item_id, exc)
+                res = {"success": False, "status": "CORE_OFFLINE", "error": str(exc)}
 
-            data_dict = res.get("data") if isinstance(res.get("data"), dict) else {}
-            item = data_dict.get("item")
-            if not item or (item.get("type") != "image" and item.get("content_type") != "image"):
-                return web.Response(status=404, text="Clipboard image not found or not an image.")
+            if isinstance(res, dict) and res.get("success", False):
+                data_dict = res.get("data") if isinstance(res.get("data"), dict) else {}
+                item = data_dict.get("item") if isinstance(data_dict.get("item"), dict) else None
+                if not item or (item.get("type") != "image" and item.get("content_type") != "image"):
+                    return web.json_response(
+                        {"success": False, "status": "NOT_FOUND", "error": "Clipboard image not found or not an image."},
+                        status=404,
+                    )
 
-            mime_hint = item.get("mime_type")
-            storage_dir = get_default_clipboard_storage_dir().resolve()
-            img_fname = data_dict.get("image_filename")
-            if isinstance(img_fname, str) and img_fname:
-                if "/" in img_fname or "\\" in img_fname or ".." in img_fname or "\0" in img_fname:
-                    return web.Response(status=403, text="Access denied.")
-                candidate = (storage_dir / img_fname).resolve()
-                if not candidate.is_relative_to(storage_dir):
-                    return web.Response(status=403, text="Access denied.")
-                if candidate.is_file():
-                    target_file = candidate
+                mime_hint = str(item.get("mime_type") or "").strip().lower()
+                storage_dir = get_default_clipboard_storage_dir().resolve()
+                img_fname = data_dict.get("image_filename")
+                if img_fname is not None:
+                    if (
+                        not isinstance(img_fname, str)
+                        or not img_fname
+                        or "/" in img_fname
+                        or "\\" in img_fname
+                        or ".." in img_fname
+                        or "\0" in img_fname
+                        or ":" in img_fname
+                        or Path(img_fname).name != img_fname
+                    ):
+                        return web.json_response(
+                            {"success": False, "status": "FORBIDDEN", "error": "Access denied."},
+                            status=403,
+                        )
+                    raw_candidate = storage_dir / img_fname
+                    if not _is_contained_non_symlink(raw_candidate, storage_dir):
+                        return web.json_response(
+                            {"success": False, "status": "FORBIDDEN", "error": "Access denied."},
+                            status=403,
+                        )
+                    if raw_candidate.resolve().is_file():
+                        target_file = raw_candidate.resolve()
+                else:
+                    sha256 = str(item.get("sha256") or "").strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{64}", sha256):
+                        matching = sorted(storage_dir.glob(f"clip_{sha256[:16]}_*.*"))
+                        for cand in matching:
+                            if not _is_contained_non_symlink(cand, storage_dir):
+                                return web.json_response(
+                                    {"success": False, "status": "FORBIDDEN", "error": "Access denied."},
+                                    status=403,
+                                )
+                            if cand.resolve().is_file():
+                                target_file = cand.resolve()
+                                break
             else:
-                sha256 = item.get("sha256", "")
-                if sha256:
-                    matching = sorted(storage_dir.glob(f"clip_{sha256[:16]}_*.*"))
-                    if matching:
-                        target_file = matching[0].resolve()
+                err_status = str((res or {}).get("status") or "").strip().upper()
+                if err_status in OFFLINE_IPC_STATUSES:
+                    ipc_unavailable = True
+                elif err_status == "INVALID_ARGUMENT":
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "status": "INVALID_ARGUMENT",
+                            "error": str((res or {}).get("error") or "Invalid item ID."),
+                        },
+                        status=400,
+                    )
+                else:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "status": err_status or "NOT_FOUND",
+                            "error": str((res or {}).get("error") or "Clipboard image not found."),
+                        },
+                        status=404,
+                    )
+        else:
+            ipc_unavailable = True
 
-        if target_file is None or not target_file.is_file():
-            return web.Response(status=404, text="Clipboard image file not found.")
+        if target_file is None and ipc_unavailable:
+            if isinstance(in_proc_buf, ClipboardRingBuffer):
+                storage_dir = in_proc_buf.storage_dir.resolve()
+                item = in_proc_buf.get_item(item_id, include_content=False)
+                if not item or (item.get("type") != "image" and item.get("content_type") != "image"):
+                    return web.json_response(
+                        {"success": False, "status": "NOT_FOUND", "error": "Clipboard image not found."},
+                        status=404,
+                    )
+                mime_hint = str(item.get("mime_type") or "").strip().lower()
+                raw_path = in_proc_buf.get_image_path(item_id)
+                if raw_path is not None:
+                    if not _is_contained_non_symlink(raw_path, storage_dir):
+                        return web.json_response(
+                            {"success": False, "status": "FORBIDDEN", "error": "Access denied."},
+                            status=403,
+                        )
+                    target_file = raw_path.resolve()
+            else:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "status": "CORE_OFFLINE",
+                        "error": "Desktop Core IPC unavailable for clipboard image lookup.",
+                    },
+                    status=503,
+                )
 
-        resolved_target = target_file.resolve()
-        if not resolved_target.is_relative_to(storage_dir):
-            return web.Response(status=403, text="Access denied.")
+        if target_file is None or storage_dir is None or not target_file.is_file():
+            return web.json_response(
+                {"success": False, "status": "NOT_FOUND", "error": "Clipboard image file not found."},
+                status=404,
+            )
+
+        if not _is_contained_non_symlink(target_file, storage_dir):
+            return web.json_response(
+                {"success": False, "status": "FORBIDDEN", "error": "Access denied."},
+                status=403,
+            )
+
+        if mime_hint == "image/jpg":
+            mime_hint = "image/jpeg"
+        if mime_hint and mime_hint not in {"image/png", "image/jpeg"}:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "UNSUPPORTED_MEDIA_TYPE",
+                    "error": f"Unsupported clipboard image MIME type '{mime_hint}'.",
+                },
+                status=415,
+            )
 
         try:
-            data = resolved_target.read_bytes()
-            mime = mime_hint or ("image/png" if resolved_target.suffix.lower() == ".png" else "image/jpeg")
+            file_size = target_file.stat().st_size
+            if file_size <= 0:
+                return web.json_response(
+                    {"success": False, "status": "CORRUPTED_IMAGE", "error": "Clipboard image file is empty."},
+                    status=422,
+                )
+            if file_size > MAX_IMAGE_BYTES:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "status": "PAYLOAD_TOO_LARGE",
+                        "error": f"Clipboard image exceeds {MAX_IMAGE_BYTES} byte limit.",
+                    },
+                    status=413,
+                )
+
+            with target_file.open("rb") as fh:
+                data = fh.read(MAX_IMAGE_BYTES + 1)
+            if len(data) > MAX_IMAGE_BYTES:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "status": "PAYLOAD_TOO_LARGE",
+                        "error": f"Clipboard image exceeds {MAX_IMAGE_BYTES} byte limit.",
+                    },
+                    status=413,
+                )
+
+            if data.startswith(PNG_SIGNATURE):
+                actual_mime = "image/png"
+            elif data.startswith(JPEG_SIGNATURE):
+                actual_mime = "image/jpeg"
+            else:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "status": "UNSUPPORTED_MEDIA_TYPE",
+                        "error": "Clipboard image binary format is corrupted or unsupported.",
+                    },
+                    status=415,
+                )
+
+            if mime_hint and mime_hint != actual_mime:
+                return web.json_response(
+                    {
+                        "success": False,
+                        "status": "UNSUPPORTED_MEDIA_TYPE",
+                        "error": "Clipboard image MIME type does not match binary content.",
+                    },
+                    status=415,
+                )
+
             return web.Response(
                 body=data,
-                content_type=mime,
+                content_type=actual_mime,
                 headers={
-                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Cache-Control": "no-store",
                     "X-Content-Type-Options": "nosniff",
                 },
             )
         except Exception as exc:
             logger.error("Failed reading clipboard image '%s': %s", item_id, exc)
-            return web.Response(status=500, text="Internal error reading image.")
+            return web.json_response(
+                {"success": False, "status": "INTERNAL_ERROR", "error": "Internal error reading image."},
+                status=500,
+            )
 
     async def handle_api_apps_windows(self, request: web.Request) -> web.Response:
         """Return list of authorized allowlisted Windows productivity applications."""

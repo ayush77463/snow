@@ -63,7 +63,7 @@ CLIPBOARD_BUFFER_CAPABILITIES: dict[str, CapabilityMetadata] = {
         destructive_hint=False,
         requires_approval=False,
         os_classification="cross_platform",
-        description="List the 10 most recent items in the SNOW shared clipboard ring buffer.",
+        description="List the 15 most recent items in the SNOW shared clipboard ring buffer.",
     ),
     "snow_clipboard_buffer_add": CapabilityMetadata(
         name="snow_clipboard_buffer_add",
@@ -534,7 +534,7 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         destructive_hint=False,
         requires_approval=False,
         os_classification="cross_platform",
-        description="List the 10 most recent items in the SNOW shared clipboard ring buffer.",
+        description="List the 15 most recent items in the SNOW shared clipboard ring buffer.",
     ),
     CapabilityMetadata(
         name="snow_clipboard_buffer_add",

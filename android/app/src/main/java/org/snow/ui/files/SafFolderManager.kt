@@ -11,7 +11,10 @@ import java.io.File
 /**
  * Storage Access Framework (SAF) folder picker and persisted URI manager for SNOW file downloads.
  */
-class SafFolderManager(private val context: Context) {
+class SafFolderManager(
+    private val context: Context,
+    private val fallbackDownloadDirOverride: File? = null
+) {
 
     companion object {
         private const val TAG = "SafFolderManager"
@@ -79,8 +82,11 @@ class SafFolderManager(private val context: Context) {
      * Fallback standard file directory if SAF URI is unset.
      */
     fun getDefaultDownloadDir(): File {
-        val publicDownloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val target = File(publicDownloads, "SNOW")
+        val target = fallbackDownloadDirOverride
+            ?: File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "SNOW"
+            )
         if (!target.exists()) {
             target.mkdirs()
         }
@@ -106,10 +112,10 @@ class SafFolderManager(private val context: Context) {
      * or inaccessible, reports failure explicitly rather than silently falling back.
      */
     fun commitVerifiedDownload(tempFile: File, fileName: String): Result<String> {
-        val safUri = getDestinationUri()
-        if (safUri != null) {
-            // User configured a custom SAF tree directory
-            val pickedDir = DocumentFile.fromTreeUri(context, safUri)
+        val configuredSafRaw = prefs.getString(KEY_DESTINATION_URI, null)?.trim()
+        if (!configuredSafRaw.isNullOrEmpty()) {
+            val safUri = getDestinationUri()
+            val pickedDir = safUri?.let { DocumentFile.fromTreeUri(context, it) }
             if (pickedDir == null || !pickedDir.canWrite()) {
                 return Result.failure(
                     IllegalStateException(
@@ -168,6 +174,81 @@ class SafFolderManager(private val context: Context) {
             } catch (e: Exception) {
                 SafeLog.e(TAG, "Write failure committing to fallback directory: ${e.message}", e)
                 Result.failure(e)
+            }
+        }
+    }
+
+    /**
+     * Atomically commit a verified multi-file bundle (1..5 files) to SAF or Downloads/SNOW.
+     * Pre-validates destination writability and avoids leaving partial files on failure.
+     */
+    fun commitVerifiedDownloadBatch(entries: List<Pair<File, String>>): Result<List<String>> {
+        if (entries.isEmpty() || entries.size > 5) {
+            return Result.failure(IllegalArgumentException("Clipboard bundle must contain 1 to 5 files."))
+        }
+        val configuredSafRaw = prefs.getString(KEY_DESTINATION_URI, null)?.trim()
+        if (!configuredSafRaw.isNullOrEmpty()) {
+            val safUri = getDestinationUri()
+            val pickedDir = safUri?.let { DocumentFile.fromTreeUri(context, it) }
+            if (pickedDir == null || !pickedDir.canWrite()) {
+                return Result.failure(
+                    IllegalStateException(
+                        "Configured SAF destination directory is inaccessible or write permission was revoked. Please select a valid folder in Settings."
+                    )
+                )
+            }
+            val createdDocs = mutableListOf<DocumentFile>()
+            val committedNames = mutableListOf<String>()
+            try {
+                for ((tempFile, safeName) in entries) {
+                    val uniqueName = generateUniqueSafName(pickedDir, safeName)
+                    val destDoc = pickedDir.createFile("application/octet-stream", uniqueName)
+                        ?: throw IllegalStateException("Failed to create SAF destination file: $uniqueName")
+                    createdDocs.add(destDoc)
+                    val outStream = context.contentResolver.openOutputStream(destDoc.uri)
+                        ?: throw IllegalStateException("ContentResolver failed opening stream for $uniqueName")
+                    outStream.use { out ->
+                        tempFile.inputStream().use { input -> input.copyTo(out) }
+                        out.flush()
+                    }
+                    committedNames.add(uniqueName)
+                }
+                entries.forEach { (tempFile, _) -> tempFile.delete() }
+                return Result.success(committedNames)
+            } catch (e: Exception) {
+                createdDocs.forEach { doc ->
+                    try { doc.delete() } catch (_: Exception) {}
+                }
+                SafeLog.e(TAG, "Batch SAF commit failed; rolled back created entries: ${e.message}", e)
+                return Result.failure(e)
+            }
+        } else {
+            val fallbackDir = getDefaultDownloadDir()
+            if (!fallbackDir.exists() && !fallbackDir.mkdirs()) {
+                return Result.failure(IllegalStateException("Failed creating fallback Downloads/SNOW directory."))
+            }
+            val createdFiles = mutableListOf<File>()
+            val committedPaths = mutableListOf<String>()
+            try {
+                for ((tempFile, safeName) in entries) {
+                    val uniqueTarget = generateUniqueFile(fallbackDir, safeName)
+                    tempFile.inputStream().use { input ->
+                        uniqueTarget.outputStream().use { out ->
+                            input.copyTo(out)
+                            out.flush()
+                        }
+                    }
+                    createdFiles.add(uniqueTarget)
+                    committedPaths.add(uniqueTarget.name)
+                }
+                entries.forEach { (tempFile, _) -> tempFile.delete() }
+                return Result.success(committedPaths)
+            } catch (e: Exception) {
+                createdFiles.forEach { f ->
+                    try { f.delete() } catch (_: Exception) {}
+                }
+                SafeLog.e(TAG, "Batch fallback commit failed; rolled back created files: ${e.message}", e)
+                return Result.failure(e)
             }
         }
     }

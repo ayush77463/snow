@@ -24,12 +24,14 @@ from ctypes import wintypes
 import hashlib
 import io
 import logging
+import mimetypes
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ CF_BITMAP: int = 2
 CF_UNICODETEXT: int = 13
 CF_DIB: int = 8
 CF_DIBV5: int = 17
+CF_HDROP: int = 15
 GMEM_MOVEABLE: int = 0x0002
 GMEM_ZEROINIT: int = 0x0040
 GHND: int = GMEM_MOVEABLE | GMEM_ZEROINIT
@@ -44,9 +47,91 @@ GHND: int = GMEM_MOVEABLE | GMEM_ZEROINIT
 MAX_CLIPBOARD_READ_BYTES: int = 1024 * 1024  # 1 MiB read cap
 MAX_CLIPBOARD_IMAGE_DIMENSION: int = 8192
 MAX_CLIPBOARD_IMAGE_PIXELS: int = 33_554_432
-MAX_CLIPBOARD_IMAGE_BYTES: int = 10 * 1024 * 1024  # 10 MiB PNG export cap
+MAX_CLIPBOARD_IMAGE_BYTES: int = 15 * 1024 * 1024  # 15 MiB PNG export cap
+MAX_CLIPBOARD_FILES: int = 5
+MAX_CLIPBOARD_FILE_BYTES: int = 15 * 1024 * 1024  # 15 MiB per-file cap
+MAX_CLIPBOARD_BUNDLE_BYTES: int = 15 * 1024 * 1024  # 15 MiB aggregate cap
 MAX_OPEN_RETRIES: int = 5
 RETRY_DELAY_SECONDS: float = 0.04  # 40ms interval
+
+SENSITIVE_CLIPBOARD_FILENAMES = frozenset({
+    "snow_devices.db",
+    "snow_devices.db-wal",
+    "snow_devices.db-shm",
+    ".ipc_secret",
+    "device_key.json",
+    "network_key.json",
+    "peer_policy.json",
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+})
+SENSITIVE_CLIPBOARD_EXTENSIONS = frozenset({".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"})
+
+
+class DROPFILES(ctypes.Structure):
+    """Win32 DROPFILES structure header for CF_HDROP clipboard format."""
+
+    _fields_ = [
+        ("pFiles", wintypes.DWORD),
+        ("pt", wintypes.POINT),
+        ("fNC", wintypes.BOOL),
+        ("fWide", wintypes.BOOL),
+    ]
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    """Return True if path is a symlink or Windows reparse/junction point."""
+    try:
+        if path.is_symlink():
+            return True
+        st = os.lstat(path)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attrs = getattr(st, "st_file_attributes", 0)
+        if reparse_flag and (file_attrs & reparse_flag):
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
+def _validate_cf_hdrop_source_path(raw_path: str) -> tuple[Optional[Path], Optional[str], Optional[str]]:
+    """Validate an incoming CF_HDROP source path for security, type, and sensitivity.
+
+    Returns (resolved_path, error_status, error_message).
+    """
+    if not raw_path or not isinstance(raw_path, str):
+        return None, "INVALID_ARGUMENT", "Empty clipboard file path."
+    path_obj = Path(raw_path)
+
+    # Check symlink/junction on path and any ancestor cleanly
+    if _is_reparse_or_symlink(path_obj):
+        return None, "SECURITY_ERROR", f"Rejected symlink or junction path in clipboard: {path_obj.name}"
+    for ancestor in path_obj.parents:
+        if str(ancestor) and ancestor != path_obj.anchor and _is_reparse_or_symlink(ancestor):
+            return None, "SECURITY_ERROR", f"Rejected path traversing symlink/junction: {path_obj.name}"
+
+    try:
+        resolved = path_obj.resolve(strict=True)
+    except OSError:
+        return None, "FILE_NOT_FOUND", f"Clipboard file does not exist: {path_obj.name}"
+
+    if resolved.is_dir() or not resolved.is_file():
+        return None, "INVALID_FILE_TYPE", f"Directories and special files are not permitted: {resolved.name}"
+
+    # Reject internal SNOW state folder (DBs, keys, IPC secrets, clipboard_buffer cache internals)
+    data_dir = os.environ.get("SNOW_DATA_DIR")
+    snow_state_dir = (Path(data_dir).resolve() if data_dir else (Path.home() / ".snow").resolve())
+    if resolved == snow_state_dir or resolved.is_relative_to(snow_state_dir):
+        return None, "SECURITY_ERROR", f"Rejected internal SNOW state file: {resolved.name}"
+
+    lower_name = resolved.name.lower()
+    if lower_name in SENSITIVE_CLIPBOARD_FILENAMES or resolved.suffix.lower() in SENSITIVE_CLIPBOARD_EXTENSIONS:
+        return None, "SECURITY_ERROR", f"Rejected credential/key file: {resolved.name}"
+
+    return resolved, None, None
 
 
 def get_default_clipboard_temp_dir() -> Path:
@@ -194,6 +279,18 @@ class WindowsClipboardManager:
 
         self._kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
         self._kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+        try:
+            self._shell32 = ctypes.windll.shell32
+            self._shell32.DragQueryFileW.argtypes = [
+                ctypes.c_void_p,
+                wintypes.UINT,
+                wintypes.LPWSTR,
+                wintypes.UINT,
+            ]
+            self._shell32.DragQueryFileW.restype = wintypes.UINT
+        except Exception:
+            self._shell32 = None
 
     def _open_clipboard_with_retry(self) -> bool:
         """Attempt to open clipboard with bounded retries for contention."""
@@ -1032,9 +1129,223 @@ class WindowsClipboardManager:
                 except Exception:
                     pass
 
+    def has_files_sync(self) -> bool:
+        """Return True if the Windows clipboard currently holds CF_HDROP file references."""
+        if not self._is_windows or not self._user32:
+            return False
+        try:
+            return bool(self._user32.IsClipboardFormatAvailable(CF_HDROP))
+        except Exception:
+            return False
+
+    def _extract_hdrop_paths(self, hdrop: Any) -> list[str]:
+        """Extract UTF-16 file paths from an open Win32 CF_HDROP handle."""
+        shell32 = getattr(self, "_shell32", None)
+        if shell32 is None and self._is_windows:
+            try:
+                shell32 = ctypes.windll.shell32
+            except Exception:
+                shell32 = None
+        if shell32 is None or not hdrop:
+            return []
+
+        count = int(shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0))
+        if count <= 0:
+            return []
+        if count > MAX_CLIPBOARD_FILES:
+            raise ValueError(f"TOO_MANY_FILES: Clipboard contains {count} files (max {MAX_CLIPBOARD_FILES}).")
+
+        paths: list[str] = []
+        for idx in range(count):
+            char_len = int(shell32.DragQueryFileW(hdrop, idx, None, 0))
+            if char_len <= 0:
+                continue
+            buf = ctypes.create_unicode_buffer(char_len + 1)
+            shell32.DragQueryFileW(hdrop, idx, buf, char_len + 1)
+            if buf.value:
+                paths.append(buf.value)
+        return paths
+
+    def get_files_sync(self) -> dict[str, Any]:
+        """Capture and validate 1..5 regular files from Windows CF_HDROP without modifying OS clipboard."""
+        if not self._is_windows or not self._user32 or not self._kernel32:
+            return {"success": False, "status": "UNSUPPORTED_PLATFORM", "error": "Windows only"}
+        if not self.has_files_sync():
+            return {"success": True, "status": "EMPTY", "type": "empty", "files": []}
+        if not self._open_clipboard_with_retry():
+            return {"success": False, "status": "CLIPBOARD_BUSY", "error": "Failed opening clipboard"}
+
+        raw_paths: list[str] = []
+        too_many_err: Optional[str] = None
+        try:
+            hdrop = self._user32.GetClipboardData(CF_HDROP)
+            if not hdrop:
+                return {"success": True, "status": "EMPTY", "type": "empty", "files": []}
+            try:
+                raw_paths = self._extract_hdrop_paths(hdrop)
+            except ValueError as ve:
+                too_many_err = str(ve)
+        finally:
+            self._user32.CloseClipboard()
+
+        if too_many_err:
+            return {"success": False, "status": "TOO_MANY_FILES", "error": too_many_err}
+        if not raw_paths:
+            return {"success": True, "status": "EMPTY", "type": "empty", "files": []}
+        if len(raw_paths) > MAX_CLIPBOARD_FILES:
+            return {
+                "success": False,
+                "status": "TOO_MANY_FILES",
+                "error": f"Clipboard contains {len(raw_paths)} files (max {MAX_CLIPBOARD_FILES}).",
+            }
+
+        validated: list[dict[str, Any]] = []
+        total_size = 0
+        for raw_p in raw_paths:
+            resolved, err_status, err_msg = _validate_cf_hdrop_source_path(raw_p)
+            if resolved is None:
+                return {"success": False, "status": err_status or "SECURITY_ERROR", "error": err_msg or "Invalid clipboard file."}
+
+            try:
+                size = resolved.stat().st_size
+            except OSError as st_err:
+                return {"success": False, "status": "IO_ERROR", "error": f"Cannot stat '{resolved.name}': {st_err}"}
+
+            if size > MAX_CLIPBOARD_FILE_BYTES:
+                return {
+                    "success": False,
+                    "status": "CONTENT_TOO_LARGE",
+                    "error": f"File '{resolved.name}' ({size} bytes) exceeds 15 MiB limit.",
+                }
+            total_size += size
+            if total_size > MAX_CLIPBOARD_BUNDLE_BYTES:
+                return {
+                    "success": False,
+                    "status": "CONTENT_TOO_LARGE",
+                    "error": f"Aggregate CF_HDROP bundle exceeds {MAX_CLIPBOARD_BUNDLE_BYTES} bytes (15 MiB).",
+                }
+
+            try:
+                data = resolved.read_bytes()
+            except OSError as rd_err:
+                return {"success": False, "status": "IO_ERROR", "error": f"Failed reading '{resolved.name}': {rd_err}"}
+
+            if len(data) != size or len(data) > MAX_CLIPBOARD_FILE_BYTES:
+                return {
+                    "success": False,
+                    "status": "CONTENT_TOO_LARGE",
+                    "error": f"File '{resolved.name}' size changed or exceeded bounds during read.",
+                }
+
+            f_sha = hashlib.sha256(data).hexdigest()
+            f_mime = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
+            validated.append(
+                {
+                    "name": resolved.name,
+                    "size_bytes": len(data),
+                    "mime_type": f_mime,
+                    "sha256": f_sha,
+                    "data": data,
+                    "source_path": str(resolved),
+                }
+            )
+
+        import json as _json
+
+        bundle_payload = _json.dumps(
+            [[e["name"], e["size_bytes"], e["sha256"]] for e in validated],
+            separators=(",", ":"),
+        ).encode("utf-8")
+        bundle_sha256 = hashlib.sha256(bundle_payload).hexdigest()
+        c_type = "file" if len(validated) == 1 else "file_bundle"
+
+        return {
+            "success": True,
+            "status": "SUCCESS",
+            "type": c_type,
+            "files": validated,
+            "sha256": bundle_sha256,
+            "total_size": total_size,
+        }
+
+    def set_files_sync(self, file_paths: Sequence[Path | str]) -> dict[str, Any]:
+        """Write 1..5 validated local regular files onto Windows clipboard as CF_HDROP."""
+        if not self._is_windows or not self._user32 or not self._kernel32:
+            return {"success": False, "status": "UNSUPPORTED_PLATFORM", "error": "Windows only"}
+        if not isinstance(file_paths, Sequence) or isinstance(file_paths, (str, bytes)) or len(file_paths) == 0:
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "file_paths must contain 1 to 5 files."}
+        if len(file_paths) > MAX_CLIPBOARD_FILES:
+            return {
+                "success": False,
+                "status": "TOO_MANY_FILES",
+                "error": f"Cannot place more than {MAX_CLIPBOARD_FILES} files on CF_HDROP.",
+            }
+
+        resolved_strings: list[str] = []
+        total_size = 0
+        for raw_fp in file_paths:
+            p = Path(raw_fp)
+            if _is_reparse_or_symlink(p):
+                return {"success": False, "status": "SECURITY_ERROR", "error": f"Refusing symlink/junction in CF_HDROP: {p.name}"}
+            try:
+                resolved = p.resolve(strict=True)
+            except OSError:
+                return {"success": False, "status": "FILE_NOT_FOUND", "error": f"File not found: {p.name}"}
+            if resolved.is_dir() or not resolved.is_file():
+                return {"success": False, "status": "INVALID_FILE_TYPE", "error": f"Non-regular file rejected: {resolved.name}"}
+            size = resolved.stat().st_size
+            total_size += size
+            if size > MAX_CLIPBOARD_FILE_BYTES or total_size > MAX_CLIPBOARD_BUNDLE_BYTES:
+                return {"success": False, "status": "CONTENT_TOO_LARGE", "error": "File/bundle size exceeds 15 MiB limit."}
+            resolved_strings.append(str(resolved))
+
+        dropfiles = DROPFILES()
+        header_size = ctypes.sizeof(DROPFILES)
+        dropfiles.pFiles = header_size
+        dropfiles.fNC = 0
+        dropfiles.fWide = 1
+        wide_paths = ("\x00".join(resolved_strings) + "\x00\x00").encode("utf-16le")
+        raw_hdrop = bytes(dropfiles) + wide_paths
+
+        h_mem = self._kernel32.GlobalAlloc(GHND, len(raw_hdrop))
+        if not h_mem:
+            return {"success": False, "status": "ALLOC_FAILED", "error": "GlobalAlloc failed for CF_HDROP."}
+        p_mem = self._kernel32.GlobalLock(h_mem)
+        if not p_mem:
+            self._kernel32.GlobalFree(h_mem)
+            return {"success": False, "status": "LOCK_FAILED", "error": "GlobalLock failed for CF_HDROP."}
+        try:
+            ctypes.memmove(p_mem, raw_hdrop, len(raw_hdrop))
+        finally:
+            self._kernel32.GlobalUnlock(h_mem)
+
+        if not self._open_clipboard_with_retry():
+            self._kernel32.GlobalFree(h_mem)
+            return {"success": False, "status": "CLIPBOARD_BUSY", "error": "Failed opening Windows clipboard."}
+        try:
+            self._user32.EmptyClipboard()
+            res_handle = self._user32.SetClipboardData(CF_HDROP, h_mem)
+            if not res_handle:
+                self._kernel32.GlobalFree(h_mem)
+                return {"success": False, "status": "SET_DATA_FAILED", "error": "SetClipboardData(CF_HDROP) failed."}
+            return {
+                "success": True,
+                "status": "SUCCESS",
+                "file_count": len(resolved_strings),
+                "total_size": total_size,
+            }
+        finally:
+            self._user32.CloseClipboard()
+
+    async def set_files(self, file_paths: Sequence[Path | str]) -> dict[str, Any]:
+        """Asynchronously write 1..5 local files onto Windows clipboard as CF_HDROP."""
+        return await asyncio.to_thread(self.set_files_sync, file_paths)
+
     def get_content_sync(self, output_dir: Optional[Path] = None) -> dict[str, Any]:
-        """Read clipboard content, detecting whether it is an image or text."""
+        """Read clipboard content, detecting file/bundle (CF_HDROP), image, or text."""
         effective_dir = Path(output_dir).resolve() if output_dir else get_default_clipboard_temp_dir()
+        if self.has_files_sync():
+            return self.get_files_sync()
         if self.has_image_sync():
             img_res = self.get_image_sync(effective_dir)
             if img_res.get("success"):

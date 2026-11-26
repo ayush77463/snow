@@ -1127,6 +1127,8 @@ class SnowIpcServer:
                                     f_resolved.unlink(missing_ok=True)
                             except Exception:
                                 pass
+                elif ctype in ("file", "file_bundle") and content.get("files"):
+                    res = buf.add_files(content["files"], source_device="pc")
                 elif ctype == "text" and content.get("text"):
                     res = buf.add_text(content["text"], source_device="pc")
                 else:
@@ -1297,6 +1299,10 @@ class SnowIpcServer:
                         "action": "clipboard_push",
                         "data": {
                             "type": "image",
+                            "item_id": item_detail.get("item_id"),
+                            "event_id": item_detail.get("event_id"),
+                            "seq": item_detail.get("seq"),
+                            "origin_device_id": item_detail.get("origin_device_id") or item_detail.get("source_device_id"),
                             "mime_type": item_detail.get("mime_type") or "image/png",
                             "transfer_id": record.transfer_id,
                             "file_name": f_name,
@@ -1304,6 +1310,112 @@ class SnowIpcServer:
                             "size": f_size,
                             "transfer_port": t_port,
                             "transfer_url": f"/api/v1/transfers/download/{record.transfer_id}",
+                        },
+                    }, ctx=ctx)
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": dev_resp.get("success", False),
+                        "status": dev_resp.get("status", "ERROR"),
+                        "data": dev_resp.get("data"),
+                        "error": dev_resp.get("error"),
+                    }, now_authed
+                elif c_type in ("file", "file_bundle"):
+                    entries = buf.get_file_entries(str(item_id))
+                    if not entries:
+                        return {
+                            "version": IPC_PROTOCOL_VERSION,
+                            "request_id": request_id,
+                            "success": False,
+                            "status": "NOT_FOUND",
+                            "error": "Clipboard file entries not found on disk.",
+                        }, now_authed
+                    resolved_dev_id = dev_id
+                    cs = getattr(self, "core_server", None)
+                    reg = getattr(self, "node_registry", None) or (getattr(cs, "node_registry", None) if cs else None)
+                    if reg and hasattr(reg, "resolve_target"):
+                        node, err = reg.resolve_target(dev_id or "")
+                        if node:
+                            resolved_dev_id = node.device_id
+                        elif err:
+                            return {
+                                "version": IPC_PROTOCOL_VERSION,
+                                "request_id": request_id,
+                                "success": False,
+                                "status": err,
+                                "error": f"Failed resolving target device: {err}",
+                            }, now_authed
+                    elif cs and hasattr(cs, "session_manager"):
+                        sm = cs.session_manager
+                        if not resolved_dev_id or resolved_dev_id in ("android", "phone"):
+                            sessions = sm.get_all_sessions()
+                            if len(sessions) == 1:
+                                resolved_dev_id = list(sessions.values())[0].device_id
+                            elif len(sessions) > 1:
+                                return {
+                                    "version": IPC_PROTOCOL_VERSION,
+                                    "request_id": request_id,
+                                    "success": False,
+                                    "status": "DEVICE_REQUIRED",
+                                    "error": "Multiple active devices. Explicit device_id required.",
+                                }, now_authed
+                            else:
+                                return {
+                                    "version": IPC_PROTOCOL_VERSION,
+                                    "request_id": request_id,
+                                    "success": False,
+                                    "status": "DEVICE_NOT_FOUND",
+                                    "error": "No active connected device found.",
+                                }, now_authed
+                    tm = getattr(cs, "transfer_manager", None) if cs else None
+                    if not tm:
+                        tm = getattr(self.capability_engine, "transfer_manager", None)
+                    if not tm:
+                        return {
+                            "version": IPC_PROTOCOL_VERSION,
+                            "request_id": request_id,
+                            "success": False,
+                            "status": "ENGINE_UNAVAILABLE",
+                            "error": "Transfer manager unavailable for clipboard file push.",
+                        }, now_authed
+                    from snow.transfer.manager import TransferDirection, TransferState
+                    t_port = 8766
+                    if cs and getattr(cs, "http_transfer_server", None):
+                        t_port = cs.http_transfer_server.bound_port or 8766
+                    staged_files = []
+                    for entry in entries:
+                        rec = tm.create_transfer(
+                            device_id=resolved_dev_id,
+                            file_name=entry["name"],
+                            file_size=entry["size_bytes"],
+                            sha256=entry["sha256"],
+                            direction=TransferDirection.DOWNLOAD,
+                            file_path=str(entry["path"]),
+                        )
+                        rec.status = TransferState.IN_PROGRESS
+                        staged_files.append({
+                            "index": entry["index"],
+                            "transfer_id": rec.transfer_id,
+                            "transfer_port": t_port,
+                            "transfer_url": f"/api/v1/transfers/download/{rec.transfer_id}",
+                            "file_name": entry["name"],
+                            "name": entry["name"],
+                            "size_bytes": entry["size_bytes"],
+                            "mime_type": entry["mime_type"],
+                            "sha256": entry["sha256"],
+                        })
+                    dev_resp = await self._handle_device_request({
+                        "device_id": resolved_dev_id,
+                        "action": "clipboard_push",
+                        "data": {
+                            "type": c_type,
+                            "item_id": item_detail.get("item_id"),
+                            "event_id": item_detail.get("event_id"),
+                            "seq": item_detail.get("seq"),
+                            "origin_device_id": item_detail.get("origin_device_id") or item_detail.get("source_device_id"),
+                            "sha256": item_detail.get("sha256"),
+                            "transfer_port": t_port,
+                            "files": staged_files,
                         },
                     }, ctx=ctx)
                     return {

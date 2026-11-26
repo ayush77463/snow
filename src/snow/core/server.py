@@ -596,6 +596,7 @@ class SnowCoreServer:
                 del_setting = getattr(db_manager, "delete_setting", None)
                 if callable(del_setting):
                     del_setting(f"device_profile:{clean_id}")
+                    del_setting(f"clip_ack:{clean_id}")
             except Exception as exc:
                 cleanup_errors.append(f"db_delete_device_profile: {exc}")
                 logger.warning("Failed deleting permission profile for [%s]: %s", clean_id, exc)

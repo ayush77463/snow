@@ -25,7 +25,8 @@ sealed class PairingState {
         val sessionId: String,
         val authToken: String? = null,
         val trustTier: String = "peer",
-        val deviceType: String? = null
+        val deviceType: String? = null,
+        val permissionProfile: String? = null
     ) : PairingState()
 
     data class WrongPin(
@@ -330,14 +331,16 @@ class PairingFlow(
         sessionId: String,
         desktopName: String = "SNOW Desktop",
         trustTier: String = "peer",
-        deviceType: String? = null
+        deviceType: String? = null,
+        permissionProfile: String? = null
     ) {
         val newState = PairingState.Paired(
             desktopId = "desktop-core",
             desktopName = desktopName,
             sessionId = sessionId,
             trustTier = trustTier,
-            deviceType = deviceType
+            deviceType = deviceType,
+            permissionProfile = permissionProfile
         )
         _state.value = newState
     }
@@ -352,6 +355,7 @@ class PairingFlow(
                 val sessionId = data?.get("session_id") as? String ?: "session-active"
                 val authToken = data?.get("auth_token") as? String
                 val trustTier = data?.get("trust_tier") as? String ?: "peer"
+                val permissionProfile = data?.get("permission_profile") as? String
                 val manifest = data?.get("manifest") as? Map<*, *>
                 val deviceType = (data?.get("device_type") as? String)
                     ?: (data?.get("platform") as? String)
@@ -368,7 +372,8 @@ class PairingFlow(
                     sessionId = sessionId,
                     authToken = authToken,
                     trustTier = trustTier,
-                    deviceType = deviceType
+                    deviceType = deviceType,
+                    permissionProfile = permissionProfile
                 )
             }
 

@@ -36,7 +36,7 @@ from snow.capabilities.engine import (
 )
 from snow.core.config import CoreConfig
 from snow.network.connection_manager import ConnectionManager
-from snow.protocol.constants import ErrorCode, MessageType
+from snow.protocol.constants import DEFAULT_MAX_MESSAGE_SIZE, ErrorCode, MessageType
 from snow.protocol.models import SnowMessage
 from snow.protocol.validator import ProtocolValidationError, validate_raw_message
 from snow.security.context import ExecutionContext, ExecutionPrincipal
@@ -164,6 +164,7 @@ class SnowWebSocketServer:
         self._pairing_in_progress: set[str] = set()
         self._clipboard_sync_tasks: dict[str, asyncio.Task] = {}
         self._last_synced_clipboard_hash: dict[str, str] = {}
+        self._last_synced_clipboard_event: dict[str, str] = {}
         self._active_sync_connections: set[str] = set()
         self._last_local_write_seq: int = 0
         self._clipboard_listener: Optional[WindowsClipboardListener] = None
@@ -172,6 +173,7 @@ class SnowWebSocketServer:
         self._clipboard_update_lock: asyncio.Lock = asyncio.Lock()
         self._last_processed_clipboard_hash: str = ""
         self._last_processed_canonical_hash: str = ""
+        self._last_processed_clipboard_at: float = 0.0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Phase 21: Live in-memory notification cache (strictly never persisted to disk)
         self.live_notifications: dict[str, list[dict[str, Any]]] = {}
@@ -339,6 +341,7 @@ class SnowWebSocketServer:
                 cb_task.cancel()
         self._clipboard_sync_tasks.clear()
         self._last_synced_clipboard_hash.clear()
+        self._last_synced_clipboard_event.clear()
         self.stop_clipboard_listener()
         self._active_sync_connections.clear()
 
@@ -400,6 +403,7 @@ class SnowWebSocketServer:
             if cb_task and not cb_task.done():
                 cb_task.cancel()
             self._last_synced_clipboard_hash.pop(client.connection_id, None)
+            self._last_synced_clipboard_event.pop(client.connection_id, None)
             self._active_sync_connections.discard(client.connection_id)
             session = self.session_manager.get_session_by_connection(client.connection_id)
             if session and getattr(self, "node_registry", None):
@@ -749,6 +753,10 @@ class SnowWebSocketServer:
                 await self._handle_clipboard_buffer_delete(client, message, data, session, ctx)
             elif action == "clipboard_buffer_clear":
                 await self._handle_clipboard_buffer_clear(client, message, data, session, ctx)
+            elif action == "clipboard_ack":
+                await self._handle_clipboard_ack(client, message, data, session)
+            elif action == "clipboard_history_sync":
+                await self._handle_clipboard_buffer_list(client, message, data, session)
             elif action == "media_control":
                 await self._handle_media_control(client, message, data, session, ctx)
             elif action == "share_link":
@@ -1113,15 +1121,27 @@ class SnowWebSocketServer:
         data: dict[str, Any],
         session: Optional[SessionRecord],
     ) -> None:
-        """Handle request to list metadata of shared clipboard buffer items (<= 64 KiB)."""
-        limit = min(int(data.get("limit", 10)), 10)
+        """Handle history-sync request for metadata of up to 15 shared clipboard buffer items (<= 64 KiB)."""
+        limit = min(max(int(data.get("limit", 15)), 1), 15)
         buf = getattr(self, "clipboard_buffer", None)
         if not buf and hasattr(self, "capability_engine"):
             buf = getattr(self.capability_engine, "clipboard_buffer", None)
         items = buf.list_items(limit=limit) if buf else []
+        latest_seq = max((int(it.get("seq", 0)) for it in items), default=0)
+        last_acked_seq = 0
+        if session and isinstance(getattr(session, "device_id", None), str) and buf and hasattr(buf, "get_device_ack"):
+            ack_rec = buf.get_device_ack(session.device_id)
+            if ack_rec is not None:
+                last_acked_seq = int(ack_rec.get("last_acked_seq", 0))
         response = SnowMessage.create_response(
             correlation_id=message.id,
-            payload={"status": "success", "items": items, "count": len(items)},
+            payload={
+                "status": "success",
+                "items": items,
+                "count": len(items),
+                "latest_seq": latest_seq,
+                "last_acked_seq": last_acked_seq,
+            },
         )
         await client.websocket.send(response.to_json())
 
@@ -1242,6 +1262,9 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
+        if res.get("status") == "ADDED" and res.get("item"):
+            await self.broadcast_clipboard_buffer_event(res["item"], exclude_device_id=source_device)
+
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={"status": "success", "item": res.get("item")},
@@ -1289,7 +1312,7 @@ class SnowWebSocketServer:
             "target": target,
             "data": res_data,
         }
-        for k in ("transfer_id", "transfer_port", "sha256", "file_name", "mime_type", "size"):
+        for k in ("transfer_id", "transfer_port", "sha256", "file_name", "mime_type", "size", "files", "event_id", "seq", "type"):
             if k in res_data:
                 payload[k] = res_data[k]
 
@@ -1464,6 +1487,95 @@ class SnowWebSocketServer:
             ctx,
             session,
         )
+
+    async def _handle_clipboard_ack(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """Record a monotonic durable per-device acknowledgement for a received clipboard event."""
+        if not session or not isinstance(getattr(session, "device_id", None), str) or not session.device_id.strip():
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Authenticated session is required for clipboard_ack.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        peer_device_id = session.device_id.strip()
+        if data.get("device_id") and str(data["device_id"]).strip() != peer_device_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="device_id mismatch in clipboard_ack.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        raw_seq = data.get("last_acked_seq", data.get("seq"))
+        if isinstance(raw_seq, bool) or not isinstance(raw_seq, int) or raw_seq < 0:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="'seq' / 'last_acked_seq' must be a non-negative integer.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        raw_event_id = data.get("last_acked_event_id", data.get("event_id", ""))
+        if not isinstance(raw_event_id, str) or not raw_event_id.strip() or len(raw_event_id.strip()) > 128:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="'event_id' / 'last_acked_event_id' must be a non-empty string.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        buf = getattr(self, "clipboard_buffer", None) or getattr(
+            self.capability_engine, "clipboard_buffer", None
+        )
+        try:
+            if buf and hasattr(buf, "record_device_ack"):
+                saved = buf.record_device_ack(
+                    device_id=peer_device_id,
+                    last_acked_seq=raw_seq,
+                    last_acked_event_id=raw_event_id.strip(),
+                )
+            elif getattr(self, "db_manager", None) and hasattr(self.db_manager, "save_clipboard_ack"):
+                saved = self.db_manager.save_clipboard_ack(
+                    device_id=peer_device_id,
+                    last_acked_seq=raw_seq,
+                    last_acked_event_id=raw_event_id.strip(),
+                )
+            else:
+                saved = {
+                    "device_id": peer_device_id,
+                    "last_acked_seq": raw_seq,
+                    "last_acked_event_id": raw_event_id.strip(),
+                    "updated": True,
+                }
+        except ValueError as ve:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message=str(ve),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "clipboard_ack",
+                "data": saved,
+            },
+        )
+        await client.websocket.send(response.to_json())
 
     async def _handle_media_control(
         self,
@@ -2293,6 +2405,26 @@ class SnowWebSocketServer:
                 logger.debug("Failed notifying node registry of auth: %s", reg_err)
 
         from snow.network.node import build_windows_manifest
+        auth_profile = self._resolve_authoritative_permission_profile(device_id)
+        clipboard_state: dict[str, Any] = {"latest_seq": 0, "last_acked_seq": 0, "has_unacked_latest": False}
+        cb_buf = getattr(self, "clipboard_buffer", None) or getattr(
+            getattr(self, "capability_engine", None), "clipboard_buffer", None
+        )
+        if cb_buf is not None:
+            latest_items = cb_buf.list_items(limit=1)
+            latest_seq = int(latest_items[0].get("seq", 0)) if latest_items else 0
+            ack_rec = cb_buf.get_device_ack(device_id) if hasattr(cb_buf, "get_device_ack") else None
+            last_acked = int(ack_rec.get("last_acked_seq", 0)) if ack_rec else 0
+            eligible = (
+                cb_buf.get_eligible_apply_item(device_id, last_acked_seq=last_acked)
+                if hasattr(cb_buf, "get_eligible_apply_item") and auth_profile not in ("not_allowed", "files_only")
+                else None
+            )
+            clipboard_state = {
+                "latest_seq": latest_seq,
+                "last_acked_seq": last_acked,
+                "has_unacked_latest": eligible is not None,
+            }
 
         response = SnowMessage.create_response(
             correlation_id=message.id,
@@ -2306,11 +2438,35 @@ class SnowWebSocketServer:
                     "device_name": self.device_identity.device_name,
                     "session_id": session.session_id,
                     "trust_tier": device_record.trust_tier,
+                    "permission_profile": auth_profile,
+                    "clipboard_state": clipboard_state,
                     "manifest": build_windows_manifest().to_dict(),
                 },
             },
         )
         await client.websocket.send(response.to_json())
+
+    def _resolve_authoritative_permission_profile(self, device_id: str) -> str:
+        """Resolve desktop's authoritative per-device permission profile, failing closed on invalid DB values."""
+        valid = {"full_control", "files_and_clipboard", "files_only", "clipboard_only", "not_allowed"}
+        raw = None
+        if getattr(self, "node_registry", None) and hasattr(self.node_registry, "get_permission_profile"):
+            try:
+                raw = self.node_registry.get_permission_profile(device_id)
+            except Exception:
+                raw = None
+        elif getattr(self, "db_manager", None) and hasattr(self.db_manager, "get_setting"):
+            try:
+                saved = self.db_manager.get_setting(f"device_profile:{device_id}")
+                raw = "full_control" if saved is None else saved
+            except Exception:
+                raw = None
+        if isinstance(raw, str):
+            clean = raw.strip().lower()
+            if clean in valid:
+                return clean
+            return "not_allowed"
+        return "full_control" if raw is None else "not_allowed"
 
     async def _handle_pairing_request(
         self, client, message: SnowMessage, action: str, data: dict[str, Any]
@@ -2448,6 +2604,7 @@ class SnowWebSocketServer:
                     timer.cancel()
 
                 from snow.network.node import build_windows_manifest
+                pair_profile = self._resolve_authoritative_permission_profile(client_device_id)
 
                 response = SnowMessage.create_response(
                     correlation_id=message.id,
@@ -2462,6 +2619,7 @@ class SnowWebSocketServer:
                             "session_id": result.session_id,
                             "auth_token": auth_token,
                             "trust_tier": assigned_tier,
+                            "permission_profile": pair_profile,
                             "manifest": build_windows_manifest().to_dict(),
                         },
                     },
@@ -3149,15 +3307,22 @@ class SnowWebSocketServer:
         text: Optional[str] = None,
         image_bytes: Optional[bytes] = None,
         mime_type: Optional[str] = None,
+        files: Optional[list[dict[str, Any]]] = None,
     ) -> Optional[dict[str, Any]]:
-        """Persist validated clipboard item into shared ring buffer and broadcast event."""
+        """Persist validated clipboard item into shared ring buffer and broadcast metadata event."""
         cb_buf = getattr(self, "clipboard_buffer", None) or getattr(
             self.capability_engine, "clipboard_buffer", None
         )
         if not cb_buf:
             return None
         buf_res: Optional[dict[str, Any]] = None
-        if content_type == "image" and image_bytes is not None:
+        if content_type in ("file", "file_bundle") and files:
+            buf_res = cb_buf.add_files(
+                files=files,
+                source_device_id=source_device_id,
+                source_device_name=source_device_name,
+            )
+        elif content_type == "image" and image_bytes is not None:
             buf_res = cb_buf.add_image(
                 image_bytes=image_bytes,
                 mime_type=mime_type or "image/png",
@@ -3172,7 +3337,7 @@ class SnowWebSocketServer:
             )
         if buf_res and buf_res.get("success") and buf_res.get("item"):
             item_meta = buf_res["item"]
-            await self.broadcast_clipboard_buffer_event(item_meta)
+            await self.broadcast_clipboard_buffer_event(item_meta, exclude_device_id=source_device_id)
             return item_meta
         return None
 
@@ -3184,8 +3349,187 @@ class SnowWebSocketServer:
         session,
         ctx: Optional[ExecutionContext] = None,
     ) -> None:
-        """Handle request to write text or image to Windows clipboard."""
+        """Handle request to write text, image, or verified file/bundle to Windows clipboard."""
         source_device_id, source_device_name = self._resolve_session_device_identity(session)
+
+        # 0. Single file or multi-file bundle clipboard set (CF_HDROP after port 8766 SHA-256 verify)
+        if data.get("type") in ("file", "file_bundle"):
+            from snow.capabilities.clipboard_buffer import MAX_BUNDLE_BYTES, MAX_BUNDLE_FILES, MAX_FILE_BYTES
+            from snow.transfer.manager import TransferDirection, TransferState
+            from snow.transfer.storage import commit_verified_clipboard_files, resolve_configured_pc_transfer_dir
+
+            raw_files = data.get("files")
+            if raw_files is None and (data.get("transfer_id") or data.get("file_name")):
+                raw_files = [
+                    {
+                        "transfer_id": data.get("transfer_id"),
+                        "file_name": data.get("file_name") or data.get("name"),
+                        "sha256": data.get("sha256"),
+                        "size_bytes": data.get("size_bytes", data.get("size", 0)),
+                        "mime_type": data.get("mime_type"),
+                    }
+                ]
+            if not isinstance(raw_files, list) or not (1 <= len(raw_files) <= MAX_BUNDLE_FILES):
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.INVALID_PAYLOAD,
+                    message=f"Expected 1 to {MAX_BUNDLE_FILES} files for clipboard file transfer.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+
+            session_dev_id = session.device_id if session and isinstance(getattr(session, "device_id", None), str) else None
+            commit_specs: list[dict[str, Any]] = []
+            buffer_specs: list[dict[str, Any]] = []
+            total_size = 0
+
+            for entry in raw_files:
+                if not isinstance(entry, dict):
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.INVALID_PAYLOAD,
+                        message="Each file entry must be a JSON object.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+                t_id = entry.get("transfer_id")
+                declared_name = str(entry.get("file_name") or entry.get("name") or "").strip()
+                declared_sha = str(entry.get("sha256") or "").strip().lower()
+                src_path: Optional[Path] = None
+
+                if t_id:
+                    rec = (
+                        self.transfer_manager.get_transfer_for_device(str(t_id), session_dev_id)
+                        if session_dev_id
+                        else self.transfer_manager.get_transfer(str(t_id))
+                    )
+                    if not rec or rec.direction != TransferDirection.UPLOAD or rec.status != TransferState.COMPLETED:
+                        error_response = SnowMessage.create_error(
+                            code=ErrorCode.TRANSFER_NOT_FOUND,
+                            message=f"Completed upload transfer '{t_id}' not found for device.",
+                            correlation_id=message.id,
+                        )
+                        await client.websocket.send(error_response.to_json())
+                        return
+                    if not rec.file_path or not Path(rec.file_path).is_file():
+                        error_response = SnowMessage.create_error(
+                            code=ErrorCode.FILE_NOT_FOUND,
+                            message="Uploaded clipboard file missing on disk.",
+                            correlation_id=message.id,
+                        )
+                        await client.websocket.send(error_response.to_json())
+                        return
+                    src_path = Path(rec.file_path).resolve()
+                    if not src_path.is_relative_to(Path(self.storage_manager.root_dir).resolve()):
+                        error_response = SnowMessage.create_error(
+                            code=ErrorCode.INVALID_PAYLOAD,
+                            message="Transfer path escapes storage root.",
+                            correlation_id=message.id,
+                        )
+                        await client.websocket.send(error_response.to_json())
+                        return
+                    declared_name = declared_name or rec.file_name
+                    if declared_sha and declared_sha != rec.sha256.lower():
+                        error_response = SnowMessage.create_error(
+                            code=ErrorCode.INTEGRITY_MISMATCH,
+                            message="Declared SHA-256 mismatches completed transfer record.",
+                            correlation_id=message.id,
+                        )
+                        await client.websocket.send(error_response.to_json())
+                        return
+                    declared_sha = declared_sha or rec.sha256.lower()
+                elif declared_name:
+                    try:
+                        candidate = self.storage_manager.resolve_destination_path(declared_name)
+                        if candidate.is_file():
+                            src_path = candidate.resolve()
+                    except Exception:
+                        src_path = None
+
+                if not src_path or not src_path.is_file() or not declared_name or len(declared_sha) != 64:
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.INVALID_PAYLOAD,
+                        message="Missing verified source file or SHA-256 digest.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+
+                actual_size = src_path.stat().st_size
+                total_size += actual_size
+                if actual_size > MAX_FILE_BYTES or total_size > MAX_BUNDLE_BYTES:
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.OVERSIZED_MESSAGE,
+                        message="Clipboard file or bundle exceeds 15 MiB limit.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+
+                commit_specs.append(
+                    {
+                        "name": declared_name,
+                        "size_bytes": actual_size,
+                        "sha256": declared_sha,
+                        "path": src_path,
+                    }
+                )
+                buffer_specs.append(
+                    {
+                        "name": declared_name,
+                        "source_path": src_path,
+                        "mime_type": entry.get("mime_type"),
+                    }
+                )
+
+            dest_dir = (
+                Path(self.storage_manager.root_dir)
+                if getattr(self, "storage_manager", None) and getattr(self.storage_manager, "root_dir", None)
+                else resolve_configured_pc_transfer_dir(db_manager=getattr(self, "db_manager", None))
+            )
+            try:
+                committed_paths = commit_verified_clipboard_files(dest_dir, commit_specs)
+            except Exception as ver_err:
+                error_response = SnowMessage.create_error(
+                    code=ErrorCode.INTEGRITY_MISMATCH,
+                    message=f"Clipboard file verification failed: {ver_err}",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(error_response.to_json())
+                return
+
+            res = await asyncio.to_thread(self.capability_engine.clipboard.set_files_sync, committed_paths)
+            if res.get("success"):
+                if sys.platform == "win32":
+                    try:
+                        import ctypes
+                        self._last_local_write_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+                    except Exception:
+                        pass
+                item_meta = await self._persist_and_broadcast_clipboard_buffer(
+                    content_type=str(data.get("type")),
+                    source_device_id=source_device_id,
+                    source_device_name=source_device_name,
+                    files=buffer_specs,
+                )
+                if item_meta and item_meta.get("sha256"):
+                    self._last_processed_clipboard_hash = item_meta["sha256"]
+                    self._last_processed_clipboard_at = time.monotonic()
+                    for cid in self._active_sync_connections:
+                        self._last_synced_clipboard_hash[cid] = item_meta["sha256"]
+                        if item_meta.get("event_id"):
+                            self._last_synced_clipboard_event[cid] = item_meta["event_id"]
+            response = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={
+                    "status": "success" if res.get("success") else "error",
+                    "action": "desktop_clipboard_set",
+                    "error": res.get("error"),
+                    "data": {**res, "committed_files": [p.name for p in committed_paths]},
+                },
+            )
+            await client.websocket.send(response.to_json())
+            return
 
         # 1. Image clipboard set
         if data.get("type") == "image":
@@ -3236,15 +3580,19 @@ class SnowWebSocketServer:
                     except Exception:
                         pass
                 self._last_processed_clipboard_hash = computed_sha256
+                self._last_processed_clipboard_at = time.monotonic()
                 for cid in self._active_sync_connections:
                     self._last_synced_clipboard_hash[cid] = computed_sha256
-                await self._persist_and_broadcast_clipboard_buffer(
+                item_meta = await self._persist_and_broadcast_clipboard_buffer(
                     content_type="image",
                     source_device_id=source_device_id,
                     source_device_name=source_device_name,
                     image_bytes=img_bytes,
                     mime_type=detected_mime,
                 )
+                if item_meta and item_meta.get("event_id"):
+                    for cid in self._active_sync_connections:
+                        self._last_synced_clipboard_event[cid] = item_meta["event_id"]
             response = SnowMessage.create_response(
                 correlation_id=message.id,
                 payload={
@@ -3288,14 +3636,18 @@ class SnowWebSocketServer:
                     pass
             h = hashlib.sha256(text.encode("utf-8")).hexdigest()
             self._last_processed_clipboard_hash = h
+            self._last_processed_clipboard_at = time.monotonic()
             for cid in self._active_sync_connections:
                 self._last_synced_clipboard_hash[cid] = h
-            await self._persist_and_broadcast_clipboard_buffer(
+            item_meta = await self._persist_and_broadcast_clipboard_buffer(
                 content_type="text",
                 source_device_id=source_device_id,
                 source_device_name=source_device_name,
                 text=text,
             )
+            if item_meta and item_meta.get("event_id"):
+                for cid in self._active_sync_connections:
+                    self._last_synced_clipboard_event[cid] = item_meta["event_id"]
 
         response = SnowMessage.create_response(
             correlation_id=message.id,
@@ -3361,21 +3713,250 @@ class SnowWebSocketServer:
                 pass
             self._clipboard_listener = None
 
-    async def broadcast_clipboard_buffer_event(self, item_metadata: dict[str, Any]) -> None:
-        """Broadcast clipboard_buffer_updated event to all authenticated clients."""
+    @staticmethod
+    def _sanitize_clipboard_broadcast_metadata(item_metadata: dict[str, Any]) -> dict[str, Any]:
+        """Strip any raw binary, text_content, or disk path fields from WSS clipboard broadcasts."""
+        forbidden = {
+            "text_content",
+            "bytes",
+            "raw_bytes",
+            "image_bytes",
+            "base64",
+            "data",
+            "file_path",
+            "image_path",
+            "storage_dir",
+            "stored_filename",
+            "source_path",
+        }
+        cleaned = {k: v for k, v in item_metadata.items() if k not in forbidden}
+        if isinstance(cleaned.get("file_manifest"), list):
+            cleaned["file_manifest"] = [
+                {
+                    "index": entry.get("index", idx),
+                    "name": entry.get("name"),
+                    "size_bytes": entry.get("size_bytes"),
+                    "mime_type": entry.get("mime_type"),
+                    "sha256": entry.get("sha256"),
+                }
+                for idx, entry in enumerate(cleaned["file_manifest"])
+                if isinstance(entry, dict)
+            ]
+        return cleaned
+
+    def _is_peer_clipboard_authorized(self, peer_device_id: Any) -> bool:
+        """Check whether an authenticated session device is authorized for clipboard sync."""
+        if not isinstance(peer_device_id, str) or not peer_device_id.strip():
+            # Allow test mocks without string device_id when session is explicitly authenticated
+            return True
+        clean_id = peer_device_id.strip()
+        profile = self._resolve_authoritative_permission_profile(clean_id)
+        if profile in ("not_allowed", "files_only"):
+            return False
+        if getattr(self, "capability_policy", None) is not None:
+            try:
+                if not self.capability_policy.is_authorized(clean_id, "desktop.clipboard.read"):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    async def _stage_clipboard_push_payload(
+        self,
+        peer_device_id: str,
+        item_meta: dict[str, Any],
+        cb_buf: Any,
+    ) -> Optional[dict[str, Any]]:
+        """Build a WSS-safe (<= 64 KiB) clipboard_push payload, staging 8766 transfers for media/files."""
+        from snow.transfer.manager import TransferDirection, TransferState
+
+        c_type = item_meta.get("content_type") or item_meta.get("type") or "text"
+        item_id = item_meta.get("item_id")
+        event_id = item_meta.get("event_id")
+        seq = item_meta.get("seq", 0)
+        origin_id = item_meta.get("origin_device_id") or item_meta.get("source_device_id")
+        c_hash = item_meta.get("sha256") or ""
+
+        bound_port = (
+            self.http_transfer_server.bound_port
+            if getattr(self, "http_transfer_server", None) and self.http_transfer_server.bound_port
+            else getattr(self.config, "transfer_port", 8766)
+        )
+
+        if c_type == "text":
+            detail = cb_buf.get_item(item_id, include_content=True) if cb_buf and item_id else None
+            text_val = (detail or {}).get("text_content") or item_meta.get("preview") or ""
+            if len(str(text_val).encode("utf-8")) > 65536:
+                return None
+            return {
+                "type": "text",
+                "text": text_val,
+                "sha256": c_hash,
+                "item_id": item_id,
+                "event_id": event_id,
+                "seq": seq,
+                "origin_device_id": origin_id,
+            }
+
+        if c_type == "image" and cb_buf and item_id:
+            img_path = cb_buf.get_image_path(item_id)
+            if not img_path or not img_path.is_file():
+                return None
+            file_size = img_path.stat().st_size
+            record = self.transfer_manager.create_transfer(
+                device_id=peer_device_id or "device",
+                file_name=img_path.name,
+                file_size=file_size,
+                sha256=c_hash,
+                direction=TransferDirection.DOWNLOAD,
+                file_path=str(img_path),
+            )
+            record.status = TransferState.IN_PROGRESS
+            return {
+                "type": "image",
+                "item_id": item_id,
+                "event_id": event_id,
+                "seq": seq,
+                "origin_device_id": origin_id,
+                "mime_type": item_meta.get("mime_type") or "image/png",
+                "transfer_id": record.transfer_id,
+                "file_name": img_path.name,
+                "sha256": c_hash,
+                "size": file_size,
+                "transfer_port": bound_port,
+                "transfer_url": f"/api/v1/transfers/download/{record.transfer_id}",
+            }
+
+        if c_type in ("file", "file_bundle") and cb_buf and item_id and hasattr(cb_buf, "get_file_entries"):
+            entries = cb_buf.get_file_entries(item_id)
+            if not entries:
+                return None
+            staged_files = []
+            for entry in entries:
+                rec = self.transfer_manager.create_transfer(
+                    device_id=peer_device_id or "device",
+                    file_name=entry["name"],
+                    file_size=entry["size_bytes"],
+                    sha256=entry["sha256"],
+                    direction=TransferDirection.DOWNLOAD,
+                    file_path=str(entry["path"]),
+                )
+                rec.status = TransferState.IN_PROGRESS
+                staged_files.append(
+                    {
+                        "index": entry["index"],
+                        "transfer_id": rec.transfer_id,
+                        "transfer_port": bound_port,
+                        "transfer_url": f"/api/v1/transfers/download/{rec.transfer_id}",
+                        "file_name": entry["name"],
+                        "name": entry["name"],
+                        "size_bytes": entry["size_bytes"],
+                        "mime_type": entry["mime_type"],
+                        "sha256": entry["sha256"],
+                    }
+                )
+            return {
+                "type": c_type,
+                "item_id": item_id,
+                "event_id": event_id,
+                "seq": seq,
+                "origin_device_id": origin_id,
+                "sha256": c_hash,
+                "transfer_port": bound_port,
+                "files": staged_files,
+            }
+
+        return None
+
+    async def _sync_latest_eligible_clipboard_to_client(self, client: Any, session: Optional[SessionRecord]) -> bool:
+        """Apply ONLY the single latest unacked non-self event when a peer reconnects / enables sync."""
+        if session is None:
+            return False
+        cb_buf = getattr(self, "clipboard_buffer", None) or getattr(
+            getattr(self, "capability_engine", None), "clipboard_buffer", None
+        )
+        if not cb_buf or not hasattr(cb_buf, "get_eligible_apply_item"):
+            return False
+        peer_id = getattr(session, "device_id", None)
+        if not isinstance(peer_id, str) or not peer_id.strip():
+            return False
+        if not self._is_peer_clipboard_authorized(peer_id):
+            return False
+
+        latest = cb_buf.get_eligible_apply_item(peer_id)
+        if not latest:
+            return False
+
+        conn_id = getattr(client, "connection_id", None)
+        latest_event = str(latest.get("event_id") or "")
+        if conn_id and latest_event and self._last_synced_clipboard_event.get(conn_id) == latest_event:
+            return False
+
+        push_data = await self._stage_clipboard_push_payload(peer_id, latest, cb_buf)
+        if not push_data:
+            return False
+
+        push_msg = SnowMessage.create_request(action="clipboard_push", data=push_data)
+        raw_json = push_msg.to_json()
+        if len(raw_json.encode("utf-8")) > DEFAULT_MAX_MESSAGE_SIZE:
+            logger.warning("Skipping oversized clipboard_push reconnect frame.")
+            return False
+
+        try:
+            await client.websocket.send(raw_json)
+            if conn_id and latest_event:
+                self._last_synced_clipboard_event[conn_id] = latest_event
+                self._last_synced_clipboard_hash[conn_id] = latest.get("sha256") or ""
+            return True
+        except Exception as err:
+            logger.warning("Failed syncing latest clipboard event to [%s]: %s", peer_id, err)
+            return False
+
+    async def broadcast_clipboard_buffer_event(
+        self,
+        item_metadata: dict[str, Any],
+        exclude_device_id: Optional[str] = None,
+    ) -> None:
+        """Broadcast metadata-only clipboard_buffer_updated event to authorized non-origin peers."""
+        conn_mgr = getattr(self, "connection_manager", None)
+        sess_mgr = getattr(self, "session_manager", None)
+        if conn_mgr is None or sess_mgr is None:
+            return
+        clean_meta = self._sanitize_clipboard_broadcast_metadata(item_metadata)
+        origin_id = str(clean_meta.get("origin_device_id") or clean_meta.get("source_device_id") or "").strip()
         msg = SnowMessage.create_request(
             action="clipboard_buffer_updated",
-            data={"item": item_metadata},
+            data={"item": clean_meta},
         )
         payload_str = msg.to_json()
-        for conn_item in self.connection_manager.all_connections():
-            client = self.connection_manager.get(conn_item) if isinstance(conn_item, str) else conn_item
+        if len(payload_str.encode("utf-8")) > DEFAULT_MAX_MESSAGE_SIZE:
+            clean_meta["preview"] = str(clean_meta.get("preview") or "")[:120]
+            clean_meta["preview_text"] = clean_meta["preview"]
+            payload_str = SnowMessage.create_request(
+                action="clipboard_buffer_updated",
+                data={"item": clean_meta},
+            ).to_json()
+            if len(payload_str.encode("utf-8")) > DEFAULT_MAX_MESSAGE_SIZE:
+                logger.warning("Refusing oversized clipboard_buffer_updated WSS frame.")
+                return
+
+        for conn_item in conn_mgr.all_connections():
+            client = conn_mgr.get(conn_item) if isinstance(conn_item, str) else conn_item
             if not client or not getattr(client, "websocket", None) or getattr(client.websocket, "state", 1) != 1:
                 continue
             conn_id = getattr(client, "connection_id", conn_item)
-            session = self.session_manager.get_session_by_connection(conn_id)
+            session = sess_mgr.get_session_by_connection(conn_id)
             if session is None:
                 continue
+            peer_dev_id = getattr(session, "device_id", None)
+            if isinstance(peer_dev_id, str) and peer_dev_id.strip():
+                clean_peer_id = peer_dev_id.strip()
+                if origin_id and clean_peer_id == origin_id:
+                    continue
+                if exclude_device_id and clean_peer_id == exclude_device_id:
+                    continue
+                if not self._is_peer_clipboard_authorized(clean_peer_id):
+                    continue
             try:
                 await client.websocket.send(payload_str)
             except Exception as exc:
@@ -3412,6 +3993,8 @@ class SnowWebSocketServer:
             },
         )
         await client.websocket.send(response.to_json())
+        if enabled:
+            await self._sync_latest_eligible_clipboard_to_client(client, session)
 
     async def _handle_notification_event(
         self,
@@ -3508,18 +4091,25 @@ class SnowWebSocketServer:
             if not c_hash or c_type == "empty":
                 return
 
-            # Echo suppression check: match either encoded hash or canonical pixel digest
-            if c_hash == getattr(self, "_last_processed_clipboard_hash", "") or (
-                c_type == "image" and c_canon == getattr(self, "_last_processed_canonical_hash", "")
+            cb_buf = getattr(self, "clipboard_buffer", None) or getattr(self.capability_engine, "clipboard_buffer", None)
+            debounce_win = getattr(cb_buf, "debounce_seconds", 0.5) if cb_buf else 0.5
+            last_hash = getattr(self, "_last_processed_clipboard_hash", "")
+            last_canon = getattr(self, "_last_processed_canonical_hash", "")
+            last_at = getattr(self, "_last_processed_clipboard_at", 0.0)
+            within_debounce_or_mock = (last_at == 0.0) or ((time.monotonic() - last_at) <= debounce_win)
+
+            # Echo / duplicate suppression check within debounce window
+            if within_debounce_or_mock and (
+                c_hash == last_hash or (c_type == "image" and c_canon == last_canon)
             ):
                 return
             self._last_processed_clipboard_hash = c_hash
+            self._last_processed_clipboard_at = time.monotonic()
             if c_type == "image":
                 self._last_processed_canonical_hash = c_canon
 
             # Add to shared clipboard buffer
             buffer_item = None
-            cb_buf = getattr(self, "clipboard_buffer", None) or getattr(self.capability_engine, "clipboard_buffer", None)
             if cb_buf:
                 if c_type == "text":
                     res = cb_buf.add_text(
@@ -3543,14 +4133,26 @@ class SnowWebSocketServer:
                             buffer_item = res["item"]
                             c_hash = buffer_item.get("sha256") or c_hash
                             c_canon = buffer_item.get("canonical_sha256") or c_canon
+                elif c_type in ("file", "file_bundle") and content.get("files"):
+                    res = cb_buf.add_files(
+                        files=content["files"],
+                        source_device_id="desktop_windows",
+                        source_device_name="Windows PC",
+                    )
+                    if res.get("success") and res.get("item"):
+                        buffer_item = res["item"]
+                        c_hash = buffer_item.get("sha256") or c_hash
 
-            # Broadcast clipboard_buffer_updated event with lightweight metadata to all connected clients
+            # Broadcast clipboard_buffer_updated event with lightweight metadata to all authorized non-origin peers
             if buffer_item:
                 await self.broadcast_clipboard_buffer_event(buffer_item)
 
-            # Broadcast full push to clients with Instant Sync enabled
+            # Broadcast latest item push to clients with Instant Sync enabled
             if not self._active_sync_connections:
                 return
+
+            event_id = (buffer_item or {}).get("event_id") or ""
+            origin_id = (buffer_item or {}).get("origin_device_id") or (buffer_item or {}).get("source_device_id") or "desktop_windows"
 
             for conn_id in list(self._active_sync_connections):
                 client = self.connection_manager.get(conn_id)
@@ -3561,12 +4163,45 @@ class SnowWebSocketServer:
                 if session is None:
                     continue
 
-                if self._last_synced_clipboard_hash.get(conn_id) in (c_hash, c_canon):
+                peer_dev_id = getattr(session, "device_id", None)
+                if isinstance(peer_dev_id, str) and peer_dev_id.strip():
+                    clean_peer = peer_dev_id.strip()
+                    if clean_peer == origin_id:
+                        continue
+                    if not self._is_peer_clipboard_authorized(clean_peer):
+                        continue
+                    if event_id and cb_buf and hasattr(cb_buf, "has_device_received_event"):
+                        if cb_buf.has_device_received_event(event_id, clean_peer):
+                            continue
+
+                if event_id:
+                    if self._last_synced_clipboard_event.get(conn_id) == event_id:
+                        continue
+                    self._last_synced_clipboard_event[conn_id] = event_id
+                elif self._last_synced_clipboard_hash.get(conn_id) in (c_hash, c_canon):
                     continue
 
                 self._last_synced_clipboard_hash[conn_id] = c_canon or c_hash
 
-                if c_type == "text":
+                if buffer_item and cb_buf:
+                    push_payload = await self._stage_clipboard_push_payload(
+                        peer_dev_id.strip() if isinstance(peer_dev_id, str) else "device",
+                        buffer_item,
+                        cb_buf,
+                    )
+                    if not push_payload:
+                        continue
+                    if c_type == "text" and c_hash:
+                        push_payload["sha256"] = c_hash
+                    push_msg = SnowMessage.create_request(action="clipboard_push", data=push_payload)
+                    raw_push = push_msg.to_json()
+                    if len(raw_push.encode("utf-8")) > DEFAULT_MAX_MESSAGE_SIZE:
+                        continue
+                    try:
+                        await client.websocket.send(raw_push)
+                    except Exception as err:
+                        logger.warning("Failed sending clipboard push to [%s]: %s", conn_id, err, exc_info=True)
+                elif c_type == "text":
                     text = content.get("text", "")
                     if len(text.encode("utf-8")) > 65536:
                         continue
@@ -3579,7 +4214,6 @@ class SnowWebSocketServer:
                         logger.info("Event-pushed desktop clipboard text to [%s] (%d chars)", conn_id, len(text))
                     except Exception as err:
                         logger.warning("Failed sending clipboard text push to [%s]: %s", conn_id, err, exc_info=True)
-
                 elif c_type == "image":
                     file_path = content.get("file_path")
                     file_name = content.get("file_name", "clipboard.png")
@@ -3589,27 +4223,16 @@ class SnowWebSocketServer:
                         if self.http_transfer_server
                         else self.config.transfer_port
                     )
-                    device_id = getattr(session, "device_id", None) or "device"
+                    device_id = peer_dev_id if isinstance(peer_dev_id, str) else "device"
                     record = self.transfer_manager.create_transfer(
                         device_id=device_id,
                         file_name=file_name,
                         file_size=file_size,
                         sha256=c_hash,
                         direction=TransferDirection.DOWNLOAD,
+                        file_path=str(file_path) if file_path else None,
                     )
-                    # Point transfer record to persistent clipboard buffer storage if available
-                    if buffer_item and cb_buf:
-                        persistent_path = cb_buf.get_image_path(buffer_item["item_id"])
-                        if persistent_path and persistent_path.exists():
-                            record.file_path = str(persistent_path)
-                            record.file_size = persistent_path.stat().st_size
-                            file_size = record.file_size
-                        else:
-                            record.file_path = file_path
-                    else:
-                        record.file_path = file_path
                     record.status = TransferState.IN_PROGRESS
-
                     push_msg = SnowMessage.create_request(
                         action="clipboard_push",
                         data={

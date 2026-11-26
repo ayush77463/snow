@@ -306,7 +306,7 @@ fun HomeScreen(
                             modifier = Modifier.padding(vertical = 8.dp)
                         )
                     } else {
-                        val visibleItems = clipboardItems.take(5)
+                        val visibleItems = clipboardItems.take(15)
                         visibleItems.forEachIndexed { idx, item ->
                             UnifiedClipboardItemRow(
                                 item = item,
@@ -1005,6 +1005,7 @@ private fun UnifiedClipboardItemRow(
 ) {
     val colors = LocalSnowColors.current
     val isImage = item.type == "image"
+    val isFileOrBundle = item.type == "file" || item.type == "file_bundle"
     val sourceLabel = friendlySourceName(item.sourceDevice)
     val thumbBitmap = remember(item.itemId, thumbnailVersion, isImage) {
         if (!isImage) null
@@ -1029,23 +1030,38 @@ private fun UnifiedClipboardItemRow(
         }
     }
 
-    val titleText = if (isImage) {
-        val raw = item.previewText.trim()
-        if (raw.isBlank() || raw.startsWith("clip_", ignoreCase = true) || raw.startsWith("[image", ignoreCase = true)) {
-            "$sourceLabel Screenshot"
-        } else {
-            raw
+    val titleText = when {
+        isImage -> {
+            val raw = item.previewText.trim()
+            if (raw.isBlank() || raw.startsWith("clip_", ignoreCase = true) || raw.startsWith("[image", ignoreCase = true)) {
+                "$sourceLabel Screenshot"
+            } else {
+                raw
+            }
         }
-    } else {
-        item.previewText.ifBlank { "Snippet" }
+        isFileOrBundle -> {
+            val raw = item.previewText.trim()
+            when {
+                raw.isNotBlank() -> raw
+                item.fileManifest.size > 1 -> "${item.fileManifest.size} files"
+                item.fileManifest.size == 1 -> item.fileManifest[0].name
+                else -> "Shared File"
+            }
+        }
+        else -> item.previewText.ifBlank { "Snippet" }
     }
 
-    val sizeLabel = if (isImage && item.sizeBytes > 0L) {
-        formatReadableClipboardSize(item.sizeBytes)
-    } else if (!isImage && item.sizeBytes > 0L) {
-        formatReadableClipboardSize(item.sizeBytes)
-    } else {
-        if (isImage) "Image" else "Text"
+    val sizeLabel = when {
+        item.type == "file_bundle" -> {
+            val count = item.fileManifest.size.coerceAtLeast(1)
+            if (item.sizeBytes > 0L) "$count files • ${formatReadableClipboardSize(item.sizeBytes)}" else "$count files"
+        }
+        isImage && item.sizeBytes > 0L -> formatReadableClipboardSize(item.sizeBytes)
+        isFileOrBundle && item.sizeBytes > 0L -> "File • ${formatReadableClipboardSize(item.sizeBytes)}"
+        !isImage && item.sizeBytes > 0L -> formatReadableClipboardSize(item.sizeBytes)
+        isImage -> "Image"
+        isFileOrBundle -> "File"
+        else -> "Text"
     }
 
     Row(
@@ -1069,7 +1085,11 @@ private fun UnifiedClipboardItemRow(
                 )
             } else {
                 Icon(
-                    imageVector = if (isImage) Icons.Default.Image else Icons.Default.Description,
+                    imageVector = when {
+                        isImage -> Icons.Default.Image
+                        isFileOrBundle -> Icons.Default.Folder
+                        else -> Icons.Default.Description
+                    },
                     contentDescription = titleText,
                     tint = colors.textSecondary,
                     modifier = Modifier.size(20.dp)
@@ -1136,8 +1156,8 @@ private fun UnifiedClipboardItemRow(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = Icons.Default.ContentCopy,
-                    contentDescription = "Copy",
+                    imageVector = if (isFileOrBundle) Icons.Default.FileDownload else Icons.Default.ContentCopy,
+                    contentDescription = if (isFileOrBundle) "Save" else "Copy",
                     tint = colors.textSecondary,
                     modifier = Modifier.size(16.dp)
                 )

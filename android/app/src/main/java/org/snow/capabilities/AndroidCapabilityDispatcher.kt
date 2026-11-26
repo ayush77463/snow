@@ -43,7 +43,8 @@ class AndroidCapabilityDispatcher(
         val telemetry = setOf("battery_status", "android_battery", "android_battery_status")
         val clipboard = setOf(
             "clipboard_pull", "clipboard_push", "android_clipboard_pull",
-            "android_clipboard_push", "android_clipboard_get", "android_clipboard_set"
+            "android_clipboard_push", "android_clipboard_get", "android_clipboard_set",
+            "clipboard_buffer_updated", "clipboard_buffer_list", "clipboard_ack"
         )
         val files = setOf(
             "file_list", "android_file_list", "file_send_request",
@@ -278,78 +279,12 @@ class AndroidCapabilityDispatcher(
                 Pair(mapOf("status" to "success", "action" to "clipboard_buffer_updated"), null)
             }
             "clipboard_push" -> {
-                val type = data?.get("type") as? String
-                if (type == "image") {
-                    val transferId = data?.get("transfer_id") as? String
-                    val sha256 = data?.get("sha256") as? String ?: ""
-                    val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: defaultTransferPort
-                    val mimeType = (data?.get("mime_type") as? String)?.lowercase() ?: "image/png"
-                    val ext = if (mimeType.contains("jpeg") || mimeType.contains("jpg")) "jpg" else "png"
-                    val host = serverHost
-                    val transferClient = transferClientProvider()
-                    if (transferClient != null && transferId != null && host.isNotBlank()) {
-                        val cacheDir = ClipboardHandler.getClipboardCacheDir(context)
-                        val fileName = "clip_${sha256.take(16)}.$ext"
-                        val localFile = File(cacheDir, fileName)
-                        ClipboardHandler.pruneImageCache(cacheDir, preserveFileName = fileName)
-
-                        val dlRes = transferClient.downloadFile(
-                            serverHost = host,
-                            transferPort = transferPort,
-                            transferId = transferId,
-                            destinationFile = localFile,
-                            expectedSha256 = sha256
-                        )
-                        if (dlRes is FileTransferClient.TransferResult.Success) {
-                            try {
-                                val contentUri = FileProvider.getUriForFile(
-                                    context,
-                                    "${context.packageName}.fileprovider",
-                                    dlRes.file
-                                )
-                                val resolvedMime = if (ext == "jpg") "image/jpeg" else "image/png"
-                                withContext(Dispatchers.Main) {
-                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    val clip = android.content.ClipData(
-                                        android.content.ClipDescription("SNOW Image", arrayOf(resolvedMime)),
-                                        android.content.ClipData.Item(contentUri)
-                                    )
-                                    cm.setPrimaryClip(clip)
-                                }
-                                ClipboardHandler.grantImeUriPermission(context, contentUri)
-                                val isUserInitiated = (data?.get("user_initiated") == true)
-                                ClipboardHandler.postShareFallbackNotification(
-                                    context,
-                                    contentUri,
-                                    resolvedMime,
-                                    isUserInitiated = isUserInitiated
-                                )
-
-                                org.snow.ui.SnowUiRepository.getInstance(context).recordIncomingClipboardText(sha256)
-                                SafeLog.i(TAG, "Pushed image to Android clipboard via FileProvider ($resolvedMime).")
-                                Pair(mapOf("status" to "success", "type" to "image"), null)
-                            } catch (e: Exception) {
-                                SafeLog.e(TAG, "Failed placing image on Android clipboard: ${e.message}", e)
-                                Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Failed setting image clip"))
-                            }
-                        } else {
-                            Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Failed downloading clipboard image"))
-                        }
-                    } else {
-                        Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Transfer client not ready"))
-                    }
-                } else {
-                    val text = data?.get("text") as? String
-                    try {
-                        org.snow.ui.SnowUiRepository.getInstance(context).recordIncomingClipboardText(text)
-                    } catch (_: Exception) {}
-                    val res = clipboardHandler.pushClipboard(text)
-                    if (res["status"] == "success" || res["success"] == true) {
-                        Pair(res, null)
-                    } else {
-                        Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = res["error"] as? String ?: "Clipboard push failed"))
-                    }
-                }
+                handleIncomingClipboardPush(
+                    data = data,
+                    serverHost = serverHost,
+                    defaultTransferPort = defaultTransferPort,
+                    transferClient = transferClientProvider()
+                )
             }
             "clipboard_pull" -> {
                 val res = clipboardHandler.pullClipboard()
@@ -561,6 +496,157 @@ class AndroidCapabilityDispatcher(
                     )
                 )
             }
+        }
+    }
+
+    suspend fun handleIncomingClipboardPush(
+        data: Map<String, Any?>?,
+        serverHost: String,
+        defaultTransferPort: Int,
+        transferClient: FileTransferClient?,
+        repoOverride: org.snow.ui.SnowUiRepository? = null,
+        clipboardHandlerOverride: ClipboardHandler? = null,
+        imageClipApplierOverride: ((File, String) -> Unit)? = null
+    ): Pair<Map<String, Any?>?, SnowError?> {
+        val repo = repoOverride ?: try {
+            org.snow.ui.SnowUiRepository.getInstance(context)
+        } catch (_: Exception) {
+            null
+        }
+        val originDeviceId = (data?.get("origin_device_id") as? String)?.trim()
+        val eventId = (data?.get("event_id") as? String)?.trim() ?: ""
+        val seq = (data?.get("seq") as? Number)?.toLong() ?: 0L
+
+        if (repo != null && repo.isSelfOriginClipboardEvent(originDeviceId)) {
+            SafeLog.i(TAG, "Suppressed self-origin clipboard_push echo (event=$eventId).")
+            return Pair(mapOf("status" to "success", "ignored_echo" to true), null)
+        }
+
+        val type = (data?.get("type") as? String)?.trim()?.lowercase() ?: "text"
+        if (type == "file" || type == "file_bundle") {
+            if (repo == null || transferClient == null || serverHost.isBlank()) {
+                return Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Transfer client or repository not ready"))
+            }
+            val bundleResult = repo.handleIncomingClipboardFilePush(
+                data = data ?: emptyMap(),
+                transferClient = transferClient,
+                serverHost = serverHost,
+                defaultTransferPort = defaultTransferPort
+            )
+            return if (bundleResult.isSuccess) {
+                val saved = bundleResult.getOrNull().orEmpty()
+                Pair(
+                    mapOf(
+                        "status" to "success",
+                        "type" to type,
+                        "saved_files" to saved,
+                        "file_count" to saved.size
+                    ),
+                    null
+                )
+            } else {
+                Pair(
+                    null,
+                    SnowError(
+                        code = ErrorCode.INTERNAL_ERROR,
+                        message = bundleResult.exceptionOrNull()?.message ?: "Failed saving clipboard files"
+                    )
+                )
+            }
+        }
+
+        if (type == "image") {
+            val transferId = data?.get("transfer_id") as? String
+            val sha256 = data?.get("sha256") as? String ?: ""
+            val declaredSize = (data?.get("size") as? Number)?.toLong() ?: 0L
+            if (declaredSize > ClipboardHandler.MAX_IMAGE_BYTES) {
+                return Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = "Clipboard image exceeds 15 MiB limit"))
+            }
+            val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: defaultTransferPort
+            val mimeType = (data?.get("mime_type") as? String)?.lowercase() ?: "image/png"
+            val ext = if (mimeType.contains("jpeg") || mimeType.contains("jpg")) "jpg" else "png"
+            if (transferClient == null || transferId.isNullOrBlank() || serverHost.isBlank()) {
+                return Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Transfer client not ready"))
+            }
+            val cacheDir = ClipboardHandler.getClipboardCacheDir(context)
+            val fileName = "clip_${sha256.take(16)}.$ext"
+            val localFile = File(cacheDir, fileName)
+            ClipboardHandler.pruneImageCache(cacheDir, preserveFileName = fileName)
+
+            val dlRes = transferClient.downloadFile(
+                serverHost = serverHost,
+                transferPort = transferPort,
+                transferId = transferId,
+                destinationFile = localFile,
+                expectedSha256 = sha256
+            )
+            if (dlRes !is FileTransferClient.TransferResult.Success) {
+                return Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Failed downloading clipboard image"))
+            }
+            if (dlRes.file.length() > ClipboardHandler.MAX_IMAGE_BYTES) {
+                dlRes.file.delete()
+                return Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = "Downloaded image exceeds 15 MiB limit"))
+            }
+            return try {
+                val resolvedMime = if (ext == "jpg") "image/jpeg" else "image/png"
+                if (imageClipApplierOverride != null) {
+                    withContext(Dispatchers.Main) {
+                        imageClipApplierOverride.invoke(dlRes.file, resolvedMime)
+                    }
+                } else {
+                    val contentUri = FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        dlRes.file
+                    )
+                    withContext(Dispatchers.Main) {
+                        val clip = ClipData(
+                            android.content.ClipDescription("SNOW Image", arrayOf(resolvedMime)),
+                            ClipData.Item(contentUri)
+                        )
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(clip)
+                    }
+                    ClipboardHandler.grantImeUriPermission(context, contentUri)
+                    val isUserInitiated = (data?.get("user_initiated") == true)
+                    ClipboardHandler.postShareFallbackNotification(
+                        context,
+                        contentUri,
+                        resolvedMime,
+                        isUserInitiated = isUserInitiated
+                    )
+                }
+                repo?.recordIncomingClipboardText(sha256)
+                if (seq > 0L && eventId.isNotBlank()) {
+                    repo?.sendClipboardAck(seq, eventId)
+                }
+                SafeLog.i(TAG, "Pushed image to Android clipboard via FileProvider ($resolvedMime).")
+                Pair(mapOf("status" to "success", "type" to "image"), null)
+            } catch (e: Exception) {
+                SafeLog.e(TAG, "Failed placing image on Android clipboard: ${e.message}", e)
+                Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = "Failed setting image clip"))
+            }
+        }
+
+        val text = data?.get("text") as? String
+        if (!ClipboardHandler.isTextWithinLimit(text)) {
+            return Pair(
+                null,
+                SnowError(code = ErrorCode.INVALID_PAYLOAD, message = "Clipboard text missing or exceeds 64 KiB limit.")
+            )
+        }
+        val effectiveClipboard = clipboardHandlerOverride ?: clipboardHandler
+        val res = effectiveClipboard.pushClipboard(text)
+        return if (res["status"] == "success" || res["success"] == true) {
+            try {
+                repo?.recordIncomingClipboardText(text)
+                if (seq > 0L && eventId.isNotBlank()) {
+                    repo?.sendClipboardAck(seq, eventId)
+                }
+            } catch (_: Exception) {}
+            Pair(res, null)
+        } else {
+            Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = res["error"] as? String ?: "Clipboard push failed"))
         }
     }
 }

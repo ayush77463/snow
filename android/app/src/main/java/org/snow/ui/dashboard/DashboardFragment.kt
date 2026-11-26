@@ -699,7 +699,7 @@ class DashboardFragment : Fragment() {
         }
 
         binding.tvBufferEmpty.visibility = View.GONE
-        items.take(10).forEach { item ->
+        items.take(15).forEach { item ->
             val row = android.widget.LinearLayout(requireContext()).apply {
                 orientation = android.widget.LinearLayout.HORIZONTAL
                 layoutParams = android.widget.LinearLayout.LayoutParams(
@@ -733,7 +733,7 @@ class DashboardFragment : Fragment() {
                 null,
                 com.google.android.material.R.attr.materialButtonOutlinedStyle
             ).apply {
-                text = "Copy"
+                text = if (item.type == "file" || item.type == "file_bundle") "Save" else "Copy"
                 textSize = 10f
                 setPadding(12, 4, 12, 4)
                 setTextColor(ContextCompat.getColor(requireContext(), R.color.primary_text))

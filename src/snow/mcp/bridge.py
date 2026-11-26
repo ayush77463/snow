@@ -1478,7 +1478,7 @@ class SnowMcpBridge:
     # Phase 26B: Shared Clipboard Buffer Methods
     # =========================================================================
 
-    async def clipboard_buffer_list(self, limit: int = 10) -> dict[str, Any]:
+    async def clipboard_buffer_list(self, limit: int = 15) -> dict[str, Any]:
         """List metadata for the latest items in the shared clipboard buffer."""
         return await self._execute_local_or_ipc(
             "clipboard_buffer_list",

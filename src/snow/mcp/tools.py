@@ -715,9 +715,9 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
 
     @server.tool(
         name="snow_clipboard_buffer_list",
-        description="List metadata of up to 10 most recent items in the SNOW shared clipboard ring buffer.",
+        description="List metadata of up to 15 most recent items in the SNOW shared clipboard ring buffer.",
     )
-    async def snow_clipboard_buffer_list(limit: int = 10) -> str:
+    async def snow_clipboard_buffer_list(limit: int = 15) -> str:
         """List metadata for items in the shared clipboard buffer."""
         result = await bridge.clipboard_buffer_list(limit=limit)
         if not result.get("success", False):
@@ -1087,9 +1087,9 @@ def register_clipboard_buffer_tools(server: FastMCP, bridge: SnowMcpBridge) -> N
 
     @server.tool(
         name="snow_clipboard_buffer_list",
-        description="List metadata of up to 10 most recent items in the SNOW shared clipboard ring buffer.",
+        description="List metadata of up to 15 most recent items in the SNOW shared clipboard ring buffer.",
     )
-    async def snow_clipboard_buffer_list(limit: int = 10) -> str:
+    async def snow_clipboard_buffer_list(limit: int = 15) -> str:
         result = await bridge.clipboard_buffer_list(limit=limit)
         if not result.get("success", False):
             return json.dumps({

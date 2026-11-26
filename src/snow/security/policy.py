@@ -80,6 +80,8 @@ ACTION_TO_CAPABILITY: dict[str, str] = {
     "clipboard_buffer_unpin": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
     "clipboard_buffer_delete": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
     "clipboard_buffer_clear": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
+    "clipboard_ack": CAPABILITY_DESKTOP_CLIPBOARD_READ,
+    "clipboard_history_sync": CAPABILITY_DESKTOP_CLIPBOARD_READ,
 }
 
 

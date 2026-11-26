@@ -58,7 +58,8 @@ sealed class AuthState {
         val peerDeviceName: String? = null,
         val peerDeviceType: String? = null,
         val peerDeviceId: String? = null,
-        val peerSnowId: String? = null
+        val peerSnowId: String? = null,
+        val permissionProfile: String? = null
     ) : AuthState()
     data class AuthFailed(val reason: String) : AuthState()
     data class FingerprintConfirmationRequired(val fingerprint: String) : AuthState()
@@ -86,6 +87,32 @@ class SnowWebSocketClient(
         const val MAX_CONNECT_RETRIES = 3
         const val MAX_PENDING_REQUESTS = 100
         const val DEFAULT_REQUEST_TIMEOUT_SECONDS = 30L
+
+        internal fun parseAuthenticatedState(data: Map<*, *>?): AuthState.Authenticated {
+            val sessionId = data?.get("session_id") as? String ?: "active"
+            val trustTier = data?.get("trust_tier") as? String ?: "peer"
+            val permissionProfile = data?.get("permission_profile") as? String
+            val manifest = data?.get("manifest") as? Map<*, *>
+            val peerName = (data?.get("device_name") as? String)
+                ?: (manifest?.get("device_name") as? String)
+            val peerType = (data?.get("device_type") as? String)
+                ?: (data?.get("platform") as? String)
+                ?: (manifest?.get("platform") as? String)
+                ?: (manifest?.get("device_type") as? String)
+            val peerDeviceId = (data?.get("server_device_id") as? String)
+                ?: (manifest?.get("device_id") as? String)
+            val peerSnowId = (data?.get("snow_id") as? String)
+                ?: (manifest?.get("snow_id") as? String)
+            return AuthState.Authenticated(
+                sessionId = sessionId,
+                trustTier = trustTier,
+                peerDeviceName = peerName,
+                peerDeviceType = peerType,
+                peerDeviceId = peerDeviceId,
+                peerSnowId = peerSnowId,
+                permissionProfile = permissionProfile
+            )
+        }
     }
 
     private var okHttpClient: OkHttpClient? = null
@@ -124,7 +151,8 @@ class SnowWebSocketClient(
         peerDeviceName: String? = null,
         peerDeviceType: String? = null,
         peerDeviceId: String? = null,
-        peerSnowId: String? = null
+        peerSnowId: String? = null,
+        permissionProfile: String? = null
     ) {
         backoffPolicy.reset()
         _authState.value = AuthState.Authenticated(
@@ -133,7 +161,8 @@ class SnowWebSocketClient(
             peerDeviceName,
             peerDeviceType,
             peerDeviceId,
-            peerSnowId
+            peerSnowId,
+            permissionProfile
         )
     }
 
@@ -697,29 +726,10 @@ class SnowWebSocketClient(
             ) { response ->
                 if (response.type == MessageType.RESPONSE && response.payload?.get("status") == "success") {
                     val data = (response.payload["data"] as? Map<*, *>) ?: response.payload
-                    val sessionId = data?.get("session_id") as? String ?: "active"
-                    val trustTier = data?.get("trust_tier") as? String ?: "peer"
-                    val manifest = data?.get("manifest") as? Map<*, *>
-                    val peerName = (data?.get("device_name") as? String)
-                        ?: (manifest?.get("device_name") as? String)
-                    val peerType = (data?.get("device_type") as? String)
-                        ?: (data?.get("platform") as? String)
-                        ?: (manifest?.get("platform") as? String)
-                        ?: (manifest?.get("device_type") as? String)
-                    val peerDeviceId = (data?.get("server_device_id") as? String)
-                        ?: (manifest?.get("device_id") as? String)
-                    val peerSnowId = (data?.get("snow_id") as? String)
-                        ?: (manifest?.get("snow_id") as? String)
+                    val authState = parseAuthenticatedState(data)
                     backoffPolicy.reset()
-                    _authState.value = AuthState.Authenticated(
-                        sessionId = sessionId,
-                        trustTier = trustTier,
-                        peerDeviceName = peerName,
-                        peerDeviceType = peerType,
-                        peerDeviceId = peerDeviceId,
-                        peerSnowId = peerSnowId
-                    )
-                    log("Authenticated successfully with peer core [session=$sessionId, tier=$trustTier, type=${peerType ?: "unknown"}]")
+                    _authState.value = authState
+                    log("Authenticated successfully with peer core [session=${authState.sessionId}, tier=${authState.trustTier}, profile=${authState.permissionProfile ?: "unset"}, type=${authState.peerDeviceType ?: "unknown"}]")
                 } else {
                     val errCode = response.error?.code ?: ErrorCode.UNAUTHORIZED
                     val errMsg = response.error?.message ?: "Authentication rejected."

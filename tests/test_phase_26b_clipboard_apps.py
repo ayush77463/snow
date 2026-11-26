@@ -74,22 +74,22 @@ class TestClipboardRingBufferSemantics(unittest.TestCase):
         self.assertEqual(items[1]["preview"], "First item")
 
     def test_02_capacity_limit_and_oldest_unpinned_eviction(self) -> None:
-        """Buffer caps at 10 items, evicting the oldest unpinned item when full."""
-        for i in range(10):
+        """Buffer caps at 15 items, evicting the oldest unpinned item when full."""
+        for i in range(15):
             res = self.buffer.add_text(f"Item {i}")
             self.assertTrue(res["success"])
             time.sleep(0.005)
 
-        self.assertEqual(len(self.buffer.list_items()), 10)
-        self.assertEqual(self.buffer.list_items()[0]["preview"], "Item 9")
-        self.assertEqual(self.buffer.list_items()[9]["preview"], "Item 0")
+        self.assertEqual(len(self.buffer.list_items()), 15)
+        self.assertEqual(self.buffer.list_items()[0]["preview"], "Item 14")
+        self.assertEqual(self.buffer.list_items()[14]["preview"], "Item 0")
 
-        # 11th item should evict "Item 0"
-        res11 = self.buffer.add_text("Item 10")
-        self.assertTrue(res11["success"])
+        # 16th item should evict "Item 0"
+        res16 = self.buffer.add_text("Item 15")
+        self.assertTrue(res16["success"])
         items = self.buffer.list_items()
-        self.assertEqual(len(items), 10)
-        self.assertEqual(items[0]["preview"], "Item 10")
+        self.assertEqual(len(items), 15)
+        self.assertEqual(items[0]["preview"], "Item 15")
         previews = [it["preview"] for it in items]
         self.assertNotIn("Item 0", previews)
         self.assertIn("Item 1", previews)
@@ -101,19 +101,19 @@ class TestClipboardRingBufferSemantics(unittest.TestCase):
         self.assertTrue(res0["success"])
         item0_id = res0["item"]["item_id"]
 
-        # Add 9 more items
-        for i in range(1, 10):
+        # Add 14 more items
+        for i in range(1, 15):
             self.buffer.add_text(f"Item {i}")
             time.sleep(0.005)
 
-        self.assertEqual(len(self.buffer.list_items()), 10)
+        self.assertEqual(len(self.buffer.list_items()), 15)
 
-        # Adding Item 10 should evict Item 1 (oldest unpinned), preserving Item 0 (pinned)
-        res_overflow = self.buffer.add_text("Item 10")
+        # Adding Item 15 should evict Item 1 (oldest unpinned), preserving Item 0 (pinned)
+        res_overflow = self.buffer.add_text("Item 15")
         self.assertTrue(res_overflow["success"])
 
         items = self.buffer.list_items()
-        self.assertEqual(len(items), 10)
+        self.assertEqual(len(items), 15)
         previews = [it["preview"] for it in items]
         self.assertIn("Item 0 (Pinned)", previews)
         self.assertNotIn("Item 1", previews)
@@ -183,8 +183,8 @@ class TestClipboardRingBufferSemantics(unittest.TestCase):
         self.assertEqual(res_jpg["item"]["content_type"], "image")
         self.assertEqual(res_jpg["item"]["mime_type"], "image/jpeg")
 
-        # Oversized image (> 10 MiB)
-        oversized_jpg = JPEG_SIGNATURE + b"\x00" * (10 * 1024 * 1024 + 1)
+        # Oversized image (> 15 MiB)
+        oversized_jpg = JPEG_SIGNATURE + b"\x00" * (15 * 1024 * 1024 + 1)
         res_oversized = self.buffer.add_image(oversized_jpg)
         self.assertFalse(res_oversized["success"])
         self.assertEqual(res_oversized["status"], "CONTENT_TOO_LARGE")
@@ -212,8 +212,8 @@ class TestClipboardRingBufferSemantics(unittest.TestCase):
         evict_img_path = self.buffer.get_image_path(evict_item_id)
         self.assertTrue(evict_img_path.is_file())
 
-        # Fill buffer with 10 text items to force eviction of the image
-        for i in range(10):
+        # Fill buffer with 15 text items to force eviction of the image
+        for i in range(15):
             self.buffer.add_text(f"Fill item {i}")
         self.assertFalse(evict_img_path.exists())
 

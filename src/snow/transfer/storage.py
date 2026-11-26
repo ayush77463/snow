@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import time
-from typing import Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -308,3 +311,155 @@ class TransferStorageManager:
                     logger.warning("Error inspecting/removing partial file '%s': %s", item, exc)
 
         return cleaned_count
+
+
+def _is_reparse_or_symlink_path(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        st = os.lstat(path)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attrs = getattr(st, "st_file_attributes", 0)
+        if reparse_flag and (file_attrs & reparse_flag):
+            return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
+def _conflict_safe_destination(dest_dir: Path, safe_name: str, expected_sha256: str) -> tuple[Path, bool]:
+    """Return (final_path, already_exists_with_matching_hash) using conflict-safe naming."""
+    resolved_root = dest_dir.resolve()
+    base_candidate = (resolved_root / safe_name).resolve()
+    if not base_candidate.is_relative_to(resolved_root):
+        raise PermissionError(f"Path escape attempt detected for filename '{safe_name}'.")
+
+    if not base_candidate.exists():
+        return base_candidate, False
+    if not base_candidate.is_dir() and not _is_reparse_or_symlink_path(base_candidate):
+        try:
+            if hmac.compare_digest(compute_stream_sha256(base_candidate), expected_sha256.lower()):
+                return base_candidate, True
+        except OSError:
+            pass
+
+    stem = Path(safe_name).stem
+    suffix = Path(safe_name).suffix
+    for idx in range(1, 1000):
+        numbered = f"{stem} ({idx}){suffix}"
+        candidate = (resolved_root / numbered).resolve()
+        if not candidate.is_relative_to(resolved_root):
+            raise PermissionError(f"Collision path escape for '{safe_name}'.")
+        if not candidate.exists():
+            return candidate, False
+        if not candidate.is_dir() and not _is_reparse_or_symlink_path(candidate):
+            try:
+                if hmac.compare_digest(compute_stream_sha256(candidate), expected_sha256.lower()):
+                    return candidate, True
+            except OSError:
+                pass
+
+    raise RuntimeError(f"Exhausted collision-safe names for '{safe_name}'.")
+
+
+def commit_verified_clipboard_files(
+    dest_dir: Path,
+    entries: Sequence[Dict[str, Any]],
+    max_files: int = 5,
+    max_total_bytes: int = 15 * 1024 * 1024,
+) -> List[Path]:
+    """Stage clipboard files into .parts, verify byte sizes & SHA-256, and commit collision-safely.
+
+    All files in the bundle are verified BEFORE committing any final file or OS clipboard handle.
+    """
+    if not entries or len(entries) > max_files:
+        raise ValueError(f"Clipboard file commit requires 1 to {max_files} entries.")
+
+    resolved_dest_dir = Path(dest_dir).resolve()
+    if _is_reparse_or_symlink_path(resolved_dest_dir):
+        raise PermissionError("Destination transfer directory cannot be a symlink or junction.")
+    resolved_dest_dir.mkdir(parents=True, exist_ok=True)
+    parts_dir = (resolved_dest_dir / ".parts").resolve()
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    staged: List[tuple[Path, str, str]] = []
+    total_size = 0
+
+    def _cleanup_parts() -> None:
+        for p_path, _, _ in staged:
+            try:
+                p_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    try:
+        for entry in entries:
+            safe_name = sanitize_filename(str(entry.get("name") or ""))
+            expected_size = int(entry.get("size_bytes", 0))
+            expected_sha256 = str(entry.get("sha256") or "").strip().lower()
+            if len(expected_sha256) != 64:
+                raise ValueError(f"Missing valid SHA-256 digest for '{safe_name}'.")
+            if expected_size < 0 or expected_size > max_total_bytes:
+                raise ValueError(f"File '{safe_name}' size ({expected_size}) exceeds 15 MiB limit.")
+
+            part_path = (parts_dir / f"cb_{uuid.uuid4().hex}.part").resolve()
+            if not part_path.is_relative_to(parts_dir):
+                raise PermissionError("Staging path escape detected.")
+
+            hasher = hashlib.sha256()
+            written = 0
+            src_path_raw = entry.get("path")
+            raw_bytes = entry.get("data")
+
+            if raw_bytes is not None:
+                raw_buf = bytes(raw_bytes)
+                written = len(raw_buf)
+                hasher.update(raw_buf)
+                part_path.write_bytes(raw_buf)
+            elif src_path_raw is not None:
+                src_p = Path(src_path_raw)
+                if _is_reparse_or_symlink_path(src_p) or not src_p.is_file():
+                    raise ValueError(f"Source file invalid or missing for '{safe_name}'.")
+                with open(src_p, "rb") as src_f, open(part_path, "wb") as dst_f:
+                    while True:
+                        chunk = src_f.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        total_size += len(chunk)
+                        if written > max_total_bytes or total_size > max_total_bytes:
+                            raise ValueError("Clipboard file bundle exceeds 15 MiB size limit.")
+                        hasher.update(chunk)
+                        dst_f.write(chunk)
+            else:
+                raise ValueError(f"Entry '{safe_name}' missing source data or path.")
+
+            if raw_bytes is not None:
+                total_size += written
+                if total_size > max_total_bytes:
+                    raise ValueError("Clipboard file bundle exceeds 15 MiB size limit.")
+
+            staged.append((part_path, safe_name, expected_sha256))
+
+            actual_sha256 = hasher.hexdigest().lower()
+            if written != expected_size or not hmac.compare_digest(actual_sha256, expected_sha256):
+                raise ValueError(
+                    f"Integrity verification failed for '{safe_name}': expected {expected_sha256} ({expected_size}B), "
+                    f"got {actual_sha256} ({written}B)."
+                )
+
+        committed_paths: List[Path] = []
+        for part_path, safe_name, expected_sha256 in staged:
+            final_dest, already_present = _conflict_safe_destination(resolved_dest_dir, safe_name, expected_sha256)
+            if already_present:
+                part_path.unlink(missing_ok=True)
+            else:
+                os.replace(part_path, final_dest)
+            committed_paths.append(final_dest)
+
+        return committed_paths
+    except Exception:
+        _cleanup_parts()
+        raise

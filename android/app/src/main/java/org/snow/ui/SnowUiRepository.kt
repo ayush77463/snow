@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.snow.capabilities.CameraCaptureHandler
@@ -62,6 +63,165 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         const val PREF_KEY_REMOTE_RELAY_ENABLED = "remote_relay_enabled"
         const val PREF_KEY_REMOTE_RELAY_ENDPOINT = "remote_relay_endpoint"
         const val PREF_KEY_PERMISSION_PROFILE = "permission_profile"
+        const val PREFS_CLIPBOARD_ACK = "snow_clipboard_ack_prefs"
+        const val PREF_KEY_CLIP_LAST_ACKED_SEQ = "clip_last_acked_seq"
+        const val PREF_KEY_CLIP_LAST_COMMITTED_EVENT = "clip_last_committed_event_id"
+        const val PREF_KEY_CLIP_LAST_COMMITTED_SEQ = "clip_last_committed_seq"
+        const val MAX_CLIPBOARD_ITEMS = 15
+        const val MAX_CLIPBOARD_TEXT_BYTES = 64 * 1024
+        const val MAX_CLIPBOARD_IMAGE_BYTES = 15L * 1024L * 1024L
+        const val MAX_CLIPBOARD_FILE_BYTES = 15L * 1024L * 1024L
+        const val MAX_CLIPBOARD_BUNDLE_BYTES = 15L * 1024L * 1024L
+        const val MAX_CLIPBOARD_BUNDLE_FILES = 5
+        private val SHA256_HEX_REGEX = Regex("^[0-9a-fA-F]{64}$")
+
+        fun parseClipboardFileManifest(rawList: Any?): List<ClipboardFileEntryDto> {
+            val list = rawList as? List<*> ?: return emptyList()
+            val out = mutableListOf<ClipboardFileEntryDto>()
+            for ((idx, item) in list.withIndex()) {
+                val map = item as? Map<*, *> ?: continue
+                val rawName = (map["name"] as? String) ?: (map["file_name"] as? String) ?: continue
+                val safeName = try {
+                    org.snow.capabilities.ClipboardHandler.sanitizeClipboardFileName(rawName)
+                } catch (_: IllegalArgumentException) {
+                    continue
+                }
+                val size = (map["size_bytes"] as? Number)?.toLong()
+                    ?: (map["size"] as? Number)?.toLong() ?: 0L
+                if (size < 0L || size > MAX_CLIPBOARD_FILE_BYTES) continue
+                val sha = (map["sha256"] as? String)?.trim()?.lowercase() ?: ""
+                if (!SHA256_HEX_REGEX.matches(sha)) continue
+                val mime = (map["mime_type"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+                    ?: "application/octet-stream"
+                val entryIdx = (map["index"] as? Number)?.toInt() ?: idx
+                val transferId = (map["transfer_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+                val transferPort = (map["transfer_port"] as? Number)?.toInt() ?: 8766
+                out.add(
+                    ClipboardFileEntryDto(
+                        index = entryIdx,
+                        name = safeName,
+                        sizeBytes = size,
+                        mimeType = mime,
+                        sha256 = sha,
+                        transferId = transferId,
+                        transferPort = transferPort
+                    )
+                )
+            }
+            return out
+        }
+
+        fun validateIncomingFileBundlePayload(rawList: Any?): Result<List<ClipboardFileEntryDto>> {
+            val list = rawList as? List<*>
+                ?: return Result.failure(IllegalArgumentException("Missing files manifest list."))
+            if (list.isEmpty() || list.size > MAX_CLIPBOARD_BUNDLE_FILES) {
+                return Result.failure(
+                    IllegalArgumentException("Clipboard bundle must contain 1 to $MAX_CLIPBOARD_BUNDLE_FILES files.")
+                )
+            }
+            val parsed = mutableListOf<ClipboardFileEntryDto>()
+            var totalBytes = 0L
+            for ((idx, rawEntry) in list.withIndex()) {
+                val map = rawEntry as? Map<*, *>
+                    ?: return Result.failure(IllegalArgumentException("Invalid file manifest entry at index $idx."))
+                val rawName = (map["name"] as? String) ?: (map["file_name"] as? String)
+                    ?: return Result.failure(IllegalArgumentException("Missing file name at index $idx."))
+                val safeName = org.snow.capabilities.ClipboardHandler.sanitizeClipboardFileName(rawName)
+                val size = (map["size_bytes"] as? Number)?.toLong()
+                    ?: (map["size"] as? Number)?.toLong() ?: -1L
+                if (size < 0L || size > MAX_CLIPBOARD_FILE_BYTES) {
+                    return Result.failure(
+                        IllegalArgumentException("File '$safeName' exceeds 15 MiB clipboard file limit.")
+                    )
+                }
+                totalBytes += size
+                if (totalBytes > MAX_CLIPBOARD_BUNDLE_BYTES) {
+                    return Result.failure(
+                        IllegalArgumentException("Clipboard bundle aggregate size exceeds 15 MiB limit.")
+                    )
+                }
+                val sha = (map["sha256"] as? String)?.trim()?.lowercase() ?: ""
+                if (!SHA256_HEX_REGEX.matches(sha)) {
+                    return Result.failure(
+                        IllegalArgumentException("File '$safeName' has invalid SHA-256 digest.")
+                    )
+                }
+                val transferId = (map["transfer_id"] as? String)?.trim()
+                if (transferId.isNullOrBlank()) {
+                    return Result.failure(
+                        IllegalArgumentException("File '$safeName' is missing transfer_id.")
+                    )
+                }
+                val mime = (map["mime_type"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+                    ?: "application/octet-stream"
+                val transferPort = (map["transfer_port"] as? Number)?.toInt() ?: 8766
+                parsed.add(
+                    ClipboardFileEntryDto(
+                        index = (map["index"] as? Number)?.toInt() ?: idx,
+                        name = safeName,
+                        sizeBytes = size,
+                        mimeType = mime,
+                        sha256 = sha,
+                        transferId = transferId,
+                        transferPort = transferPort
+                    )
+                )
+            }
+            return Result.success(parsed)
+        }
+
+        fun parseClipboardBufferItems(rawItems: List<*>): List<ClipboardItemDto> {
+            return rawItems.mapNotNull { itemMap ->
+                (itemMap as? Map<*, *>)?.let { map ->
+                    val contentType = (map["content_type"] as? String)
+                        ?: (map["type"] as? String) ?: "text"
+                    val originId = (map["origin_device_id"] as? String)
+                        ?: (map["source_device_id"] as? String)
+                        ?: (map["source_device"] as? String)
+                        ?: "pc"
+                    val manifest = if (contentType == "file" || contentType == "file_bundle") {
+                        parseClipboardFileManifest(map["file_manifest"])
+                    } else {
+                        emptyList()
+                    }
+                    ClipboardItemDto(
+                        itemId = map["item_id"] as? String ?: "",
+                        type = contentType,
+                        sourceDevice = map["source_device"] as? String ?: originId,
+                        previewText = map["preview_text"] as? String
+                            ?: (map["preview"] as? String ?: (map["text_content"] as? String ?: "")),
+                        sizeBytes = (map["size_bytes"] as? Number)?.toLong() ?: 0L,
+                        timestamp = (map["timestamp"] as? Number)?.toDouble() ?: 0.0,
+                        isPinned = (map["is_pinned"] as? Boolean) ?: (map["pinned"] as? Boolean) ?: false,
+                        eventId = map["event_id"] as? String ?: "",
+                        seq = (map["seq"] as? Number)?.toLong() ?: 0L,
+                        originDeviceId = originId,
+                        sha256 = (map["sha256"] as? String) ?: "",
+                        mimeType = (map["mime_type"] as? String) ?: "",
+                        fileManifest = manifest
+                    )
+                }
+            }.filter { it.itemId.isNotBlank() }
+                .sortedWith(compareByDescending<ClipboardItemDto> { it.seq }.thenByDescending { it.timestamp })
+                .take(MAX_CLIPBOARD_ITEMS)
+        }
+
+        fun shouldApplyRemoteClipboardEvent(
+            originDeviceId: String?,
+            selfDeviceId: String,
+            eventId: String?,
+            seq: Long,
+            lastAckedSeq: Long
+        ): Boolean {
+            val cleanOrigin = originDeviceId?.trim()
+            if (!cleanOrigin.isNullOrBlank() && cleanOrigin == selfDeviceId.trim()) {
+                return false
+            }
+            if (seq > 0L && seq <= lastAckedSeq) {
+                return false
+            }
+            return true
+        }
 
         data class BatteryIntentSpec(
             val action: String,
@@ -576,7 +736,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _cameraDelivery = MutableStateFlow(CameraDeliveryInfo())
     val cameraDelivery: StateFlow<CameraDeliveryInfo> = _cameraDelivery.asStateFlow()
 
-    // Phase 26B Shared Clipboard Buffer DTO & State
+    // Phase 26B / V7 Shared Clipboard Buffer DTO & State
+    data class ClipboardFileEntryDto(
+        val index: Int = 0,
+        val name: String,
+        val sizeBytes: Long,
+        val mimeType: String,
+        val sha256: String,
+        val transferId: String? = null,
+        val transferPort: Int = 8766
+    )
+
     data class ClipboardItemDto(
         val itemId: String,
         val type: String,
@@ -584,7 +754,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val previewText: String,
         val sizeBytes: Long,
         val timestamp: Double,
-        val isPinned: Boolean
+        val isPinned: Boolean,
+        val eventId: String = "",
+        val seq: Long = 0L,
+        val originDeviceId: String = "",
+        val sha256: String = "",
+        val mimeType: String = "",
+        val fileManifest: List<ClipboardFileEntryDto> = emptyList()
     )
 
     private val _clipboardBufferItems = MutableStateFlow<List<ClipboardItemDto>>(emptyList())
@@ -735,7 +911,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         peerDeviceName = auth.peerDeviceName,
                         peerDeviceType = auth.peerDeviceType,
                         peerDeviceId = auth.peerDeviceId,
-                        peerSnowId = auth.peerSnowId
+                        peerSnowId = auth.peerSnowId,
+                        peerPermissionProfile = auth.permissionProfile
                     )
                 } else {
                     _fileTransferClient = null
@@ -934,12 +1111,21 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         pairingFlow.submitHandshakeToken(handshakeToken, networkId, client) { state ->
             appendLog("INFO", TAG, "QR handshake pairing state changed: $state")
             if (state is PairingState.Paired) {
-                client.setAuthenticated(state.sessionId, state.trustTier, state.desktopName, state.deviceType)
+                client.setAuthenticated(
+                    sessionId = state.sessionId,
+                    trustTier = state.trustTier,
+                    peerDeviceName = state.desktopName,
+                    peerDeviceType = state.deviceType,
+                    peerDeviceId = state.desktopId,
+                    permissionProfile = state.permissionProfile
+                )
                 _authState.value = AuthState.Authenticated(
-                    state.sessionId,
-                    state.trustTier,
-                    state.desktopName,
-                    state.deviceType
+                    sessionId = state.sessionId,
+                    trustTier = state.trustTier,
+                    peerDeviceName = state.desktopName,
+                    peerDeviceType = state.deviceType,
+                    peerDeviceId = state.desktopId,
+                    permissionProfile = state.permissionProfile
                 )
             }
             onStateChanged?.invoke(state)
@@ -963,12 +1149,21 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         pairingFlow.submitPin(cleanPin, client) { state ->
             appendLog("INFO", TAG, "Pairing state changed: $state")
             if (state is PairingState.Paired) {
-                client.setAuthenticated(state.sessionId, state.trustTier, state.desktopName, state.deviceType)
+                client.setAuthenticated(
+                    sessionId = state.sessionId,
+                    trustTier = state.trustTier,
+                    peerDeviceName = state.desktopName,
+                    peerDeviceType = state.deviceType,
+                    peerDeviceId = state.desktopId,
+                    permissionProfile = state.permissionProfile
+                )
                 _authState.value = AuthState.Authenticated(
-                    state.sessionId,
-                    state.trustTier,
-                    state.desktopName,
-                    state.deviceType
+                    sessionId = state.sessionId,
+                    trustTier = state.trustTier,
+                    peerDeviceName = state.desktopName,
+                    peerDeviceType = state.deviceType,
+                    peerDeviceId = state.desktopId,
+                    permissionProfile = state.permissionProfile
                 )
             }
             onStateChanged?.invoke(state)
@@ -1087,7 +1282,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         peerDeviceName: String? = null,
         peerDeviceType: String? = null,
         peerDeviceId: String? = null,
-        peerSnowId: String? = null
+        peerSnowId: String? = null,
+        peerPermissionProfile: String? = null
     ) {
         val cleanHost = host.trim()
         val pinnedFp = certPinStorage.getPinnedFingerprint()
@@ -1113,6 +1309,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val resolvedName = peerDeviceName?.takeIf { it.isNotBlank() }
             ?: matchedDiscovered?.deviceName?.takeIf { it.isNotBlank() }
         val normalizedIncomingTier = normalizeTrustTier(tier)
+        val hasExplicitRemoteProfile = isExplicitPermissionProfileToken(peerPermissionProfile)
+        val normalizedRemoteProfile = if (peerPermissionProfile != null) {
+            normalizeAccessProfile(peerPermissionProfile)
+        } else {
+            null
+        }
 
         val current = _savedDevices.value.toMutableList()
         val probe = SavedDevice(
@@ -1125,7 +1327,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             certFingerprint = pinnedFp,
             snowId = resolvedSnowId,
             deviceType = resolvedType ?: "pc",
-            permissionProfile = "not_allowed"
+            permissionProfile = normalizedRemoteProfile ?: "not_allowed"
         )
         val existingIdx = current.indexOfFirst { canMergeSavedDevices(it, probe) }
 
@@ -1151,6 +1353,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 existing.trustTier,
                 existing.permissionProfile
             )
+            val effectiveProfile = if (hasExplicitRemoteProfile && normalizedRemoteProfile != null) {
+                normalizedRemoteProfile
+            } else {
+                preservedProfile
+            }
             current[existingIdx] = existing.copy(
                 deviceId = canonicalKey,
                 deviceName = effectiveName,
@@ -1162,7 +1369,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 certFingerprint = pinnedFp ?: existing.certFingerprint,
                 recentEndpoints = updatedEndpoints.take(5),
                 snowId = resolvedSnowId ?: existing.snowId,
-                permissionProfile = preservedProfile
+                permissionProfile = effectiveProfile
             )
         } else {
             val finalType = resolvedType ?: "pc"
@@ -1181,7 +1388,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     recentEndpoints = updatedEndpoints.take(5),
                     snowId = resolvedSnowId,
                     deviceType = finalType,
-                    permissionProfile = "not_allowed"
+                    permissionProfile = normalizedRemoteProfile ?: "not_allowed"
                 )
             )
         }
@@ -1363,7 +1570,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         peerDeviceName = auth.peerDeviceName,
                         peerDeviceType = auth.peerDeviceType,
                         peerDeviceId = auth.peerDeviceId,
-                        peerSnowId = auth.peerSnowId
+                        peerSnowId = auth.peerSnowId,
+                        peerPermissionProfile = auth.permissionProfile
                     )
                     finishQr(true, null)
                     return@launch
@@ -1379,7 +1587,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                     tier = pState.trustTier,
                                     peerDeviceName = pState.desktopName,
                                     peerDeviceType = pState.deviceType,
-                                    peerDeviceId = pState.desktopId
+                                    peerDeviceId = pState.desktopId,
+                                    peerPermissionProfile = pState.permissionProfile
                                 )
                                 finishQr(true, null)
                             }
@@ -2080,6 +2289,203 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     private var lastClipboardHash: String? = null
+
+    private fun clipboardAckPrefs() =
+        appContext.getSharedPreferences(PREFS_CLIPBOARD_ACK, Context.MODE_PRIVATE)
+
+    fun getLastAckedClipboardSeq(): Long =
+        clipboardAckPrefs().getLong(PREF_KEY_CLIP_LAST_ACKED_SEQ, 0L)
+
+    fun hasCommittedClipboardEvent(eventId: String?): Boolean {
+        val clean = eventId?.trim() ?: return false
+        if (clean.isEmpty()) return false
+        return clipboardAckPrefs().getString(PREF_KEY_CLIP_LAST_COMMITTED_EVENT, null) == clean
+    }
+
+    fun markCommittedClipboardEvent(eventId: String?, seq: Long) {
+        val prefs = clipboardAckPrefs()
+        val editor = prefs.edit()
+        val clean = eventId?.trim()
+        if (!clean.isNullOrEmpty()) {
+            editor.putString(PREF_KEY_CLIP_LAST_COMMITTED_EVENT, clean)
+        }
+        val currentSeq = prefs.getLong(PREF_KEY_CLIP_LAST_COMMITTED_SEQ, 0L)
+        if (seq > currentSeq) {
+            editor.putLong(PREF_KEY_CLIP_LAST_COMMITTED_SEQ, seq)
+        }
+        editor.apply()
+    }
+
+    fun isSelfOriginClipboardEvent(originDeviceId: String?): Boolean {
+        val clean = originDeviceId?.trim() ?: return false
+        return clean.isNotEmpty() && clean == identity.deviceId.trim()
+    }
+
+    internal var clipboardAckObserverForTest: ((Long, String) -> Unit)? = null
+
+    fun sendClipboardAck(
+        seq: Long,
+        eventId: String,
+        clientOverride: org.snow.network.SnowWebSocketClient? = null
+    ): Boolean {
+        val cleanEventId = eventId.trim()
+        if (seq <= 0L || cleanEventId.isEmpty()) {
+            return false
+        }
+        val prefs = clipboardAckPrefs()
+        val currentAcked = prefs.getLong(PREF_KEY_CLIP_LAST_ACKED_SEQ, 0L)
+        if (seq > currentAcked) {
+            prefs.edit().putLong(PREF_KEY_CLIP_LAST_ACKED_SEQ, seq).apply()
+        }
+        clipboardAckObserverForTest?.invoke(seq, cleanEventId)
+        val client = clientOverride ?: serviceRef?.client ?: return (clipboardAckObserverForTest != null)
+        client.sendRequest(
+            "clipboard_ack",
+            mapOf(
+                "seq" to seq,
+                "event_id" to cleanEventId,
+                "last_acked_seq" to seq,
+                "last_acked_event_id" to cleanEventId
+            )
+        ) { resp ->
+            if (!resp.isSuccess) {
+                SafeLog.w(TAG, "clipboard_ack rejected by host for seq=$seq: ${resp.error?.message}")
+            }
+        }
+        return true
+    }
+
+    suspend fun handleIncomingClipboardFilePush(
+        data: Map<String, Any?>,
+        transferClient: FileTransferClient,
+        serverHost: String,
+        defaultTransferPort: Int = 8766,
+        safManagerOverride: SafFolderManager? = null,
+        clientOverride: org.snow.network.SnowWebSocketClient? = null,
+        notifyUser: Boolean = true
+    ): Result<List<String>> = withContext(Dispatchers.IO) {
+        val originId = data["origin_device_id"] as? String
+        if (isSelfOriginClipboardEvent(originId)) {
+            return@withContext Result.success(emptyList())
+        }
+        val eventId = (data["event_id"] as? String)?.trim() ?: ""
+        val seq = (data["seq"] as? Number)?.toLong() ?: 0L
+        val rawFiles = data["files"]
+        val parsed = validateIncomingFileBundlePayload(rawFiles).getOrElse { err ->
+            return@withContext Result.failure(err)
+        }
+        return@withContext applyRemoteClipboardBundle(
+            entries = parsed,
+            transferClient = transferClient,
+            serverHost = serverHost,
+            defaultTransferPort = defaultTransferPort,
+            eventId = eventId,
+            seq = seq,
+            safManagerOverride = safManagerOverride,
+            clientOverride = clientOverride,
+            notifyUser = notifyUser
+        )
+    }
+
+    suspend fun applyRemoteClipboardBundle(
+        entries: List<ClipboardFileEntryDto>,
+        transferClient: FileTransferClient,
+        serverHost: String,
+        defaultTransferPort: Int = 8766,
+        eventId: String = "",
+        seq: Long = 0L,
+        safManagerOverride: SafFolderManager? = null,
+        clientOverride: org.snow.network.SnowWebSocketClient? = null,
+        notifyUser: Boolean = true
+    ): Result<List<String>> = withContext(Dispatchers.IO) {
+        if (entries.isEmpty() || entries.size > MAX_CLIPBOARD_BUNDLE_FILES) {
+            return@withContext Result.failure(IllegalArgumentException("Bundle must contain 1..5 files."))
+        }
+        if (serverHost.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Desktop host is unknown."))
+        }
+        if (eventId.isNotBlank() && hasCommittedClipboardEvent(eventId)) {
+            if (seq > 0L) {
+                sendClipboardAck(seq, eventId, clientOverride)
+            }
+            return@withContext Result.success(emptyList())
+        }
+
+        val saf = safManagerOverride ?: safFolderManager
+        val stagingDir = saf.getStagingDir()
+        val stagedPairs = mutableListOf<Pair<File, String>>()
+        var totalDownloadedBytes = 0L
+
+        for ((idx, entry) in entries.withIndex()) {
+            val transferId = entry.transferId?.takeIf { it.isNotBlank() }
+                ?: return@withContext Result.failure(IllegalArgumentException("Missing transfer_id for ${entry.name}"))
+            val safeName = try {
+                org.snow.capabilities.ClipboardHandler.sanitizeClipboardFileName(entry.name)
+            } catch (e: IllegalArgumentException) {
+                return@withContext Result.failure(e)
+            }
+            val safePrefix = transferId.replace(Regex("[^A-Za-z0-9_-]"), "_")
+            val stagedFile = File(stagingDir, "${safePrefix}_${idx}_$safeName")
+            val dlRes = transferClient.downloadFile(
+                serverHost = serverHost,
+                transferPort = entry.transferPort.takeIf { it > 0 } ?: defaultTransferPort,
+                transferId = transferId,
+                destinationFile = stagedFile,
+                expectedSha256 = entry.sha256
+            )
+            if (dlRes !is FileTransferClient.TransferResult.Success) {
+                val errMsg = (dlRes as? FileTransferClient.TransferResult.Error)?.message
+                    ?: "Failed downloading clipboard file '${safeName}'"
+                return@withContext Result.failure(IllegalStateException(errMsg))
+            }
+            val actualLen = dlRes.file.length()
+            if (actualLen > MAX_CLIPBOARD_FILE_BYTES) {
+                dlRes.file.delete()
+                return@withContext Result.failure(
+                    IllegalStateException("Downloaded file '$safeName' exceeds 15 MiB limit.")
+                )
+            }
+            totalDownloadedBytes += actualLen
+            if (totalDownloadedBytes > MAX_CLIPBOARD_BUNDLE_BYTES) {
+                dlRes.file.delete()
+                return@withContext Result.failure(
+                    IllegalStateException("Downloaded clipboard bundle exceeds 15 MiB limit.")
+                )
+            }
+            stagedPairs.add(Pair(dlRes.file, safeName))
+        }
+
+        val commitRes = saf.commitVerifiedDownloadBatch(stagedPairs)
+        if (commitRes.isFailure) {
+            return@withContext commitRes
+        }
+
+        val savedNames = commitRes.getOrNull().orEmpty()
+        markCommittedClipboardEvent(eventId, seq)
+        if (notifyUser && savedNames.isNotEmpty()) {
+            try {
+                val label = if (savedNames.size == 1) {
+                    "Saved ${savedNames[0]}"
+                } else {
+                    "Saved ${savedNames.size} files: ${savedNames.take(3).joinToString(", ")}"
+                }
+                val openIntent = Intent(appContext, org.snow.ui.MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                org.snow.capabilities.ActionNotificationHelper.postActionNotification(
+                    context = appContext,
+                    title = "Clipboard Files Received",
+                    content = label,
+                    intent = openIntent,
+                    isSilent = true
+                )
+            } catch (_: Exception) {}
+        }
+        if (seq > 0L && eventId.isNotBlank()) {
+            sendClipboardAck(seq, eventId, clientOverride)
+        }
+        Result.success(savedNames)
+    }
 
     fun recordIncomingClipboardText(text: String?) {
         if (!text.isNullOrEmpty()) {
@@ -3001,9 +3407,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         }
                         return@launch
                     }
-                    if (fileSize > 20 * 1024 * 1024) {
+                    if (fileSize > MAX_CLIPBOARD_IMAGE_BYTES) {
                         repoScope.launch(Dispatchers.Main) {
-                            onComplete(false, "Image exceeds 20 MB limit.")
+                            onComplete(false, "Image exceeds 15 MiB limit.")
                         }
                         return@launch
                     }
@@ -3168,23 +3574,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             onComplete?.invoke(false, "Client disconnected")
             return
         }
-        client.sendRequest("clipboard_buffer_list", mapOf("limit" to 10)) { resp ->
+        client.sendRequest("clipboard_buffer_list", mapOf("limit" to MAX_CLIPBOARD_ITEMS)) { resp ->
             if (resp.isSuccess) {
                 val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
                 val rawItems = data?.get("items") as? List<*> ?: emptyList<Any>()
-                val parsed = rawItems.mapNotNull { itemMap ->
-                    (itemMap as? Map<*, *>)?.let { map ->
-                        ClipboardItemDto(
-                            itemId = map["item_id"] as? String ?: "",
-                            type = map["type"] as? String ?: "text",
-                            sourceDevice = map["source_device"] as? String ?: "pc",
-                            previewText = map["preview_text"] as? String ?: (map["text_content"] as? String ?: ""),
-                            sizeBytes = (map["size_bytes"] as? Number)?.toLong() ?: 0L,
-                            timestamp = (map["timestamp"] as? Number)?.toDouble() ?: 0.0,
-                            isPinned = (map["is_pinned"] as? Boolean) ?: false
-                        )
-                    }
-                }
+                val parsed = parseClipboardBufferItems(rawItems)
                 _clipboardBufferItems.value = parsed
                 prefetchClipboardThumbnails(parsed)
                 repoScope.launch(Dispatchers.Main) {
@@ -3204,7 +3598,58 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             onComplete(false, "Client disconnected or offline")
             return
         }
+        if (item.type == "file" || item.type == "file_bundle") {
+            val transferClient = _fileTransferClient ?: run {
+                onComplete(false, "File transfer client offline")
+                return
+            }
+            val targetHost = client.currentTargetHost.takeIf { it.isNotBlank() } ?: connectedHost
+            val targetDevice = identity.deviceId
+            client.sendRequest("clipboard_buffer_apply", mapOf("item_id" to item.itemId, "target" to targetDevice, "stage_only" to true)) { resp ->
+                if (resp.isSuccess) {
+                    val data = resp.payload?.get("data") as? Map<*, *> ?: resp.payload
+                    val rawFiles = data?.get("files")
+                    val validated = validateIncomingFileBundlePayload(rawFiles)
+                    if (validated.isFailure) {
+                        repoScope.launch(Dispatchers.Main) {
+                            onComplete(false, validated.exceptionOrNull()?.message ?: "Invalid file manifest")
+                        }
+                        return@sendRequest
+                    }
+                    repoScope.launch(Dispatchers.IO) {
+                        val result = applyRemoteClipboardBundle(
+                            entries = validated.getOrThrow(),
+                            transferClient = transferClient,
+                            serverHost = targetHost,
+                            defaultTransferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: 8766,
+                            eventId = (data?.get("event_id") as? String) ?: item.eventId,
+                            seq = (data?.get("seq") as? Number)?.toLong() ?: item.seq,
+                            notifyUser = true
+                        )
+                        repoScope.launch(Dispatchers.Main) {
+                            if (result.isSuccess) {
+                                val saved = result.getOrNull().orEmpty()
+                                val msg = if (saved.isEmpty()) "Files saved" else "Saved: ${saved.joinToString(", ")}"
+                                onComplete(true, msg)
+                            } else {
+                                onComplete(false, result.exceptionOrNull()?.message ?: "Failed saving clipboard files")
+                            }
+                        }
+                    }
+                } else {
+                    val errMsg = resp.error?.message ?: "Failed preparing clipboard files"
+                    repoScope.launch(Dispatchers.Main) {
+                        onComplete(false, errMsg)
+                    }
+                }
+            }
+            return
+        }
         if (item.type == "image") {
+            if (item.sizeBytes > MAX_CLIPBOARD_IMAGE_BYTES) {
+                onComplete(false, "Image exceeds 15 MiB clipboard limit")
+                return
+            }
             val transferClient = _fileTransferClient ?: run {
                 onComplete(false, "File transfer client offline")
                 return
@@ -3218,6 +3663,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     val sha256 = (data?.get("sha256") as? String) ?: ""
                     val transferPort = (data?.get("transfer_port") as? Number)?.toInt() ?: 8766
                     val mimeType = data?.get("mime_type") as? String
+                    val eventId = (data?.get("event_id") as? String) ?: item.eventId
+                    val seq = (data?.get("seq") as? Number)?.toLong() ?: item.seq
                     if (transferId != null && targetHost.isNotBlank()) {
                         repoScope.launch(Dispatchers.IO) {
                             val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
@@ -3233,6 +3680,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                 expectedSha256 = sha256
                             )
                             if (dlRes is FileTransferClient.TransferResult.Success) {
+                                if (dlRes.file.length() > MAX_CLIPBOARD_IMAGE_BYTES) {
+                                    dlRes.file.delete()
+                                    repoScope.launch(Dispatchers.Main) {
+                                        onComplete(false, "Downloaded image exceeds 15 MiB limit")
+                                    }
+                                    return@launch
+                                }
                                 repoScope.launch(Dispatchers.Main) {
                                     try {
                                         val contentUri = androidx.core.content.FileProvider.getUriForFile(
@@ -3248,9 +3702,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                         )
                                         cm.setPrimaryClip(clip)
                                         org.snow.capabilities.ClipboardHandler.grantImeUriPermission(appContext, contentUri)
-                                        org.snow.capabilities.ClipboardHandler.postShareFallbackNotification(appContext, contentUri, resolvedMime)
+                                        org.snow.capabilities.ClipboardHandler.postShareFallbackNotification(appContext, contentUri, resolvedMime, isUserInitiated = true)
 
                                         recordIncomingClipboardText(sha256)
+                                        if (seq > 0L && eventId.isNotBlank()) {
+                                            sendClipboardAck(seq, eventId, client)
+                                        }
                                         appendLog("INFO", TAG, "Applied image buffer item to Android clipboard (${dlRes.file.length()} bytes, $resolvedMime).")
                                         onComplete(true, "Copied image to Android clipboard")
                                     } catch (e: Exception) {
@@ -3266,7 +3723,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         }
                     } else {
                         repoScope.launch(Dispatchers.Main) {
-                            onComplete(true, "Applied image to clipboard")
+                            onComplete(false, "Image transfer details unavailable")
                         }
                     }
                 } else {
@@ -3286,7 +3743,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 val textContent = data?.get("text_content") as? String
                 if (textContent != null) {
                     val bytes = textContent.toByteArray(Charsets.UTF_8)
-                    if (bytes.size > 65536) {
+                    if (bytes.size > MAX_CLIPBOARD_TEXT_BYTES) {
                         repoScope.launch(Dispatchers.Main) {
                             onComplete(false, "Item exceeds 64 KiB clipboard limit")
                         }
@@ -3298,6 +3755,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                             val clip = ClipData.newPlainText("SNOW Shared Clipboard", textContent)
                             cm.setPrimaryClip(clip)
                             recordIncomingClipboardText(textContent)
+                            if (item.seq > 0L && item.eventId.isNotBlank()) {
+                                sendClipboardAck(item.seq, item.eventId, client)
+                            }
                             appendLog("INFO", TAG, "Applied full text buffer item to Android clipboard (${bytes.size} bytes).")
                             onComplete(true, "Copied full text to Android clipboard")
                         } catch (e: Exception) {
@@ -4022,7 +4482,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         if (targetHost.isBlank()) return
 
         val cacheDir = org.snow.capabilities.ClipboardHandler.getClipboardCacheDir(appContext)
-        items.filter { it.type == "image" && it.itemId.isNotBlank() && it.sizeBytes in 1L..(10L * 1024L * 1024L) }
+        items.filter { it.type == "image" && it.itemId.isNotBlank() && it.sizeBytes in 1L..MAX_CLIPBOARD_IMAGE_BYTES }
             .take(4)
             .forEach { item ->
                 if (findCachedClipboardImageFile(cacheDir, item.itemId) != null) return@forEach

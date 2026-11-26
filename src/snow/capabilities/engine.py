@@ -740,7 +740,7 @@ class CapabilityEngine:
 
         # --- Shared Clipboard Ring Buffer (Phase 26B) ---
         if action == "clipboard_buffer_list":
-            limit = int(params.get("limit", 10))
+            limit = min(max(int(params.get("limit", 15)), 1), 15)
             items = self.clipboard_buffer.list_items(limit=limit)
             return CapabilityResponse(
                 success=True,
@@ -751,27 +751,40 @@ class CapabilityEngine:
         if action == "clipboard_buffer_add":
             text = params.get("text")
             image_bytes = params.get("image_bytes")
+            files = params.get("files")
             mime_type = params.get("mime_type", "image/png")
             source_device = params.get("source_device") or (ctx.device_id if ctx and ctx.device_id else "pc")
+            source_device_name = params.get("source_device_name") or (
+                "Windows PC" if source_device in ("pc", "desktop_windows") else str(source_device)
+            )
             is_pinned = bool(params.get("is_pinned", False))
-            if image_bytes:
+            if files:
+                b_res = self.clipboard_buffer.add_files(
+                    files=files,
+                    source_device_id=source_device,
+                    source_device_name=source_device_name,
+                    pin=is_pinned,
+                )
+            elif image_bytes:
                 b_res = self.clipboard_buffer.add_image(
                     image_bytes=image_bytes,
                     mime_type=mime_type,
                     source_device_id=source_device,
+                    source_device_name=source_device_name,
                     pin=is_pinned,
                 )
             elif text is not None:
                 b_res = self.clipboard_buffer.add_text(
                     text=str(text),
                     source_device_id=source_device,
+                    source_device_name=source_device_name,
                     pin=is_pinned,
                 )
             else:
                 return CapabilityResponse(
                     success=False,
                     status="INVALID_ARGUMENT",
-                    error="Either 'text' or 'image_bytes' is required.",
+                    error="One of 'text', 'image_bytes', or 'files' is required.",
                 )
             if not b_res.get("success"):
                 return CapabilityResponse(
@@ -779,6 +792,16 @@ class CapabilityEngine:
                     status=b_res.get("status", "ERROR"),
                     error=b_res.get("error", "Failed adding item to clipboard buffer."),
                 )
+            if (
+                b_res.get("status") == "ADDED"
+                and b_res.get("item")
+                and self.core_server
+                and hasattr(self.core_server, "broadcast_clipboard_buffer_event")
+            ):
+                try:
+                    asyncio.create_task(self.core_server.broadcast_clipboard_buffer_event(b_res["item"]))
+                except Exception:
+                    pass
             return CapabilityResponse(
                 success=True,
                 status="SUCCESS",
@@ -879,13 +902,65 @@ class CapabilityEngine:
                     if not img_path or not img_path.exists():
                         return CapabilityResponse(success=False, status="FILE_NOT_FOUND", error="Image file missing on disk.")
                     res = self.clipboard.set_image_sync(img_path)
+                    is_ok = res.get("success", False)
+                    apply_extra: dict[str, Any] = {}
+                elif c_type in ("file", "file_bundle"):
+                    entries = self.clipboard_buffer.get_file_entries(target_id)
+                    if not entries:
+                        return CapabilityResponse(success=False, status="FILE_NOT_FOUND", error="Clipboard file entries missing on disk.")
+                    from snow.transfer.storage import (
+                        commit_verified_clipboard_files,
+                        resolve_configured_pc_transfer_dir,
+                    )
+
+                    if self.storage_manager and hasattr(self.storage_manager, "root_dir"):
+                        dest_dir = Path(self.storage_manager.root_dir)
+                    else:
+                        dest_dir = resolve_configured_pc_transfer_dir(db_manager=self.db_manager)
+                    try:
+                        committed_paths = commit_verified_clipboard_files(dest_dir, entries)
+                    except PermissionError as p_err:
+                        return CapabilityResponse(success=False, status="SECURITY_ERROR", error=str(p_err))
+                    except ValueError as v_err:
+                        return CapabilityResponse(success=False, status="INTEGRITY_MISMATCH", error=str(v_err))
+                    except Exception as fs_err:
+                        return CapabilityResponse(success=False, status="IO_ERROR", error=str(fs_err))
+
+                    set_files_async = getattr(self.clipboard, "set_files", None)
+                    if callable(set_files_async):
+                        import inspect as _inspect
+                        maybe = set_files_async(committed_paths)
+                        res = await maybe if _inspect.isawaitable(maybe) else maybe
+                    elif hasattr(self.clipboard, "set_files_sync"):
+                        res = self.clipboard.set_files_sync(committed_paths)
+                    else:
+                        res = {"success": False, "status": "UNSUPPORTED_PLATFORM", "error": "set_files unavailable."}
+                    is_ok = res.get("success", False)
+                    apply_extra = {
+                        "committed_files": [p.name for p in committed_paths],
+                        "file_count": len(committed_paths),
+                    }
                 else:
                     res = await self.clipboard.set_clipboard(text=item.get("text_content", ""))
-                is_ok = res.get("success", False)
+                    is_ok = res.get("success", False)
+                    apply_extra = {}
+
+                if is_ok and self.core_server and getattr(self.core_server, "ws_server", None):
+                    ws_srv = self.core_server.ws_server
+                    if sys.platform == "win32":
+                        try:
+                            import ctypes as _ctypes
+                            ws_srv._last_local_write_seq = _ctypes.windll.user32.GetClipboardSequenceNumber()
+                        except Exception:
+                            pass
+                    if item.get("sha256"):
+                        ws_srv._last_processed_clipboard_hash = item["sha256"]
+                        ws_srv._last_processed_clipboard_at = __import__("time").monotonic()
+
                 return CapabilityResponse(
                     success=is_ok,
                     status="SUCCESS" if is_ok else res.get("status", "ERROR"),
-                    data={"applied": is_ok, "item_id": target_id, "type": c_type, "target": "pc"},
+                    data={"applied": is_ok, "item_id": target_id, "type": c_type, "target": "pc", **apply_extra},
                     error=res.get("error"),
                 )
             else:
@@ -921,13 +996,95 @@ class CapabilityEngine:
                         return CapabilityResponse(success=False, status="DEVICE_NOT_FOUND", error="No active connected device found.")
 
                 stage_only = bool(params.get("stage_only", False))
+                transfer_port = 8766
+                if self.http_transfer_server and hasattr(self.http_transfer_server, "bound_port"):
+                    transfer_port = self.http_transfer_server.bound_port or 8766
+                elif self.core_server and hasattr(self.core_server, "config"):
+                    transfer_port = getattr(self.core_server.config, "transfer_port", 8766)
+
                 if c_type == "text":
-                    route_res = await router.route_request(
-                        action="clipboard_push",
-                        target=resolved_target,
-                        data={"text": item.get("text_content", "")},
-                        ctx=ctx,
-                    )
+                    push_data = {
+                        "type": "text",
+                        "text": item.get("text_content", ""),
+                        "item_id": target_id,
+                        "event_id": item.get("event_id"),
+                        "seq": item.get("seq"),
+                        "origin_device_id": item.get("origin_device_id") or item.get("source_device_id"),
+                        "sha256": item.get("sha256"),
+                    }
+                    if stage_only:
+                        route_res = {"success": True, "status": "SUCCESS"}
+                    else:
+                        route_res = await router.route_request(
+                            action="clipboard_push",
+                            target=resolved_target,
+                            data=push_data,
+                            ctx=ctx,
+                        )
+                    res_data = {"applied": route_res.get("success", False), "item_id": target_id, "type": c_type, "target": target}
+                elif c_type in ("file", "file_bundle"):
+                    entries = self.clipboard_buffer.get_file_entries(target_id)
+                    if not entries:
+                        return CapabilityResponse(success=False, status="FILE_NOT_FOUND", error="Clipboard file entries missing on disk.")
+                    from snow.transfer.manager import TransferDirection, TransferState
+                    tm = self.transfer_manager
+                    staged_files: list[dict[str, Any]] = []
+                    for entry in entries:
+                        if tm and hasattr(tm, "create_transfer"):
+                            rec = tm.create_transfer(
+                                device_id=resolved_target,
+                                file_name=entry["name"],
+                                file_size=entry["size_bytes"],
+                                sha256=entry["sha256"],
+                                direction=TransferDirection.DOWNLOAD,
+                                file_path=str(entry["path"]),
+                            )
+                            rec.status = TransferState.IN_PROGRESS
+                            t_id = rec.transfer_id
+                        else:
+                            import secrets
+                            t_id = secrets.token_hex(16)
+                        staged_files.append(
+                            {
+                                "index": entry["index"],
+                                "transfer_id": t_id,
+                                "transfer_port": transfer_port,
+                                "transfer_url": f"/api/v1/transfers/download/{t_id}",
+                                "file_name": entry["name"],
+                                "name": entry["name"],
+                                "size_bytes": entry["size_bytes"],
+                                "mime_type": entry["mime_type"],
+                                "sha256": entry["sha256"],
+                            }
+                        )
+                    push_data = {
+                        "type": c_type,
+                        "item_id": target_id,
+                        "event_id": item.get("event_id"),
+                        "seq": item.get("seq"),
+                        "origin_device_id": item.get("origin_device_id") or item.get("source_device_id"),
+                        "sha256": item.get("sha256"),
+                        "transfer_port": transfer_port,
+                        "files": staged_files,
+                    }
+                    if stage_only:
+                        route_res = {"success": True, "status": "SUCCESS"}
+                    else:
+                        route_res = await router.route_request(
+                            action="clipboard_push",
+                            target=resolved_target,
+                            data=push_data,
+                            ctx=ctx,
+                        )
+                    res_data = {
+                        "applied": route_res.get("success", False),
+                        "item_id": target_id,
+                        "type": c_type,
+                        "target": target,
+                        "transfer_port": transfer_port,
+                        "sha256": item.get("sha256"),
+                        "files": staged_files,
+                    }
                 else:
                     img_path = self.clipboard_buffer.get_image_path(target_id)
                     if not img_path or not img_path.exists():
@@ -952,7 +1109,7 @@ class CapabilityEngine:
                         except Exception as sc_err:
                             logger.warning("Failed staging clipboard transfer file '%s': %s", img_path.name, sc_err)
 
-                    from snow.transfer.manager import TransferDirection
+                    from snow.transfer.manager import TransferDirection, TransferState
                     tm = self.transfer_manager
                     if tm and hasattr(tm, "create_transfer"):
                         record = tm.create_transfer(
@@ -961,22 +1118,23 @@ class CapabilityEngine:
                             file_size=file_size,
                             sha256=file_sha256,
                             direction=TransferDirection.DOWNLOAD,
+                            file_path=str(img_path),
                         )
+                        record.status = TransferState.IN_PROGRESS
                         transfer_id = record.transfer_id
                     else:
                         import secrets
                         transfer_id = secrets.token_hex(16)
 
-                    transfer_port = 8766
-                    if self.http_transfer_server and hasattr(self.http_transfer_server, "bound_port"):
-                        transfer_port = self.http_transfer_server.bound_port or 8766
-                    elif self.core_server and hasattr(self.core_server, "config"):
-                        transfer_port = getattr(self.core_server.config, "transfer_port", 8766)
-
                     push_data = {
                         "type": "image",
+                        "item_id": target_id,
+                        "event_id": item.get("event_id"),
+                        "seq": item.get("seq"),
+                        "origin_device_id": item.get("origin_device_id") or item.get("source_device_id"),
                         "transfer_id": transfer_id,
                         "transfer_port": transfer_port,
+                        "transfer_url": f"/api/v1/transfers/download/{transfer_id}",
                         "sha256": file_sha256,
                         "mime_type": item.get("mime_type") or "image/png",
                         "file_name": img_path.name,
@@ -992,16 +1150,18 @@ class CapabilityEngine:
                             data=push_data,
                             ctx=ctx,
                         )
-                is_ok = route_res.get("success", False)
-                res_data = {"applied": is_ok, "item_id": target_id, "type": c_type, "target": target}
-                if c_type == "image":
-                    res_data.update({
+                    res_data = {
+                        "applied": route_res.get("success", False),
+                        "item_id": target_id,
+                        "type": c_type,
+                        "target": target,
                         "transfer_id": transfer_id,
                         "transfer_port": transfer_port,
                         "sha256": file_sha256,
                         "file_name": img_path.name,
                         "mime_type": item.get("mime_type") or "image/png",
-                    })
+                    }
+                is_ok = route_res.get("success", False)
                 return CapabilityResponse(
                     success=is_ok,
                     status=route_res.get("status", "SUCCESS" if is_ok else "ERROR"),

@@ -21,6 +21,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Any, Generator, List, Optional
 import uuid
@@ -95,6 +96,7 @@ class DatabaseManager:
             self.db_path = base_dir / DEFAULT_DB_FILENAME
 
         # Ensure parent directory exists
+        self._lock = threading.RLock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_schema()
 
@@ -441,7 +443,7 @@ class DatabaseManager:
                 ON oauth_tokens(family_id);
             """)
 
-            # Clipboard Ring Buffer persistence (Batch 3)
+            # Clipboard Ring Buffer persistence (Batch 3 + V7 additive columns)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS clipboard_buffer_items (
                     item_id TEXT PRIMARY KEY,
@@ -455,12 +457,31 @@ class DatabaseManager:
                     pinned INTEGER NOT NULL DEFAULT 0,
                     text_content TEXT,
                     image_rel_path TEXT,
-                    mime_type TEXT
+                    mime_type TEXT,
+                    event_id TEXT,
+                    seq INTEGER NOT NULL DEFAULT 0,
+                    file_manifest_json TEXT NOT NULL DEFAULT '[]'
                 );
             """)
+            cur_cb = conn.execute("PRAGMA table_info(clipboard_buffer_items);")
+            cb_columns = {row[1] for row in cur_cb.fetchall()}
+            if "event_id" not in cb_columns:
+                conn.execute("ALTER TABLE clipboard_buffer_items ADD COLUMN event_id TEXT;")
+            if "seq" not in cb_columns:
+                conn.execute(
+                    "ALTER TABLE clipboard_buffer_items ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;"
+                )
+            if "file_manifest_json" not in cb_columns:
+                conn.execute(
+                    "ALTER TABLE clipboard_buffer_items ADD COLUMN file_manifest_json TEXT NOT NULL DEFAULT '[]';"
+                )
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_clipboard_timestamp
                 ON clipboard_buffer_items(timestamp DESC);
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_clipboard_seq
+                ON clipboard_buffer_items(seq DESC, timestamp DESC);
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_clipboard_sha256
@@ -1468,69 +1489,239 @@ class DatabaseManager:
         text_content: Optional[str] = None,
         image_rel_path: Optional[str] = None,
         mime_type: Optional[str] = None,
+        event_id: Optional[str] = None,
+        seq: int = 0,
+        file_manifest_json: Optional[str] = None,
+        file_manifest: Optional[List[dict[str, Any]]] = None,
     ) -> bool:
         """Insert or replace a clipboard ring buffer item in persistent storage."""
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            raise ValueError("Clipboard sequence number must be a non-negative integer.")
+
+        if file_manifest_json is not None:
+            if not isinstance(file_manifest_json, str):
+                raise ValueError("file_manifest_json must be a JSON string.")
+            manifest_str = file_manifest_json
+        elif file_manifest is not None:
+            manifest_str = json.dumps(file_manifest, separators=(",", ":"))
+        else:
+            manifest_str = "[]"
+
+        clean_event_id = str(event_id).strip() if event_id is not None else None
+        if clean_event_id == "":
+            clean_event_id = None
+
         query = """
             INSERT INTO clipboard_buffer_items (
                 item_id, content_type, preview, source_device_id, source_device_name,
-                timestamp, sha256, size_bytes, pinned, text_content, image_rel_path, mime_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                timestamp, sha256, size_bytes, pinned, text_content, image_rel_path, mime_type,
+                event_id, seq, file_manifest_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id) DO UPDATE SET
+                content_type = excluded.content_type,
                 pinned = excluded.pinned,
                 preview = excluded.preview,
+                source_device_id = excluded.source_device_id,
+                source_device_name = excluded.source_device_name,
+                timestamp = excluded.timestamp,
+                sha256 = excluded.sha256,
+                size_bytes = excluded.size_bytes,
                 text_content = excluded.text_content,
-                image_rel_path = excluded.image_rel_path;
+                image_rel_path = excluded.image_rel_path,
+                mime_type = excluded.mime_type,
+                event_id = excluded.event_id,
+                seq = excluded.seq,
+                file_manifest_json = excluded.file_manifest_json;
         """
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                query,
-                (
-                    item_id,
-                    content_type,
-                    preview,
-                    source_device_id,
-                    source_device_name,
-                    timestamp,
-                    sha256,
-                    size_bytes,
-                    1 if pinned else 0,
-                    text_content,
-                    image_rel_path,
-                    mime_type,
-                ),
-            )
-            return cursor.rowcount > 0
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    query,
+                    (
+                        item_id,
+                        content_type,
+                        preview,
+                        source_device_id,
+                        source_device_name,
+                        timestamp,
+                        sha256,
+                        size_bytes,
+                        1 if pinned else 0,
+                        text_content,
+                        image_rel_path,
+                        mime_type,
+                        clean_event_id,
+                        seq,
+                        manifest_str,
+                    ),
+                )
+                return cursor.rowcount > 0
 
     def delete_clipboard_item(self, item_id: str) -> bool:
         """Delete a clipboard item from persistent storage."""
-        with self._get_connection() as conn:
-            cursor = conn.execute("DELETE FROM clipboard_buffer_items WHERE item_id = ?;", (item_id,))
-            return cursor.rowcount > 0
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.execute("DELETE FROM clipboard_buffer_items WHERE item_id = ?;", (item_id,))
+                return cursor.rowcount > 0
 
     def update_clipboard_pinned(self, item_id: str, pinned: bool) -> bool:
         """Update pinned state of a clipboard buffer item."""
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                "UPDATE clipboard_buffer_items SET pinned = ? WHERE item_id = ?;",
-                (1 if pinned else 0, item_id),
-            )
-            return cursor.rowcount > 0
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "UPDATE clipboard_buffer_items SET pinned = ? WHERE item_id = ?;",
+                    (1 if pinned else 0, item_id),
+                )
+                return cursor.rowcount > 0
 
     def load_all_clipboard_items(self) -> List[dict[str, Any]]:
-        """Load all persistent clipboard buffer items ordered by timestamp descending."""
-        query = "SELECT * FROM clipboard_buffer_items ORDER BY timestamp DESC;"
-        with self._get_connection() as conn:
-            cursor = conn.execute(query)
-            return [dict(row) for row in cursor.fetchall()]
+        """Load all persistent clipboard buffer items ordered newest-first."""
+        query = "SELECT * FROM clipboard_buffer_items ORDER BY seq DESC, timestamp DESC;"
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.execute(query)
+                return [dict(row) for row in cursor.fetchall()]
 
     def clear_clipboard_items(self, unpinned_only: bool = False) -> int:
         """Clear clipboard buffer items from persistent storage."""
-        with self._get_connection() as conn:
-            if unpinned_only:
-                cursor = conn.execute("DELETE FROM clipboard_buffer_items WHERE pinned = 0;")
-            else:
-                cursor = conn.execute("DELETE FROM clipboard_buffer_items;")
-            return cursor.rowcount
+        with self._lock:
+            with self._get_connection() as conn:
+                if unpinned_only:
+                    cursor = conn.execute("DELETE FROM clipboard_buffer_items WHERE pinned = 0;")
+                else:
+                    cursor = conn.execute("DELETE FROM clipboard_buffer_items;")
+                return cursor.rowcount
+
+    @staticmethod
+    def _validate_clipboard_ack_device_id(device_id: Any) -> str:
+        if not isinstance(device_id, str):
+            raise ValueError("device_id must be a non-empty string.")
+        clean = device_id.strip()
+        if not clean or len(clean) > 128:
+            raise ValueError("device_id must be between 1 and 128 characters.")
+        if any(ord(ch) < 32 or ch in ("/", "\\", "\x00") or ch.isspace() for ch in clean):
+            raise ValueError("device_id contains invalid characters.")
+        if clean in (".", "..") or ".." in clean:
+            raise ValueError("device_id contains disallowed path segments.")
+        return clean
+
+    @staticmethod
+    def _parse_clipboard_ack_json(raw_value: Optional[str], expected_device_id: str) -> Optional[dict[str, Any]]:
+        if not raw_value or not isinstance(raw_value, str):
+            return None
+        try:
+            parsed = json.loads(raw_value)
+        except Exception:
+            logger.warning("Corrupt clipboard ack JSON for device %s; failing closed.", expected_device_id)
+            return None
+        if not isinstance(parsed, dict):
+            logger.warning("Malformed clipboard ack payload type for device %s; failing closed.", expected_device_id)
+            return None
+        seq = parsed.get("last_acked_seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            logger.warning("Invalid last_acked_seq in clipboard ack for device %s; failing closed.", expected_device_id)
+            return None
+        event_id = parsed.get("last_acked_event_id", "")
+        if event_id is None:
+            event_id = ""
+        if not isinstance(event_id, str) or len(event_id) > 128:
+            logger.warning("Invalid last_acked_event_id in clipboard ack for device %s; failing closed.", expected_device_id)
+            return None
+        updated_at = parsed.get("updated_at")
+        if updated_at is not None and (isinstance(updated_at, bool) or not isinstance(updated_at, (int, float))):
+            logger.warning("Invalid updated_at in clipboard ack for device %s; failing closed.", expected_device_id)
+            return None
+        return {
+            "device_id": expected_device_id,
+            "last_acked_seq": seq,
+            "last_acked_event_id": event_id.strip(),
+            "updated_at": float(updated_at) if updated_at is not None else 0.0,
+        }
+
+    def get_clipboard_ack(self, device_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve the durable monotonic clipboard acknowledgement state for a peer."""
+        try:
+            clean_id = self._validate_clipboard_ack_device_id(device_id)
+        except ValueError:
+            return None
+        raw = self.get_setting(f"clip_ack:{clean_id}")
+        return self._parse_clipboard_ack_json(raw, clean_id)
+
+    def save_clipboard_ack(
+        self,
+        device_id: str,
+        last_acked_seq: int,
+        last_acked_event_id: str = "",
+        updated_at: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Persist a monotonic per-device clipboard acknowledgement in app_settings."""
+        clean_id = self._validate_clipboard_ack_device_id(device_id)
+        if isinstance(last_acked_seq, bool) or not isinstance(last_acked_seq, int) or last_acked_seq < 0:
+            raise ValueError("last_acked_seq must be a non-negative integer.")
+        if last_acked_event_id is None:
+            clean_event_id = ""
+        elif isinstance(last_acked_event_id, str):
+            clean_event_id = last_acked_event_id.strip()
+            if len(clean_event_id) > 128 or any(ord(ch) < 32 for ch in clean_event_id):
+                raise ValueError("last_acked_event_id is invalid.")
+        else:
+            raise ValueError("last_acked_event_id must be a string.")
+
+        ts = float(updated_at) if updated_at is not None else time.time()
+        setting_key = f"clip_ack:{clean_id}"
+
+        with self._lock:
+            with self._get_connection() as conn:
+                cur = conn.execute("SELECT value FROM app_settings WHERE key = ?;", (setting_key,))
+                row = cur.fetchone()
+                existing = self._parse_clipboard_ack_json(row["value"] if row else None, clean_id)
+                if existing and last_acked_seq < existing["last_acked_seq"]:
+                    return {
+                        **existing,
+                        "updated": False,
+                        "monotonic_retained": True,
+                    }
+
+                record = {
+                    "device_id": clean_id,
+                    "last_acked_seq": last_acked_seq,
+                    "last_acked_event_id": clean_event_id or (existing["last_acked_event_id"] if existing and last_acked_seq == existing["last_acked_seq"] else ""),
+                    "updated_at": ts,
+                }
+                conn.execute(
+                    """
+                    INSERT INTO app_settings (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """,
+                    (setting_key, json.dumps(record, separators=(",", ":"))),
+                )
+                return {
+                    **record,
+                    "updated": True,
+                    "monotonic_retained": False,
+                }
+
+    def list_clipboard_acks(self) -> dict[str, dict[str, Any]]:
+        """List all valid durable clipboard acknowledgements keyed by device_id."""
+        with self._lock:
+            entries = self.list_settings_prefix("clip_ack:")
+        result: dict[str, dict[str, Any]] = {}
+        for key, val in entries.items():
+            dev_id = key[len("clip_ack:") :]
+            parsed = self._parse_clipboard_ack_json(val, dev_id)
+            if parsed is not None:
+                result[dev_id] = parsed
+        return result
+
+    def delete_clipboard_ack(self, device_id: str) -> bool:
+        """Delete stored clipboard acknowledgement state for a removed device."""
+        try:
+            clean_id = self._validate_clipboard_ack_device_id(device_id)
+        except ValueError:
+            return False
+        with self._lock:
+            return self.delete_setting(f"clip_ack:{clean_id}")
 
 
 SENSITIVE_KEY_PATTERNS = {

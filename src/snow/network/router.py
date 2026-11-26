@@ -254,6 +254,8 @@ CAPABILITY_CATEGORY_MAP: dict[str, str] = {
     "clipboard_buffer_get": "clipboard",
     "clipboard_buffer_add": "clipboard",
     "clipboard_buffer_apply": "clipboard",
+    "clipboard_ack": "clipboard",
+    "clipboard_history_sync": "clipboard",
     # Files
     "desktop_file_list": "files",
     "windows_file_list": "files",
