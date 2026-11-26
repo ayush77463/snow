@@ -1497,6 +1497,61 @@ html.theme-light .file-dropzone {
     margin-top: 6px;
 }
 
+.pc-share-active-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: var(--snow-radius-md);
+    background-color: var(--snow-status-emerald-bg);
+    border: 1px solid var(--snow-accent-emerald);
+    color: var(--snow-status-emerald-text);
+}
+
+.sender-switcher-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.sender-pill {
+    border: 1px solid var(--snow-border);
+    background-color: var(--snow-bg-nested);
+    color: var(--snow-text-secondary);
+    padding: 4px 10px;
+    border-radius: 9999px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.sender-pill.active {
+    background-color: var(--snow-accent-blue);
+    border-color: var(--snow-accent-blue);
+    color: #FFFFFF;
+}
+
+.share-targets-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 240px;
+    overflow-y: auto;
+}
+
+.share-target-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: var(--snow-radius-md);
+    border: 1px solid var(--snow-border);
+    background-color: var(--snow-bg-nested);
+    cursor: pointer;
+}
+
 /* =========================================================================
    9. RESPONSIVE BREAKPOINTS (1366x768, 1440x900, 1920x1080)
    ========================================================================= */

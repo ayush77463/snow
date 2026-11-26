@@ -381,11 +381,17 @@
                                         <h3 class="card-title">Screen &amp; Camera</h3>
                                         <span id="screen-stream-badge" class="chip chip-sm chip-neutral">Standby</span>
                                     </div>
-                                    <div class="flex items-center gap-2">
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                        <button id="btn-share-pc-screen" class="btn btn-xs btn-tonal" title="Share this PC screen with connected Full Control devices">Share PC Screen</button>
                                         <button id="btn-enlarge-capture" class="btn btn-xs btn-tonal d-none" title="Enlarge preview">Enlarge</button>
                                         <button id="btn-stop-screen-stream" class="btn btn-xs btn-danger d-none" style="flex-shrink:0;">Stop Stream</button>
                                     </div>
                                 </div>
+                                <div id="pc-screen-share-bar" class="pc-share-active-bar d-none">
+                                    <span id="pc-screen-share-targets-label" class="text-xs fw-600 truncate">Sharing PC Screen</span>
+                                    <button id="btn-stop-pc-share" class="btn btn-xs btn-danger" style="flex-shrink:0;">Stop Sharing</button>
+                                </div>
+                                <div id="screen-sender-switcher" class="sender-switcher-bar d-none" role="tablist" aria-label="Active Screen Senders"></div>
                                 <div class="flex flex-col items-center justify-center p-3 gap-2" style="background-color: var(--snow-bg-nested); border-radius: var(--snow-radius-md); min-height: 170px;">
                                     <img id="latest-capture-img" src="" alt="Capture Preview" style="max-height: 240px; max-width: 100%; object-fit: contain; border-radius: var(--snow-radius-sm); display: none; cursor: pointer;">
                                     <div id="latest-capture-placeholder" class="empty-state" style="padding: 16px;">
@@ -850,7 +856,7 @@
                             <div class="card flex flex-col gap-3">
                                 <div class="card-header-row" style="margin-bottom: 4px;">
                                     <h3 class="card-title">Advanced &amp; Diagnostics</h3>
-                                    <span id="diag-version" class="chip chip-sm chip-cyan mono">SNOW v5.1.0</span>
+                                    <span id="diag-version" class="chip chip-sm chip-cyan mono">SNOW v5.2.0</span>
                                 </div>
                                 <div class="flex items-center gap-2 flex-wrap">
                                     <button id="btn-diag-update-check" class="btn btn-xs btn-tonal">Check Updates</button>
@@ -1144,6 +1150,24 @@
             <div class="flex justify-between gap-3 mt-3">
                 <button id="btn-killswitch-cancel" class="btn btn-tonal w-full">Cancel</button>
                 <button id="btn-killswitch-confirm" class="btn btn-danger w-full">Revoke All Grants</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Share PC Screen Target Picker Modal -->
+    <div id="pc-share-targets-modal" class="modal-overlay d-none" role="dialog" aria-modal="true" aria-labelledby="pc-share-modal-title">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3 id="pc-share-modal-title" class="card-title">Share This PC Screen</h3>
+                <button id="btn-close-pc-share-modal" class="icon-btn" style="width: 28px; height: 28px;" title="Close">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+            <p class="text-xs text-muted">Select devices to share with (Full Control authorized devices only):</p>
+            <div id="pc-share-targets-list" class="share-targets-list"></div>
+            <div class="flex gap-2">
+                <button id="btn-pc-share-cancel" class="btn btn-tonal btn-sm w-full">Cancel</button>
+                <button id="btn-pc-share-confirm" class="btn btn-primary btn-sm w-full">Start Sharing</button>
             </div>
         </div>
     </div>

@@ -233,8 +233,8 @@ class Stage5CClosureRegressionTest {
             assertTrue(repoSource.contains("Intent.FLAG_GRANT_READ_URI_PERMISSION"))
 
             val gradleText = resolveModuleFile("build.gradle.kts").readText()
-            assertTrue(gradleText.contains("versionCode = 3"))
-            assertTrue(gradleText.contains("versionName = \"5.1.0\""))
+            assertTrue(gradleText.contains("versionCode = 4"))
+            assertTrue(gradleText.contains("versionName = \"5.2.0\""))
         } finally {
             tempDir.deleteRecursively()
         }

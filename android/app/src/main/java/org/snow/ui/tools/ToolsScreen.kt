@@ -1,5 +1,8 @@
 package org.snow.ui.tools
 
+import android.graphics.BitmapFactory
+import android.widget.Toast
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -8,6 +11,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -15,9 +19,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowUpward
@@ -42,6 +49,7 @@ import androidx.compose.material.icons.filled.VolumeDown
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -60,12 +68,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import org.snow.ui.ActiveTransferInfo
 import org.snow.ui.PcFileItem
 import org.snow.ui.SnowUiRepository
@@ -90,11 +103,12 @@ enum class ToolSubTab(val title: String) {
     FILES("Files"),
     APPS("Apps"),
     MEDIA("Media"),
-    TERMINAL("Terminal")
+    TERMINAL("Terminal"),
+    SCREEN("Screen")
 }
 
 /**
- * Flagship Tools Screen containing 4-pill switcher: Files, Apps, Media, Terminal.
+ * Flagship Tools Screen containing 5-pill switcher: Files, Apps, Media, Terminal, Screen.
  */
 @Composable
 fun ToolsScreen(
@@ -116,7 +130,7 @@ fun ToolsScreen(
     // Apps parameters
     allowlistedApps: List<WindowsAppItem>,
     onLaunchApp: (target: String, friendlyName: String) -> Unit,
-    // Media parameters
+    // Media & Screen parameters
     isScreenSharing: Boolean,
     onToggleScreenShare: (Boolean) -> Unit,
     onTriggerCameraCapture: () -> Unit,
@@ -125,6 +139,13 @@ fun ToolsScreen(
     cameraDelivery: SnowUiRepository.CameraDeliveryInfo = SnowUiRepository.CameraDeliveryInfo(),
     onRetryCameraUpload: () -> Unit = {},
     onDismissCameraDelivery: () -> Unit = {},
+    incomingStreams: Map<String, SnowUiRepository.IncomingScreenStream> = emptyMap(),
+    selectedIncomingSenderId: String? = null,
+    onSelectIncomingSender: (String) -> Unit = {},
+    onCloseIncomingViewer: () -> Unit = {},
+    eligibleScreenTargets: List<SnowUiRepository.ScreenShareTarget> = emptyList(),
+    onStartScreenShareWithTargets: (List<String>) -> Unit = { onToggleScreenShare(true) },
+    activePermissionProfile: String = "full_control",
     // Terminal parameters
     terminalState: TerminalExecutionState,
     onExecuteTerminalCommand: (String) -> Unit,
@@ -142,14 +163,14 @@ fun ToolsScreen(
     ) {
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 4-Pill Segment Selector
+        // 5-Pill Segment Selector (single-line ellipsis safe across narrow widths)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(9999.dp))
                 .background(colors.surfaceElevated)
                 .padding(4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             ToolSubTab.values().forEach { tab ->
                 val selected = currentSubTab == tab
@@ -159,13 +180,16 @@ fun ToolsScreen(
                         .clip(RoundedCornerShape(9999.dp))
                         .background(if (selected) (if (colors.isDark) Color(0xFF282828) else Color.White) else Color.Transparent)
                         .clickable { onSubTabChanged(tab) }
-                        .padding(vertical = 8.dp),
+                        .padding(horizontal = 4.dp, vertical = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = tab.title,
-                        style = SnowTypography.labelMedium,
-                        color = if (selected) colors.textPrimary else colors.textMuted
+                        style = SnowTypography.labelMedium.copy(fontSize = 11.sp),
+                        color = if (selected) colors.textPrimary else colors.textMuted,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -199,8 +223,6 @@ fun ToolsScreen(
             }
             ToolSubTab.MEDIA -> {
                 MediaToolView(
-                    isScreenSharing = isScreenSharing,
-                    onToggleScreenShare = onToggleScreenShare,
                     onTriggerCameraCapture = onTriggerCameraCapture,
                     onSendMediaKey = onSendMediaKey,
                     onSendMediaVolume = onSendMediaVolume,
@@ -216,6 +238,19 @@ fun ToolsScreen(
                     onConfirmCommand = onConfirmTerminalCommand,
                     onCancelCommand = onCancelTerminalCommand,
                     onClearTerminal = onClearTerminal
+                )
+            }
+            ToolSubTab.SCREEN -> {
+                ScreenToolView(
+                    isScreenSharing = isScreenSharing,
+                    onStopScreenShare = { onToggleScreenShare(false) },
+                    incomingStreams = incomingStreams,
+                    selectedIncomingSenderId = selectedIncomingSenderId,
+                    onSelectIncomingSender = onSelectIncomingSender,
+                    onCloseIncomingViewer = onCloseIncomingViewer,
+                    eligibleScreenTargets = eligibleScreenTargets,
+                    onStartScreenShareWithTargets = onStartScreenShareWithTargets,
+                    activePermissionProfile = activePermissionProfile
                 )
             }
         }
@@ -717,12 +752,10 @@ private fun AppsToolView(
 }
 
 /**
- * Media Control & Screen Sharing Sub-Screen
+ * Media Control & Camera Delivery Sub-Screen (Screen share & capture moved cleanly to Screen tab).
  */
 @Composable
 private fun MediaToolView(
-    isScreenSharing: Boolean,
-    onToggleScreenShare: (Boolean) -> Unit,
     onTriggerCameraCapture: () -> Unit,
     onSendMediaKey: (String) -> Unit,
     onSendMediaVolume: (Int) -> Unit = {},
@@ -832,50 +865,14 @@ private fun MediaToolView(
             }
         }
 
-        // Screen Share & Remote Camera Card
+        // Camera Photo Delivery Card (Screen capabilities now reside cleanly in Screen tab)
         SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
             Column {
                 Text(
-                    text = "VIDEO & STREAMING CAPABILITIES",
+                    text = "CAMERA CAPTURE",
                     style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp),
                     color = colors.textMuted
                 )
-                Spacer(modifier = Modifier.height(14.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = if (isScreenSharing) Icons.Default.ScreenShare else Icons.Default.StopScreenShare,
-                            contentDescription = null,
-                            tint = if (isScreenSharing) colors.accentEmerald else colors.textSecondary,
-                            modifier = Modifier.size(24.dp)
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column {
-                            Text(text = "Android Screen Share", style = SnowTypography.titleSmall, color = colors.textPrimary)
-                            Text(text = if (isScreenSharing) "Live stream active" else "Standby", style = SnowTypography.bodySmall, color = colors.textSecondary)
-                        }
-                    }
-
-                    if (isScreenSharing) {
-                        SnowOutlinedButton(text = "Stop", onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onToggleScreenShare(false)
-                        })
-                    } else {
-                        SnowGradientButton(text = "Start", onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onToggleScreenShare(true)
-                        })
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-                Divider(color = colors.borderSubtle)
                 Spacer(modifier = Modifier.height(14.dp))
 
                 Row(
@@ -944,6 +941,421 @@ private fun MediaToolView(
                             }
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(text = detailText, style = SnowTypography.bodySmall, color = colors.textSecondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Dedicated Screen Sub-Screen consolidating Universal Any-to-Any Screen Sharing & Capture.
+ */
+@Composable
+private fun ScreenToolView(
+    isScreenSharing: Boolean,
+    onStopScreenShare: () -> Unit,
+    incomingStreams: Map<String, SnowUiRepository.IncomingScreenStream>,
+    selectedIncomingSenderId: String?,
+    onSelectIncomingSender: (String) -> Unit,
+    onCloseIncomingViewer: () -> Unit,
+    eligibleScreenTargets: List<SnowUiRepository.ScreenShareTarget>,
+    onStartScreenShareWithTargets: (List<String>) -> Unit,
+    activePermissionProfile: String
+) {
+    val colors = LocalSnowColors.current
+    val context = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+
+    var showTargetPicker by remember { mutableStateOf(false) }
+    var selectedTargetIds by remember(eligibleScreenTargets) {
+        mutableStateOf(
+            eligibleScreenTargets.firstOrNull()?.deviceId?.let { setOf(it) } ?: emptySet()
+        )
+    }
+    var isFullscreenViewer by remember { mutableStateOf(false) }
+
+    val activeStream = remember(incomingStreams, selectedIncomingSenderId) {
+        when {
+            incomingStreams.isEmpty() -> null
+            selectedIncomingSenderId != null && incomingStreams.containsKey(selectedIncomingSenderId) ->
+                incomingStreams[selectedIncomingSenderId]
+            else -> incomingStreams.values.firstOrNull()
+        }
+    }
+
+    LaunchedEffect(activeStream) {
+        if (activeStream == null) {
+            isFullscreenViewer = false
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        // 1. Dynamic Incoming Live Screen Viewer: ONLY shown when at least 1 remote sender is streaming
+        if (activeStream != null) {
+            val frameBitmap = remember(activeStream.frameBytes) {
+                try {
+                    BitmapFactory.decodeByteArray(activeStream.frameBytes, 0, activeStream.frameBytes.size)
+                } catch (_: Exception) {
+                    null
+                }
+            }
+
+            SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "INCOMING LIVE SCREEN",
+                                style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp),
+                                color = colors.textMuted
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = activeStream.senderName,
+                                style = SnowTypography.titleSmall,
+                                color = colors.textPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        SnowStatusBadge(
+                            text = activeStream.routeBadge.ifBlank { "Live" },
+                            type = SnowBadgeType.CONNECTED
+                        )
+                    }
+
+                    if (incomingStreams.size > 1) {
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(incomingStreams.values.toList(), key = { it.senderId }) { sender ->
+                                SnowFilterChip(
+                                    text = sender.senderName,
+                                    selected = sender.senderId == activeStream.senderId,
+                                    onClick = { onSelectIncomingSender(sender.senderId) }
+                                )
+                            }
+                        }
+                    }
+
+                    if (frameBitmap != null) {
+                        val ratio = if (frameBitmap.height > 0) {
+                            (frameBitmap.width.toFloat() / frameBitmap.height.toFloat()).coerceIn(0.45f, 2.2f)
+                        } else 16f / 9f
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(ratio)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF0B0F17))
+                                .clickable { isFullscreenViewer = true },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Image(
+                                bitmap = frameBitmap.asImageBitmap(),
+                                contentDescription = "Live screen from ${activeStream.senderName}",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = buildString {
+                                append(String.format(java.util.Locale.US, "%.1f FPS", activeStream.fps))
+                                if (activeStream.width > 0 && activeStream.height > 0) {
+                                    append("  •  ${activeStream.width}x${activeStream.height}")
+                                }
+                            },
+                            style = SnowTypography.bodySmall,
+                            color = colors.textSecondary
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SnowTonalButton(
+                                text = "Fullscreen",
+                                onClick = { isFullscreenViewer = true }
+                            )
+                            SnowOutlinedButton(
+                                text = "Close",
+                                onClick = onCloseIncomingViewer
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Outbound Phone Screen Share Card
+        SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "SHARE THIS PHONE SCREEN",
+                        style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp),
+                        color = colors.textMuted
+                    )
+                    SnowStatusBadge(
+                        text = if (isScreenSharing) "Live Stream" else "Standby",
+                        type = if (isScreenSharing) SnowBadgeType.CONNECTED else SnowBadgeType.STANDBY
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = if (isScreenSharing) Icons.Default.ScreenShare else Icons.Default.StopScreenShare,
+                            contentDescription = null,
+                            tint = if (isScreenSharing) colors.accentEmerald else colors.textSecondary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Live Screen Share",
+                                style = SnowTypography.titleSmall,
+                                color = colors.textPrimary
+                            )
+                            Text(
+                                text = when {
+                                    isScreenSharing -> "Broadcasting over authenticated media transport"
+                                    activePermissionProfile.trim().lowercase() != "full_control" ->
+                                        "Blocked: Full Control permission profile required"
+                                    eligibleScreenTargets.isEmpty() ->
+                                        "Connect an authorized Full Control device first"
+                                    else -> "Ready (${eligibleScreenTargets.size} eligible target)"
+                                },
+                                style = SnowTypography.bodySmall,
+                                color = colors.textSecondary
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+                    if (isScreenSharing) {
+                        SnowOutlinedButton(
+                            text = "Stop Sharing",
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onStopScreenShare()
+                            }
+                        )
+                    } else {
+                        SnowGradientButton(
+                            text = "Start Sharing",
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                if (activePermissionProfile.trim().lowercase() != "full_control") {
+                                    Toast.makeText(
+                                        context,
+                                        "Screen sharing requires Full Control permission profile.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else if (eligibleScreenTargets.isEmpty()) {
+                                    Toast.makeText(
+                                        context,
+                                        "Connect an authorized Full Control device to share your screen.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                } else {
+                                    selectedTargetIds = setOf(eligibleScreenTargets.first().deviceId)
+                                    showTargetPicker = true
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        // 3. One-Time Screen Capture Card (consolidated cleanly from Media into Screen)
+        SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "ONE-TIME SCREEN CAPTURE",
+                    style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp),
+                    color = colors.textMuted
+                )
+                Text(
+                    text = "Screen Snapshot Consent",
+                    style = SnowTypography.titleSmall,
+                    color = colors.textPrimary
+                )
+                Text(
+                    text = "One-time screen captures requested by an authorized PC or peer host prompt explicitly via Android MediaProjection before capturing a single PNG over HTTPS.",
+                    style = SnowTypography.bodySmall,
+                    color = colors.textSecondary
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+    }
+
+    if (showTargetPicker) {
+        AlertDialog(
+            onDismissRequest = { showTargetPicker = false },
+            title = {
+                Text(
+                    text = "Select devices to share with",
+                    style = SnowTypography.titleMedium,
+                    color = colors.textPrimary
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    eligibleScreenTargets.forEach { target ->
+                        val checked = selectedTargetIds.contains(target.deviceId)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .border(1.dp, colors.borderSubtle, RoundedCornerShape(12.dp))
+                                .clickable {
+                                    selectedTargetIds = if (checked) {
+                                        selectedTargetIds - target.deviceId
+                                    } else {
+                                        selectedTargetIds + target.deviceId
+                                    }
+                                }
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = checked,
+                                    onCheckedChange = { isChecked ->
+                                        selectedTargetIds = if (isChecked) {
+                                            selectedTargetIds + target.deviceId
+                                        } else {
+                                            selectedTargetIds - target.deviceId
+                                        }
+                                    }
+                                )
+                                Column {
+                                    Text(
+                                        text = target.deviceName,
+                                        style = SnowTypography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                                        color = colors.textPrimary
+                                    )
+                                    Text(
+                                        text = target.routeBadge,
+                                        style = SnowTypography.bodySmall,
+                                        color = colors.textSecondary
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                SnowGradientButton(
+                    text = "Start Sharing",
+                    onClick = {
+                        val picked = selectedTargetIds.toList()
+                        if (picked.isNotEmpty()) {
+                            showTargetPicker = false
+                            onStartScreenShareWithTargets(picked)
+                        }
+                    },
+                    enabled = selectedTargetIds.isNotEmpty()
+                )
+            },
+            dismissButton = {
+                SnowOutlinedButton(
+                    text = "Cancel",
+                    onClick = { showTargetPicker = false }
+                )
+            },
+            containerColor = colors.surface
+        )
+    }
+
+    if (isFullscreenViewer && activeStream != null) {
+        val fullBitmap = remember(activeStream.frameBytes) {
+            try {
+                BitmapFactory.decodeByteArray(activeStream.frameBytes, 0, activeStream.frameBytes.size)
+            } catch (_: Exception) {
+                null
+            }
+        }
+        Dialog(
+            onDismissRequest = { isFullscreenViewer = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = Color(0xFF090C12)
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
+                            Text(
+                                text = activeStream.senderName,
+                                style = SnowTypography.titleMedium,
+                                color = Color.White
+                            )
+                            Text(
+                                text = activeStream.routeBadge,
+                                style = SnowTypography.bodySmall,
+                                color = Color(0xFF94A3B8)
+                            )
+                        }
+                        SnowOutlinedButton(
+                            text = "Close",
+                            onClick = { isFullscreenViewer = false }
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (fullBitmap != null) {
+                            Image(
+                                bitmap = fullBitmap.asImageBitmap(),
+                                contentDescription = "Fullscreen view of ${activeStream.senderName}",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
                         }
                     }
                 }

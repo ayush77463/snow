@@ -129,6 +129,10 @@
     let screenFrameErrorCount = 0;
     let lastKnownStreamState = "IDLE";
     let isCaptureStreamActive = false;
+    let selectedScreenSenderId = "";
+    let activeScreenSenders = [];
+    let isPcScreenSharing = false;
+    let eligiblePcShareTargets = [];
     let lastCaptureTitle = "Capture Preview";
     let lastFocusedBeforeLightbox = null;
     let revealedIpcSecret = "";
@@ -816,6 +820,15 @@
         document.getElementById("btn-active-transfer-cancel")?.addEventListener("click", cancelActiveTransfer);
         document.getElementById("btn-files-transfer-cancel")?.addEventListener("click", cancelActiveTransfer);
 
+        document.getElementById("btn-share-pc-screen")?.addEventListener("click", openPcSharePicker);
+        document.getElementById("btn-stop-pc-share")?.addEventListener("click", stopPcScreenShare);
+        document.getElementById("btn-close-pc-share-modal")?.addEventListener("click", () => {
+            document.getElementById("pc-share-targets-modal")?.classList.add("d-none");
+        });
+        document.getElementById("btn-pc-share-cancel")?.addEventListener("click", () => {
+            document.getElementById("pc-share-targets-modal")?.classList.add("d-none");
+        });
+        document.getElementById("btn-pc-share-confirm")?.addEventListener("click", confirmStartPcScreenShare);
         document.getElementById("btn-stop-screen-stream")?.addEventListener("click", stopRemoteScreenStream);
         document.getElementById("btn-enlarge-capture")?.addEventListener("click", () => {
             const latestImg = document.getElementById("latest-capture-img");
@@ -997,6 +1010,140 @@
         lbBadge?.classList.toggle("d-none", !isCaptureStreamActive);
     }
 
+    function renderSenderSwitcher(senders) {
+        const container = document.getElementById("screen-sender-switcher");
+        if (!container) return;
+        const list = Array.isArray(senders) ? senders : [];
+        if (list.length === 0) {
+            container.innerHTML = "";
+            container.classList.add("d-none");
+            return;
+        }
+        container.classList.remove("d-none");
+        if (!selectedScreenSenderId || !list.some(s => (s.sender_device_id || s.device_id) === selectedScreenSenderId)) {
+            selectedScreenSenderId = list[0].sender_device_id || list[0].device_id || "";
+        }
+        container.innerHTML = "";
+        list.forEach(s => {
+            const sid = s.sender_device_id || s.device_id || "";
+            const name = s.sender_name || sid || "Sender";
+            const badge = s.route_badge ? ` • ${s.route_badge}` : "";
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = `sender-pill${sid === selectedScreenSenderId ? " active" : ""}`;
+            btn.textContent = `${name}${badge}`;
+            btn.dataset.senderId = sid;
+            btn.addEventListener("click", () => {
+                selectedScreenSenderId = sid;
+                renderSenderSwitcher(activeScreenSenders);
+                fetchNextScreenFrame();
+            });
+            container.appendChild(btn);
+        });
+    }
+
+    function updatePcSharingUi(pcSharing) {
+        const bar = document.getElementById("pc-screen-share-bar");
+        const label = document.getElementById("pc-screen-share-targets-label");
+        const shareBtn = document.getElementById("btn-share-pc-screen");
+        const state = String(pcSharing?.state || "IDLE").toUpperCase();
+        isPcScreenSharing = state === "STREAMING";
+        if (isPcScreenSharing) {
+            const targetIds = Array.isArray(pcSharing?.target_device_ids) ? pcSharing.target_device_ids : [];
+            const names = targetIds.map(tid => {
+                const match = registeredDevices.find(d => d.device_id === tid);
+                return match?.device_name || tid;
+            });
+            if (label) {
+                label.textContent = names.length > 0
+                    ? `Sharing PC Screen -> ${names.join(", ")}`
+                    : "Sharing PC Screen";
+            }
+            bar?.classList.remove("d-none");
+            if (shareBtn) shareBtn.textContent = "Sharing";
+        } else {
+            bar?.classList.add("d-none");
+            if (shareBtn) shareBtn.textContent = "Share PC Screen";
+        }
+    }
+
+    async function openPcSharePicker() {
+        const sendersRes = await apiRequest("/api/screen/senders");
+        let eligible = Array.isArray(sendersRes?.eligible_targets) ? sendersRes.eligible_targets : [];
+        if (eligible.length === 0 && Array.isArray(registeredDevices)) {
+            eligible = registeredDevices
+                .filter(d => !isLocalNode(d) && d.is_connected && String(d.permission_profile || "full_control").toLowerCase() === "full_control")
+                .map(d => ({
+                    device_id: d.device_id,
+                    device_name: d.device_name || d.device_id,
+                    platform: d.platform || "android",
+                    route_badge: resolveTransportLabel(d),
+                }));
+        }
+        eligiblePcShareTargets = eligible;
+        if (eligible.length === 0) {
+            showNotificationToast("Connect an authorized Full Control device to share your PC screen.", "warning");
+            return;
+        }
+        const modal = document.getElementById("pc-share-targets-modal");
+        const listEl = document.getElementById("pc-share-targets-list");
+        if (!modal || !listEl) return;
+        listEl.innerHTML = "";
+        eligible.forEach((dev, idx) => {
+            const labelEl = document.createElement("label");
+            labelEl.className = "share-target-option";
+            const left = document.createElement("div");
+            left.className = "flex items-center gap-2";
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.className = "pc-share-target-cb";
+            cb.value = dev.device_id;
+            cb.checked = idx === 0;
+            const nameSpan = document.createElement("span");
+            nameSpan.className = "text-sm fw-600";
+            nameSpan.textContent = dev.device_name || dev.device_id;
+            left.appendChild(cb);
+            left.appendChild(nameSpan);
+
+            const right = document.createElement("span");
+            right.className = "chip chip-sm chip-neutral";
+            right.textContent = dev.route_badge || dev.platform || "Full Control";
+
+            labelEl.appendChild(left);
+            labelEl.appendChild(right);
+            listEl.appendChild(labelEl);
+        });
+        modal.classList.remove("d-none");
+    }
+
+    async function confirmStartPcScreenShare() {
+        const checkboxes = Array.from(document.querySelectorAll(".pc-share-target-cb"));
+        const selectedIds = checkboxes.filter(cb => cb.checked).map(cb => cb.value).filter(Boolean);
+        if (selectedIds.length === 0) {
+            showNotificationToast("Select at least one authorized Full Control device.", "warning");
+            return;
+        }
+        document.getElementById("pc-share-targets-modal")?.classList.add("d-none");
+        const res = await apiRequest("/api/screen/share/start", "POST", { target_device_ids: selectedIds });
+        if (res && res.success) {
+            showNotificationToast("PC live screen share started.", "success");
+            pollScreenStreamStatus();
+        } else {
+            showNotificationToast(res?.error || "Failed starting PC screen share.", "error");
+        }
+    }
+
+    async function stopPcScreenShare() {
+        const res = await apiRequest("/api/screen/share/stop", "POST", {});
+        if (res && res.success) {
+            showNotificationToast("PC live screen share stopped.", "info");
+            updatePcSharingUi({ state: "IDLE", target_device_ids: [] });
+            pollScreenStreamStatus();
+        } else {
+            showNotificationToast(res?.error || "Failed stopping PC screen share.", "error");
+        }
+    }
+
     function stopScreenFramePolling() {
         if (screenStreamTimer) {
             clearInterval(screenStreamTimer);
@@ -1008,19 +1155,22 @@
     function fetchNextScreenFrame() {
         if (document.hidden || isScreenFrameInFlight) return;
         isScreenFrameInFlight = true;
-        const frameUrl = `/api/screen/frame?t=${Date.now()}`;
+        const senderQuery = selectedScreenSenderId ? `&sender_id=${encodeURIComponent(selectedScreenSenderId)}` : "";
+        const frameUrl = `/api/screen/frame?t=${Date.now()}${senderQuery}`;
         const preloader = new Image();
         preloader.onload = () => {
             isScreenFrameInFlight = false;
             screenFrameErrorCount = 0;
-            lastCaptureTitle = "Live Android Screen";
+            const activeSender = activeScreenSenders.find(s => (s.sender_device_id || s.device_id) === selectedScreenSenderId);
+            const senderLabel = activeSender?.sender_name ? `${activeSender.sender_name} Screen` : "Live Screen";
+            lastCaptureTitle = senderLabel;
             const latestImg = document.getElementById("latest-capture-img");
             const enlargeBtn = document.getElementById("btn-enlarge-capture");
             const placeholder = document.getElementById("latest-capture-placeholder");
             if (latestImg) {
                 latestImg.src = frameUrl;
                 latestImg.style.display = "block";
-                latestImg.onclick = () => openMediaPreview(latestImg.src, "Live Android Screen", isCaptureStreamActive);
+                latestImg.onclick = () => openMediaPreview(latestImg.src, senderLabel, isCaptureStreamActive);
             }
             enlargeBtn?.classList.remove("d-none");
             placeholder?.classList.add("d-none");
@@ -1048,23 +1198,40 @@
         if (document.hidden || isScreenStatusPolling) return;
         isScreenStatusPolling = true;
         try {
-            const st = await apiRequest("/api/screen/status");
+            const stUrl = selectedScreenSenderId
+                ? `/api/screen/status?sender_id=${encodeURIComponent(selectedScreenSenderId)}`
+                : "/api/screen/status";
+            const st = await apiRequest(stUrl);
+            updatePcSharingUi(st?.pc_sharing || { state: "IDLE" });
+            activeScreenSenders = Array.isArray(st?.senders) ? st.senders : [];
+            renderSenderSwitcher(activeScreenSenders);
+
             const state = String(st?.state || "IDLE").toUpperCase();
             if (state === "STREAMING") {
                 const fpsText = st?.fps ? `${Number(st.fps).toFixed(1)} FPS` : "Live";
-                const dimText = (st?.width && st?.height) ? `${st.width}x${st.height}` : "";
-                setScreenViewerState("STREAMING", [fpsText, dimText].filter(Boolean).join(" • "));
+                const dimText = (st?.frame_width && st?.frame_height) ? `${st.frame_width}x${st.frame_height}` : "";
+                const senderTag = st?.sender_name ? `${st.sender_name}` : "";
+                setScreenViewerState("STREAMING", [senderTag, fpsText, dimText].filter(Boolean).join(" • "));
                 if (st?.has_frame && !screenStreamTimer) {
                     screenFrameErrorCount = 0;
                     fetchNextScreenFrame();
-                    screenStreamTimer = setInterval(fetchNextScreenFrame, 1000);
+                    screenStreamTimer = setInterval(fetchNextScreenFrame, 500);
                 } else if (st?.has_frame) {
                     fetchNextScreenFrame();
                 }
             } else {
                 stopScreenFramePolling();
+                const latestImg = document.getElementById("latest-capture-img");
                 if (lastKnownStreamState === "STREAMING" && (state === "STOPPED" || state === "REVOKED" || state === "IDLE")) {
-                    setScreenViewerState("STOPPED", state === "REVOKED" ? "Screen share revoked on phone" : "Live stream stopped");
+                    if (latestImg) {
+                        latestImg.removeAttribute("src");
+                        latestImg.style.display = "none";
+                    }
+                    const mediaModal = document.getElementById("media-preview-modal");
+                    if (mediaModal && !mediaModal.classList.contains("d-none") && isCaptureStreamActive) {
+                        closeMediaPreview();
+                    }
+                    setScreenViewerState("STOPPED", state === "REVOKED" ? "Screen share revoked on sender" : "Live stream stopped");
                 } else if (state === "ERROR") {
                     setScreenViewerState("ERROR", st?.error || "Screen stream error");
                 } else if (screenFrameErrorCount === 0) {
@@ -1079,8 +1246,13 @@
 
     async function stopRemoteScreenStream() {
         stopScreenFramePolling();
-        const res = await apiRequest("/api/screen/stop", "POST", {});
+        const res = await apiRequest("/api/screen/stop", "POST", selectedScreenSenderId ? { sender_id: selectedScreenSenderId } : {});
         lastKnownStreamState = "STOPPED";
+        const latestImg = document.getElementById("latest-capture-img");
+        if (latestImg) {
+            latestImg.removeAttribute("src");
+            latestImg.style.display = "none";
+        }
         setScreenViewerState("STOPPED", "Live stream stopped");
         if (res && res.success) {
             showNotificationToast("Live screen stream stopped.", "info");
@@ -2224,7 +2396,7 @@
                 if (apkUrlEl) apkUrlEl.textContent = res.download_url || "Ready for LAN download";
                 if (dlBtn) {
                     dlBtn.href = res.local_download_url || res.download_url || "#";
-                    dlBtn.textContent = `Download ${res.file_name || "SNOW-Mobile.apk"} (${res.version || "5.1.0"})`;
+                    dlBtn.textContent = `Download ${res.file_name || "SNOW-Mobile.apk"} (${res.version || "5.2.0"})`;
                     dlBtn.classList.remove("d-none");
                 }
             } else {
@@ -2402,6 +2574,15 @@
             };
         }
 
+        document.getElementById("btn-share-pc-screen")?.addEventListener("click", openPcSharePicker);
+        document.getElementById("btn-stop-pc-share")?.addEventListener("click", stopPcScreenShare);
+        document.getElementById("btn-close-pc-share-modal")?.addEventListener("click", () => {
+            document.getElementById("pc-share-targets-modal")?.classList.add("d-none");
+        });
+        document.getElementById("btn-pc-share-cancel")?.addEventListener("click", () => {
+            document.getElementById("pc-share-targets-modal")?.classList.add("d-none");
+        });
+        document.getElementById("btn-pc-share-confirm")?.addEventListener("click", confirmStartPcScreenShare);
         document.getElementById("btn-stop-screen-stream")?.addEventListener("click", stopRemoteScreenStream);
         document.getElementById("btn-retry-screen-stream")?.addEventListener("click", () => {
             screenFrameErrorCount = 0;
@@ -3225,7 +3406,7 @@
                 pendingUpdateMeta = null;
                 applyBtn?.classList.add("d-none");
                 if (banner) {
-                    banner.textContent = `Current version ${res?.current_version || "5.1.0"} is up to date.`;
+                    banner.textContent = `Current version ${res?.current_version || "5.2.0"} is up to date.`;
                     banner.classList.remove("d-none");
                 }
                 showNotificationToast("SNOW is up to date.", "info");

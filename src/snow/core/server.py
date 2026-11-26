@@ -176,8 +176,330 @@ class SnowCoreServer:
         self.relay_group_id: str = getattr(self.config, "relay_group_id", "")
         self.relay_ticket: str = getattr(self.config, "relay_ticket", "")
         self.session_router.relay_enabled = self.relay_enabled
+        self.screen_stream_manager: Optional[Any] = None
         self._is_paused: bool = False
         self._paused_state: dict[str, Any] = {}
+
+    def _ensure_screen_stream_manager(self):
+        """Lazily initialize the PC WindowsScreenStreamManager without loading Pillow at startup."""
+        if self.screen_stream_manager is not None:
+            return self.screen_stream_manager
+        from snow.capabilities.windows.screen_stream import WindowsScreenStreamManager
+
+        local_id = getattr(self.device_identity, "device_id", None) or "desktop-core"
+        local_name = getattr(self.device_identity, "device_name", None) or "Windows PC"
+        network_id = getattr(self.config, "network_id", None)
+
+        def _is_full_control(dev_id: str) -> bool:
+            if not dev_id:
+                return False
+            if dev_id == "local_dashboard" or dev_id == local_id:
+                return True
+            if self.db_manager:
+                saved = self.db_manager.get_setting(f"device_profile:{dev_id}")
+                if saved is not None and str(saved).strip().lower() != "full_control":
+                    return False
+                paired = self.db_manager.get_paired_device(dev_id)
+                if paired is not None:
+                    return True
+            node = self.node_registry.get_node(dev_id) if getattr(self, "node_registry", None) else None
+            if node is not None and getattr(node, "permission_profile", None) is not None:
+                return str(node.permission_profile).strip().lower() == "full_control"
+            # Check active full_control federation grant
+            fed = getattr(self.ws_server, "federation_manager", None) if getattr(self, "ws_server", None) else None
+            if fed is not None and hasattr(fed, "has_active_full_control_grant"):
+                try:
+                    return bool(fed.has_active_full_control_grant(dev_id))
+                except Exception:
+                    return False
+            return node is not None
+
+        self.screen_stream_manager = WindowsScreenStreamManager(
+            sender_device_id=local_id,
+            sender_name=local_name,
+            sender_network_id=network_id,
+            transfer_server=self.http_transfer_server,
+            permission_checker=_is_full_control,
+            on_frame_ready=self._on_pc_screen_frame_ready,
+            on_state_change=self._on_pc_screen_state_change,
+        )
+        if getattr(self, "ws_server", None):
+            self.ws_server.screen_stream_manager = self.screen_stream_manager
+        if getattr(self, "http_transfer_server", None):
+            self.http_transfer_server.screen_stream_manager = self.screen_stream_manager
+        return self.screen_stream_manager
+
+    def list_eligible_screen_targets(self) -> list[dict[str, Any]]:
+        """List currently connected, paired/federated, and Full Control authorized targets for PC sharing."""
+        eligible: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        local_id = getattr(self.device_identity, "device_id", None) or "desktop-core"
+
+        def _profile_for(dev_id: str) -> str:
+            if self.db_manager:
+                saved = self.db_manager.get_setting(f"device_profile:{dev_id}")
+                if saved is not None:
+                    return str(saved).strip().lower()
+            node = self.node_registry.get_node(dev_id) if getattr(self, "node_registry", None) else None
+            if node and getattr(node, "permission_profile", None):
+                return str(node.permission_profile).strip().lower()
+            return "full_control"
+
+        # 1. Inbound connected sessions (Android USB/Wi-Fi or remote inbound)
+        sess_mgr = getattr(self, "session_manager", None) or getattr(self.ws_server, "session_manager", None)
+        conn_mgr = getattr(self, "connection_manager", None) or getattr(self.ws_server, "connection_manager", None)
+        if sess_mgr and conn_mgr:
+            for s in sess_mgr.all_sessions() if hasattr(sess_mgr, "all_sessions") else []:
+                did = getattr(s, "device_id", None)
+                cid = getattr(s, "connection_id", None)
+                if not did or did == local_id or did in seen_ids:
+                    continue
+                conn = conn_mgr.get(cid) if cid else None
+                if not conn or not getattr(conn, "is_active", False):
+                    continue
+                if _profile_for(did) != "full_control":
+                    continue
+                node = self.node_registry.get_node(did) if getattr(self, "node_registry", None) else None
+                paired = self.db_manager.get_paired_device(did) if self.db_manager else None
+                from snow.network.router import classify_transport_badge
+                tr = getattr(node, "transport", None) or "wifi_lan"
+                host = getattr(node, "host", None) or getattr(paired, "last_known_host", None)
+                badge = classify_transport_badge(transport=tr, host=host)
+                eligible.append({
+                    "device_id": did,
+                    "device_name": (getattr(paired, "device_name", None) or getattr(node, "device_name", None) or did),
+                    "platform": (getattr(paired, "platform", None) or getattr(node, "platform", None) or "android"),
+                    "route_badge": badge,
+                    "transport": tr,
+                    "permission_profile": "full_control",
+                    "online": True,
+                })
+                seen_ids.add(did)
+
+        # 2. Outbound connected peer PCs
+        for did, client in list(getattr(self, "peer_clients", {}).items()):
+            if not did or did == local_id or did in seen_ids or not getattr(client, "is_connected", False):
+                continue
+            if _profile_for(did) != "full_control":
+                continue
+            paired = self.db_manager.get_paired_device(did) if self.db_manager else None
+            from snow.network.router import classify_transport_badge
+            host = getattr(client, "host", None)
+            badge = classify_transport_badge(transport="wifi_lan", host=host)
+            eligible.append({
+                "device_id": did,
+                "device_name": getattr(paired, "device_name", None) or getattr(client, "remote_device_name", None) or did,
+                "platform": getattr(paired, "platform", None) or "windows",
+                "route_badge": badge,
+                "transport": "peer_link",
+                "permission_profile": "full_control",
+                "online": True,
+            })
+            seen_ids.add(did)
+
+        # 3. Relay-connected paired peers when E2E relay is active
+        if self.relay_enabled and self.relay_client and getattr(self.relay_client, "_is_connected", False) and self.db_manager:
+            for p in self.db_manager.list_paired_devices():
+                did = p.device_id
+                if did == local_id or did in seen_ids or _profile_for(did) != "full_control":
+                    continue
+                tun = getattr(self.relay_client, "_tunnels", {}).get(did)
+                if tun is not None and getattr(tun, "handshake_done", False):
+                    eligible.append({
+                        "device_id": did,
+                        "device_name": p.device_name or did,
+                        "platform": p.platform or "android",
+                        "route_badge": "Remote • Uses Data",
+                        "transport": "remote_relay",
+                        "permission_profile": "full_control",
+                        "online": True,
+                    })
+                    seen_ids.add(did)
+
+        return eligible
+
+    def get_pc_screen_share_status(self) -> dict[str, Any]:
+        """Return current local PC live screen share state."""
+        if self.screen_stream_manager is None:
+            return {"state": "IDLE", "target_device_ids": [], "viewer_count": 0}
+        return self.screen_stream_manager.get_status()
+
+    async def start_pc_screen_share(
+        self,
+        target_device_ids: list[str],
+        fps: float = 4.0,
+    ) -> dict[str, Any]:
+        """Start sharing this PC's screen to explicit Full Control target devices."""
+        if not target_device_ids:
+            return {
+                "success": False,
+                "status": "NO_TARGETS_SELECTED",
+                "error": "Select at least one connected Full Control device to share with.",
+            }
+        mgr = self._ensure_screen_stream_manager()
+        if getattr(self, "http_transfer_server", None):
+            mgr.transfer_server = self.http_transfer_server
+            self.http_transfer_server.screen_stream_manager = mgr
+        # Pre-register connected target devices as authorized initial viewers; targets can unsubscribe cleanly
+        connected_ids = {t["device_id"] for t in self.list_eligible_screen_targets()}
+        valid_targets = [tid for tid in target_device_ids if tid in connected_ids]
+        if not valid_targets:
+            return {
+                "success": False,
+                "status": "NO_ELIGIBLE_TARGETS",
+                "error": "No connected Full Control target device matched the selection.",
+            }
+        res = await mgr.start(
+            target_device_ids=valid_targets,
+            fps=fps,
+            initial_viewers=valid_targets,
+        )
+        return res
+
+    async def stop_pc_screen_share(self, reason: str = "STOPPED") -> dict[str, Any]:
+        """Stop local PC screen share cleanly."""
+        if self.screen_stream_manager is None:
+            return {"success": True, "status": "IDLE", "state": "IDLE"}
+        return await self.screen_stream_manager.stop(reason=reason)
+
+    async def revoke_screen_target(self, device_id: str) -> None:
+        """Immediately remove a downgraded/revoked device from PC live sharing and stop if empty."""
+        mgr = getattr(self, "screen_stream_manager", None)
+        if mgr is not None and mgr.state == "STREAMING":
+            mgr.revoke_target(device_id)
+            if not mgr.target_device_ids or mgr.active_viewer_count() == 0:
+                await mgr.stop(reason="REVOKED")
+            elif getattr(self, "ws_server", None):
+                await self.ws_server.broadcast_screen_stream_event(
+                    "STREAM_STOPPED",
+                    {"sender_device_id": mgr.sender_device_id, "reason": "PERMISSION_REVOKED"},
+                    target_device_ids=[device_id],
+                )
+
+    async def _on_pc_screen_state_change(self, status_meta: dict[str, Any]) -> None:
+        """Broadcast metadata-only PC screen stream start/stop events across WSS and E2E Relay."""
+        ev_type = "STREAM_AVAILABLE" if status_meta.get("state") == "STREAMING" else "STREAM_STOPPED"
+        targets = list(status_meta.get("target_device_ids") or [])
+        transfer_port = (
+            getattr(self.http_transfer_server, "bound_port", None)
+            or getattr(self.config, "transfer_port", 8766)
+        )
+        payload = {
+            **status_meta,
+            "transfer_port": transfer_port,
+        }
+        if getattr(self, "ws_server", None):
+            await self.ws_server.broadcast_screen_stream_event(
+                ev_type,
+                payload,
+                target_device_ids=targets if targets else None,
+            )
+        if self.relay_enabled and self.relay_client and getattr(self.relay_client, "_is_connected", False):
+            for tid in targets:
+                if tid in getattr(self.relay_client, "_tunnels", {}):
+                    try:
+                        await self.relay_client.send_message(
+                            tid,
+                            SnowMessage.create_request(
+                                action="screen_stream_event",
+                                data={"event_type": ev_type, **payload},
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.debug("Relay screen event notify failed for [%s]: %s", tid, exc)
+
+    async def _on_pc_screen_frame_ready(self, meta: dict[str, Any], jpeg_bytes: bytes) -> None:
+        """Deliver bounded PC JPEG frames to E2E Relay and peer PC HTTPS targets (WSS stays media-free)."""
+        targets = list(meta.get("target_device_ids") or [])
+        if not targets:
+            return
+        local_sessions = getattr(self.ws_server, "session_manager", None) if getattr(self, "ws_server", None) else None
+        for tid in targets:
+            # Verify Full Control permission remains intact on every delivery cycle
+            saved = self.db_manager.get_setting(f"device_profile:{tid}") if self.db_manager else None
+            if saved is not None and str(saved).strip().lower() != "full_control":
+                continue
+            # If peer PC connected via outbound SnowPeerClient, push over its HTTPS transfer server
+            peer_client = getattr(self, "peer_clients", {}).get(tid)
+            if peer_client is not None and getattr(peer_client, "is_connected", False):
+                asyncio.create_task(self._push_frame_to_peer_https(tid, peer_client, meta, jpeg_bytes))
+                continue
+            # If target has no local inbound WSS connection and E2E Relay tunnel is active, push over E2E Relay media plane
+            has_local_wss = False
+            if local_sessions:
+                sess = local_sessions.get_session_by_device(tid)
+                conn_mgr = getattr(self.ws_server, "connection_manager", None)
+                if sess and sess.connection_id and conn_mgr:
+                    c = conn_mgr.get(sess.connection_id)
+                    has_local_wss = bool(c and getattr(c, "is_active", False))
+            if (not has_local_wss) and self.relay_enabled and self.relay_client and getattr(self.relay_client, "_is_connected", False):
+                tun = getattr(self.relay_client, "_tunnels", {}).get(tid)
+                if tun is not None and getattr(tun, "handshake_done", False):
+                    await self.relay_client.send_screen_frame(tid, {**meta, "route_badge": "Remote • Uses Data"}, jpeg_bytes)
+
+    async def _push_frame_to_peer_https(self, target_id: str, peer_client: Any, meta: dict[str, Any], jpeg_bytes: bytes) -> None:
+        """Push bounded JPEG frame to a connected peer PC's authenticated HTTPS transfer server."""
+        try:
+            import ssl
+            import aiohttp
+            host = getattr(peer_client, "host", None)
+            token = getattr(peer_client, "auth_token", None) or (self.session_router.get_peer_token(target_id) if hasattr(self, "session_router") else "")
+            if not host or not token:
+                return
+            node = self.node_registry.get_node(target_id) if getattr(self, "node_registry", None) else None
+            transfer_port = getattr(node, "transfer_port", None) or 8766
+            use_tls = bool(getattr(peer_client, "use_tls", True))
+            scheme = "https" if use_tls else "http"
+            url = f"{scheme}://{host}:{transfer_port}/api/v1/screen/frame"
+            ssl_ctx = None
+            if use_tls:
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "X-Snow-Device-Id": str(meta.get("sender_device_id") or "desktop-core"),
+                "X-Snow-Sender-Id": str(meta.get("sender_device_id") or "desktop-core"),
+                "X-Snow-Sender-Name": str(meta.get("sender_name") or "Windows PC"),
+                "X-Snow-Sender-Platform": str(meta.get("sender_platform") or "windows"),
+                "X-Snow-Session-Id": str(meta.get("session_id") or ""),
+                "X-Snow-Frame-Seq": str(meta.get("frame_seq") or 0),
+                "X-Snow-Frame-Width": str(meta.get("frame_width") or 0),
+                "X-Snow-Frame-Height": str(meta.get("frame_height") or 0),
+                "X-Snow-FPS": str(meta.get("fps") or 4.0),
+                "X-Snow-Target-Device-Ids": target_id,
+                "Content-Type": "image/jpeg",
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.0)) as session:
+                async with session.post(url, data=jpeg_bytes, headers=headers, ssl=ssl_ctx):
+                    pass
+        except Exception as exc:
+            logger.debug("Peer HTTPS frame push error to [%s]: %s", target_id, exc)
+
+    async def _handle_incoming_relay_media_frame(
+        self, source_id: str, meta: dict[str, Any], jpeg_bytes: bytes
+    ) -> None:
+        """Accept bounded E2E encrypted screen frame over Relay ONLY from paired Full Control peers."""
+        if not self.http_transfer_server or not self.db_manager:
+            return
+        paired = self.db_manager.get_paired_device(source_id)
+        if not paired:
+            return
+        saved = self.db_manager.get_setting(f"device_profile:{source_id}")
+        if saved is not None and str(saved).strip().lower() != "full_control":
+            return
+        enriched_meta = {
+            **meta,
+            "sender_device_id": source_id,
+            "sender_name": meta.get("sender_name") or paired.device_name or source_id,
+            "sender_platform": meta.get("sender_platform") or paired.platform or "remote",
+            "route_badge": "Remote • Uses Data",
+        }
+        self.http_transfer_server.publish_screen_frame(
+            sender_device_id=source_id,
+            frame_bytes=jpeg_bytes,
+            meta=enriched_meta,
+        )
 
     async def connect_peer(
         self,
@@ -576,11 +898,12 @@ class SnowCoreServer:
                 if p.cert_fingerprint:
                     client.set_peer_pinned_fingerprint(p.device_id, p.cert_fingerprint)
 
-        # Wire incoming request dispatcher
+        # Wire incoming request and E2E media frame handlers
         async def _relay_request_dispatcher(source_id: str, req: SnowMessage) -> Optional[SnowMessage]:
             return await self._handle_incoming_relay_request(source_id, req)
 
         client.request_dispatcher = _relay_request_dispatcher
+        client.media_frame_handler = self._handle_incoming_relay_media_frame
 
         connected = await client.connect()
         if connected:
@@ -594,9 +917,38 @@ class SnowCoreServer:
 
     async def _handle_incoming_relay_request(self, source_id: str, req: SnowMessage) -> Optional[SnowMessage]:
         """Dispatch incoming capability request received over inner E2E relay tunnel."""
-        # Verify sender is paired
+        action = req.action
+        data = req.data
         paired = self.db_manager.get_paired_device(source_id) if self.db_manager else None
         if not paired:
+            # Bootstrap rendezvous peers may ONLY complete cryptographic pairing verification
+            # via the real PairingManager path; all other capability requests remain strictly denied.
+            if action in ("pair_request", "pair_verify") and self.ws_server is not None:
+                captured_responses: list[str] = []
+
+                class _RelayCaptureWs:
+                    async def send(self, payload_text: str) -> None:
+                        captured_responses.append(payload_text)
+
+                    async def close(self, *args: Any, **kwargs: Any) -> None:
+                        return None
+
+                class _RelayCaptureClient:
+                    def __init__(self) -> None:
+                        self.connection_id = f"relay:{source_id}"
+                        self.remote_address = ("relay", 0)
+                        self.websocket = _RelayCaptureWs()
+
+                pair_data = dict(data) if isinstance(data, dict) else {}
+                pair_data.setdefault("device_id", source_id)
+                await self.ws_server._handle_pairing_request(
+                    _RelayCaptureClient(), req, action, pair_data
+                )
+                if captured_responses:
+                    try:
+                        return SnowMessage.from_json(captured_responses[-1])
+                    except Exception:
+                        pass
             logger.warning("Incoming relay request from unpaired peer [%s] rejected.", source_id)
             return SnowMessage.create_error(
                 code="UNAUTHORIZED",
@@ -604,8 +956,6 @@ class SnowCoreServer:
                 correlation_id=req.id,
             )
 
-        action = req.action
-        data = req.data
         if not action:
             return SnowMessage.create_error(
                 code="INVALID_ARGUMENT",
@@ -985,6 +1335,13 @@ class SnowCoreServer:
                 await self.usb_watcher.stop()
             except Exception as exc:
                 logger.debug("Error stopping UsbWatcher: %s", exc)
+
+        # Stop live PC screen stream cleanly if running
+        if getattr(self, "screen_stream_manager", None) is not None:
+            try:
+                await self.screen_stream_manager.stop(reason="STOPPED")
+            except Exception as exc:
+                logger.debug("Error stopping screen_stream_manager: %s", exc)
 
         # Stop IPC server first so external tool requests terminate cleanly before core shuts down
         if self.ipc_server:

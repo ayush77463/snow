@@ -170,7 +170,20 @@ class SnowForegroundService : Service() {
             certPinStorage = certPinStorage,
             expectedPeerFingerprint = expectedFingerprint,
             isClientMode = isClientMode
-        )
+        ).apply {
+            requestDispatcher = { action, data ->
+                capabilityDispatcher.dispatch(
+                    action = action,
+                    data = data,
+                    serverHost = endpoint,
+                    defaultTransferPort = 8766
+                )
+            }
+            mediaFrameHandler = { sourceId, meta, jpegBytes ->
+                org.snow.ui.SnowUiRepository.getInstance(applicationContext)
+                    .onIncomingRelayScreenFrame(sourceId, meta, jpegBytes)
+            }
+        }
         relayClient?.connect()
     }
 
@@ -199,6 +212,7 @@ class SnowForegroundService : Service() {
                 }
                 if (client.connectionState.value == ConnectionState.DISCONNECTED ||
                     client.connectionState.value == ConnectionState.RECONNECTING) {
+                    discoveryManager.startListening()
                     val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
                     val savedHost = prefs.getString(PREF_SAVED_HOST, null)
                     val savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
@@ -206,6 +220,10 @@ class SnowForegroundService : Service() {
                         SafeLog.i("SnowForegroundService", "Network restored: triggering reconnect to $savedHost:$savedPort")
                         client.connect(savedHost, savedPort)
                     }
+                } else if (relayClient != null || DiscoveryManager.isRelayEndpoint(client.currentTargetHost)) {
+                    // Network transition while on Remote Relay: scan briefly for local promotion without dropping relay first.
+                    discoveryManager.startListening()
+                    promoteLocalRouteFromDiscoveryIfAvailable()
                 }
             }
         }
@@ -238,7 +256,8 @@ class SnowForegroundService : Service() {
             dispatcher = capabilityDispatcher,
             localDeviceId = org.snow.security.DeviceIdentity.getOrCreate(applicationContext).deviceId,
             manifestProvider = { org.snow.network.DeviceNode.buildAndroidManifest(applicationContext).toMap() },
-            parentScope = serviceScope
+            parentScope = serviceScope,
+            mediaPort = 8766
         )
         if (success) {
             updateNotification("Peer Host Active on Port ${peerHostManager.activePort}")
@@ -370,11 +389,42 @@ class SnowForegroundService : Service() {
                 } else null
 
                 if (projection != null) {
+                    val targetIds = intent.getStringArrayListExtra(EXTRA_TARGET_IDS)?.toList().orEmpty()
                     liveScreenHandler.onRevoked = {
                         demoteScreenShareNotification()
                     }
+                    val devIdentity = DeviceIdentity.getOrCreate(applicationContext)
+                    liveScreenHandler.relayMediaSender = { meta, jpegBytes ->
+                        val rc = relayClient
+                        if (rc != null && rc.reachabilityState.value == org.snow.network.ReachabilityState.ONLINE_RELAYED &&
+                            (client.connectionState.value != ConnectionState.CONNECTED ||
+                                DiscoveryManager.isRelayEndpoint(client.currentTargetHost))
+                        ) {
+                            rc.sendScreenFrame(meta, jpegBytes)
+                        } else false
+                    }
                     val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
-                    liveScreenHandler.startStreaming(projection, host, 8766)
+                    if (client.connectionState.value == ConnectionState.CONNECTED &&
+                        client.authState.value is AuthState.Authenticated
+                    ) {
+                        client.sendRequest(
+                            action = "screen_stream_start",
+                            data = mapOf(
+                                "sender_name" to (android.os.Build.MODEL ?: devIdentity.deviceName),
+                                "sender_platform" to "android",
+                                "target_device_ids" to targetIds
+                            )
+                        ) {}
+                    }
+                    liveScreenHandler.startStreaming(
+                        projection = projection,
+                        serverHost = host,
+                        transferPort = 8766,
+                        targetIds = targetIds,
+                        senderDeviceId = devIdentity.deviceId,
+                        senderName = (android.os.Build.MODEL ?: devIdentity.deviceName),
+                        initialViewerCount = 1
+                    )
                 } else {
                     org.snow.security.SafeLog.w("SnowForegroundService", "MediaProjection is null after elevation, cannot start screen share.")
                     demoteScreenShareNotification()
@@ -506,11 +556,17 @@ class SnowForegroundService : Service() {
                         updateNotification("Connecting...")
                     }
                     ConnectionState.CONNECTED -> {
-                        if (auth is AuthState.Authenticated) {
+                        if (DiscoveryManager.shouldPauseDiscovery(state, auth, client.currentTargetHost)) {
                             discoveryManager.stopListening()
+                            if (relayClient != null) {
+                                SafeLog.i("SnowForegroundService", "Local route authenticated; retiring redundant relay tunnel.")
+                                stopRelay()
+                            }
                             updateNotification("Connected to desktop")
                         } else if (auth is AuthState.ConnectedUnauthenticated) {
                             updateNotification("Connected — awaiting pairing...")
+                        } else if (auth is AuthState.Authenticated) {
+                            updateNotification("Connected via remote relay")
                         } else {
                             updateNotification("Authenticating...")
                         }
@@ -526,17 +582,43 @@ class SnowForegroundService : Service() {
         }
     }
 
+    fun promoteLocalRouteFromDiscoveryIfAvailable(): Boolean {
+        if (userDisconnected) return false
+        val currentHost = client.currentTargetHost.trim().lowercase()
+        if (currentHost in setOf("127.0.0.1", "localhost", "::1")) {
+            return false
+        }
+        val candidate = discoveryManager.getCandidateForPairedDesktop() ?: return false
+        val isLocalAuth = client.connectionState.value == ConnectionState.CONNECTED &&
+            client.authState.value is AuthState.Authenticated &&
+            !DiscoveryManager.isRelayEndpoint(client.currentTargetHost) &&
+            client.currentTargetHost == candidate.ipAddress &&
+            client.currentTargetPort == candidate.port
+        if (isLocalAuth) {
+            return false
+        }
+        // Keep relay alive until the promoted local route completes authentication.
+        if (client.connectionState.value == ConnectionState.DISCONNECTED ||
+            DiscoveryManager.isRelayEndpoint(client.currentTargetHost)
+        ) {
+            client.connect(candidate.ipAddress, candidate.port)
+        } else {
+            client.updateTargetEndpoint(candidate.ipAddress, candidate.port)
+        }
+        return true
+    }
+
     private fun startObservingDiscovery() {
         discoveryObserverJob?.cancel()
         discoveryObserverJob = serviceScope.launch {
             discoveryManager.peers.collectLatest { _ ->
-                val currentHost = client.currentTargetHost.trim().lowercase()
-                if (currentHost in setOf("127.0.0.1", "localhost", "::1")) {
-                    return@collectLatest
-                }
-                val candidate = discoveryManager.getCandidateForPairedDesktop()
-                if (candidate != null) {
-                    client.updateTargetEndpoint(candidate.ipAddress, candidate.port)
+                if (!DiscoveryManager.shouldPauseDiscovery(
+                        client.connectionState.value,
+                        client.authState.value,
+                        client.currentTargetHost
+                    )
+                ) {
+                    promoteLocalRouteFromDiscoveryIfAvailable()
                 }
             }
         }
@@ -669,6 +751,7 @@ class SnowForegroundService : Service() {
                 SafeLog.i("SnowForegroundService", "Connected via UDP discovery.")
                 return@launch
             }
+            discoveryManager.stopListening()
 
             if (userDisconnected) return@launch
 
@@ -853,6 +936,7 @@ class SnowForegroundService : Service() {
         const val EXTRA_PORT = "org.snow.extra.PORT"
         const val EXTRA_RESULT_CODE = "org.snow.extra.RESULT_CODE"
         const val EXTRA_RESULT_DATA = "org.snow.extra.RESULT_DATA"
+        const val EXTRA_TARGET_IDS = "org.snow.extra.TARGET_IDS"
 
         @Volatile
         var isUserDisconnected: Boolean = false
@@ -912,11 +996,19 @@ class SnowForegroundService : Service() {
             context.startService(intent)
         }
 
-        fun startScreenShare(context: Context, resultCode: Int, data: Intent) {
+        fun startScreenShare(
+            context: Context,
+            resultCode: Int,
+            data: Intent,
+            targetDeviceIds: List<String> = emptyList()
+        ) {
             val intent = Intent(context, SnowForegroundService::class.java).apply {
                 action = ACTION_START_SCREEN_SHARE
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_RESULT_DATA, data)
+                if (targetDeviceIds.isNotEmpty()) {
+                    putStringArrayListExtra(EXTRA_TARGET_IDS, ArrayList(targetDeviceIds))
+                }
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)

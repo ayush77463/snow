@@ -90,12 +90,14 @@ class SnowHttpTransferServer:
         self.app.router.add_get("/api/v1/transfers/download/{transfer_id}", self.handle_download)
         self.app.router.add_post("/api/v1/transfers/{transfer_id}/cancel", self.handle_cancel)
 
-        # Screen streaming routes (Phase 26A)
+        # Screen streaming routes (Phase 26A / Stage 6C any-to-any multi-sender)
         self.app.router.add_post("/api/v1/screen/frame", self.handle_screen_frame)
         self.app.router.add_get("/api/v1/screen/status", self.handle_screen_status)
+        self.app.router.add_get("/api/v1/screen/senders", self.handle_screen_senders)
         self.app.router.add_get("/api/v1/screen/frame", self.handle_get_screen_frame)
         self.app.router.add_post("/api/v1/screen/start", self.handle_screen_start)
         self.app.router.add_post("/api/v1/screen/stop", self.handle_screen_stop)
+        self.app.router.add_post("/api/v1/screen/subscribe", self.handle_screen_subscribe)
         self.app.router.add_get("/api/v1/desktop/wallpaper", self.handle_desktop_wallpaper)
 
         # Direct Signed APK update routes (Port 8766)
@@ -578,74 +580,246 @@ class SnowHttpTransferServer:
         fps: float = 2.0,
         width: int = 720,
         height: int = 1280,
+        sender_name: Optional[str] = None,
+        sender_platform: Optional[str] = None,
+        target_device_ids: Optional[list[str]] = None,
+        sender_network_id: Optional[str] = None,
+        route_badge: Optional[str] = None,
     ) -> None:
-        """Update or register screen streaming session state for a device."""
+        """Update or register screen streaming session state for a sender device."""
         if not device_id or device_id == "all":
             for sess in cls._screen_sessions.values():
                 sess["state"] = state
-                if state == "STOPPED":
+                if state in ("STOPPED", "REVOKED", "IDLE"):
                     sess.pop("frame_bytes", None)
+                    sess["frame_size"] = 0
             return
 
-        sess = cls._screen_sessions.setdefault(device_id, {})
+        sess = cls._screen_sessions.setdefault(device_id, {"device_id": device_id, "sender_device_id": device_id})
+        sess["device_id"] = device_id
+        sess["sender_device_id"] = device_id
         sess["state"] = state
         if session_id:
+            if sess.get("session_id") != session_id:
+                sess["frame_seq"] = 0
             sess["session_id"] = session_id
+        if sender_name:
+            sess["sender_name"] = sender_name
+        if sender_platform:
+            sess["sender_platform"] = sender_platform
+        if sender_network_id is not None:
+            sess["sender_network_id"] = sender_network_id
+        if target_device_ids is not None:
+            sess["target_device_ids"] = [str(t) for t in target_device_ids if str(t or "").strip()]
+        if route_badge:
+            sess["route_badge"] = route_badge
         sess["fps"] = fps
         sess["frame_width"] = width
         sess["frame_height"] = height
         sess["timestamp"] = time.time()
-        if state == "STOPPED":
+        if state in ("STOPPED", "REVOKED", "IDLE"):
             sess.pop("frame_bytes", None)
+            sess["frame_size"] = 0
 
     @classmethod
-    def get_latest_screen_frame(cls, device_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Retrieve the latest frame dictionary for a device or the single active stream."""
-        if device_id and device_id in cls._screen_sessions:
-            sess = cls._screen_sessions[device_id]
-            if sess.get("frame_bytes"):
+    def publish_screen_frame(
+        cls,
+        sender_device_id: str,
+        frame_bytes: bytes,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Publish a bounded frame for a specific sender without cross-sender mixing."""
+        if not sender_device_id or not frame_bytes or len(frame_bytes) > MAX_SCREEN_FRAME_BYTES:
+            return False
+        m = meta or {}
+        sess = cls._screen_sessions.get(sender_device_id, {})
+        incoming_session = str(m.get("session_id") or sess.get("session_id") or str(uuid.uuid4()))
+        try:
+            incoming_seq = int(m.get("frame_seq") or 0)
+        except (TypeError, ValueError):
+            incoming_seq = 0
+        current_seq = int(sess.get("frame_seq") or 0)
+        if incoming_seq > 0 and sess.get("session_id") == incoming_session and incoming_seq < current_seq:
+            return False  # Drop stale out-of-order frame
+
+        import hashlib
+        frame_sha = str(m.get("frame_sha256") or hashlib.sha256(frame_bytes).hexdigest())
+        now = float(m.get("timestamp") or time.time())
+        targets = m.get("target_device_ids")
+        if targets is not None:
+            clean_targets = [str(t) for t in targets if str(t or "").strip()]
+        else:
+            clean_targets = list(sess.get("target_device_ids") or [])
+
+        cls._screen_sessions[sender_device_id] = {
+            "session_id": incoming_session,
+            "state": "STREAMING",
+            "frame_bytes": frame_bytes,
+            "content_type": "image/jpeg",
+            "frame_width": int(m.get("frame_width") or sess.get("frame_width") or 0),
+            "frame_height": int(m.get("frame_height") or sess.get("frame_height") or 0),
+            "fps": float(m.get("fps") or sess.get("fps") or 2.0),
+            "timestamp": now,
+            "frame_size": len(frame_bytes),
+            "frame_seq": incoming_seq if incoming_seq > 0 else (current_seq + 1),
+            "frame_sha256": frame_sha,
+            "device_id": sender_device_id,
+            "sender_device_id": sender_device_id,
+            "sender_name": m.get("sender_name") or sess.get("sender_name") or sender_device_id,
+            "sender_platform": m.get("sender_platform") or sess.get("sender_platform") or "unknown",
+            "sender_network_id": m.get("sender_network_id") or sess.get("sender_network_id"),
+            "target_device_ids": clean_targets,
+            "route_badge": m.get("route_badge") or sess.get("route_badge") or "",
+        }
+        return True
+
+    @classmethod
+    def _is_requester_allowed_for_session(
+        cls, sess: Dict[str, Any], requester_device_id: Optional[str]
+    ) -> bool:
+        if not requester_device_id or requester_device_id in ("local_dashboard_proxy", "local_dashboard", "anonymous"):
+            return True
+        sender_id = sess.get("sender_device_id") or sess.get("device_id")
+        if requester_device_id == sender_id:
+            return True
+        targets = sess.get("target_device_ids") or []
+        if not targets or "all" in targets:
+            return True
+        return requester_device_id in targets
+
+    @classmethod
+    def revoke_target_from_streams(cls, device_id: str) -> None:
+        """Remove a downgraded/revoked device from all screen streams immediately."""
+        clean_id = (device_id or "").strip()
+        if not clean_id:
+            return
+        for sender_id, sess in list(cls._screen_sessions.items()):
+            if sender_id == clean_id:
+                cls.set_session_state(sender_id, "REVOKED")
+                continue
+            targets = list(sess.get("target_device_ids") or [])
+            if clean_id in targets:
+                remaining = [t for t in targets if t != clean_id]
+                sess["target_device_ids"] = remaining
+                if not remaining:
+                    cls.set_session_state(sender_id, "STOPPED")
+
+    @classmethod
+    def list_active_screen_streams(
+        cls, requester_device_id: Optional[str] = None
+    ) -> list[Dict[str, Any]]:
+        """List active live stream metadata records authorized for requester."""
+        streams: list[Dict[str, Any]] = []
+        for sender_id, sess in cls._screen_sessions.items():
+            if sess.get("state") != "STREAMING":
+                continue
+            if not cls._is_requester_allowed_for_session(sess, requester_device_id):
+                continue
+            streams.append({
+                "sender_device_id": sender_id,
+                "device_id": sender_id,
+                "sender_name": sess.get("sender_name") or sender_id,
+                "sender_platform": sess.get("sender_platform") or "unknown",
+                "sender_network_id": sess.get("sender_network_id"),
+                "session_id": sess.get("session_id"),
+                "state": "STREAMING",
+                "fps": sess.get("fps", 0.0),
+                "frame_width": sess.get("frame_width", 0),
+                "frame_height": sess.get("frame_height", 0),
+                "frame_seq": sess.get("frame_seq", 0),
+                "frame_sha256": sess.get("frame_sha256", ""),
+                "timestamp": sess.get("timestamp", 0.0),
+                "frame_size": sess.get("frame_size", 0),
+                "has_frame": bool(sess.get("frame_bytes")),
+                "target_device_ids": list(sess.get("target_device_ids") or []),
+                "route_badge": sess.get("route_badge") or "",
+            })
+        return streams
+
+    @classmethod
+    def get_latest_screen_frame(
+        cls,
+        device_id: Optional[str] = None,
+        requester_device_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve the latest frame dictionary for a requested sender (isolated per sender)."""
+        if device_id:
+            sess = cls._screen_sessions.get(device_id)
+            if (
+                sess
+                and sess.get("state") == "STREAMING"
+                and sess.get("frame_bytes")
+                and cls._is_requester_allowed_for_session(sess, requester_device_id)
+            ):
                 return sess
+            return None  # Strict sender isolation: never mix another sender's frame
         for sess in cls._screen_sessions.values():
-            if sess.get("state") == "STREAMING" and sess.get("frame_bytes"):
-                return sess
-        for sess in cls._screen_sessions.values():
-            if sess.get("frame_bytes"):
+            if (
+                sess.get("state") == "STREAMING"
+                and sess.get("frame_bytes")
+                and cls._is_requester_allowed_for_session(sess, requester_device_id)
+            ):
                 return sess
         return None
 
     @classmethod
-    def get_screen_stream_status(cls, device_id: Optional[str] = None) -> Dict[str, Any]:
-        """Retrieve the status dictionary of the screen stream."""
-        if device_id and device_id in cls._screen_sessions:
-            sess = cls._screen_sessions[device_id]
-            return {
-                "state": sess.get("state", "IDLE"),
-                "session_id": sess.get("session_id"),
-                "fps": sess.get("fps", 0.0),
-                "frame_width": sess.get("frame_width", 0),
-                "frame_height": sess.get("frame_height", 0),
-                "timestamp": sess.get("timestamp", 0.0),
-                "has_frame": bool(sess.get("frame_bytes")),
-                "frame_size": sess.get("frame_size", 0),
-            }
-        for d_id, sess in cls._screen_sessions.items():
-            if sess.get("state") == "STREAMING":
+    def get_screen_stream_status(
+        cls,
+        device_id: Optional[str] = None,
+        requester_device_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Retrieve the status dictionary of a sender or active live screen streams."""
+        active_senders = cls.list_active_screen_streams(requester_device_id=requester_device_id)
+        if device_id:
+            sess = cls._screen_sessions.get(device_id)
+            if sess and cls._is_requester_allowed_for_session(sess, requester_device_id):
                 return {
-                    "state": "STREAMING",
-                    "device_id": d_id,
+                    "state": sess.get("state", "IDLE"),
+                    "device_id": device_id,
+                    "sender_device_id": device_id,
+                    "sender_name": sess.get("sender_name") or device_id,
+                    "sender_platform": sess.get("sender_platform") or "unknown",
                     "session_id": sess.get("session_id"),
                     "fps": sess.get("fps", 0.0),
                     "frame_width": sess.get("frame_width", 0),
                     "frame_height": sess.get("frame_height", 0),
+                    "frame_seq": sess.get("frame_seq", 0),
+                    "frame_sha256": sess.get("frame_sha256", ""),
                     "timestamp": sess.get("timestamp", 0.0),
                     "has_frame": bool(sess.get("frame_bytes")),
                     "frame_size": sess.get("frame_size", 0),
+                    "target_device_ids": list(sess.get("target_device_ids") or []),
+                    "route_badge": sess.get("route_badge") or "",
+                    "senders": active_senders,
                 }
-        return {"state": "IDLE", "has_frame": False}
+            return {"state": "IDLE", "device_id": device_id, "sender_device_id": device_id, "has_frame": False, "senders": active_senders}
+        if active_senders:
+            first = active_senders[0]
+            return {**first, "senders": active_senders}
+        return {"state": "IDLE", "has_frame": False, "senders": []}
+
+    def _is_screen_authorized(self, device_id: str) -> bool:
+        if not self.config.auth_required or not self.db_manager:
+            return True
+        if not device_id or device_id in ("local_dashboard_proxy", "local_dashboard", "anonymous"):
+            return True
+        if not hasattr(self.db_manager, "get_setting"):
+            return True
+        saved = self.db_manager.get_setting(f"device_profile:{device_id}")
+        if saved is None or not isinstance(saved, str):
+            return True
+        return saved.strip().lower() == "full_control"
 
     async def handle_screen_frame(self, request: web.Request) -> web.Response:
-        """Ingest a bounded JPEG screen frame from an authenticated device."""
-        device_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id", "unknown")
+        """Ingest a bounded JPEG screen frame from an authenticated Full Control device."""
+        requester_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id", "unknown")
+        if not self._is_screen_authorized(requester_id):
+            return web.json_response(
+                {"error": "PERMISSION_DENIED: Screen sharing requires Full Control permission profile."},
+                status=403,
+            )
+
+        sender_id = request.headers.get("X-Snow-Sender-Id") or requester_id
 
         content_type = request.headers.get("Content-Type", "")
         if "image/jpeg" not in content_type.lower() and "image/jpg" not in content_type.lower():
@@ -661,51 +835,108 @@ class SnowHttpTransferServer:
                 status=413,
             )
 
-        session_id = request.headers.get("X-Snow-Session-Id")
-        sess = self._screen_sessions.setdefault(device_id, {})
-        if not session_id:
-            session_id = sess.get("session_id") or str(uuid.uuid4())
-
+        sess = self._screen_sessions.get(sender_id, {})
+        session_id = request.headers.get("X-Snow-Session-Id") or sess.get("session_id") or str(uuid.uuid4())
         try:
-            width = int(request.headers.get("X-Snow-Frame-Width", 0)) or sess.get("frame_width", 0)
-            height = int(request.headers.get("X-Snow-Frame-Height", 0)) or sess.get("frame_height", 0)
-            fps = float(request.headers.get("X-Snow-FPS", 0.0)) or sess.get("fps", 2.0)
+            width = int(request.headers.get("X-Snow-Frame-Width", 0)) or int(sess.get("frame_width", 0))
+            height = int(request.headers.get("X-Snow-Frame-Height", 0)) or int(sess.get("frame_height", 0))
+            fps = float(request.headers.get("X-Snow-FPS", 0.0)) or float(sess.get("fps", 2.0))
+            seq = int(request.headers.get("X-Snow-Frame-Seq", 0)) or (int(sess.get("frame_seq", 0)) + 1)
         except ValueError:
-            width = sess.get("frame_width", 0)
-            height = sess.get("frame_height", 0)
-            fps = sess.get("fps", 2.0)
+            width = int(sess.get("frame_width", 0))
+            height = int(sess.get("frame_height", 0))
+            fps = float(sess.get("fps", 2.0))
+            seq = int(sess.get("frame_seq", 0)) + 1
 
-        now = time.time()
-        self._screen_sessions[device_id] = {
-            "session_id": session_id,
-            "state": "STREAMING",
-            "frame_bytes": body,
-            "content_type": "image/jpeg",
-            "frame_width": width,
-            "frame_height": height,
-            "fps": fps,
-            "timestamp": now,
-            "frame_size": len(body),
-            "device_id": device_id,
-        }
+        raw_targets = request.headers.get("X-Snow-Target-Device-Ids", "")
+        targets = (
+            [t.strip() for t in raw_targets.split(",") if t.strip()]
+            if raw_targets
+            else sess.get("target_device_ids")
+        )
+        sender_name = request.headers.get("X-Snow-Sender-Name") or sess.get("sender_name") or sender_id
+        sender_platform = request.headers.get("X-Snow-Sender-Platform") or sess.get("sender_platform") or "android"
+        route_badge = request.headers.get("X-Snow-Route-Badge") or sess.get("route_badge") or ""
 
+        accepted = self.publish_screen_frame(
+            sender_device_id=sender_id,
+            frame_bytes=body,
+            meta={
+                "session_id": session_id,
+                "frame_width": width,
+                "frame_height": height,
+                "fps": fps,
+                "frame_seq": seq,
+                "sender_name": sender_name,
+                "sender_platform": sender_platform,
+                "target_device_ids": targets,
+                "route_badge": route_badge,
+            },
+        )
+        if not accepted:
+            return web.json_response({"status": "STALE_FRAME_DROPPED"}, status=200)
+
+        saved_sess = self._screen_sessions[sender_id]
         return web.json_response({
             "status": "ACCEPTED",
             "frame_size": len(body),
             "session_id": session_id,
-            "timestamp": now,
+            "frame_seq": saved_sess.get("frame_seq", seq),
+            "sender_device_id": sender_id,
+            "timestamp": saved_sess.get("timestamp", time.time()),
         }, status=200)
 
     async def handle_screen_status(self, request: web.Request) -> web.Response:
         """Query live screen streaming session metadata."""
-        device_id = request.query.get("device_id")
-        status_dict = self.get_screen_stream_status(device_id)
+        requester_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id")
+        if requester_id and not self._is_screen_authorized(requester_id):
+            return web.json_response({"error": "PERMISSION_DENIED"}, status=403)
+        device_id = request.query.get("sender_id") or request.query.get("device_id")
+        status_dict = self.get_screen_stream_status(device_id, requester_device_id=requester_id)
         return web.json_response({"success": True, **status_dict})
 
+    async def handle_screen_senders(self, request: web.Request) -> web.Response:
+        """List active screen streaming senders permitted for requester."""
+        requester_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id")
+        if requester_id and not self._is_screen_authorized(requester_id):
+            return web.json_response({"error": "PERMISSION_DENIED"}, status=403)
+        senders = self.list_active_screen_streams(requester_device_id=requester_id)
+        return web.json_response({"success": True, "senders": senders, "count": len(senders)})
+
+    async def handle_screen_subscribe(self, request: web.Request) -> web.Response:
+        """Register or unregister viewer lease on the local screen stream manager."""
+        requester_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id")
+        if requester_id and not self._is_screen_authorized(requester_id):
+            return web.json_response({"error": "PERMISSION_DENIED"}, status=403)
+        action = "subscribe"
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                action = str(body.get("action") or "subscribe").strip().lower()
+        except Exception:
+            pass
+        mgr = getattr(self, "screen_stream_manager", None)
+        if mgr is not None:
+            if action == "unsubscribe":
+                mgr.remove_viewer(requester_id)
+            else:
+                ok = mgr.add_viewer(requester_id, ttl_seconds=6.0)
+                if not ok:
+                    return web.json_response({"success": False, "error": "PERMISSION_DENIED"}, status=403)
+        return web.json_response({"success": True, "action": action, "device_id": requester_id})
+
     async def handle_get_screen_frame(self, request: web.Request) -> web.Response:
-        """Retrieve the latest live screen JPEG frame."""
-        device_id = request.query.get("device_id")
-        frame_dict = self.get_latest_screen_frame(device_id)
+        """Retrieve the latest live screen JPEG frame for requested sender."""
+        requester_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id")
+        if requester_id and not self._is_screen_authorized(requester_id):
+            return web.json_response({"error": "PERMISSION_DENIED"}, status=403)
+        device_id = request.query.get("sender_id") or request.query.get("device_id")
+        # Renew active viewer lease if local Windows screen streamer is streaming to this viewer
+        mgr = getattr(self, "screen_stream_manager", None)
+        if mgr is not None and (not device_id or device_id == mgr.sender_device_id):
+            if mgr.state == "STREAMING" and requester_id:
+                mgr.add_viewer(requester_id, ttl_seconds=6.0)
+        frame_dict = self.get_latest_screen_frame(device_id, requester_device_id=requester_id)
         if not frame_dict or not frame_dict.get("frame_bytes"):
             return web.Response(status=204)
 
@@ -716,17 +947,27 @@ class SnowHttpTransferServer:
                 "Cache-Control": "no-store, no-cache, must-revalidate",
                 "X-Content-Type-Options": "nosniff",
                 "X-Snow-Session-Id": str(frame_dict.get("session_id", "")),
+                "X-Snow-Sender-Id": str(frame_dict.get("sender_device_id") or frame_dict.get("device_id") or ""),
+                "X-Snow-Sender-Name": str(frame_dict.get("sender_name") or ""),
+                "X-Snow-Frame-Seq": str(frame_dict.get("frame_seq", 0)),
+                "X-Snow-Frame-SHA256": str(frame_dict.get("frame_sha256") or ""),
                 "X-Snow-Timestamp": str(frame_dict.get("timestamp", 0)),
             },
         )
 
     async def handle_screen_start(self, request: web.Request) -> web.Response:
         """Start or register an active screen streaming session."""
-        device_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id", "unknown")
+        requester_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id", "unknown")
+        if not self._is_screen_authorized(requester_id):
+            return web.json_response({"error": "PERMISSION_DENIED"}, status=403)
+        device_id = requester_id
         session_id = str(uuid.uuid4())
         fps = 2.0
         width = 720
         height = 1280
+        sender_name = None
+        sender_platform = None
+        target_device_ids = None
 
         try:
             body = await request.json()
@@ -736,6 +977,9 @@ class SnowHttpTransferServer:
                 fps = float(body.get("fps", fps))
                 width = int(body.get("frame_width", width))
                 height = int(body.get("frame_height", height))
+                sender_name = body.get("sender_name")
+                sender_platform = body.get("sender_platform")
+                target_device_ids = body.get("target_device_ids")
         except Exception:
             pass
 
@@ -746,16 +990,23 @@ class SnowHttpTransferServer:
             fps=fps,
             width=width,
             height=height,
+            sender_name=sender_name,
+            sender_platform=sender_platform,
+            target_device_ids=target_device_ids,
         )
         return web.json_response({
             "status": "STREAMING",
             "session_id": session_id,
+            "device_id": device_id,
             "fps": fps,
         })
 
     async def handle_screen_stop(self, request: web.Request) -> web.Response:
         """Stop an active screen streaming session."""
-        device_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id")
+        requester_id = request.get("device_id") or request.headers.get("X-Snow-Device-Id")
+        if requester_id and not self._is_screen_authorized(requester_id):
+            return web.json_response({"error": "PERMISSION_DENIED"}, status=403)
+        device_id = requester_id
         try:
             body = await request.json()
             if isinstance(body, dict):
@@ -765,7 +1016,7 @@ class SnowHttpTransferServer:
 
         if device_id and device_id in self._screen_sessions:
             self.set_session_state(device_id, "STOPPED")
-        else:
+        elif device_id in (None, "all", "local_dashboard_proxy", "anonymous"):
             for d in list(self._screen_sessions.keys()):
                 self.set_session_state(d, "STOPPED")
         return web.json_response({"status": "STOPPED"})
@@ -854,8 +1105,8 @@ class SnowHttpTransferServer:
         sha256 = h.hexdigest()
         size_bytes = apk_path.stat().st_size
 
-        version_name = getattr(self.config, "version", "5.1.0") or "5.1.0"
-        version_code = 3 if version_name.startswith("5.1") else 2
+        version_name = getattr(self.config, "version", "5.2.0") or "5.2.0"
+        version_code = 4 if version_name.startswith("5.2") else (3 if version_name.startswith("5.1") else 2)
 
         name_match = _re.search(r"SNOW-Mobile-(\d+)\.(\d+)\.(\d+)\.apk$", apk_path.name, _re.IGNORECASE)
         if name_match:

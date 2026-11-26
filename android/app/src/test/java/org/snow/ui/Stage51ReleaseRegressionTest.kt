@@ -100,10 +100,10 @@ class Stage51ReleaseRegressionTest {
     @Test
     fun testWorkstream12VersionCode3And510() {
         val gradleSrc = resolveModuleFile("build.gradle.kts").readText()
-        assertTrue(gradleSrc.contains("versionCode = 3"))
-        assertTrue(gradleSrc.contains("versionName = \"5.1.0\""))
+        assertTrue(gradleSrc.contains("versionCode = 4"))
+        assertTrue(gradleSrc.contains("versionName = \"5.2.0\""))
 
         val settingsXml = resolveModuleFile("src/main/res/layout/fragment_settings.xml").readText()
-        assertTrue(settingsXml.contains("5.1.0"))
+        assertTrue(settingsXml.contains("5.2.0"))
     }
 }

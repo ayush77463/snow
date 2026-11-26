@@ -62,6 +62,22 @@ class DiscoveryManager(
         const val STALE_TIMEOUT_MS = 10_000L
         const val MAX_TIMESTAMP_DRIFT_SEC = 30.0
 
+        fun isRelayEndpoint(host: String?): Boolean {
+            val h = host?.trim()?.lowercase().orEmpty()
+            return h.contains("relay") || h.contains("tunnel") || h.contains("hub") || h.contains("onrender.com")
+        }
+
+        fun shouldPauseDiscovery(
+            connectionState: ConnectionState,
+            authState: AuthState,
+            targetHost: String?
+        ): Boolean {
+            if (connectionState != ConnectionState.CONNECTED) return false
+            if (authState !is AuthState.Authenticated) return false
+            if (targetHost.isNullOrBlank() || isRelayEndpoint(targetHost)) return false
+            return true
+        }
+
         /**
          * Pure parsing and validation function for an incoming discovery beacon datagram.
          */
@@ -138,7 +154,13 @@ class DiscoveryManager(
      */
     @Synchronized
     fun startListening() {
-        if (isListening) return
+        if (isListening && listenJob?.isActive == true) return
+        listenJob?.cancel()
+        pruneJob?.cancel()
+        try {
+            socket?.close()
+        } catch (_: Exception) {}
+        socket = null
 
         try {
             val sock = DatagramSocket(null).apply {

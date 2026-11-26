@@ -122,6 +122,13 @@ fun SnowApp(
     val desktopWallpaper by repository.desktopWallpaper.collectAsState()
     val activePermissionProfile by repository.permissionProfileState.collectAsState()
     val cameraDelivery by repository.cameraDelivery.collectAsState()
+    val screenShareState by repository.screenShareState.collectAsState()
+    val isScreenSharing = screenShareState == org.snow.capabilities.LiveScreenStreamHandler.StreamState.STREAMING
+    val incomingStreams by repository.incomingScreenStreams.collectAsState()
+    val selectedIncomingSenderId by repository.selectedIncomingSenderId.collectAsState()
+    val eligibleScreenTargets = remember(savedDevices, connectedEndpoint, authState, activePermissionProfile) {
+        repository.getEligibleScreenTargets()
+    }
 
     // Navigation and Modal Visibility States
     var currentTab by remember { mutableStateOf(SnowTab.HOME) }
@@ -218,7 +225,7 @@ fun SnowApp(
         else "Auto"
     }
 
-    // Refresh files when navigating to Tools Files tab
+    // Refresh files when navigating to Tools Files tab, or screen streams on Screen tab
     LaunchedEffect(currentTab, currentToolSubTab, currentPcPath, connectionState) {
         if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.FILES && connectionState == ConnectionState.CONNECTED) {
             repository.listPcDirectory(currentPcPath) { files, err ->
@@ -226,6 +233,8 @@ fun SnowApp(
                     pcFilesList = files
                 }
             }
+        } else if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.SCREEN && connectionState == ConnectionState.CONNECTED) {
+            repository.refreshIncomingStreamsOnce()
         }
     }
 
@@ -287,17 +296,43 @@ fun SnowApp(
                 .statusBarsPadding()
                 .navigationBarsPadding(),
             topBar = {
-                SnowTopAppBar(
-                    connectionState = connectionState,
-                    connectedDeviceName = activeDeviceName,
-                    transportMode = transport,
-                    unreadApprovalsCount = pendingApprovalsCount,
-                    onCapsuleClick = { showDeviceIsland = true },
-                    onApprovalsClick = {
-                        approvalsInitialTab = 0
-                        showApprovalsSheet = true
+                Column {
+                    SnowTopAppBar(
+                        connectionState = connectionState,
+                        connectedDeviceName = activeDeviceName,
+                        transportMode = transport,
+                        unreadApprovalsCount = pendingApprovalsCount,
+                        onCapsuleClick = { showDeviceIsland = true },
+                        onApprovalsClick = {
+                            approvalsInitialTab = 0
+                            showApprovalsSheet = true
+                        }
+                    )
+                    if (isScreenSharing) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = colors.accentEmerald.copy(alpha = 0.16f)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Sharing Screen",
+                                    style = SnowTypography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                    color = colors.accentEmerald
+                                )
+                                SnowOutlinedButton(
+                                    text = "Stop",
+                                    onClick = { repository.stopScreenShare() }
+                                )
+                            }
+                        }
                     }
-                )
+                }
             },
             bottomBar = {
                 SnowBottomNavigationBar(
@@ -399,7 +434,11 @@ fun SnowApp(
                                         currentTab = SnowTab.TOOLS
                                         currentToolSubTab = ToolSubTab.TERMINAL
                                     }
-                                    "media_screen", "media_camera", "media_control" -> {
+                                    "media_screen" -> {
+                                        currentTab = SnowTab.TOOLS
+                                        currentToolSubTab = ToolSubTab.SCREEN
+                                    }
+                                    "media_camera", "media_control" -> {
                                         currentTab = SnowTab.TOOLS
                                         currentToolSubTab = ToolSubTab.MEDIA
                                     }
@@ -541,6 +580,7 @@ fun SnowApp(
                             onRefresh = {
                                 isDevicesRefreshing = true
                                 repository.refreshPhoneTelemetry()
+                                repository.refreshDiscovery(resumeUdp = true)
                                 if (connectionState == ConnectionState.CONNECTED) {
                                     repository.listFederationGrants { ok, grants, _ ->
                                         if (ok && grants != null) federationGrantsList = grants
@@ -588,7 +628,7 @@ fun SnowApp(
                                     Toast.makeText(context, if (success) "Launched $friendlyName" else "Launch failed: $err", Toast.LENGTH_SHORT).show()
                                 }
                             },
-                            isScreenSharing = repository.screenShareState.collectAsState().value == org.snow.capabilities.LiveScreenStreamHandler.StreamState.STREAMING,
+                            isScreenSharing = isScreenSharing,
                             onToggleScreenShare = { start ->
                                 if (start) {
                                     onToggleScreenShareConsent()
@@ -596,6 +636,16 @@ fun SnowApp(
                                     repository.stopScreenShare()
                                 }
                             },
+                            incomingStreams = incomingStreams,
+                            selectedIncomingSenderId = selectedIncomingSenderId,
+                            onSelectIncomingSender = { senderId -> repository.selectIncomingSender(senderId) },
+                            onCloseIncomingViewer = { repository.closeIncomingViewer() },
+                            eligibleScreenTargets = eligibleScreenTargets,
+                            onStartScreenShareWithTargets = { targetIds ->
+                                repository.setPendingScreenShareTargets(targetIds)
+                                onToggleScreenShareConsent()
+                            },
+                            activePermissionProfile = activePermissionProfile,
                             onTriggerCameraCapture = onLaunchCameraCapture,
                             onSendMediaKey = { key ->
                                 repository.sendMediaKey(key) { success, err ->
@@ -707,7 +757,7 @@ fun SnowApp(
                                 appUpdateStatusText = "Checking..."
                                 repository.checkAppUpdate { info ->
                                     updateInfo = info
-                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v5.1.0 • Up to date"
+                                    appUpdateStatusText = if (info?.available == true) "Update available: v${info.versionName}" else "v5.2.0 • Up to date"
                                 }
                             },
                             updateStatusText = appUpdateStatusText,

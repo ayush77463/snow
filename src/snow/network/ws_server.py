@@ -725,6 +725,12 @@ class SnowWebSocketServer:
                 await self._handle_screen_stream_stop(client, message, data, session)
             elif action == "screen_stream_status":
                 await self._handle_screen_stream_status(client, message, data, session)
+            elif action == "screen_stream_subscribe":
+                await self._handle_screen_stream_subscribe(client, message, data, session, subscribe=True)
+            elif action == "screen_stream_unsubscribe":
+                await self._handle_screen_stream_subscribe(client, message, data, session, subscribe=False)
+            elif action == "screen_stream_senders":
+                await self._handle_screen_stream_senders(client, message, data, session)
             elif action == "camera_photo_delivered":
                 await self._handle_camera_photo_delivered(client, message, data, session)
             elif action == "clipboard_buffer_list":
@@ -769,6 +775,65 @@ class SnowWebSocketServer:
                 )
                 await client.websocket.send(error_response.to_json())
 
+    def _is_device_full_control(self, device_id: Optional[str]) -> bool:
+        """Screen sharing is strictly permitted for Full Control peers only."""
+        clean_id = (device_id or "").strip()
+        if not clean_id:
+            return False
+        if getattr(self, "db_manager", None) is not None and hasattr(self.db_manager, "get_setting"):
+            saved = self.db_manager.get_setting(f"device_profile:{clean_id}")
+            if isinstance(saved, str):
+                return saved.strip().lower() == "full_control"
+        node = None
+        reg = getattr(self, "node_registry", None)
+        if reg is not None and hasattr(reg, "get_node"):
+            node = reg.get_node(clean_id)
+        if node is not None and getattr(node, "permission_profile", None) is not None:
+            return str(node.permission_profile).strip().lower() == "full_control"
+        return True
+
+    async def broadcast_screen_stream_event(
+        self,
+        event_type: str,
+        metadata: dict[str, Any],
+        target_device_ids: Optional[list[str]] = None,
+    ) -> int:
+        """Broadcast metadata-only screen stream lifecycle event (strictly NO image bytes)."""
+        safe_meta = {
+            k: v
+            for k, v in (metadata or {}).items()
+            if k not in ("frame_bytes", "jpeg_bytes", "image_base64", "data_url", "pixels")
+        }
+        allowed_targets = {str(t).strip() for t in (target_device_ids or []) if str(t or "").strip()}
+        sent_count = 0
+        for conn_item in self.connection_manager.all_connections():
+            client = self.connection_manager.get(conn_item) if isinstance(conn_item, str) else conn_item
+            if not client or not getattr(client, "websocket", None) or getattr(client.websocket, "state", 1) != 1:
+                continue
+            conn_id = getattr(client, "connection_id", conn_item)
+            session = self.session_manager.get_session_by_connection(conn_id)
+            if session is None or not getattr(session, "device_id", None):
+                continue
+            dev_id = session.device_id
+            if not self._is_device_full_control(dev_id):
+                continue
+            if allowed_targets and "all" not in allowed_targets and dev_id not in allowed_targets:
+                continue
+
+            push_msg = SnowMessage.create_request(
+                action="screen_stream_event",
+                data={
+                    "event_type": event_type,
+                    **safe_meta,
+                },
+            )
+            try:
+                await client.websocket.send(push_msg.to_json())
+                sent_count += 1
+            except Exception as exc:
+                logger.debug("Failed sending screen_stream_event to [%s]: %s", dev_id, exc)
+        return sent_count
+
     async def _handle_screen_stream_start(
         self,
         client: Any,
@@ -778,13 +843,33 @@ class SnowWebSocketServer:
     ) -> None:
         """Handle control-plane request to start screen streaming. Metadata only (no image bytes)."""
         device_id = session.device_id if session and session.device_id else "unknown"
+        if not self._is_device_full_control(device_id):
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="PERMISSION_DENIED: Screen sharing requires Full Control permission profile.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
         session_id = str(data.get("session_id") or uuid.uuid4())
         fps = float(data.get("fps", 2.0))
         width = int(data.get("frame_width", 720))
         height = int(data.get("frame_height", 1280))
+        raw_sess_name = getattr(session, "device_name", None)
+        session_dev_name = raw_sess_name if isinstance(raw_sess_name, str) else None
+        sender_name = str(data.get("sender_name") or session_dev_name or device_id)
+        sender_platform = str(data.get("sender_platform") or "android")
+        raw_targets = data.get("target_device_ids")
+        target_device_ids = [str(t) for t in raw_targets if str(t or "").strip()] if isinstance(raw_targets, list) else []
 
         self._screen_stream_sessions[device_id] = {
             "session_id": session_id,
+            "device_id": device_id,
+            "sender_device_id": device_id,
+            "sender_name": sender_name,
+            "sender_platform": sender_platform,
+            "target_device_ids": target_device_ids,
             "state": "STREAMING",
             "fps": fps,
             "frame_width": width,
@@ -795,14 +880,21 @@ class SnowWebSocketServer:
         # Sync with HTTP transfer server session state if bound
         if self.http_transfer_server:
             try:
-                self.http_transfer_server.set_session_state(
-                    device_id=device_id,
-                    state="STREAMING",
-                    session_id=session_id,
-                    fps=fps,
-                    width=width,
-                    height=height,
-                )
+                state_kwargs: dict[str, Any] = {
+                    "device_id": device_id,
+                    "state": "STREAMING",
+                    "session_id": session_id,
+                    "fps": fps,
+                    "width": width,
+                    "height": height,
+                }
+                if data.get("sender_name") or session_dev_name:
+                    state_kwargs["sender_name"] = sender_name
+                if data.get("sender_platform"):
+                    state_kwargs["sender_platform"] = sender_platform
+                if target_device_ids:
+                    state_kwargs["target_device_ids"] = target_device_ids
+                self.http_transfer_server.set_session_state(**state_kwargs)
             except Exception as e:
                 logger.debug("Failed notifying http_transfer_server of screen_stream_start: %s", e)
 
@@ -812,12 +904,28 @@ class SnowWebSocketServer:
                 "status": "success",
                 "state": "STREAMING",
                 "session_id": session_id,
+                "sender_device_id": device_id,
                 "fps": fps,
                 "frame_width": width,
                 "frame_height": height,
+                "target_device_ids": target_device_ids,
             },
         )
         await client.websocket.send(response.to_json())
+        if target_device_ids:
+            await self.broadcast_screen_stream_event(
+                "STREAM_AVAILABLE",
+                {
+                    "sender_device_id": device_id,
+                    "sender_name": sender_name,
+                    "sender_platform": sender_platform,
+                    "session_id": session_id,
+                    "fps": fps,
+                    "frame_width": width,
+                    "frame_height": height,
+                },
+                target_device_ids=target_device_ids,
+            )
 
     async def _handle_screen_stream_stop(
         self,
@@ -828,6 +936,15 @@ class SnowWebSocketServer:
     ) -> None:
         """Handle control-plane request to stop screen streaming."""
         device_id = session.device_id if session and session.device_id else "unknown"
+        if not self._is_device_full_control(device_id):
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="PERMISSION_DENIED: Screen sharing requires Full Control permission profile.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
         if device_id in self._screen_stream_sessions:
             self._screen_stream_sessions[device_id]["state"] = "STOPPED"
 
@@ -842,9 +959,14 @@ class SnowWebSocketServer:
             payload={
                 "status": "success",
                 "state": "STOPPED",
+                "sender_device_id": device_id,
             },
         )
         await client.websocket.send(response.to_json())
+        await self.broadcast_screen_stream_event(
+            "STREAM_STOPPED",
+            {"sender_device_id": device_id},
+        )
 
     async def _handle_screen_stream_status(
         self,
@@ -855,13 +977,105 @@ class SnowWebSocketServer:
     ) -> None:
         """Return screen streaming metadata for the session. Strictly metadata only."""
         device_id = session.device_id if session and session.device_id else "unknown"
-        meta = self._screen_stream_sessions.get(device_id, {"state": "IDLE"})
+        if not self._is_device_full_control(device_id):
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="PERMISSION_DENIED: Screen sharing requires Full Control permission profile.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+        sender_id = str(data.get("sender_id") or "") if isinstance(data, dict) else ""
+        if self.http_transfer_server:
+            raw_meta = self.http_transfer_server.get_screen_stream_status(
+                sender_id or None, requester_device_id=device_id
+            )
+            meta = (
+                raw_meta
+                if isinstance(raw_meta, dict)
+                else self._screen_stream_sessions.get(sender_id or device_id, {"state": "IDLE"})
+            )
+        else:
+            meta = self._screen_stream_sessions.get(sender_id or device_id, {"state": "IDLE"})
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
                 "status": "success",
                 "metadata": meta,
             },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_screen_stream_subscribe(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+        subscribe: bool = True,
+    ) -> None:
+        """Subscribe or unsubscribe an authorized Full Control peer viewer on local stream manager."""
+        device_id = session.device_id if session and session.device_id else "unknown"
+        if not self._is_device_full_control(device_id):
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="PERMISSION_DENIED: Screen sharing requires Full Control permission profile.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        mgr = getattr(self, "screen_stream_manager", None)
+        accepted = True
+        if mgr is not None:
+            if subscribe:
+                accepted = mgr.add_viewer(device_id)
+            else:
+                mgr.remove_viewer(device_id)
+        if not accepted:
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="Viewer subscription denied for this stream target list.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "subscribed": bool(subscribe),
+                "device_id": device_id,
+                "viewer_count": mgr.active_viewer_count() if mgr is not None else 0,
+            },
+        )
+        await client.websocket.send(response.to_json())
+
+    async def _handle_screen_stream_senders(
+        self,
+        client: Any,
+        message: SnowMessage,
+        data: dict[str, Any],
+        session: Optional[SessionRecord],
+    ) -> None:
+        """List active live screen senders permitted for this authenticated Full Control peer."""
+        device_id = session.device_id if session and session.device_id else "unknown"
+        if not self._is_device_full_control(device_id):
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message="PERMISSION_DENIED: Screen sharing requires Full Control permission profile.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+        senders = (
+            self.http_transfer_server.list_active_screen_streams(requester_device_id=device_id)
+            if self.http_transfer_server
+            else [s for s in self._screen_stream_sessions.values() if s.get("state") == "STREAMING"]
+        )
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={"status": "success", "senders": senders, "count": len(senders)},
         )
         await client.websocket.send(response.to_json())
 

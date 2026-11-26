@@ -48,13 +48,14 @@ class Stage5BAndroidComposeUiTest {
 
     @Test
     fun testToolsSubTabsIntegrity() {
-        // Assert exactly 4 tool sub-screens exist
+        // Assert exactly 5 tool sub-screens exist including Stage 6C Screen tab
         val subTabs = ToolSubTab.values()
-        assertEquals(4, subTabs.size)
+        assertEquals(5, subTabs.size)
         assertEquals(ToolSubTab.FILES, subTabs[0])
         assertEquals(ToolSubTab.APPS, subTabs[1])
         assertEquals(ToolSubTab.MEDIA, subTabs[2])
         assertEquals(ToolSubTab.TERMINAL, subTabs[3])
+        assertEquals(ToolSubTab.SCREEN, subTabs[4])
     }
 
     @Test

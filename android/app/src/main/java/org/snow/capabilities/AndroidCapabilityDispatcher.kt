@@ -519,6 +519,16 @@ class AndroidCapabilityDispatcher(
                 org.snow.service.SnowForegroundService.stopScreenShare(context)
                 Pair(mapOf("status" to "success", "action" to "screen_stream_stop"), null)
             }
+            "screen_stream_event" -> {
+                try {
+                    org.snow.ui.SnowUiRepository.getInstance(context).onScreenStreamEvent(data ?: emptyMap())
+                } catch (_: Exception) {}
+                Pair(mapOf("status" to "success", "action" to "screen_stream_event"), null)
+            }
+            "screen_stream_status" -> {
+                val active = org.snow.ui.SnowUiRepository.getInstance(context).screenShareState.value
+                Pair(mapOf("status" to "success", "state" to active.name), null)
+            }
             "approval_event" -> {
                 val eventType = data?.get("event_type") as? String ?: ""
                 val appReq = data?.get("request") as? Map<*, *>

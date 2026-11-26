@@ -16,11 +16,65 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 from typing import Optional
 import urllib.request
+import zipfile
+
+# Web UI static asset allowlist & required core assets (kept in sync with snow.updater)
+ALLOWED_WEB_EXTENSIONS = {
+    ".html", ".css", ".js", ".svg", ".png",
+    ".jpg", ".jpeg", ".ico", ".woff", ".woff2",
+}
+REQUIRED_WEB_ASSETS = ("index.html", "app.js", "app.css", "tokens.css", "theme-init.js")
+
+
+def _read_android_version_code(repo_root: Path, rel_ver: str) -> int:
+    """Parse versionCode from android/app/build.gradle.kts with deterministic fallback."""
+    gradle_file = repo_root / "android" / "app" / "build.gradle.kts"
+    if gradle_file.is_file():
+        m = re.search(r"\bversionCode\s*=\s*(\d+)", gradle_file.read_text(encoding="utf-8"))
+        if m:
+            return int(m.group(1))
+    if rel_ver.startswith("5.2"):
+        return 4
+    if rel_ver.startswith("5.1"):
+        return 3
+    return 2
+
+
+def build_web_ui_archive(static_dir: Path, zip_path: Path) -> Path:
+    """Package static Web UI assets into a validated ZIP matching snow.updater rules."""
+    static_root = static_dir.resolve()
+    if not static_root.is_dir():
+        raise FileNotFoundError(f"Static Web UI directory not found: {static_root}")
+
+    for req in REQUIRED_WEB_ASSETS:
+        req_file = static_root / req
+        if not req_file.is_file() or req_file.stat().st_size == 0:
+            raise FileNotFoundError(f"Required Web UI asset missing or empty: {req_file}")
+
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_zip = zip_path.with_suffix(".zip.tmp")
+    if tmp_zip.exists():
+        tmp_zip.unlink()
+
+    with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(static_root.rglob("*")):
+            if not file_path.is_file() or file_path.is_symlink():
+                continue
+            if file_path.suffix.lower() not in ALLOWED_WEB_EXTENSIONS:
+                continue
+            rel = file_path.relative_to(static_root).as_posix()
+            if ".." in rel.split("/") or rel.startswith("/"):
+                raise ValueError(f"Unsafe relative asset path: {rel}")
+            zf.write(file_path, arcname=rel)
+
+    os.replace(tmp_zip, zip_path)
+    return zip_path
 
 # Pinned official Cloudflare Windows AMD64 distribution details
 CLOUDFLARED_VERSION: str = "2026.11.2"
@@ -225,13 +279,13 @@ def run_pipeline(
             print(f"[!] Failed staging cloudflared.exe into distribution: {exc}", file=sys.stderr)
             return 1
 
-    # 5b. Stage release-signed Android APK and OTA manifest into frozen bundle when available
+    # 5b. Stage release-signed Android APK and Web UI update archive
     sys.path.insert(0, str(repo_root / "src"))
     try:
         import snow as _snow_pkg
-        rel_ver = getattr(_snow_pkg, "__version__", "5.1.0")
+        rel_ver = getattr(_snow_pkg, "__version__", "5.2.0")
     except Exception:
-        rel_ver = "5.1.0"
+        rel_ver = "5.2.0"
 
     staged_apk = output_dir / f"SNOW-Mobile-{rel_ver}.apk"
     if not staged_apk.is_file():
@@ -264,7 +318,11 @@ def run_pipeline(
                 return iscc_res.returncode
             print(f"[+] SNOW Windows Installer successfully generated in: {output_dir}")
 
-    # 7. Write/update OTA manifest when release installer or APK are present
+    # 7. Package validated Web UI bundle and write/update OTA manifest
+    web_ui_zip = output_dir / f"snow-web-ui-{rel_ver}.zip"
+    build_web_ui_archive(repo_root / "src" / "snow" / "web" / "static", web_ui_zip)
+    print(f"[+] Packaged Web UI update archive: {web_ui_zip}")
+
     import json
     manifest: dict[str, object] = {
         "version": rel_ver,
@@ -273,25 +331,34 @@ def run_pipeline(
     setup_exe = output_dir / f"SNOW-Setup-{rel_ver}.exe"
     if setup_exe.is_file():
         manifest["desktop"] = {
-            "url": f"https://github.com/ayush/snow/releases/download/v{rel_ver}/{setup_exe.name}",
+            "url": f"https://github.com/ayush77463/snow/releases/download/v{rel_ver}/{setup_exe.name}",
             "filename": setup_exe.name,
             "sha256": compute_file_sha256(setup_exe),
             "size_bytes": setup_exe.stat().st_size,
         }
+    if web_ui_zip.is_file():
+        manifest["web_ui"] = {
+            "url": f"https://github.com/ayush77463/snow/releases/download/v{rel_ver}/{web_ui_zip.name}",
+            "filename": web_ui_zip.name,
+            "sha256": compute_file_sha256(web_ui_zip),
+            "size_bytes": web_ui_zip.stat().st_size,
+        }
     if staged_apk.is_file():
         manifest["android"] = {
-            "version_code": 3 if rel_ver.startswith("5.1") else 2,
+            "version_code": _read_android_version_code(repo_root, rel_ver),
             "version_name": rel_ver,
             "apk_name": staged_apk.name,
             "sha256": compute_file_sha256(staged_apk),
             "size_bytes": staged_apk.stat().st_size,
         }
-    if "desktop" in manifest or "android" in manifest:
+    if "desktop" in manifest or "web_ui" in manifest or "android" in manifest:
         manifest_path = output_dir / "update_manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         print(f"[+] Wrote OTA manifest: {manifest_path}")
-        if (dist_snow_dir / "packaging" / "output").is_dir():
-            shutil.copy2(manifest_path, dist_snow_dir / "packaging" / "output" / "update_manifest.json")
+        if dist_snow_dir.is_dir():
+            dist_out_dir = dist_snow_dir / "packaging" / "output"
+            dist_out_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(manifest_path, dist_out_dir / "update_manifest.json")
     return 0
 
 

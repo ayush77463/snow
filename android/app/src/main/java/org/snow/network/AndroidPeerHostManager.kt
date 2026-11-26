@@ -55,6 +55,7 @@ class AndroidPeerHostManager {
     private val hostModeSettingEnabled = AtomicBoolean(false)
     private val isRunning = AtomicBoolean(false)
     private var server: AndroidPeerHostServer? = null
+    private var mediaServer: AndroidPeerMediaServer? = null
     private var currentEphemeralPin: EphemeralPin? = null
     private val secureRandom = java.security.SecureRandom()
 
@@ -203,7 +204,8 @@ class AndroidPeerHostManager {
         localDeviceId: String,
         manifestProvider: () -> Map<String, Any?> = { emptyMap() },
         peerTokenValidator: ((String) -> Boolean)? = null,
-        parentScope: CoroutineScope? = null
+        parentScope: CoroutineScope? = null,
+        mediaPort: Int = 0
     ): Boolean {
         if (!hostModeSettingEnabled.get()) {
             SafeLog.w(
@@ -246,6 +248,18 @@ class AndroidPeerHostManager {
             server = newServer
             activePort = newServer.boundPort
             isRunning.set(true)
+            if (mediaPort > 0) {
+                val ms = AndroidPeerMediaServer(
+                    requestedPort = mediaPort,
+                    sslContext = certResult.sslContext,
+                    tokenStorage = tokenStorage,
+                    peerTokenValidator = peerTokenValidator,
+                    activeProfileProvider = { dispatcher.activePermissionProfile }
+                )
+                if (ms.start()) {
+                    mediaServer = ms
+                }
+            }
             val ip = getLocalIpv4Address() ?: "127.0.0.1"
             _hostState.value = PeerHostState(
                 isActive = true,
@@ -279,6 +293,10 @@ class AndroidPeerHostManager {
             return
         }
         SafeLog.i(TAG, "Disabling foreground peer host mode...")
+        try {
+            mediaServer?.stop()
+        } catch (_: Exception) {}
+        mediaServer = null
         try {
             server?.stop()
         } catch (e: Exception) {

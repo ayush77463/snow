@@ -72,7 +72,7 @@ sealed class AuthState {
  */
 class SnowWebSocketClient(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
-    private val backoffPolicy: BackoffPolicy = BackoffPolicy(),
+    private val backoffPolicy: BackoffPolicy = BackoffPolicy.batterySchedule(maxJitterMs = 0L),
     var certPinStorage: CertPinStorage? = null,
     var tokenStorage: TokenStorage? = null,
     var identity: DeviceIdentity? = null,
@@ -126,6 +126,7 @@ class SnowWebSocketClient(
         peerDeviceId: String? = null,
         peerSnowId: String? = null
     ) {
+        backoffPolicy.reset()
         _authState.value = AuthState.Authenticated(
             sessionId,
             trustTier,
@@ -463,12 +464,18 @@ class SnowWebSocketClient(
         )
     }
 
+    @Synchronized
     private fun scheduleReconnection() {
         if (userInitiatedDisconnect.get() || !autoReconnectEnabled) {
             if (!autoReconnectEnabled) {
                 log("Auto-reconnect disabled; staying disconnected.")
                 _connectionState.value = ConnectionState.DISCONNECTED
             }
+            return
+        }
+
+        // Prevent duplicate concurrent reconnect loops
+        if (reconnectJob?.isActive == true) {
             return
         }
 
@@ -482,10 +489,11 @@ class SnowWebSocketClient(
             return
         }
 
-        if (backoffPolicy.currentAttempt >= MAX_CONNECT_RETRIES) {
-            log("Maximum connection retries ($MAX_CONNECT_RETRIES) reached. Stopping auto-reconnect.")
+        val maxAttempts = maxOf(MAX_CONNECT_RETRIES, backoffPolicy.scheduleStepCount())
+        if (backoffPolicy.currentAttempt >= maxAttempts) {
+            log("Maximum connection retries ($maxAttempts) reached. Stopping auto-reconnect.")
             _connectionState.value = ConnectionState.DISCONNECTED
-            _authState.value = AuthState.AuthFailed("Connection retry limit reached ($MAX_CONNECT_RETRIES attempts).")
+            _authState.value = AuthState.AuthFailed("Connection retry limit reached ($maxAttempts attempts).")
             reconnectJob?.cancel()
             reconnectJob = null
             return
@@ -493,7 +501,7 @@ class SnowWebSocketClient(
 
         _connectionState.value = ConnectionState.RECONNECTING
         val delayMs = backoffPolicy.nextDelayMs()
-        log("Reconnecting in ${delayMs}ms (attempt #${backoffPolicy.currentAttempt}/$MAX_CONNECT_RETRIES) ...")
+        log("Reconnecting in ${delayMs}ms (attempt #${backoffPolicy.currentAttempt}/$maxAttempts) ...")
 
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
@@ -565,9 +573,8 @@ class SnowWebSocketClient(
             }
 
             _connectionState.value = ConnectionState.CONNECTED
-            backoffPolicy.reset()
             val scheme = if (useTls) "wss" else "ws"
-            log("Connected to $scheme://$targetHost:$targetPort")
+            log("Connected to $scheme://$targetHost:$targetPort (awaiting authentication before resetting backoff)")
             lastAckTimestamp = System.currentTimeMillis()
             startHeartbeatLoop()
 
@@ -703,6 +710,7 @@ class SnowWebSocketClient(
                         ?: (manifest?.get("device_id") as? String)
                     val peerSnowId = (data?.get("snow_id") as? String)
                         ?: (manifest?.get("snow_id") as? String)
+                    backoffPolicy.reset()
                     _authState.value = AuthState.Authenticated(
                         sessionId = sessionId,
                         trustTier = trustTier,

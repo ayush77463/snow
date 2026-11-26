@@ -25,6 +25,7 @@ VALID_LOG_LEVELS: FrozenSet[str] = frozenset(
     {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 )
 _LOOPBACK_HUB_HOSTS: FrozenSet[str] = frozenset({"127.0.0.1", "localhost", "::1"})
+DEFAULT_BUILTIN_HUB_URL: str = "https://snow-relay.onrender.com"
 
 
 def validate_hub_url(url: str, allow_dev_loopback: Optional[bool] = None) -> str:
@@ -77,18 +78,31 @@ def resolve_default_hub_url(
     explicit: Optional[str] = None,
     allow_dev_loopback: Optional[bool] = None,
 ) -> str:
-    """Resolve and validate configured hub URL from explicit override, DB setting, or SNOW_DEFAULT_HUB_URL."""
-    candidates: list[Optional[str]] = [explicit]
+    """Resolve and validate the SNOW Hub URL with deterministic precedence.
+
+    Precedence order (highest to lowest):
+      1. Explicit caller argument (``explicit``) when non-empty.
+      2. Persisted user setting (``db_manager.get_setting("default_hub_url")``) so custom
+         Advanced Settings choices survive upgrades untouched.
+      3. Process environment override (``SNOW_DEFAULT_HUB_URL``).
+      4. Built-in production Render Hub default (``DEFAULT_BUILTIN_HUB_URL``).
+    """
+    if isinstance(explicit, str) and explicit.strip():
+        return validate_hub_url(explicit.strip(), allow_dev_loopback=allow_dev_loopback)
     if db_manager is not None and hasattr(db_manager, "get_setting"):
         try:
-            candidates.append(db_manager.get_setting("default_hub_url", ""))
+            persisted = db_manager.get_setting("default_hub_url", "")
+            if isinstance(persisted, str) and persisted.strip():
+                try:
+                    return validate_hub_url(persisted.strip(), allow_dev_loopback=allow_dev_loopback)
+                except ValueError as exc:
+                    logger.warning("Ignoring invalid persisted default_hub_url setting: %s", exc)
         except Exception:
             pass
-    candidates.append(os.getenv("SNOW_DEFAULT_HUB_URL", ""))
-    for raw in candidates:
-        if isinstance(raw, str) and raw.strip():
-            return validate_hub_url(raw.strip(), allow_dev_loopback=allow_dev_loopback)
-    return ""
+    env_hub = os.getenv("SNOW_DEFAULT_HUB_URL", "")
+    if isinstance(env_hub, str) and env_hub.strip():
+        return validate_hub_url(env_hub.strip(), allow_dev_loopback=allow_dev_loopback)
+    return DEFAULT_BUILTIN_HUB_URL
 
 
 @dataclass(frozen=True)
@@ -99,7 +113,7 @@ class CoreConfig:
     """
 
     app_name: str = "SNOW Desktop Core"
-    version: str = "5.1.0"
+    version: str = "5.2.0"
     bind_host: str = "0.0.0.0"
     port: int = 8765
     log_level: str = "INFO"
@@ -126,7 +140,7 @@ class CoreConfig:
     relay_url: str = ""
     relay_group_id: str = ""
     relay_ticket: str = ""
-    default_hub_url: str = ""
+    default_hub_url: str = DEFAULT_BUILTIN_HUB_URL
     staged_apk_path: str | None = None
 
     def __post_init__(self) -> None:
@@ -532,7 +546,11 @@ class CoreConfig:
         relay_group_id = os.getenv("SNOW_RELAY_GROUP_ID", "").strip()
         relay_ticket = os.getenv("SNOW_RELAY_TICKET", "").strip()
         raw_default_hub = os.getenv("SNOW_DEFAULT_HUB_URL", "").strip()
-        default_hub_url = validate_hub_url(raw_default_hub) if raw_default_hub else ""
+        default_hub_url = (
+            validate_hub_url(raw_default_hub)
+            if raw_default_hub
+            else DEFAULT_BUILTIN_HUB_URL
+        )
 
         return cls(
             app_name=app_name,

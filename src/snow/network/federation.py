@@ -86,6 +86,12 @@ FEDERATION_TIER_CAPABILITIES: dict[str, tuple[str, ...]] = {
         "android_ring",
         "media_control",
         "share_link",
+        "screen_share",
+        "screen_stream_start",
+        "screen_stream_stop",
+        "screen_stream_subscribe",
+        "windows_screen_share",
+        "android_screen_share",
     ),
     "files_and_clipboard": (
         "android.status",
@@ -146,7 +152,7 @@ FEDERATION_CAPABILITY_ALIAS_TO_ACTION: dict[str, str] = {
 }
 
 _FED_TIER_ALLOWED_CATEGORIES: dict[str, frozenset[str]] = {
-    "full_control": frozenset({"telemetry", "clipboard", "files", "apps", "execution", "media", "system"}),
+    "full_control": frozenset({"telemetry", "clipboard", "files", "apps", "execution", "media", "screen", "system"}),
     "files_and_clipboard": frozenset({"telemetry", "clipboard", "files"}),
     "files_only": frozenset({"telemetry", "files"}),
     "clipboard_only": frozenset({"telemetry", "clipboard"}),
@@ -184,6 +190,12 @@ _FED_CAPABILITY_CATEGORY: dict[str, str] = {
     "android_notification_reply": "system",
     "android_whatsapp_send": "system",
     "android_dnd_toggle": "system",
+    "screen_share": "screen",
+    "screen_stream_start": "screen",
+    "screen_stream_stop": "screen",
+    "screen_stream_subscribe": "screen",
+    "windows_screen_share": "screen",
+    "android_screen_share": "screen",
 }
 
 # Centralized destructive and administrative capability denylist for cross-network federation (Repair 1)

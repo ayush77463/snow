@@ -195,14 +195,16 @@ class ScreenCaptureHandler(
             }
         }
 
+        var imageReader: android.media.ImageReader? = null
+        var virtualDisplay: android.hardware.display.VirtualDisplay? = null
         return try {
             // Android 14+ (API 34+) strictly requires a registered callback before createVirtualDisplay
             proj.registerCallback(projectionCallback, null)
 
-            val imageReader = android.media.ImageReader.newInstance(
+            imageReader = android.media.ImageReader.newInstance(
                 width, height, android.graphics.PixelFormat.RGBA_8888, 2
             )
-            val virtualDisplay = proj.createVirtualDisplay(
+            virtualDisplay = proj.createVirtualDisplay(
                 "SnowScreenCapture",
                 width,
                 height,
@@ -216,34 +218,56 @@ class ScreenCaptureHandler(
             // Allow short frame draw cycle
             Thread.sleep(100)
             val image = imageReader.acquireLatestImage()
-            val bitmap = if (image != null) {
-                val planes = image.planes
-                val buffer = planes[0].buffer
-                val pixelStride = planes[0].pixelStride
-                val rowStride = planes[0].rowStride
-                val rowPadding = rowStride - pixelStride * width
-                val bmp = Bitmap.createBitmap(
-                    width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888
-                )
-                bmp.copyPixelsFromBuffer(buffer)
-                image.close()
-                bmp
+            if (image != null) {
+                var rawBmp: Bitmap? = null
+                try {
+                    val planes = image.planes
+                    if (planes.isEmpty()) return null
+                    val buffer = planes[0].buffer
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+                    val rowPadding = rowStride - pixelStride * width
+                    rawBmp = Bitmap.createBitmap(
+                        width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888
+                    )
+                    rawBmp.copyPixelsFromBuffer(buffer)
+                    val outBmp = if (rowPadding != 0) {
+                        val cropped = Bitmap.createBitmap(rawBmp, 0, 0, width, height)
+                        rawBmp.recycle()
+                        rawBmp = null
+                        cropped
+                    } else {
+                        val b = rawBmp
+                        rawBmp = null
+                        b
+                    }
+                    outBmp
+                } catch (t: Throwable) {
+                    if (rawBmp != null && !rawBmp.isRecycled) {
+                        rawBmp.recycle()
+                    }
+                    throw t
+                } finally {
+                    try {
+                        image.close()
+                    } catch (_: Exception) {}
+                }
             } else {
                 null
             }
-
-            virtualDisplay.release()
-            imageReader.close()
-            try {
-                proj.unregisterCallback(projectionCallback)
-            } catch (_: Exception) {}
-            bitmap
         } catch (e: Exception) {
             SafeLog.e(TAG, "Virtual display capture error: ${e.message}", e)
+            null
+        } finally {
+            try {
+                virtualDisplay?.release()
+            } catch (_: Exception) {}
+            try {
+                imageReader?.close()
+            } catch (_: Exception) {}
             try {
                 proj.unregisterCallback(projectionCallback)
             } catch (_: Exception) {}
-            null
         }
     }
 }

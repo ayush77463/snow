@@ -418,7 +418,7 @@ fun SettingsScreen(
                                 color = colors.textPrimary
                             )
                             Text(
-                                text = updateStatusText.ifBlank { "v5.1.0 • Up to date" },
+                                text = updateStatusText.ifBlank { "v5.2.0 • Up to date" },
                                 style = SnowTypography.bodySmall,
                                 color = colors.textSecondary
                             )

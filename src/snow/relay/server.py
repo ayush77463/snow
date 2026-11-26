@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
+import re
 import secrets
 import ssl
 import time
@@ -17,6 +18,7 @@ import urllib.parse
 import uuid
 
 from aiohttp import web, WSMsgType
+import hmac
 
 from snow.relay.auth import (
     canonical_hub_challenge_message,
@@ -42,8 +44,18 @@ from snow.relay.rendezvous import (
 logger = logging.getLogger(__name__)
 
 MAX_HUB_JSON_BYTES = 16 * 1024
+MAX_RENDEZVOUS_TTL_SECONDS = 120.0
+MAX_RENDEZVOUS_ENTRIES = 512
+MAX_RENDEZVOUS_FAILED_ATTEMPTS = 5
 _ALLOWED_MCP_SUBPATH_PREFIXES = ("mcp/", "oauth/", ".well-known/")
-_ALLOWED_MCP_SUBPATHS_EXACT = frozenset({"mcp", "oauth", "snow_logo.png", "favicon.ico"})
+_ALLOWED_MCP_SUBPATHS_EXACT = frozenset({
+    "mcp",
+    "oauth",
+    "snow_logo.png",
+    "favicon.ico",
+    "icon.png",
+    "apple-touch-icon.png",
+})
 
 
 class _BoundedIpRateLimiter:
@@ -193,12 +205,17 @@ class SnowRelayServer:
         self._hub_challenges: Dict[str, Dict[str, Any]] = {}
         self._hub_sessions: Dict[str, Dict[str, Any]] = {}
         self._network_coordinators: Dict[str, _NetworkCoordinatorState] = {}
+        self._rendezvous_openings: Dict[str, Dict[str, Any]] = {}
+        self._bootstrap_sessions: Dict[str, Dict[str, Any]] = {}
         self._hub_challenge_limiter = _BoundedIpRateLimiter(max_requests=30, window_seconds=60.0)
         self._hub_session_limiter = _BoundedIpRateLimiter(max_requests=30, window_seconds=60.0)
         self._directory_limiter = _BoundedIpRateLimiter(max_requests=60, window_seconds=60.0)
+        self._rendezvous_open_limiter = _BoundedIpRateLimiter(max_requests=20, window_seconds=60.0)
+        self._rendezvous_join_limiter = _BoundedIpRateLimiter(max_requests=20, window_seconds=60.0)
 
     def _build_app(self) -> web.Application:
         app = web.Application(client_max_size=self.config.max_frame_size + 1024)
+        app.router.add_get("/", self.handle_root)
         app.router.add_get("/v1/tunnel", self.handle_tunnel_ws)
         app.router.add_get("/v1/presence", self.handle_get_presence)
         app.router.add_get("/v1/resolve/{snow_id}", self.handle_resolve_snow_id)
@@ -206,6 +223,9 @@ class SnowRelayServer:
         app.router.add_post("/v1/hub/challenge", self.handle_hub_challenge)
         app.router.add_post("/v1/hub/session", self.handle_hub_session)
         app.router.add_post("/v1/hub/revoke", self.handle_hub_revoke)
+        app.router.add_post("/v1/rendezvous/open", self.handle_rendezvous_open)
+        app.router.add_post("/v1/rendezvous/join", self.handle_rendezvous_join)
+        app.router.add_post("/v1/rendezvous/cancel", self.handle_rendezvous_cancel)
         app.router.add_post("/v1/auth/ticket", self.handle_post_ticket)
         app.router.add_post("/v1/revoke", self.handle_post_revoke)
         app.router.add_route("*", "/u/{snow_id}/{subpath:.*}", self.handle_mcp_reverse_proxy)
@@ -215,6 +235,20 @@ class SnowRelayServer:
         app.router.add_get("/health", self.handle_health, allow_head=False)
         app.router.add_head("/health", self.handle_health)
         return app
+
+    async def handle_root(self, request: web.Request) -> web.Response:
+        """Unauthenticated root metadata endpoint for SNOW Relay / Hub."""
+        headers = {"Cache-Control": "no-store"}
+        if request.method == "HEAD":
+            return web.Response(status=200, content_type="application/json", headers=headers)
+        return web.json_response(
+            {
+                "service": "snow-relay",
+                "status": "online",
+                "health": "/health",
+            },
+            headers=headers,
+        )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """Fast unauthenticated UptimeRobot & Render health endpoint (GET/HEAD)."""
@@ -303,6 +337,35 @@ class SnowRelayServer:
             return False, None, "Hub session token has expired or been revoked."
         if required_network_id and sess.get("network_id") != required_network_id.strip().upper():
             return False, None, "Hub session token does not match target network scope."
+        # Periodic cleanup ensures expired rendezvous openings do not remain in memory
+        return True, sess, ""
+
+    @staticmethod
+    def _hash_rendezvous_secret(salt: str, value: str) -> str:
+        return hashlib.sha256(f"{salt}:{value}".encode("utf-8")).hexdigest()
+
+    def _authenticate_bootstrap_session(
+        self,
+        raw_token: str,
+        required_network_id: Optional[str] = None,
+        claimed_device_id: Optional[str] = None,
+    ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        """Validate an ephemeral single-target rendezvous bootstrap token (never grants hub/owner privilege)."""
+        clean = str(raw_token or "").strip()
+        if not clean.startswith("rbs1_") or len(clean) > 256:
+            return False, None, "Invalid bootstrap session token."
+        tok_hash = hashlib.sha256(clean.encode("ascii", errors="ignore")).hexdigest()
+        sess = self._bootstrap_sessions.get(tok_hash)
+        if not sess:
+            return False, None, "Bootstrap session token is invalid or expired."
+        now = time.time()
+        if sess.get("revoked") or now > float(sess.get("expires_at", 0.0)):
+            self._bootstrap_sessions.pop(tok_hash, None)
+            return False, None, "Bootstrap session token has expired or been revoked."
+        if required_network_id and sess.get("network_id") != required_network_id.strip().upper():
+            return False, None, "Bootstrap token network scope mismatch."
+        if claimed_device_id and claimed_device_id != sess.get("client_device_id"):
+            return False, None, "Bootstrap token device scope mismatch."
         return True, sess, ""
 
     def _authenticate_hub_or_control(self, request: web.Request) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
@@ -339,6 +402,26 @@ class SnowRelayServer:
         while len(self._hub_sessions) >= self.config.max_hub_sessions:
             oldest = next(iter(self._hub_sessions))
             self._hub_sessions.pop(oldest, None)
+
+        expired_rdv = [
+            rid for rid, r in self._rendezvous_openings.items()
+            if r.get("revoked") or r.get("consumed") or t > float(r.get("expires_at", 0.0))
+        ]
+        for rid in expired_rdv:
+            self._rendezvous_openings.pop(rid, None)
+        while len(self._rendezvous_openings) >= MAX_RENDEZVOUS_ENTRIES:
+            oldest = next(iter(self._rendezvous_openings))
+            self._rendezvous_openings.pop(oldest, None)
+
+        expired_bs = [
+            bh for bh, b in self._bootstrap_sessions.items()
+            if b.get("revoked") or t > float(b.get("expires_at", 0.0))
+        ]
+        for bh in expired_bs:
+            self._bootstrap_sessions.pop(bh, None)
+        while len(self._bootstrap_sessions) >= self.config.max_hub_sessions:
+            oldest = next(iter(self._bootstrap_sessions))
+            self._bootstrap_sessions.pop(oldest, None)
 
     async def _read_bounded_hub_json(self, request: web.Request) -> Tuple[Optional[Dict[str, Any]], Optional[web.Response]]:
         if request.content_length is not None and request.content_length > MAX_HUB_JSON_BYTES:
@@ -528,6 +611,386 @@ class SnowRelayServer:
         if not sess:
             return web.json_response({"success": False, "error": "Session not found."}, status=401)
         return web.json_response({"success": True, "revoked": True, "network_id": sess["network_id"]})
+
+    async def handle_rendezvous_open(self, request: web.Request) -> web.Response:
+        """Open a short-lived (<=120s), network-scoped rendezvous slot for unpaired remote onboarding."""
+        client_ip = request.remote or "unknown"
+        allowed, retry_after = self._rendezvous_open_limiter.check(client_ip)
+        if not allowed:
+            return web.json_response(
+                {"success": False, "error": "Rate limit exceeded. Retry later."},
+                status=429,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
+
+        auth_header = request.headers.get("Authorization", "").strip()
+        if not auth_header.startswith("Bearer "):
+            return web.json_response(
+                {"success": False, "error": "Authenticated Ed25519 hub session required."},
+                status=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        token = auth_header[7:].strip()
+        ok_hub, hub_sess, hub_err = self._authenticate_hub_session(token)
+        if not ok_hub or not hub_sess:
+            return web.json_response(
+                {"success": False, "error": hub_err or "Unauthorized hub session."},
+                status=401,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        body, err_resp = await self._read_bounded_hub_json(request)
+        if err_resp is not None:
+            return err_resp
+        assert body is not None
+
+        authed_net_id = str(hub_sess["network_id"]).strip().upper()
+        req_net_id = str(body.get("network_id") or authed_net_id).strip().upper()
+        if not is_valid_network_id(req_net_id) or req_net_id != authed_net_id:
+            return web.json_response(
+                {"success": False, "error": "Forbidden: cannot open rendezvous for another network."},
+                status=403,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        sess_dev = str(hub_sess.get("device_id") or "").strip()
+        host_device_id = str(body.get("host_device_id") or sess_dev or "").strip()
+        if not host_device_id or len(host_device_id) > 128 or (sess_dev and host_device_id != sess_dev):
+            return web.json_response(
+                {"success": False, "error": "Forbidden or invalid host_device_id."},
+                status=403,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        mode = str(body.get("mode") or "pairing").strip().lower()
+        if mode not in ("pairing", "federation"):
+            return web.json_response(
+                {"success": False, "error": "mode must be 'pairing' or 'federation'."},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        raw_ttl = body.get("ttl_seconds", MAX_RENDEZVOUS_TTL_SECONDS)
+        if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, (int, float)) or raw_ttl <= 0:
+            return web.json_response(
+                {"success": False, "error": "ttl_seconds must be a positive number (<= 120)."},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        ttl_seconds = min(MAX_RENDEZVOUS_TTL_SECONDS, max(10.0, float(raw_ttl)))
+
+        host_snow_id = str(body.get("host_snow_id") or body.get("snow_id") or hub_sess.get("snow_id") or "").strip().upper()
+        if host_snow_id and not is_valid_snow_id(host_snow_id):
+            return web.json_response(
+                {"success": False, "error": "Invalid host_snow_id format."},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        raw_fp = str(body.get("cert_fingerprint") or "").replace(":", "").replace(" ", "").strip().upper()
+        if raw_fp and (len(raw_fp) != 64 or any(c not in "0123456789ABCDEF" for c in raw_fp)):
+            return web.json_response(
+                {"success": False, "error": "cert_fingerprint must be a 64-char hex SHA-256 fingerprint."},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        salt = secrets.token_hex(16)
+        pin_hash: Optional[str] = None
+        handshake_hash: Optional[str] = None
+        fed_hash: Optional[str] = None
+
+        if mode == "pairing":
+            raw_pin = str(body.get("pin") or "").strip()
+            raw_htok = str(body.get("handshake_token") or "").strip()
+            if raw_pin:
+                if len(raw_pin) != 6 or not raw_pin.isdigit():
+                    return web.json_response(
+                        {"success": False, "error": "Pairing PIN must be exactly 6 digits."},
+                        status=400,
+                        headers={"Cache-Control": "no-store"},
+                    )
+                if not host_snow_id:
+                    return web.json_response(
+                        {"success": False, "error": "host_snow_id is required when opening PIN rendezvous."},
+                        status=400,
+                        headers={"Cache-Control": "no-store"},
+                    )
+                pin_hash = self._hash_rendezvous_secret(salt, raw_pin)
+            if raw_htok:
+                if len(raw_htok) < 16 or len(raw_htok) > 256:
+                    return web.json_response(
+                        {"success": False, "error": "handshake_token must be 16..256 characters."},
+                        status=400,
+                        headers={"Cache-Control": "no-store"},
+                    )
+                handshake_hash = self._hash_rendezvous_secret(salt, raw_htok)
+            if not pin_hash and not handshake_hash:
+                return web.json_response(
+                    {"success": False, "error": "Pairing rendezvous requires 'pin' (with snow_id) or 'handshake_token'."},
+                    status=400,
+                    headers={"Cache-Control": "no-store"},
+                )
+        else:
+            raw_fed = re.sub(r"\D", "", str(body.get("federation_code") or ""))
+            if len(raw_fed) != 9:
+                return web.json_response(
+                    {"success": False, "error": "federation_code must contain exactly 9 digits."},
+                    status=400,
+                    headers={"Cache-Control": "no-store"},
+                )
+            fed_hash = self._hash_rendezvous_secret(salt, raw_fed)
+
+        now = time.time()
+        expires_at = now + ttl_seconds
+        rendezvous_id = f"rdv_{secrets.token_urlsafe(16)}"
+
+        async with self._hub_lock:
+            self._prune_hub_stores_unlocked(now)
+            self._rendezvous_openings[rendezvous_id] = {
+                "rendezvous_id": rendezvous_id,
+                "network_id": authed_net_id,
+                "host_device_id": host_device_id,
+                "host_snow_id": host_snow_id,
+                "host_cert_fingerprint": raw_fp,
+                "mode": mode,
+                "salt": salt,
+                "pin_hash": pin_hash,
+                "handshake_token_hash": handshake_hash,
+                "federation_code_hash": fed_hash,
+                "created_at": now,
+                "expires_at": expires_at,
+                "failed_attempts": 0,
+                "consumed": False,
+                "revoked": False,
+            }
+
+        return web.json_response(
+            {
+                "success": True,
+                "rendezvous_id": rendezvous_id,
+                "network_id": authed_net_id,
+                "host_device_id": host_device_id,
+                "host_snow_id": host_snow_id,
+                "mode": mode,
+                "expires_in": int(round(ttl_seconds)),
+                "expires_at": int(expires_at),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def handle_rendezvous_cancel(self, request: web.Request) -> web.Response:
+        """Cancel an open rendezvous entry cleanly (authenticated owning hub network only)."""
+        auth_header = request.headers.get("Authorization", "").strip()
+        if not auth_header.startswith("Bearer "):
+            return web.json_response({"success": False, "error": "Missing Bearer authorization."}, status=401, headers={"Cache-Control": "no-store"})
+        ok_hub, hub_sess, hub_err = self._authenticate_hub_session(auth_header[7:].strip())
+        if not ok_hub or not hub_sess:
+            return web.json_response({"success": False, "error": hub_err or "Unauthorized."}, status=401, headers={"Cache-Control": "no-store"})
+
+        body, err_resp = await self._read_bounded_hub_json(request)
+        if err_resp is not None:
+            return err_resp
+        assert body is not None
+
+        rdv_id = str(body.get("rendezvous_id") or "").strip()
+        if not rdv_id:
+            return web.json_response({"success": False, "error": "Missing rendezvous_id."}, status=400, headers={"Cache-Control": "no-store"})
+
+        async with self._hub_lock:
+            entry = self._rendezvous_openings.get(rdv_id)
+            if not entry:
+                return web.json_response({"success": False, "error": "Rendezvous entry not found."}, status=404, headers={"Cache-Control": "no-store"})
+            if entry["network_id"] != hub_sess["network_id"]:
+                return web.json_response({"success": False, "error": "Forbidden: rendezvous belongs to another network."}, status=403, headers={"Cache-Control": "no-store"})
+            entry["revoked"] = True
+            self._rendezvous_openings.pop(rdv_id, None)
+
+        return web.json_response({"success": True, "cancelled": True, "rendezvous_id": rdv_id}, headers={"Cache-Control": "no-store"})
+
+    async def handle_rendezvous_join(self, request: web.Request) -> web.Response:
+        """Redeem a short-lived rendezvous credential for scoped ephemeral E2E bootstrap material only.
+
+        CRITICAL: Never completes pairing/trust directly; only issues an ephemeral single-target
+        relay bootstrap token so the joining device and host can run the real E2E TLS-pinned
+        handshake + explicit owner consent flow.
+        """
+        client_ip = request.remote or "unknown"
+        allowed, retry_after = self._rendezvous_join_limiter.check(client_ip)
+        if not allowed:
+            return web.json_response(
+                {"success": False, "error": "Too many rendezvous join attempts. Retry later."},
+                status=429,
+                headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"},
+            )
+
+        body, err_resp = await self._read_bounded_hub_json(request)
+        if err_resp is not None:
+            return err_resp
+        assert body is not None
+
+        client_device_id = str(body.get("client_device_id") or "").strip()
+        if not client_device_id or len(client_device_id) > 128:
+            return web.json_response({"success": False, "error": "Valid client_device_id is required."}, status=400, headers={"Cache-Control": "no-store"})
+
+        req_rdv_id = str(body.get("rendezvous_id") or "").strip()
+        raw_snow_id = str(body.get("snow_id") or "").strip().upper()
+        raw_pin = str(body.get("pin") or "").strip()
+        raw_htok = str(body.get("handshake_token") or "").strip()
+        raw_fed_raw = body.get("federation_code")
+        raw_fed = re.sub(r"\D", "", str(raw_fed_raw)) if raw_fed_raw is not None else ""
+
+        if raw_snow_id and not is_valid_snow_id(raw_snow_id):
+            return web.json_response({"success": False, "error": "Invalid snow_id format."}, status=400, headers={"Cache-Control": "no-store"})
+
+        provided_methods = int(bool(raw_pin)) + int(bool(raw_htok)) + int(bool(raw_fed))
+        if provided_methods != 1:
+            return web.json_response(
+                {"success": False, "error": "Provide exactly one join credential: (snow_id + pin), handshake_token, or federation_code."},
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if raw_pin:
+            if not raw_snow_id or len(raw_pin) != 6 or not raw_pin.isdigit():
+                return web.json_response({"success": False, "error": "PIN onboarding requires valid snow_id and 6-digit pin."}, status=400, headers={"Cache-Control": "no-store"})
+            join_kind = "pin"
+            expected_mode = "pairing"
+        elif raw_htok:
+            if len(raw_htok) < 16 or len(raw_htok) > 256:
+                return web.json_response({"success": False, "error": "Invalid handshake_token format."}, status=400, headers={"Cache-Control": "no-store"})
+            join_kind = "handshake_token"
+            expected_mode = "pairing"
+        else:
+            if len(raw_fed) != 9:
+                return web.json_response({"success": False, "error": "federation_code must contain 9 digits."}, status=400, headers={"Cache-Control": "no-store"})
+            join_kind = "federation_code"
+            expected_mode = "federation"
+
+        now = time.time()
+        matched_snapshot: Optional[Dict[str, Any]] = None
+        bootstrap_token = ""
+        bootstrap_ttl = 120.0
+
+        async with self._hub_lock:
+            self._prune_hub_stores_unlocked(now)
+
+            candidates: List[Dict[str, Any]] = []
+            if req_rdv_id:
+                cand = self._rendezvous_openings.get(req_rdv_id)
+                if cand is not None:
+                    candidates = [cand]
+            else:
+                for cand in self._rendezvous_openings.values():
+                    if expected_mode == "pairing" and join_kind == "pin":
+                        if cand.get("mode") == "pairing" and cand.get("host_snow_id") == raw_snow_id:
+                            candidates.append(cand)
+                    elif expected_mode == "pairing" and join_kind == "handshake_token":
+                        if cand.get("mode") == "pairing" and (not raw_snow_id or cand.get("host_snow_id") == raw_snow_id):
+                            candidates.append(cand)
+                    else:
+                        if cand.get("mode") == "federation":
+                            candidates.append(cand)
+
+            if not candidates:
+                return web.json_response({"success": False, "error": "Rendezvous slot not found, expired, or already used."}, status=401, headers={"Cache-Control": "no-store"})
+
+            saw_scope_mismatch = False
+            saw_lockout = False
+            for entry in candidates:
+                if entry.get("revoked") or entry.get("consumed") or now > float(entry.get("expires_at", 0.0)):
+                    continue
+                if entry.get("mode") != expected_mode:
+                    saw_scope_mismatch = True
+                    continue
+                if raw_snow_id and entry.get("host_snow_id") and entry.get("host_snow_id") != raw_snow_id:
+                    saw_scope_mismatch = True
+                    continue
+
+                salt = str(entry["salt"])
+                verified = False
+                if join_kind == "pin" and entry.get("pin_hash"):
+                    verified = hmac.compare_digest(
+                        self._hash_rendezvous_secret(salt, raw_pin),
+                        str(entry["pin_hash"]),
+                    )
+                elif join_kind == "handshake_token" and entry.get("handshake_token_hash"):
+                    verified = hmac.compare_digest(
+                        self._hash_rendezvous_secret(salt, raw_htok),
+                        str(entry["handshake_token_hash"]),
+                    )
+                elif join_kind == "federation_code" and entry.get("federation_code_hash"):
+                    verified = hmac.compare_digest(
+                        self._hash_rendezvous_secret(salt, raw_fed),
+                        str(entry["federation_code_hash"]),
+                    )
+
+                if verified:
+                    entry["consumed"] = True
+                    self._rendezvous_openings.pop(entry["rendezvous_id"], None)
+                    matched_snapshot = dict(entry)
+                    bootstrap_token = f"rbs1_{secrets.token_urlsafe(32)}"
+                    remaining = max(30.0, min(MAX_RENDEZVOUS_TTL_SECONDS, float(entry["expires_at"]) - now + 30.0))
+                    bootstrap_ttl = remaining
+                    tok_hash = hashlib.sha256(bootstrap_token.encode("ascii")).hexdigest()
+                    self._bootstrap_sessions[tok_hash] = {
+                        "network_id": entry["network_id"],
+                        "host_device_id": entry["host_device_id"],
+                        "client_device_id": client_device_id,
+                        "mode": entry["mode"],
+                        "rendezvous_id": entry["rendezvous_id"],
+                        "created_at": now,
+                        "expires_at": now + bootstrap_ttl,
+                        "revoked": False,
+                    }
+                    break
+                else:
+                    entry["failed_attempts"] = int(entry.get("failed_attempts", 0)) + 1
+                    if entry["failed_attempts"] >= MAX_RENDEZVOUS_FAILED_ATTEMPTS:
+                        entry["revoked"] = True
+                        self._rendezvous_openings.pop(entry["rendezvous_id"], None)
+                        saw_lockout = True
+
+        if not matched_snapshot:
+            if saw_lockout:
+                return web.json_response(
+                    {"success": False, "error": "Rendezvous locked after excessive failed attempts."},
+                    status=429,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if saw_scope_mismatch:
+                return web.json_response(
+                    {"success": False, "error": "Rendezvous mode or target scope mismatch."},
+                    status=403,
+                    headers={"Cache-Control": "no-store"},
+                )
+            return web.json_response(
+                {"success": False, "error": "Rendezvous verification failed."},
+                status=401,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        proto = request.headers.get("X-Forwarded-Proto", request.scheme or "http").split(",")[0].strip()
+        ws_proto = "wss" if proto == "https" else "ws"
+        host = request.host
+
+        return web.json_response(
+            {
+                "success": True,
+                "rendezvous_id": matched_snapshot["rendezvous_id"],
+                "mode": matched_snapshot["mode"],
+                "network_id": matched_snapshot["network_id"],
+                "host_device_id": matched_snapshot["host_device_id"],
+                "host_snow_id": matched_snapshot.get("host_snow_id") or "",
+                "host_cert_fingerprint": matched_snapshot.get("host_cert_fingerprint") or "",
+                "relay_ws_url": f"{ws_proto}://{host}/v1/tunnel",
+                "bootstrap_token": bootstrap_token,
+                "expires_in": int(round(bootstrap_ttl)),
+                "trust_completed": False,
+                "requires_end_to_end_verification": True,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _broadcast_coordinator_update(self, coord: _NetworkCoordinatorState) -> None:
         """Push coordinator primary + epoch update to all online hosts in this network."""
@@ -933,9 +1396,11 @@ class SnowRelayServer:
                 return ws
 
             hub_token = str(hello_data.get("hub_token") or "").strip()
+            bootstrap_token = str(hello_data.get("bootstrap_token") or "").strip()
             ticket = str(hello_data.get("ticket") or "").strip()
             authed_network_id: Optional[str] = None
             raw_hello_snow_id = ""
+            bootstrap_allowed_target: Optional[str] = None
 
             if hub_token:
                 claimed_net_id = str(hello_data.get("network_id") or "").strip().upper()
@@ -958,6 +1423,20 @@ class SnowRelayServer:
                 if raw_hello_snow_id and not is_valid_snow_id(raw_hello_snow_id):
                     await ws.close(code=4002, message=b"Invalid SNOW ID format.")
                     return ws
+            elif bootstrap_token:
+                claimed_net_id = str(hello_data.get("network_id") or "").strip().upper()
+                claimed_dev = str(hello_data.get("device_id") or "").strip()
+                ok_bs, bs_sess, bs_err = self._authenticate_bootstrap_session(
+                    bootstrap_token,
+                    required_network_id=claimed_net_id or None,
+                    claimed_device_id=claimed_dev or None,
+                )
+                if not ok_bs or not bs_sess:
+                    await ws.close(code=4001, message=f"Auth failed: {bs_err}".encode("utf-8"))
+                    return ws
+                device_id = str(bs_sess["client_device_id"])
+                group_id = str(bs_sess["network_id"])
+                bootstrap_allowed_target = str(bs_sess["host_device_id"])
             else:
                 is_valid, claimed_dev, claimed_grp, err_msg = verify_relay_ticket(ticket, self.config.shared_secret)
                 if not is_valid or not claimed_dev or not claimed_grp:
@@ -1002,7 +1481,7 @@ class SnowRelayServer:
             primary_device_id: Optional[str] = None
             is_primary = False
 
-            if authed_network_id:
+            if authed_network_id and not bootstrap_allowed_target:
                 coord = self._network_coordinators.get(authed_network_id)
                 if coord is None:
                     coord = _NetworkCoordinatorState(network_id=authed_network_id)
@@ -1174,6 +1653,14 @@ class SnowRelayServer:
 
                     if mtype == "relay_frame":
                         target_id = data.get("target")
+                        if bootstrap_allowed_target and target_id != bootstrap_allowed_target:
+                            await ws.send_json({
+                                "type": "relay_error",
+                                "error_code": "BOOTSTRAP_SCOPE_DENIED",
+                                "target": target_id,
+                                "message": "Bootstrap tunnel is restricted to the authorized onboarding host.",
+                            })
+                            continue
                         payload_b64 = data.get("payload_b64", "")
                         payload_bytes = base64.b64decode(payload_b64)
 
@@ -1225,6 +1712,14 @@ class SnowRelayServer:
                         continue
 
                     target_id = raw_bytes[1 : 1 + t_len].decode("ascii", errors="ignore")
+                    if bootstrap_allowed_target and target_id != bootstrap_allowed_target:
+                        await ws.send_json({
+                            "type": "relay_error",
+                            "error_code": "BOOTSTRAP_SCOPE_DENIED",
+                            "target": target_id,
+                            "message": "Bootstrap tunnel is restricted to the authorized onboarding host.",
+                        })
+                        continue
                     payload = raw_bytes[1 + t_len :]
 
                     q_ok, q_err = self.quotas.check_and_record_transfer(device_id, len(payload))

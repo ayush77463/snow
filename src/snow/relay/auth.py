@@ -11,11 +11,14 @@ import time
 from typing import Any, Optional, Tuple
 
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-
 SNOW_ID_REGEX = re.compile(r"^SNW-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 NETWORK_ID_REGEX = re.compile(r"^SNW-NET-[A-F0-9]{8}$")
+
+
+def _get_ed25519_types():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    return Ed25519PublicKey, Encoding, PublicFormat
 
 
 def is_valid_snow_id(val: Any) -> bool:
@@ -37,6 +40,7 @@ def encode_ed25519_pubkey(raw_bytes: bytes) -> str:
     if not isinstance(raw_bytes, (bytes, bytearray)) or len(raw_bytes) != 32:
         raise ValueError("Ed25519 public key must be exactly 32 raw bytes.")
     raw = bytes(raw_bytes)
+    Ed25519PublicKey, _, _ = _get_ed25519_types()
     Ed25519PublicKey.from_public_bytes(raw)
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -63,6 +67,7 @@ def decode_ed25519_pubkey(pubkey: str | bytes) -> bytes:
     if len(raw) != 32:
         raise ValueError(f"Ed25519 public key must decode to exactly 32 bytes, got {len(raw)}.")
     try:
+        Ed25519PublicKey, Encoding, PublicFormat = _get_ed25519_types()
         key_obj = Ed25519PublicKey.from_public_bytes(raw)
         return key_obj.public_bytes(Encoding.Raw, PublicFormat.Raw)
     except Exception as exc:
@@ -104,6 +109,7 @@ def verify_ed25519_signature(pubkey: str | bytes, message: bytes, signature_b64:
         if len(sig_bytes) != 64:
             return False
         raw_pub = decode_ed25519_pubkey(pubkey)
+        Ed25519PublicKey, _, _ = _get_ed25519_types()
         pub_obj = Ed25519PublicKey.from_public_bytes(raw_pub)
         pub_obj.verify(sig_bytes, bytes(message))
         return True

@@ -72,7 +72,9 @@ class LiveScreenStreamHandler(
         val totalBytes: Long = 0L,
         val lastFrameTimestamp: Long = 0L,
         val frameWidth: Int = 0,
-        val frameHeight: Int = 0
+        val frameHeight: Int = 0,
+        val deduplicatedSkips: Long = 0L,
+        val zeroViewerPauses: Long = 0L
     )
 
     private val _streamState = MutableStateFlow(StreamState.IDLE)
@@ -92,6 +94,30 @@ class LiveScreenStreamHandler(
 
     @Volatile
     private var currentSessionId: String? = null
+    @Volatile
+    var targetDeviceIds: List<String> = emptyList()
+        private set
+    @Volatile
+    var activeViewerCount: Int = 1
+        private set
+    @Volatile
+    private var lastFrameSha256: String? = null
+    @Volatile
+    private var lastDims: Pair<Int, Int>? = null
+    @Volatile
+    private var wasPausedZeroViewers: Boolean = false
+    @Volatile
+    private var frameSeqCounter: Long = 0L
+
+    var relayMediaSender: ((meta: Map<String, Any?>, jpegBytes: ByteArray) -> Boolean)? = null
+
+    fun setViewerCount(count: Int) {
+        val prev = activeViewerCount
+        activeViewerCount = count.coerceAtLeast(0)
+        if (activeViewerCount == 0 || (prev == 0 && activeViewerCount > 0)) {
+            lastFrameSha256 = null
+        }
+    }
 
     /**
      * Optional callback invoked when MediaProjection is revoked by OS,
@@ -106,7 +132,11 @@ class LiveScreenStreamHandler(
         projection: MediaProjection,
         serverHost: String,
         transferPort: Int = 8766,
-        targetFps: Float = DEFAULT_FPS
+        targetFps: Float = DEFAULT_FPS,
+        targetIds: List<String> = emptyList(),
+        senderDeviceId: String = "",
+        senderName: String = "Android Phone",
+        initialViewerCount: Int = 1
     ) {
         synchronized(this) {
             if (_streamState.value == StreamState.STREAMING || _streamState.value == StreamState.STARTING) {
@@ -120,6 +150,12 @@ class LiveScreenStreamHandler(
         val clampedFps = targetFps.coerceIn(MIN_FPS, MAX_FPS)
         val sessionId = UUID.randomUUID().toString().take(8)
         currentSessionId = sessionId
+        targetDeviceIds = targetIds.filter { it.isNotBlank() }.distinct()
+        activeViewerCount = initialViewerCount.coerceAtLeast(0)
+        lastFrameSha256 = null
+        lastDims = null
+        wasPausedZeroViewers = false
+        frameSeqCounter = 0L
 
         val metrics = context.resources.displayMetrics
         val rawWidth = metrics.widthPixels
@@ -185,13 +221,32 @@ class LiveScreenStreamHandler(
             )
 
             // Start frame acquisition & transmission loop
-            startFrameLoop(reader, targetWidth, targetHeight, clampedFps, serverHost, transferPort, sessionId)
+            startFrameLoop(
+                reader,
+                targetWidth,
+                targetHeight,
+                clampedFps,
+                serverHost,
+                transferPort,
+                sessionId,
+                senderDeviceId,
+                senderName
+            )
 
         } catch (e: Exception) {
             SafeLog.e(TAG, "Failed starting screen stream: ${e.message}", e)
             _streamState.value = StreamState.ERROR
             cleanup()
         }
+    }
+
+    private fun sha256Hex(bytes: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        val sb = StringBuilder(digest.size * 2)
+        for (b in digest) {
+            sb.append(String.format("%02x", b))
+        }
+        return sb.toString()
     }
 
     /**
@@ -204,7 +259,9 @@ class LiveScreenStreamHandler(
         fps: Float,
         serverHost: String,
         transferPort: Int,
-        sessionId: String
+        sessionId: String,
+        senderDeviceId: String = "",
+        senderName: String = "Android Phone"
     ) {
         frameLoopJob?.cancel()
         val intervalMs = (1000f / fps).toLong().coerceAtLeast(200L)
@@ -212,34 +269,90 @@ class LiveScreenStreamHandler(
         frameLoopJob = handlerScope.launch {
             var frameCount = 0L
             var totalBytesSent = 0L
+            var dedupSkips = 0L
+            var zeroPauses = 0L
 
             while (isActive && _streamState.value == StreamState.STREAMING) {
                 val loopStartTime = System.currentTimeMillis()
 
                 try {
+                    if (activeViewerCount <= 0) {
+                        zeroPauses++
+                        wasPausedZeroViewers = true
+                        lastFrameSha256 = null
+                        _stats.value = _stats.value.copy(zeroViewerPauses = zeroPauses)
+                        delay(intervalMs)
+                        continue
+                    }
+
                     // 1. Acquire frame bytes (either from test hook or live ImageReader)
                     val frameBytes: ByteArray? = if (mockFrameProvider != null) {
-                        mockFrameProvider!!.invoke()
+                        val mockRaw = mockFrameProvider!!.invoke()
+                        if (mockRaw != null) {
+                            val mockHash = sha256Hex(mockRaw)
+                            if (!wasPausedZeroViewers && lastDims == Pair(width, height) && mockHash == lastFrameSha256) {
+                                dedupSkips++
+                                _stats.value = _stats.value.copy(deduplicatedSkips = dedupSkips)
+                                null
+                            } else {
+                                lastDims = Pair(width, height)
+                                wasPausedZeroViewers = false
+                                lastFrameSha256 = mockHash
+                                mockRaw
+                            }
+                        } else null
                     } else {
-                        acquireLatestFrameJpeg(reader, width, height)
+                        val res = acquireLatestFrameJpegWithDedup(reader, width, height)
+                        if (res == null && _stats.value.deduplicatedSkips != dedupSkips) {
+                            dedupSkips = _stats.value.deduplicatedSkips
+                        }
+                        res
                     }
 
                     if (frameBytes != null && frameBytes.isNotEmpty()) {
                         if (frameBytes.size.toLong() <= MAX_FRAME_BYTES) {
-                            // 2. Transmit frame over authenticated HTTPS (port 8766)
+                            frameSeqCounter++
+                            val seq = frameSeqCounter
+                            // 2. Transmit frame over authenticated HTTPS or E2E Relay
                             val sent = if (mockFramePoster != null) {
                                 mockFramePoster!!.invoke(frameBytes, sessionId, width, height, fps)
                             } else {
-                                val transferClient = transferClientProvider()
-                                transferClient?.postScreenFrame(
-                                    serverHost = serverHost,
-                                    transferPort = transferPort,
-                                    frameBytes = frameBytes,
-                                    sessionId = sessionId,
-                                    width = width,
-                                    height = height,
-                                    fps = fps
-                                ) ?: false
+                                var ok = false
+                                val relayFn = relayMediaSender
+                                if (relayFn != null) {
+                                    ok = relayFn.invoke(
+                                        mapOf(
+                                            "sender_device_id" to senderDeviceId,
+                                            "sender_name" to senderName,
+                                            "sender_platform" to "android",
+                                            "session_id" to sessionId,
+                                            "frame_seq" to seq,
+                                            "frame_width" to width,
+                                            "frame_height" to height,
+                                            "fps" to fps,
+                                            "target_device_ids" to targetDeviceIds
+                                        ),
+                                        frameBytes
+                                    )
+                                }
+                                if (!ok && serverHost.isNotBlank()) {
+                                    val transferClient = transferClientProvider()
+                                    ok = transferClient?.postScreenFrame(
+                                        serverHost = serverHost,
+                                        transferPort = transferPort,
+                                        frameBytes = frameBytes,
+                                        sessionId = sessionId,
+                                        width = width,
+                                        height = height,
+                                        fps = fps,
+                                        senderId = senderDeviceId.ifBlank { null },
+                                        senderName = senderName,
+                                        senderPlatform = "android",
+                                        frameSeq = seq,
+                                        targetDeviceIds = targetDeviceIds
+                                    ) ?: false
+                                }
+                                ok
                             }
 
                             if (sent) {
@@ -251,7 +364,9 @@ class LiveScreenStreamHandler(
                                     totalBytes = totalBytesSent,
                                     lastFrameTimestamp = System.currentTimeMillis(),
                                     frameWidth = width,
-                                    frameHeight = height
+                                    frameHeight = height,
+                                    deduplicatedSkips = dedupSkips,
+                                    zeroViewerPauses = zeroPauses
                                 )
                             }
                         } else {
@@ -271,16 +386,15 @@ class LiveScreenStreamHandler(
         }
     }
 
-    /**
-     * Acquire the latest frame from the ImageReader and encode to bounded JPEG.
-     */
-    private fun acquireLatestFrameJpeg(reader: ImageReader, width: Int, height: Int): ByteArray? {
+    private fun acquireLatestFrameJpegWithDedup(reader: ImageReader, width: Int, height: Int): ByteArray? {
         val image = try {
             reader.acquireLatestImage() ?: return null
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             return null
         }
 
+        var rawBitmap: Bitmap? = null
+        var cleanBitmap: Bitmap? = null
         try {
             val planes = image.planes
             if (planes.isEmpty()) return null
@@ -289,31 +403,53 @@ class LiveScreenStreamHandler(
             val rowStride = planes[0].rowStride
             val rowPadding = rowStride - pixelStride * width
 
-            val bitmap = Bitmap.createBitmap(
+            val dup = buffer.duplicate()
+            val rawBytes = ByteArray(dup.remaining())
+            dup.get(rawBytes)
+            val dims = Pair(width, height)
+            val hash = sha256Hex(rawBytes)
+            if (!wasPausedZeroViewers && lastDims == dims && hash == lastFrameSha256) {
+                val skips = _stats.value.deduplicatedSkips + 1L
+                _stats.value = _stats.value.copy(deduplicatedSkips = skips)
+                return null
+            }
+
+            rawBitmap = Bitmap.createBitmap(
                 width + rowPadding / pixelStride,
                 height,
                 Bitmap.Config.ARGB_8888
             )
-            bitmap.copyPixelsFromBuffer(buffer)
+            buffer.rewind()
+            rawBitmap.copyPixelsFromBuffer(buffer)
 
-            val cleanBitmap = if (rowPadding != 0) {
-                val cropped = Bitmap.createBitmap(bitmap, 0, 0, width, height)
-                bitmap.recycle()
-                cropped
+            cleanBitmap = if (rowPadding != 0) {
+                Bitmap.createBitmap(rawBitmap, 0, 0, width, height)
             } else {
-                bitmap
+                rawBitmap
             }
 
             synchronized(reusableBaos) {
                 reusableBaos.reset()
                 cleanBitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, reusableBaos)
-                cleanBitmap.recycle()
+                lastDims = dims
+                wasPausedZeroViewers = false
+                lastFrameSha256 = hash
                 return reusableBaos.toByteArray()
             }
         } catch (e: Exception) {
             SafeLog.w(TAG, "Bitmap processing error: ${e.message}")
             return null
         } finally {
+            try {
+                if (cleanBitmap != null && cleanBitmap !== rawBitmap && !cleanBitmap.isRecycled) {
+                    cleanBitmap.recycle()
+                }
+            } catch (_: Exception) {}
+            try {
+                if (rawBitmap != null && !rawBitmap.isRecycled) {
+                    rawBitmap.recycle()
+                }
+            } catch (_: Exception) {}
             try {
                 image.close()
             } catch (_: Exception) {}
@@ -333,6 +469,11 @@ class LiveScreenStreamHandler(
         }
 
         cleanup(isExplicitStop = true)
+        lastFrameSha256 = null
+        lastDims = null
+        wasPausedZeroViewers = false
+        frameSeqCounter = 0L
+        targetDeviceIds = emptyList()
 
         // Inform desktop server of stream termination
         if (!serverHost.isNullOrBlank()) {

@@ -19,6 +19,7 @@ import asyncio
 from dataclasses import dataclass, field
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -897,6 +898,27 @@ class SnowIpcServer:
                 "error": dev_resp.get("error"),
             }, now_authed
 
+        if op == "screen_stream_start":
+            start_data = await self._handle_screen_stream_start(payload, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": bool(start_data.get("success", False)),
+                "status": start_data.get("status", "ERROR"),
+                "data": start_data,
+                "error": start_data.get("error"),
+            }, now_authed
+
+        if op == "screen_stream_senders":
+            senders_data = self._handle_screen_stream_senders(payload)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": True,
+                "status": "SUCCESS",
+                "data": senders_data,
+            }, now_authed
+
         if op == "screen_stream_status":
             status_data = self._handle_screen_stream_status(payload)
             return {
@@ -1558,6 +1580,14 @@ class SnowIpcServer:
                     self.core_server.node_registry.set_permission_profile(device_id, profile)
                 if getattr(self, "node_registry", None):
                     self.node_registry.set_permission_profile(device_id, profile)
+                if profile != "full_control":
+                    from snow.transfer.http_server import SnowHttpTransferServer
+                    SnowHttpTransferServer.revoke_target_from_streams(device_id)
+                    revoke_fn = getattr(self.core_server, "revoke_screen_target", None)
+                    if callable(revoke_fn):
+                        revoke_res = revoke_fn(device_id)
+                        if inspect.isawaitable(revoke_res):
+                            await revoke_res
 
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -1627,6 +1657,13 @@ class SnowIpcServer:
                             logger.debug("Error closing revoked client websocket: %s", close_err)
                 self.core_server.session_manager.revoke_session(session.session_id)
                 logger.info("Revoked active session [%s] for device [%s]", session.session_id, device_id)
+            from snow.transfer.http_server import SnowHttpTransferServer
+            SnowHttpTransferServer.revoke_target_from_streams(device_id)
+            revoke_fn = getattr(self.core_server, "revoke_screen_target", None)
+            if callable(revoke_fn):
+                revoke_res = revoke_fn(device_id)
+                if inspect.isawaitable(revoke_res):
+                    await revoke_res
 
             if hasattr(self.core_server, "peer_clients") and device_id in self.core_server.peer_clients:
                 peer_client = self.core_server.peer_clients.pop(device_id, None)
@@ -2767,49 +2804,121 @@ class SnowIpcServer:
         except Exception as exc:
             return {"success": False, "status": "INTERNAL_ERROR", "error": f"Error requesting file from Android: {exc}"}
 
+    async def _handle_screen_stream_start(
+        self, payload: dict, ctx: Optional[ExecutionContext] = None
+    ) -> dict:
+        """Start local Windows PC screen share to selected Full Control devices."""
+        if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+            return {
+                "success": False,
+                "status": "POLICY_DENIED",
+                "error": "Initiating PC screen sharing requires OWNER_MANUAL authority.",
+            }
+        cs = self.core_server
+        if cs is None or not hasattr(cs, "start_pc_screen_share"):
+            return {"success": False, "status": "UNSUPPORTED_OPERATION", "error": "PC screen streamer unavailable."}
+        raw_targets = payload.get("target_device_ids") if isinstance(payload, dict) else []
+        if not isinstance(raw_targets, list):
+            raw_targets = []
+        fps = float(payload.get("fps", 4.0)) if isinstance(payload, dict) else 4.0
+        return await cs.start_pc_screen_share(target_device_ids=[str(t) for t in raw_targets], fps=fps)
+
+    def _handle_screen_stream_senders(self, payload: dict) -> dict:
+        """Return active screen stream senders and eligible Full Control PC-share targets."""
+        cs = self.core_server
+        from snow.transfer.http_server import SnowHttpTransferServer
+        senders = SnowHttpTransferServer.list_active_screen_streams(requester_device_id="local_dashboard")
+        raw_pc_sharing = (
+            cs.get_pc_screen_share_status()
+            if cs is not None and callable(getattr(cs, "get_pc_screen_share_status", None))
+            else None
+        )
+        pc_sharing = raw_pc_sharing if isinstance(raw_pc_sharing, dict) else {"state": "IDLE"}
+        raw_targets = (
+            cs.list_eligible_screen_targets()
+            if cs is not None and callable(getattr(cs, "list_eligible_screen_targets", None))
+            else None
+        )
+        eligible_targets = raw_targets if isinstance(raw_targets, list) else []
+        return {
+            "senders": senders,
+            "count": len(senders),
+            "pc_sharing": pc_sharing,
+            "eligible_targets": eligible_targets,
+        }
+
     def _handle_screen_stream_status(self, payload: dict) -> dict:
         """Query live screen streaming session metadata."""
-        device_id = payload.get("device_id") if isinstance(payload, dict) else None
+        device_id = (
+            (payload.get("sender_id") or payload.get("device_id"))
+            if isinstance(payload, dict)
+            else None
+        )
         from snow.transfer.http_server import SnowHttpTransferServer
-        status_data = SnowHttpTransferServer.get_screen_stream_status(device_id)
+        status_data = SnowHttpTransferServer.get_screen_stream_status(
+            device_id, requester_device_id="local_dashboard"
+        )
         cs = self.core_server
+        raw_pc_sharing = (
+            cs.get_pc_screen_share_status()
+            if cs is not None and callable(getattr(cs, "get_pc_screen_share_status", None))
+            else None
+        )
+        pc_sharing = raw_pc_sharing if isinstance(raw_pc_sharing, dict) else {"state": "IDLE"}
         transfer_port = (
             cs.http_transfer_server.bound_port
             if cs and getattr(cs, "http_transfer_server", None)
             else (cs.config.transfer_port if cs and hasattr(cs, "config") else 8766)
         )
         use_tls = bool(
-            cs and getattr(cs, "http_transfer_server", None) and cs.http_transfer_server.ssl_context
+            cs and getattr(cs, "http_transfer_server", None) and getattr(cs.http_transfer_server, "ssl_context", None)
         )
-        cert_path = (
+        raw_cert_path = (
             getattr(cs.http_transfer_server, "cert_path", None)
             if cs and getattr(cs, "http_transfer_server", None)
             else (getattr(cs.config, "tls_cert_path", None) or getattr(cs.config, "tls_cert_file", None) if cs and hasattr(cs, "config") else None)
         )
+        cert_path = raw_cert_path if isinstance(raw_cert_path, (str, Path)) else None
         return {
             **status_data,
+            "pc_sharing": pc_sharing,
             "transfer_port": transfer_port,
             "use_tls": use_tls,
             "cert_path": str(cert_path) if cert_path else None,
         }
 
     async def _handle_screen_stream_stop(self, payload: dict, ctx: Optional[ExecutionContext] = None) -> dict:
-        """Stop active screen streaming session across transfer server and connected Android device."""
-        device_id = payload.get("device_id") if isinstance(payload, dict) else None
+        """Stop active screen streaming session across transfer server, local PC share, and connected peers."""
+        device_id = (
+            (payload.get("sender_id") or payload.get("device_id"))
+            if isinstance(payload, dict)
+            else None
+        )
+        cs = self.core_server
         from snow.transfer.http_server import SnowHttpTransferServer
+
+        raw_local_id = getattr(getattr(cs, "device_identity", None), "device_id", None) if cs else None
+        local_pc_id = raw_local_id if isinstance(raw_local_id, str) else None
+        stop_pc_fn = getattr(cs, "stop_pc_screen_share", None) if cs is not None else None
+        if callable(stop_pc_fn):
+            if not device_id or device_id == "all" or (local_pc_id and device_id == local_pc_id) or (isinstance(payload, dict) and payload.get("stop_pc_share")):
+                stop_res = stop_pc_fn(reason="STOPPED")
+                if inspect.isawaitable(stop_res):
+                    await stop_res
+
         # 1. Clear session buffer in transfer server
         SnowHttpTransferServer.set_session_state(device_id=device_id, state="STOPPED")
 
-        # 2. Dispatch screen_stream_stop to connected Android device via SessionRouter if available
+        # 2. Dispatch screen_stream_stop to connected peer device via SessionRouter if targeting remote sender
         dispatched = False
         router = getattr(self, "session_router", None) or (
             getattr(self.core_server, "session_router", None) if self.core_server else None
         )
-        if router is not None:
+        if router is not None and (not device_id or not local_pc_id or device_id != local_pc_id):
             try:
                 res = await router.route_request(
                     action="screen_stream_stop",
-                    target=device_id or None,
+                    target=None if device_id == "all" else (device_id or None),
                     data={},
                     ctx=ctx or ExecutionContext(principal=ExecutionPrincipal.OWNER_MANUAL, origin="ipc"),
                     timeout=5.0,

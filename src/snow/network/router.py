@@ -188,7 +188,7 @@ PERMISSION_PROFILES: dict[str, dict[str, Any]] = {
     "full_control": {
         "name": "Full Control",
         "description": "Full access to all permitted capabilities.",
-        "allowed_categories": {"telemetry", "clipboard", "files", "apps", "execution", "media", "system", "cross_network"},
+        "allowed_categories": {"telemetry", "clipboard", "files", "apps", "execution", "media", "screen", "system", "cross_network"},
     },
     "files_and_clipboard": {
         "name": "Files & Clipboard",
@@ -307,11 +307,18 @@ CAPABILITY_CATEGORY_MAP: dict[str, str] = {
     "snow_android_screenshot": "media",
     "screen_capture": "media",
     "android.screen.capture": "media",
-    "screen_stream_start": "media",
-    "screen_stream_stop": "media",
-    "android_screen_stream_stop": "media",
-    "android.screen.stream": "media",
-    "android.media.projection": "media",
+    "screen_stream_start": "screen",
+    "screen_stream_stop": "screen",
+    "android_screen_stream_stop": "screen",
+    "screen_stream_status": "screen",
+    "screen_stream_subscribe": "screen",
+    "screen_stream_unsubscribe": "screen",
+    "screen_stream_senders": "screen",
+    "windows_screen_share": "screen",
+    "android_screen_share": "screen",
+    "screen_share": "screen",
+    "android.screen.stream": "screen",
+    "android.media.projection": "screen",
     "android_camera_capture": "media",
     "snow_android_camera_capture": "media",
     "camera_capture": "media",
@@ -440,6 +447,53 @@ def classify_transport_badge(
     return "Wi-Fi • Zero Data"
 
 
+def classify_route_priority(
+    transport: Optional[str] = None,
+    host: Optional[str] = None,
+    connection_mode: Optional[str] = None,
+) -> int:
+    """Return canonical route priority: 0=USB, 1=Wi-Fi LAN, 2=Remote Relay."""
+    badge = classify_transport_badge(transport=transport, host=host, connection_mode=connection_mode)
+    if badge == "USB • Zero Data":
+        return 0
+    if badge == "Wi-Fi • Zero Data":
+        return 1
+    return 2
+
+
+def evaluate_preferred_route(
+    candidates: list[dict[str, Any]],
+    connection_mode: str = "auto",
+) -> Optional[dict[str, Any]]:
+    """Select the highest-priority active route honoring zero-data preference and mode policy."""
+    mode = (connection_mode or "auto").strip().lower()
+    eligible: list[tuple[int, dict[str, Any]]] = []
+    for cand in candidates:
+        if not cand or cand.get("active") is False:
+            continue
+        prio = classify_route_priority(
+            transport=cand.get("transport"),
+            host=cand.get("host"),
+            connection_mode=cand.get("connection_mode"),
+        )
+        if mode == "local_only" and prio == 2:
+            continue
+        if mode == "remote_only" and prio != 2:
+            continue
+        enriched = dict(cand)
+        enriched["priority"] = prio
+        enriched["transport_badge"] = classify_transport_badge(
+            transport=cand.get("transport"),
+            host=cand.get("host"),
+            connection_mode=mode if mode == "remote_only" else cand.get("connection_mode"),
+        )
+        eligible.append((prio, enriched))
+    if not eligible:
+        return None
+    eligible.sort(key=lambda item: item[0])
+    return eligible[0][1]
+
+
 class SessionRouter:
     """Layer 3 unified cross-device routing and session lifecycle coordinator."""
 
@@ -471,6 +525,8 @@ class SessionRouter:
         self._peer_tokens: dict[str, str] = {}
         # Bounded transfer idempotency cache across route failover switches: (device_id, transfer_id) -> result
         self._completed_transfer_routes: dict[tuple[str, str], dict[str, Any]] = {}
+        # Track verified local route promotions: device_id -> diagnostics dict
+        self._route_promotion_status: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     @staticmethod
@@ -520,6 +576,185 @@ class SessionRouter:
     def register_outbound_client(self, device_id: str, client: SnowPeerClient) -> None:
         """Register an active outbound SnowPeerClient."""
         self._outbound_clients[device_id] = client
+
+    def get_route_promotion_status(self, device_id: str) -> Optional[dict[str, Any]]:
+        """Return latest local route promotion diagnostics for a paired device."""
+        rec = self._route_promotion_status.get(device_id)
+        return dict(rec) if rec else None
+
+    async def promote_local_route(
+        self,
+        device_id: str,
+        host: str,
+        port: int = 8765,
+        transport: Optional[str] = None,
+        expected_fingerprint: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Promote a paired peer from Remote Relay to a local USB or Wi-Fi LAN link.
+
+        Strictly requires peer authentication and certificate fingerprint verification
+        before claiming promotion, retaining the relay fallback if local verification fails.
+        """
+        clean_id = (device_id or "").strip()
+        clean_host = (host or "").strip()
+        if not clean_id or not clean_host:
+            return {
+                "promoted": False,
+                "status": "INVALID_ARGUMENT",
+                "error": "Device ID and local host are required for promotion.",
+                "fallback_retained": True,
+            }
+
+        paired_rec = self.db_manager.get_paired_device(clean_id) if self.db_manager else None
+        if not paired_rec:
+            return {
+                "promoted": False,
+                "status": "DEVICE_NOT_PAIRED",
+                "error": f"Device '{clean_id}' is not paired.",
+                "fallback_retained": True,
+            }
+
+        conn_mode = (getattr(paired_rec, "connection_mode", "auto") or "auto").strip().lower()
+        if conn_mode == "remote_only":
+            return {
+                "promoted": False,
+                "status": "POLICY_REMOTE_ONLY",
+                "error": f"Local promotion blocked by 'remote_only' policy for '{clean_id}'.",
+                "fallback_retained": True,
+            }
+
+        pinned_fp = (getattr(paired_rec, "cert_fingerprint", None) or "").strip()
+        provided_fp = (expected_fingerprint or "").strip()
+        if pinned_fp and provided_fp and pinned_fp.replace(":", "").lower() != provided_fp.replace(":", "").lower():
+            return {
+                "promoted": False,
+                "status": "FINGERPRINT_MISMATCH",
+                "error": "Candidate peer certificate fingerprint does not match pinned trust record.",
+                "fallback_retained": True,
+            }
+        effective_fp = pinned_fp or provided_fp or None
+
+        target_transport = transport or ("usb_adb" if self._is_loopback_host(clean_host) else "wifi_lan")
+        dial_timeout = timeout if timeout is not None else self.direct_dial_timeout
+
+        # Reuse an already-authenticated inbound local WSS session matching the same host if live.
+        if self.ws_server is not None:
+            sess = self.ws_server.session_manager.get_session_by_device(clean_id)
+            if sess and sess.connection_id:
+                conn = self.ws_server.connection_manager.get(sess.connection_id)
+                node_existing = (
+                    self.node_registry.get_node(clean_id)
+                    if hasattr(self.node_registry, "get_node")
+                    else None
+                )
+                sess_host = (getattr(node_existing, "host", None) or "").strip()
+                if conn and conn.is_active and sess_host == clean_host and "relay" not in (getattr(node_existing, "transport", "") or "").lower():
+                    status_rec = {
+                        "promoted": True,
+                        "status": "PROMOTED",
+                        "device_id": clean_id,
+                        "transport": target_transport,
+                        "transport_badge": classify_transport_badge(transport=target_transport, host=clean_host),
+                        "host": clean_host,
+                        "port": int(port),
+                        "promoted_at": time.time(),
+                        "fallback_retained": True,
+                    }
+                    self._route_promotion_status[clean_id] = status_rec
+                    return dict(status_rec)
+
+        client = SnowPeerClient(
+            host=clean_host,
+            port=int(port),
+            expected_fingerprint=effective_fp,
+            use_tls=True,
+        )
+        try:
+            dial_token = self.get_peer_token(clean_id)
+            conn_res = await client.connect(auth_token=dial_token, timeout=dial_timeout)
+            if not conn_res.success:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                return {
+                    "promoted": False,
+                    "status": conn_res.status or "LOCAL_PROBE_FAILED",
+                    "error": conn_res.error or "Local handshake failed; keeping relay fallback.",
+                    "fallback_retained": True,
+                }
+            if conn_res.remote_device_id and conn_res.remote_device_id != clean_id:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                return {
+                    "promoted": False,
+                    "status": "IDENTITY_MISMATCH",
+                    "error": f"Expected device '{clean_id}', got '{conn_res.remote_device_id}'.",
+                    "fallback_retained": True,
+                }
+        except Exception as exc:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            return {
+                "promoted": False,
+                "status": "LOCAL_PROBE_ERROR",
+                "error": str(exc),
+                "fallback_retained": True,
+            }
+
+        async with self._lock:
+            old_client = self._outbound_clients.get(clean_id)
+            self._outbound_clients[clean_id] = client
+        if old_client is not None and old_client is not client:
+            try:
+                await old_client.close()
+            except Exception:
+                pass
+
+        try:
+            if self.db_manager and hasattr(self.db_manager, "update_device_endpoint"):
+                self.db_manager.update_device_endpoint(clean_id, clean_host, int(port))
+        except Exception:
+            pass
+
+        node = self.node_registry.get_node(clean_id) if hasattr(self.node_registry, "get_node") else None
+        if node is not None:
+            node.transport = target_transport
+            node.host = clean_host
+            node.wss_port = int(port)
+            node.reachability_state = ReachabilityState.CONNECTED_SESSION
+        if hasattr(self.node_registry, "on_session_authenticated"):
+            try:
+                self.node_registry.on_session_authenticated(
+                    device_id=clean_id,
+                    connection_id=f"promoted_{clean_id}",
+                    host=clean_host,
+                    port=int(port),
+                    transport=target_transport,
+                )
+            except Exception:
+                pass
+
+        badge = classify_transport_badge(transport=target_transport, host=clean_host)
+        status_rec = {
+            "promoted": True,
+            "status": "PROMOTED",
+            "device_id": clean_id,
+            "transport": target_transport,
+            "transport_badge": badge,
+            "host": clean_host,
+            "port": int(port),
+            "promoted_at": time.time(),
+            "fallback_retained": True,
+        }
+        self._route_promotion_status[clean_id] = status_rec
+        logger.info("Promoted route for [%s] to local %s (%s:%d)", clean_id, badge, clean_host, int(port))
+        return dict(status_rec)
 
     async def route_request(
         self,
@@ -720,6 +955,26 @@ class SessionRouter:
             candidate_dispatches.append((prio, label, ("outbound", outbound_client)))
 
         candidate_dispatches.sort(key=lambda item: item[0])
+        # Automatic Relay -> Local promotion check: if only Remote active routes exist, probe live local discovery candidate first
+        if candidate_dispatches and all(prio == 2 for prio, _, _ in candidate_dispatches) and conn_mode != "remote_only":
+            disc_peer = None
+            if self.discovery_service is not None and hasattr(self.discovery_service, "get_discovered_peer"):
+                try:
+                    disc_peer = self.discovery_service.get_discovered_peer(device_id)
+                except Exception:
+                    disc_peer = None
+            if disc_peer and getattr(disc_peer, "ip_address", None):
+                attempted_transports.append("local_route_promotion")
+                promo = await self.promote_local_route(
+                    device_id=device_id,
+                    host=disc_peer.ip_address,
+                    port=getattr(disc_peer, "port", None) or 8765,
+                    expected_fingerprint=getattr(disc_peer, "cert_fingerprint", None),
+                )
+                if promo.get("promoted") and device_id in self._outbound_clients:
+                    promoted_client = self._outbound_clients[device_id]
+                    candidate_dispatches.insert(0, (1, "promoted_local_peer", ("outbound", promoted_client)))
+
         for prio, label, (kind, handle) in candidate_dispatches:
             if prio == 2 and conn_mode == "local_only":
                 continue

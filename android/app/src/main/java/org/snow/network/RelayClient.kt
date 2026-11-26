@@ -51,6 +51,8 @@ class RelayClient(
     companion object {
         private const val TAG = "RelayClient"
         private val TUNNEL_INIT_SIGNAL = "SNOW_TUNNEL_INIT".toByteArray(Charsets.UTF_8)
+        private val MEDIA_FRAME_MAGIC = "SNOW_MEDIA_JPG\u0000".toByteArray(Charsets.UTF_8)
+        const val MAX_RELAY_MEDIA_FRAME_BYTES = 524288
     }
 
     private var webSocket: WebSocket? = null
@@ -60,6 +62,7 @@ class RelayClient(
     val reachabilityState: StateFlow<ReachabilityState> = _reachabilityState.asStateFlow()
 
     var requestDispatcher: (suspend (action: String, data: Map<String, Any?>?) -> Pair<Map<String, Any?>?, SnowError?>)? = null
+    var mediaFrameHandler: ((sourceId: String, meta: Map<String, Any?>, jpegBytes: ByteArray) -> Unit)? = null
 
     @Volatile
     private var shouldReconnect = false
@@ -149,12 +152,15 @@ class RelayClient(
         tunnel = null
     }
 
+    @Synchronized
     private fun scheduleReconnect() {
         if (!shouldReconnect) return
+        if (reconnectJob?.isActive == true) return
+        val backoffSchedule = BackoffPolicy.STAGE6C_BATTERY_SCHEDULE_MS
+        val backoffMs = backoffSchedule[minOf(reconnectAttempts, backoffSchedule.lastIndex)]
+        reconnectAttempts++
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            val backoffMs = minOf(60000L, (1000L * (1 shl minOf(reconnectAttempts, 6)))) + (Math.random() * 500).toLong()
-            reconnectAttempts++
             SafeLog.i(TAG, "Scheduling relay reconnect in ${backoffMs}ms (attempt $reconnectAttempts)...")
             delay(backoffMs)
             if (shouldReconnect) {
@@ -185,10 +191,36 @@ class RelayClient(
         }
     }
 
+    fun sendScreenFrame(meta: Map<String, Any?>, jpegBytes: ByteArray): Boolean {
+        if (jpegBytes.isEmpty() || jpegBytes.size > MAX_RELAY_MEDIA_FRAME_BYTES) return false
+        val tun = tunnel ?: return false
+        val ws = webSocket ?: return false
+        if (!tun.handshakeDone) return false
+        return try {
+            val metaJson = JSONObject(meta).toString().toByteArray(Charsets.UTF_8)
+            val plaintext = ByteArray(MEDIA_FRAME_MAGIC.size + metaJson.size + 1 + jpegBytes.size)
+            System.arraycopy(MEDIA_FRAME_MAGIC, 0, plaintext, 0, MEDIA_FRAME_MAGIC.size)
+            System.arraycopy(metaJson, 0, plaintext, MEDIA_FRAME_MAGIC.size, metaJson.size)
+            plaintext[MEDIA_FRAME_MAGIC.size + metaJson.size] = 0
+            System.arraycopy(jpegBytes, 0, plaintext, MEDIA_FRAME_MAGIC.size + metaJson.size + 1, jpegBytes.size)
+
+            val ciphertext = tun.encryptApplicationData(plaintext)
+            val payloadB64 = Base64.encodeToString(ciphertext, Base64.NO_WRAP)
+            val frame = JSONObject().apply {
+                put("type", "relay_frame")
+                put("target", targetPeerId)
+                put("payload_b64", payloadB64)
+            }
+            ws.send(frame.toString())
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Error sending E2E screen frame: ${e.message}")
+            false
+        }
+    }
+
     private inner class RelayWebSocketListener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             SafeLog.i(TAG, "Relay WebSocket open. Sending hello ticket...")
-            reconnectAttempts = 0
             val hello = JSONObject().apply {
                 put("type", "hello")
                 put("ticket", ticket)
@@ -205,6 +237,7 @@ class RelayClient(
                     "hello_ack" -> {
                         val success = data.optBoolean("success", false)
                         if (success) {
+                            reconnectAttempts = 0
                             SafeLog.i(TAG, "Relay authenticated successfully as [$deviceId]")
                             _reachabilityState.value = ReachabilityState.ONLINE_RELAYED
 
@@ -292,6 +325,32 @@ class RelayClient(
             if (tun.handshakeDone) {
                 val decrypted = tun.decryptApplicationData()
                 if (decrypted.isNotEmpty()) {
+                    if (decrypted.size > MEDIA_FRAME_MAGIC.size &&
+                        decrypted.copyOfRange(0, MEDIA_FRAME_MAGIC.size).contentEquals(MEDIA_FRAME_MAGIC)
+                    ) {
+                        var sepIdx = -1
+                        for (i in MEDIA_FRAME_MAGIC.size until decrypted.size) {
+                            if (decrypted[i] == 0.toByte()) {
+                                sepIdx = i
+                                break
+                            }
+                        }
+                        if (sepIdx > MEDIA_FRAME_MAGIC.size && sepIdx + 1 < decrypted.size) {
+                            val headerStr = String(decrypted, MEDIA_FRAME_MAGIC.size, sepIdx - MEDIA_FRAME_MAGIC.size, Charsets.UTF_8)
+                            val jpegBytes = decrypted.copyOfRange(sepIdx + 1, decrypted.size)
+                            if (jpegBytes.size <= MAX_RELAY_MEDIA_FRAME_BYTES) {
+                                val metaObj = JSONObject(headerStr)
+                                val metaMap = mutableMapOf<String, Any?>()
+                                val keys = metaObj.keys()
+                                while (keys.hasNext()) {
+                                    val k = keys.next()
+                                    metaMap[k] = metaObj.opt(k)
+                                }
+                                mediaFrameHandler?.invoke(source, metaMap, jpegBytes)
+                            }
+                        }
+                        return
+                    }
                     val rawJson = String(decrypted, Charsets.UTF_8)
                     val message = JsonSerialization.fromJson(rawJson)
                     handleDecryptedMessage(source, message)

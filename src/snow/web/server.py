@@ -1746,25 +1746,92 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_screen_status(self, request: web.Request) -> web.Response:
-        """Query live screen streaming session status for dashboard."""
+        """Query live screen streaming session status and multi-sender list for dashboard."""
+        sender_id = request.query.get("sender_id") or request.query.get("device_id")
         if self.transfer_server is not None:
-            status = self.transfer_server.get_screen_stream_status()
+            status = self.transfer_server.get_screen_stream_status(sender_id, requester_device_id="local_dashboard")
             return web.json_response({"success": True, **status})
 
         # Production path: query via IPC
         try:
-            res = await self.bridge.call("screen_stream_status")
-            status = res.get("data") if isinstance(res.get("data"), dict) else {"state": "IDLE", "has_frame": False}
+            res = await self.bridge.call("screen_stream_status", {"sender_id": sender_id} if sender_id else {})
+            status = res.get("data") if isinstance(res.get("data"), dict) else {"state": "IDLE", "has_frame": False, "senders": []}
             return web.json_response({"success": True, **status})
         except Exception as e:
             logger.debug("Failed querying screen status via IPC: %s", e)
-            return web.json_response({"success": True, "state": "IDLE", "has_frame": False})
+            return web.json_response({"success": True, "state": "IDLE", "has_frame": False, "senders": []})
+
+    async def handle_api_screen_senders(self, request: web.Request) -> web.Response:
+        """List active live screen senders and eligible Full Control PC-share targets."""
+        if self.transfer_server is not None:
+            senders = self.transfer_server.list_active_screen_streams(requester_device_id="local_dashboard")
+            return web.json_response({
+                "success": True,
+                "senders": senders,
+                "count": len(senders),
+                "pc_sharing": {"state": "IDLE", "target_device_ids": []},
+                "eligible_targets": [],
+            })
+        try:
+            res = await self.bridge.call("screen_stream_senders")
+            data = res.get("data") if isinstance(res.get("data"), dict) else {}
+            return web.json_response({
+                "success": bool(res.get("success", True)),
+                "senders": data.get("senders", []),
+                "count": len(data.get("senders", [])),
+                "pc_sharing": data.get("pc_sharing", {"state": "IDLE"}),
+                "eligible_targets": data.get("eligible_targets", []),
+            })
+        except Exception as e:
+            logger.debug("Failed querying screen senders via IPC: %s", e)
+            return web.json_response({"success": False, "senders": [], "eligible_targets": [], "error": str(e)}, status=500)
+
+    async def handle_api_screen_share_start(self, request: web.Request) -> web.Response:
+        """Start sharing this PC's screen to explicit Full Control targets."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        targets = body.get("target_device_ids")
+        if not isinstance(targets, list) or not [str(t).strip() for t in targets if str(t or "").strip()]:
+            return web.json_response(
+                {"success": False, "status": "NO_TARGETS_SELECTED", "error": "Select at least one authorized Full Control target device."},
+                status=400,
+            )
+        clean_targets = [str(t).strip() for t in targets if str(t or "").strip()]
+        fps = float(body.get("fps", 4.0) or 4.0)
+        try:
+            res = await self.bridge.call(
+                "screen_stream_start",
+                {"target_device_ids": clean_targets, "fps": fps},
+            )
+            ok = bool(res.get("success", False))
+            status_code = 403 if res.get("status") == "PERMISSION_DENIED" else (200 if ok else 400)
+            data = res.get("data") if isinstance(res.get("data"), dict) else {}
+            return web.json_response(
+                {"success": ok, "status": res.get("status"), "error": res.get("error"), **data},
+                status=status_code,
+            )
+        except Exception as e:
+            logger.debug("Failed starting PC screen share via IPC: %s", e)
+            return web.json_response({"success": False, "status": "ERROR", "error": str(e)}, status=500)
+
+    async def handle_api_screen_share_stop(self, request: web.Request) -> web.Response:
+        """Stop PC live screen sharing."""
+        try:
+            res = await self.bridge.call("screen_stream_stop", {"stop_pc_share": True})
+            return web.json_response({"success": bool(res.get("success", True)), "status": "STOPPED", **(res.get("data") or {})})
+        except Exception as e:
+            return web.json_response({"success": False, "status": "ERROR", "error": str(e)}, status=500)
 
     async def handle_api_screen_frame(self, request: web.Request) -> web.Response:
         """Serve latest live screen JPEG frame to authenticated dashboard."""
+        sender_id = request.query.get("sender_id") or request.query.get("device_id")
         # Test fallback: direct access if transfer_server injected into same process
         if self.transfer_server is not None:
-            frame_dict = self.transfer_server.get_latest_screen_frame()
+            frame_dict = self.transfer_server.get_latest_screen_frame(sender_id, requester_device_id="local_dashboard")
             if not frame_dict or not frame_dict.get("frame_bytes"):
                 return web.Response(status=204)
             return web.Response(
@@ -1774,6 +1841,9 @@ class SnowWebServer:
                     "Cache-Control": "no-store, no-cache, must-revalidate",
                     "X-Content-Type-Options": "nosniff",
                     "X-Snow-Session-Id": str(frame_dict.get("session_id", "")),
+                    "X-Snow-Sender-Id": str(frame_dict.get("sender_device_id") or frame_dict.get("device_id") or ""),
+                    "X-Snow-Sender-Name": str(frame_dict.get("sender_name") or ""),
+                    "X-Snow-Frame-Seq": str(frame_dict.get("frame_seq", 0)),
                     "X-Snow-Timestamp": str(frame_dict.get("timestamp", 0)),
                 },
             )
@@ -1790,13 +1860,15 @@ class SnowWebServer:
 
         try:
             # Query status via IPC to get transfer port and TLS mode
-            status_res = await self.bridge.call("screen_stream_status")
+            status_res = await self.bridge.call("screen_stream_status", {"sender_id": sender_id} if sender_id else {})
             status_data = status_res.get("data") if isinstance(status_res.get("data"), dict) else {}
             transfer_port = status_data.get("transfer_port") or 8766
             use_tls = status_data.get("use_tls", False)
 
             scheme = "https" if use_tls else "http"
-            url = f"{scheme}://127.0.0.1:{transfer_port}/api/v1/screen/frame"
+            from urllib.parse import quote
+            suffix = f"?sender_id={quote(sender_id)}" if sender_id else ""
+            url = f"{scheme}://127.0.0.1:{transfer_port}/api/v1/screen/frame{suffix}"
 
             import ssl
             import aiohttp
@@ -1817,6 +1889,7 @@ class SnowWebServer:
 
             headers = {
                 "X-Snow-Ipc-Secret": secret,
+                "X-Snow-Device-Id": "local_dashboard_proxy",
             }
 
             timeout = aiohttp.ClientTimeout(total=2.0)
@@ -1832,6 +1905,9 @@ class SnowWebServer:
                                     "Cache-Control": "no-store, no-cache, must-revalidate",
                                     "X-Content-Type-Options": "nosniff",
                                     "X-Snow-Session-Id": resp.headers.get("X-Snow-Session-Id", ""),
+                                    "X-Snow-Sender-Id": resp.headers.get("X-Snow-Sender-Id", ""),
+                                    "X-Snow-Sender-Name": resp.headers.get("X-Snow-Sender-Name", ""),
+                                    "X-Snow-Frame-Seq": resp.headers.get("X-Snow-Frame-Seq", "0"),
                                     "X-Snow-Timestamp": resp.headers.get("X-Snow-Timestamp", "0"),
                                 },
                             )
@@ -1845,12 +1921,19 @@ class SnowWebServer:
 
     async def handle_api_screen_stop(self, request: web.Request) -> web.Response:
         """Stop live screen streaming session from dashboard."""
+        sender_id = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                sender_id = body.get("sender_id") or body.get("device_id")
+        except Exception:
+            pass
         if self.transfer_server is not None:
-            self.transfer_server.set_session_state("all", "STOPPED")
+            self.transfer_server.set_session_state(sender_id or "all", "STOPPED")
 
         try:
             if self.bridge and hasattr(self.bridge, "call"):
-                res = self.bridge.call("screen_stream_stop")
+                res = self.bridge.call("screen_stream_stop", {"sender_id": sender_id} if sender_id else {})
                 if asyncio.iscoroutine(res) or inspect.isawaitable(res):
                     res = await res
                 if isinstance(res, dict):
@@ -2939,7 +3022,7 @@ class SnowWebServer:
                 "params": {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {},
-                    "clientInfo": {"name": "snow-test-runner", "version": "5.1.0"},
+                    "clientInfo": {"name": "snow-test-runner", "version": "5.2.0"},
                 },
             }
             if proc.stdin is None or proc.stdout is None:
@@ -3537,12 +3620,15 @@ class SnowWebServer:
         app.router.add_post("/api/settings/hub", self.handle_api_settings_hub_post)
         app.router.add_get("/api/mcp-gateway/status", self.handle_api_mcp_gateway_status)
 
-        # Screen streaming & Camera delivery routes (Phase 26A)
+        # Screen streaming & Camera delivery routes (Phase 26A / Stage 6C any-to-any)
         app.router.add_post("/api/screen/capture-phone", self.handle_api_screen_capture_phone)
         app.router.add_get("/api/screen/capture-latest", self.handle_api_screen_capture_latest)
         app.router.add_get("/api/screen/status", self.handle_api_screen_status)
+        app.router.add_get("/api/screen/senders", self.handle_api_screen_senders)
         app.router.add_get("/api/screen/frame", self.handle_api_screen_frame)
         app.router.add_post("/api/screen/stop", self.handle_api_screen_stop)
+        app.router.add_post("/api/screen/share/start", self.handle_api_screen_share_start)
+        app.router.add_post("/api/screen/share/stop", self.handle_api_screen_share_stop)
         app.router.add_get("/api/camera/latest", self.handle_api_camera_latest)
 
         # Clipboard & Capture Hub (Phase 26B)

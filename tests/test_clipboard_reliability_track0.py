@@ -243,7 +243,7 @@ class TestClipboardReliabilityTrack0(unittest.IsolatedAsyncioTestCase):
         self.assertIn("token", body)
         self.assertIn("download_url", body)
         self.assertIn("svg", body)
-        self.assertEqual(body["version"], "5.1.0")
+        self.assertEqual(body["version"], "5.2.0")
 
     async def test_07_download_apk_with_valid_token(self) -> None:
         """Verify handle_api_install_android_apk validates ?token= correctly."""

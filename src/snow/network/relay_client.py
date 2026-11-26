@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 import logging
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 import aiohttp
 
@@ -20,6 +20,8 @@ from snow.protocol.models import MessageType, SnowMessage
 logger = logging.getLogger(__name__)
 
 TUNNEL_INIT_SIGNAL = b"SNOW_TUNNEL_INIT"
+MEDIA_FRAME_MAGIC = b"SNOW_MEDIA_JPG\x00"
+MAX_RELAY_MEDIA_FRAME_BYTES = 512 * 1024
 
 
 def is_tls_server_role(local_id: str, remote_id: str) -> bool:
@@ -44,11 +46,17 @@ class RelayTunnelClient:
         ticket: str,
         cert_path: str,
         key_path: str,
+        hub_token: Optional[str] = None,
+        bootstrap_token: Optional[str] = None,
+        network_id: Optional[str] = None,
     ) -> None:
         self.relay_url = relay_url
         self.device_id = device_id
         self.group_id = group_id
         self.ticket = ticket
+        self.hub_token = hub_token
+        self.bootstrap_token = bootstrap_token
+        self.network_id = network_id
         self.cert_path = cert_path
         self.key_path = key_path
 
@@ -70,6 +78,8 @@ class RelayTunnelClient:
 
         # Optional request dispatcher callback: async (source_id: str, msg: SnowMessage) -> Optional[SnowMessage]
         self.request_dispatcher: Optional[Callable[[str, SnowMessage], Any]] = None
+        # Optional async callback for incoming E2E screen media frames: async (source_id, meta, jpeg_bytes)
+        self.media_frame_handler: Optional[Callable[[str, dict[str, Any], bytes], Awaitable[None]]] = None
 
     def set_peer_pinned_fingerprint(
         self,
@@ -94,12 +104,20 @@ class RelayTunnelClient:
                 timeout=timeout,
             )
             # Send hello frame
-            await self._ws.send_json({
+            hello_payload: Dict[str, Any] = {
                 "type": "hello",
-                "ticket": self.ticket,
                 "device_id": self.device_id,
                 "group_id": self.group_id,
-            })
+            }
+            if self.hub_token:
+                hello_payload["hub_token"] = self.hub_token
+                hello_payload["network_id"] = self.network_id or self.group_id
+            elif self.bootstrap_token:
+                hello_payload["bootstrap_token"] = self.bootstrap_token
+                hello_payload["network_id"] = self.network_id or self.group_id
+            else:
+                hello_payload["ticket"] = self.ticket
+            await self._ws.send_json(hello_payload)
 
             ack_msg = await asyncio.wait_for(self._ws.receive(), timeout=timeout)
             if ack_msg.type != aiohttp.WSMsgType.TEXT:
@@ -249,6 +267,29 @@ class RelayTunnelClient:
             return True
         return False
 
+    async def send_screen_frame(
+        self, target_id: str, meta: dict[str, Any], jpeg_bytes: bytes
+    ) -> bool:
+        """Encrypt and send a bounded JPEG screen frame over the inner E2E TLS 1.3 tunnel."""
+        if not jpeg_bytes or len(jpeg_bytes) > MAX_RELAY_MEDIA_FRAME_BYTES:
+            return False
+        tunnel = self._tunnels.get(target_id)
+        if not tunnel or not tunnel.handshake_done:
+            ok = await self.initiate_e2e_tunnel(target_id)
+            if not ok:
+                return False
+            tunnel = self._tunnels.get(target_id)
+            if not tunnel:
+                return False
+
+        header_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
+        plaintext = MEDIA_FRAME_MAGIC + header_bytes + b"\x00" + jpeg_bytes
+        encrypted = tunnel.encrypt_application_data(plaintext)
+        if encrypted:
+            await self._send_relay_frame(target_id, encrypted)
+            return True
+        return False
+
     async def receive_message(self, peer_id: str, timeout: Optional[float] = None) -> Optional[SnowMessage]:
         """Receive the next decrypted SnowMessage from a specific peer tunnel."""
         queue = self._incoming_queues.setdefault(peer_id, asyncio.Queue())
@@ -348,6 +389,22 @@ class RelayTunnelClient:
         if tunnel.handshake_done:
             decrypted = tunnel.decrypt_application_data()
             if decrypted:
+                if decrypted.startswith(MEDIA_FRAME_MAGIC):
+                    try:
+                        rest = decrypted[len(MEDIA_FRAME_MAGIC):]
+                        sep_idx = rest.find(b"\x00")
+                        if sep_idx > 0:
+                            meta = json.loads(rest[:sep_idx].decode("utf-8"))
+                            jpeg_bytes = rest[sep_idx + 1:]
+                            if (
+                                isinstance(meta, dict)
+                                and 0 < len(jpeg_bytes) <= MAX_RELAY_MEDIA_FRAME_BYTES
+                                and self.media_frame_handler is not None
+                            ):
+                                asyncio.create_task(self.media_frame_handler(source_id, meta, jpeg_bytes))
+                    except Exception as me:
+                        logger.warning("Failed parsing encrypted screen frame from [%s]: %s", source_id, me)
+                    return
                 try:
                     msg_obj = SnowMessage.from_json(decrypted.decode("utf-8"))
                     queue = self._incoming_queues.setdefault(source_id, asyncio.Queue())

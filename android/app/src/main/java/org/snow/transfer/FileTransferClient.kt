@@ -592,6 +592,28 @@ open class FileTransferClient(
         }
     }
 
+    data class ScreenSenderInfo(
+        val senderDeviceId: String,
+        val senderName: String,
+        val senderPlatform: String,
+        val sessionId: String,
+        val fps: Float,
+        val frameWidth: Int,
+        val frameHeight: Int,
+        val frameSeq: Long,
+        val routeBadge: String,
+        val hasFrame: Boolean
+    )
+
+    data class ScreenFrameResult(
+        val bytes: ByteArray,
+        val sessionId: String,
+        val senderId: String,
+        val senderName: String,
+        val frameSeq: Long,
+        val timestamp: String
+    )
+
     /**
      * Post a single bounded JPEG screen frame to the desktop HTTP transfer server.
      */
@@ -602,23 +624,38 @@ open class FileTransferClient(
         sessionId: String,
         width: Int,
         height: Int,
-        fps: Float
+        fps: Float,
+        senderId: String? = null,
+        senderName: String? = null,
+        senderPlatform: String = "android",
+        frameSeq: Long = 0L,
+        targetDeviceIds: List<String> = emptyList()
     ): Boolean = withContext(Dispatchers.IO) {
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val url = "$baseUrl/api/v1/screen/frame"
         val token = getAuthToken() ?: ""
         val mediaType = "image/jpeg".toMediaType()
         val reqBody = frameBytes.toRequestBody(mediaType)
-        val request = Request.Builder()
+        val reqBuilder = Request.Builder()
             .url(url)
             .addHeader("Authorization", "Bearer $token")
             .addHeader("X-Snow-Device-Id", deviceId)
+            .addHeader("X-Snow-Sender-Id", senderId ?: deviceId)
+            .addHeader("X-Snow-Sender-Platform", senderPlatform)
             .addHeader("X-Snow-Session-Id", sessionId)
             .addHeader("X-Snow-Frame-Width", width.toString())
             .addHeader("X-Snow-Frame-Height", height.toString())
             .addHeader("X-Snow-FPS", fps.toString())
-            .post(reqBody)
-            .build()
+        if (!senderName.isNullOrBlank()) {
+            reqBuilder.addHeader("X-Snow-Sender-Name", senderName)
+        }
+        if (frameSeq > 0L) {
+            reqBuilder.addHeader("X-Snow-Frame-Seq", frameSeq.toString())
+        }
+        if (targetDeviceIds.isNotEmpty()) {
+            reqBuilder.addHeader("X-Snow-Target-Device-Ids", targetDeviceIds.joinToString(","))
+        }
+        val request = reqBuilder.post(reqBody).build()
 
         try {
             httpClient.newCall(request).execute().use { response ->
@@ -626,6 +663,118 @@ open class FileTransferClient(
             }
         } catch (e: Exception) {
             SafeLog.w(TAG, "Screen frame POST error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * List active screen senders authorized for this Full Control device.
+     */
+    suspend fun getScreenSenders(
+        serverHost: String,
+        transferPort: Int = 8766
+    ): List<ScreenSenderInfo> = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val url = "$baseUrl/api/v1/screen/senders"
+        val token = getAuthToken() ?: ""
+        val req = Request.Builder()
+            .url(url)
+            .get()
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("X-Snow-Device-Id", deviceId)
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext emptyList()
+                val raw = resp.body?.string() ?: return@withContext emptyList()
+                val obj = JSONObject(raw)
+                val arr = obj.optJSONArray("senders") ?: return@withContext emptyList()
+                val list = mutableListOf<ScreenSenderInfo>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    list.add(
+                        ScreenSenderInfo(
+                            senderDeviceId = item.optString("sender_device_id", item.optString("device_id", "")),
+                            senderName = item.optString("sender_name", "Peer Device"),
+                            senderPlatform = item.optString("sender_platform", "unknown"),
+                            sessionId = item.optString("session_id", ""),
+                            fps = item.optDouble("fps", 2.0).toFloat(),
+                            frameWidth = item.optInt("frame_width", 0),
+                            frameHeight = item.optInt("frame_height", 0),
+                            frameSeq = item.optLong("frame_seq", 0L),
+                            routeBadge = item.optString("route_badge", ""),
+                            hasFrame = item.optBoolean("has_frame", false)
+                        )
+                    )
+                }
+                list
+            }
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "getScreenSenders error: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Fetch the latest live screen frame for an authorized sender over HTTPS.
+     */
+    suspend fun getScreenFrame(
+        serverHost: String,
+        transferPort: Int = 8766,
+        senderId: String? = null
+    ): ScreenFrameResult? = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val suffix = if (!senderId.isNullOrBlank()) "?sender_id=${java.net.URLEncoder.encode(senderId, "UTF-8")}" else ""
+        val url = "$baseUrl/api/v1/screen/frame$suffix"
+        val token = getAuthToken() ?: ""
+        val req = Request.Builder()
+            .url(url)
+            .get()
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("X-Snow-Device-Id", deviceId)
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (resp.code != 200) return@withContext null
+                val bytes = resp.body?.bytes() ?: return@withContext null
+                if (bytes.isEmpty() || bytes.size > 524288) return@withContext null
+                ScreenFrameResult(
+                    bytes = bytes,
+                    sessionId = resp.header("X-Snow-Session-Id") ?: "",
+                    senderId = resp.header("X-Snow-Sender-Id") ?: (senderId ?: ""),
+                    senderName = resp.header("X-Snow-Sender-Name") ?: "Peer Screen",
+                    frameSeq = resp.header("X-Snow-Frame-Seq")?.toLongOrNull() ?: 0L,
+                    timestamp = resp.header("X-Snow-Timestamp") ?: ""
+                )
+            }
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "getScreenFrame error: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Notify host viewer subscription state so zero viewers stops capture automatically.
+     */
+    suspend fun postScreenSubscribe(
+        serverHost: String,
+        transferPort: Int = 8766,
+        subscribe: Boolean
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = getBaseUrl(serverHost, transferPort)
+        val url = "$baseUrl/api/v1/screen/subscribe"
+        val token = getAuthToken() ?: ""
+        val body = JSONObject().put("action", if (subscribe) "subscribe" else "unsubscribe").toString()
+            .toRequestBody(JSON_MEDIA_TYPE)
+        val req = Request.Builder()
+            .url(url)
+            .post(body)
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("X-Snow-Device-Id", deviceId)
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { it.isSuccessful }
+        } catch (_: Exception) {
             false
         }
     }

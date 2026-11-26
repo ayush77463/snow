@@ -11,9 +11,13 @@ import asyncio
 import ctypes
 from ctypes import wintypes
 import logging
+import os
 import re
+import subprocess
 import sys
 from typing import Any, Callable, Optional
+
+from snow.core.subprocess_util import get_no_window_subprocess_kwargs
 
 import psutil
 
@@ -560,6 +564,103 @@ def _default_set_brightness_win32(level: int) -> dict[str, Any]:
         }
 
 
+_WMI_SET_BRIGHTNESS_SCRIPT = (
+    "$ErrorActionPreference='Stop';"
+    "$lvl=[int]$env:SNOW_BRIGHTNESS_LEVEL;"
+    "if($lvl -lt 0 -or $lvl -gt 100){exit 2};"
+    "$monitors=@(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop);"
+    "if($monitors.Count -eq 0){$monitors=@(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods -ErrorAction Stop)};"
+    "if($monitors.Count -eq 0){exit 3};"
+    "foreach($m in $monitors){$null = $m.WmiSetBrightness(1, $lvl)};"
+    "Write-Output $monitors.Count"
+)
+
+
+def _default_set_brightness_wmi(level: int) -> dict[str, Any]:
+    """Adjust internal laptop panel brightness cleanly via Windows WmiMonitorBrightnessMethods."""
+    if sys.platform != "win32":
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_PLATFORM",
+            "error": "WMI brightness adjustment is only supported on Windows.",
+        }
+    if isinstance(level, bool) or not isinstance(level, int) or level < 0 or level > 100:
+        return {
+            "success": False,
+            "status": "INVALID_BRIGHTNESS_LEVEL",
+            "error": "Brightness 'level' must be an integer between 0 and 100.",
+        }
+
+    env = dict(os.environ)
+    env["SNOW_BRIGHTNESS_LEVEL"] = str(int(level))
+    cmd = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        _WMI_SET_BRIGHTNESS_SCRIPT,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            shell=False,
+            **get_no_window_subprocess_kwargs(),
+        )
+    except FileNotFoundError as exc:
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_DISPLAY",
+            "error": f"Windows PowerShell unavailable for WMI brightness fallback: {exc}",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_DISPLAY",
+            "error": "WMI brightness fallback timed out.",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "status": "UNSUPPORTED_DISPLAY",
+            "error": f"WMI brightness fallback failed: {exc}",
+        }
+
+    stderr_txt = (proc.stderr or "").strip()
+    stdout_txt = (proc.stdout or "").strip()
+    if proc.returncode == 0:
+        try:
+            count = max(1, int(stdout_txt.splitlines()[-1])) if stdout_txt else 1
+        except Exception:
+            count = 1
+        return {
+            "success": True,
+            "status": "SUCCESS",
+            "level": int(level),
+            "monitors_updated": count,
+            "method": "wmi",
+            "message": f"Set display brightness to {int(level)}% via WMI.",
+        }
+
+    low_err = stderr_txt.lower()
+    if "access" in low_err and "denied" in low_err:
+        return {
+            "success": False,
+            "status": "PERMISSION_DENIED",
+            "error": f"Permission denied calling WmiMonitorBrightnessMethods: {stderr_txt}",
+        }
+    return {
+        "success": False,
+        "status": "UNSUPPORTED_DISPLAY",
+        "error": stderr_txt or f"WMI brightness unavailable (exit code {proc.returncode}).",
+    }
+
+
 class WindowsSystemControls:
     """Thread-safe, testable Windows workstation & shell notification capabilities."""
 
@@ -572,6 +673,7 @@ class WindowsSystemControls:
         focus_window_fn: Optional[Callable[[Optional[int], str, str], dict[str, Any]]] = None,
         send_hotkey_fn: Optional[Callable[[str], dict[str, Any]]] = None,
         set_brightness_fn: Optional[Callable[[int], dict[str, Any]]] = None,
+        wmi_brightness_fn: Optional[Callable[[int], dict[str, Any]]] = None,
     ) -> None:
         self._active_window_fn = active_window_fn or _default_active_window_win32
         self._notify_fn = notify_fn or _default_notify_win32
@@ -580,6 +682,7 @@ class WindowsSystemControls:
         self._focus_window_fn = focus_window_fn or _default_focus_window_win32
         self._send_hotkey_fn = send_hotkey_fn or _default_send_hotkey_win32
         self._set_brightness_fn = set_brightness_fn or _default_set_brightness_win32
+        self._wmi_brightness_fn = wmi_brightness_fn or _default_set_brightness_wmi
 
     def get_active_window_sync(self) -> dict[str, Any]:
         """Synchronously inspect the active foreground window title and process."""
@@ -776,7 +879,7 @@ class WindowsSystemControls:
         return await asyncio.to_thread(self.send_hotkey_sync, shortcut)
 
     def set_brightness_sync(self, level: Any) -> dict[str, Any]:
-        """Validate display brightness percentage (0..100 strict int) and apply via DDC/CI."""
+        """Validate display brightness percentage (0..100 strict int) and apply via DDC/CI then WMI fallback."""
         if isinstance(level, bool) or not isinstance(level, int):
             return {
                 "success": False,
@@ -791,6 +894,20 @@ class WindowsSystemControls:
             }
         try:
             res = self._set_brightness_fn(int(level))
+            if isinstance(res, dict) and res.get("success"):
+                out = dict(res)
+                out.setdefault("method", "ddc_ci")
+                return out
+            primary_status = res.get("status") if isinstance(res, dict) else "UNSUPPORTED_DISPLAY"
+            if primary_status == "UNSUPPORTED_DISPLAY" and self._wmi_brightness_fn is not None:
+                wmi_res = self._wmi_brightness_fn(int(level))
+                if isinstance(wmi_res, dict):
+                    if wmi_res.get("success"):
+                        out = dict(wmi_res)
+                        out.setdefault("method", "wmi")
+                        return out
+                    if wmi_res.get("status") == "PERMISSION_DENIED":
+                        return dict(wmi_res)
             return dict(res) if isinstance(res, dict) else {"success": False, "status": "UNSUPPORTED_DISPLAY"}
         except Exception as exc:
             logger.error("Failed setting Windows brightness level %s: %s", level, exc)

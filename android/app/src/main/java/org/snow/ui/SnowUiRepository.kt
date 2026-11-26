@@ -19,6 +19,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.snow.capabilities.CameraCaptureHandler
 import org.snow.capabilities.ClipboardHandler
 import org.snow.capabilities.LiveScreenStreamHandler
@@ -137,6 +139,46 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             return "SNW-${hex.substring(0, 4)}-${hex.substring(4, 8)}"
         }
 
+        const val DEFAULT_BUILTIN_HUB_URL = "https://snow-relay.onrender.com"
+
+        /**
+         * Validate a SNOW Hub HTTPS URL (or loopback HTTP under explicit dev mode).
+         * Rejects embedded credentials, query strings, fragments, and unexpected paths.
+         */
+        fun validateHubUrl(raw: String, allowDevLoopback: Boolean = false): String {
+            val clean = raw.trim()
+            if (clean.isEmpty()) throw IllegalArgumentException("Hub URL cannot be empty.")
+            if (clean.any { it.isWhitespace() || it.code < 32 }) {
+                throw IllegalArgumentException("Hub URL contains invalid whitespace or control characters.")
+            }
+            val uri = java.net.URI(clean)
+            val scheme = (uri.scheme ?: "").lowercase()
+            if (uri.rawUserInfo != null || uri.rawAuthority?.contains("@") == true) {
+                throw IllegalArgumentException("Hub URL must not contain embedded credentials.")
+            }
+            if (!uri.rawQuery.isNullOrEmpty() || !uri.rawFragment.isNullOrEmpty()) {
+                throw IllegalArgumentException("Hub URL must not contain query parameters or fragments.")
+            }
+            val path = uri.path ?: ""
+            if (path.isNotEmpty() && path != "/" && path != "/v1/tunnel") {
+                throw IllegalArgumentException("Hub URL must be a root origin without unexpected paths.")
+            }
+            val host = (uri.host ?: "").trim().lowercase()
+            val authority = uri.rawAuthority ?: ""
+            if (host.isEmpty() || authority.isEmpty()) {
+                throw IllegalArgumentException("Hub URL missing valid hostname.")
+            }
+            val isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+            when {
+                scheme == "https" -> {}
+                scheme == "http" && allowDevLoopback && isLoopback -> {}
+                else -> throw IllegalArgumentException("Hub URL must use https://")
+            }
+            val portSuffix = if (uri.port != -1) ":${uri.port}" else ""
+            val hostBracketed = if (host.contains(":") && !host.startsWith("[")) "[$host]" else host
+            return "$scheme://$hostBracketed$portSuffix"
+        }
+
         fun normalizeRelayUrl(raw: String): String {
             var s = raw.trim()
             if (s.isEmpty()) return ""
@@ -235,9 +277,41 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val _logs = MutableStateFlow<List<UiLogEntry>>(emptyList())
     val logs: StateFlow<List<UiLogEntry>> = _logs.asStateFlow()
 
-    // Phase 26A Live Screen Sharing state
+    // Phase 26A & Stage 6C Live Screen Sharing state (outbound & multi-sender incoming viewer)
+    data class IncomingScreenStream(
+        val senderId: String,
+        val senderName: String,
+        val senderPlatform: String,
+        val sessionId: String,
+        val frameSeq: Long,
+        val width: Int,
+        val height: Int,
+        val fps: Float,
+        val routeBadge: String,
+        val timestampMs: Long,
+        val frameBytes: ByteArray
+    )
+
+    data class ScreenShareTarget(
+        val deviceId: String,
+        val deviceName: String,
+        val platform: String,
+        val routeBadge: String
+    )
+
     private val _screenShareState = MutableStateFlow(LiveScreenStreamHandler.StreamState.IDLE)
     val screenShareState: StateFlow<LiveScreenStreamHandler.StreamState> = _screenShareState.asStateFlow()
+
+    private val _incomingScreenStreams = MutableStateFlow<Map<String, IncomingScreenStream>>(emptyMap())
+    val incomingScreenStreams: StateFlow<Map<String, IncomingScreenStream>> = _incomingScreenStreams.asStateFlow()
+
+    private val _selectedIncomingSenderId = MutableStateFlow<String?>(null)
+    val selectedIncomingSenderId: StateFlow<String?> = _selectedIncomingSenderId.asStateFlow()
+
+    private val _pendingScreenShareTargets = MutableStateFlow<List<String>>(emptyList())
+    val pendingScreenShareTargets: StateFlow<List<String>> = _pendingScreenShareTargets.asStateFlow()
+
+    private var incomingStreamPollJob: Job? = null
 
     // Phase 26A Camera Delivery State Machine
     enum class CameraDeliveryStatus {
@@ -336,6 +410,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         screenShareJob = null
         peerHostJob?.cancel()
         peerHostJob = null
+        closeIncomingViewer()
         _screenShareState.value = LiveScreenStreamHandler.StreamState.IDLE
         _peerHostState.value = org.snow.network.PeerHostState()
         serviceRef = null
@@ -366,6 +441,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     _fileTransferClient = null
                     _connectedEndpoint.value = null
                     connectedHost = ""
+                    closeIncomingViewer()
                     invalidateWallpaperCache()
                 }
             }
@@ -1107,11 +1183,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             }
 
             // Hub directory resolution fallback (GET /v1/directory/resolve/{snowId}) before relay cascade
-            val hubBase = getRemoteRelayEndpoint()
-                .replace("wss://", "https://")
-                .replace("ws://", "http://")
-                .removeSuffix("/v1/tunnel")
-                .trimEnd('/')
+            val hubBase = getDefaultHubUrl()
             if (hubBase.startsWith("https://") || hubBase.startsWith("http://")) {
                 repoScope.launch(Dispatchers.IO) {
                     var resolvedOnline = false
@@ -1463,6 +1535,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 .putString("active_permission_profile", canonical)
                 .apply()
             _permissionProfileState.value = canonical
+            if (canonical != "full_control") {
+                stopScreenShare()
+                closeIncomingViewer()
+            }
             appendLog("INFO", TAG, "Active permission profile updated to $canonical")
         }
 
@@ -1973,11 +2049,249 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
+    fun setPendingScreenShareTargets(targetIds: List<String>) {
+        _pendingScreenShareTargets.value = targetIds.filter { it.isNotBlank() }.distinct()
+    }
+
+    fun getEligibleScreenTargets(): List<ScreenShareTarget> {
+        if (!isSessionTrulyConnected(_connectionState.value, _authState.value)) {
+            return emptyList()
+        }
+        val activeBadge = resolveTransportBadge(_connectedEndpoint.value)
+        val targets = mutableListOf<ScreenShareTarget>()
+        val currentAuth = _authState.value as? AuthState.Authenticated
+        val activePeerId = currentAuth?.peerDeviceId?.takeIf { it.isNotBlank() }
+        val activePeerName = currentAuth?.peerDeviceName?.takeIf { it.isNotBlank() }
+        val activePeerType = currentAuth?.peerDeviceType?.takeIf { it.isNotBlank() } ?: "windows"
+
+        if (activePermissionProfile.trim().lowercase() == "full_control" && activePeerId != null) {
+            targets.add(
+                ScreenShareTarget(
+                    deviceId = activePeerId,
+                    deviceName = activePeerName ?: "Connected Host",
+                    platform = activePeerType,
+                    routeBadge = activeBadge
+                )
+            )
+        }
+        _savedDevices.value.forEach { dev ->
+            if (dev.deviceId != activePeerId &&
+                dev.trustTier.trim().lowercase() == "full_control" &&
+                targets.none { it.deviceId == dev.deviceId }
+            ) {
+                val badge = resolveTransportBadge(if (dev.port > 0) "${dev.host}:${dev.port}" else dev.host)
+                targets.add(
+                    ScreenShareTarget(
+                        deviceId = dev.deviceId,
+                        deviceName = dev.deviceName,
+                        platform = dev.deviceType,
+                        routeBadge = badge
+                    )
+                )
+            }
+        }
+        return targets
+    }
+
+    fun selectIncomingSender(senderId: String) {
+        if (_incomingScreenStreams.value.containsKey(senderId)) {
+            _selectedIncomingSenderId.value = senderId
+            ensureIncomingStreamPolling(active = true)
+        }
+    }
+
+    fun refreshIncomingStreamsOnce() {
+        val client = serviceRef?.client ?: return
+        val tc = _fileTransferClient ?: serviceRef?.transferClient ?: return
+        if (!isSessionTrulyConnected(_connectionState.value, _authState.value)) return
+        if (activePermissionProfile.trim().lowercase() != "full_control") return
+        val host = client.currentTargetHost.takeIf { it.isNotBlank() } ?: connectedHost
+        if (host.isBlank()) return
+
+        repoScope.launch(Dispatchers.IO) {
+            val senders = tc.getScreenSenders(host, 8766)
+                .filter { it.senderDeviceId != identity.deviceId }
+            if (senders.isEmpty()) {
+                val currentStreams = _incomingScreenStreams.value.toMutableMap()
+                if (currentStreams.isNotEmpty()) {
+                    currentStreams.clear()
+                    _incomingScreenStreams.value = emptyMap()
+                    _selectedIncomingSenderId.value = null
+                }
+                return@launch
+            }
+
+            ensureIncomingStreamPolling(active = true)
+            val chosen = _selectedIncomingSenderId.value?.takeIf { id -> senders.any { it.senderDeviceId == id } }
+                ?: senders.first().senderDeviceId
+            _selectedIncomingSenderId.value = chosen
+
+            val frame = tc.getScreenFrame(host, 8766, chosen)
+            if (frame != null) {
+                val info = senders.firstOrNull { it.senderDeviceId == chosen }
+                val badge = info?.routeBadge?.takeIf { it.isNotBlank() } ?: resolveTransportBadge(_connectedEndpoint.value)
+                val updated = _incomingScreenStreams.value.toMutableMap()
+                updated[chosen] = IncomingScreenStream(
+                    senderId = chosen,
+                    senderName = frame.senderName.ifBlank { info?.senderName ?: chosen },
+                    senderPlatform = info?.senderPlatform ?: "windows",
+                    sessionId = frame.sessionId,
+                    frameSeq = frame.frameSeq,
+                    width = info?.frameWidth ?: 0,
+                    height = info?.frameHeight ?: 0,
+                    fps = info?.fps ?: 4.0f,
+                    routeBadge = badge,
+                    timestampMs = System.currentTimeMillis(),
+                    frameBytes = frame.bytes
+                )
+                _incomingScreenStreams.value = updated
+            }
+        }
+    }
+
+    fun ensureIncomingStreamPolling(active: Boolean) {
+        if (!active) {
+            incomingStreamPollJob?.cancel()
+            incomingStreamPollJob = null
+            return
+        }
+        if (incomingStreamPollJob?.isActive == true) return
+        incomingStreamPollJob = repoScope.launch(Dispatchers.IO) {
+            while (kotlinx.coroutines.currentCoroutineContext()[Job]?.isActive == true) {
+                if (!isSessionTrulyConnected(_connectionState.value, _authState.value)) {
+                    _incomingScreenStreams.value = emptyMap()
+                    _selectedIncomingSenderId.value = null
+                    break
+                }
+                val host = serviceRef?.client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
+                val tc = _fileTransferClient ?: serviceRef?.transferClient
+                if (host.isNotBlank() && tc != null) {
+                    val senders = tc.getScreenSenders(host, 8766)
+                        .filter { it.senderDeviceId != identity.deviceId }
+                    if (senders.isEmpty()) {
+                        if (_incomingScreenStreams.value.isNotEmpty()) {
+                            _incomingScreenStreams.value = emptyMap()
+                            _selectedIncomingSenderId.value = null
+                        }
+                        break
+                    }
+                    val chosen = _selectedIncomingSenderId.value?.takeIf { id -> senders.any { it.senderDeviceId == id } }
+                        ?: senders.first().senderDeviceId
+                    _selectedIncomingSenderId.value = chosen
+                    val frame = tc.getScreenFrame(host, 8766, chosen)
+                    if (frame != null) {
+                        val info = senders.firstOrNull { it.senderDeviceId == chosen }
+                        val badge = info?.routeBadge?.takeIf { it.isNotBlank() } ?: resolveTransportBadge(_connectedEndpoint.value)
+                        val updated = _incomingScreenStreams.value.toMutableMap()
+                        val prev = updated[chosen]
+                        if (prev == null || prev.sessionId != frame.sessionId || frame.frameSeq >= prev.frameSeq) {
+                            updated[chosen] = IncomingScreenStream(
+                                senderId = chosen,
+                                senderName = frame.senderName.ifBlank { info?.senderName ?: chosen },
+                                senderPlatform = info?.senderPlatform ?: "windows",
+                                sessionId = frame.sessionId,
+                                frameSeq = frame.frameSeq,
+                                width = info?.frameWidth ?: 0,
+                                height = info?.frameHeight ?: 0,
+                                fps = info?.fps ?: 4.0f,
+                                routeBadge = badge,
+                                timestampMs = System.currentTimeMillis(),
+                                frameBytes = frame.bytes
+                            )
+                            _incomingScreenStreams.value = updated
+                        }
+                    }
+                }
+                kotlinx.coroutines.delay(500L)
+            }
+        }
+    }
+
+    fun closeIncomingViewer() {
+        ensureIncomingStreamPolling(active = false)
+        val host = serviceRef?.client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
+        val tc = _fileTransferClient ?: serviceRef?.transferClient
+        if (host.isNotBlank() && tc != null) {
+            repoScope.launch(Dispatchers.IO) {
+                tc.postScreenSubscribe(host, 8766, subscribe = false)
+            }
+        }
+        _incomingScreenStreams.value = emptyMap()
+        _selectedIncomingSenderId.value = null
+    }
+
+    fun onScreenStreamEvent(data: Map<String, Any?>) {
+        if (activePermissionProfile.trim().lowercase() != "full_control") {
+            closeIncomingViewer()
+            return
+        }
+        val eventType = (data["event_type"] as? String)?.trim()?.uppercase().orEmpty()
+        val senderId = (data["sender_device_id"] as? String)?.trim().orEmpty()
+        if (eventType == "STREAM_STOPPED" || eventType == "REVOKED") {
+            if (senderId.isBlank()) {
+                closeIncomingViewer()
+            } else {
+                val updated = _incomingScreenStreams.value.toMutableMap()
+                updated.remove(senderId)
+                _incomingScreenStreams.value = updated
+                if (_selectedIncomingSenderId.value == senderId) {
+                    _selectedIncomingSenderId.value = updated.keys.firstOrNull()
+                }
+                if (updated.isEmpty()) {
+                    ensureIncomingStreamPolling(active = false)
+                }
+            }
+            return
+        }
+        if (eventType == "STREAM_AVAILABLE" && senderId.isNotBlank() && senderId != identity.deviceId) {
+            _selectedIncomingSenderId.value = _selectedIncomingSenderId.value ?: senderId
+            val host = serviceRef?.client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
+            val tc = _fileTransferClient ?: serviceRef?.transferClient
+            if (host.isNotBlank() && tc != null) {
+                repoScope.launch(Dispatchers.IO) {
+                    tc.postScreenSubscribe(host, 8766, subscribe = true)
+                }
+            }
+            refreshIncomingStreamsOnce()
+            ensureIncomingStreamPolling(active = true)
+        }
+    }
+
+    fun onIncomingRelayScreenFrame(sourceId: String, meta: Map<String, Any?>, jpegBytes: ByteArray) {
+        if (activePermissionProfile.trim().lowercase() != "full_control") return
+        val senderId = (meta["sender_device_id"] as? String)?.ifBlank { sourceId } ?: sourceId
+        val sessionId = (meta["session_id"] as? String) ?: ""
+        val seq = (meta["frame_seq"] as? Number)?.toLong() ?: 0L
+        val existing = _incomingScreenStreams.value[senderId]
+        if (existing != null && existing.sessionId == sessionId && seq > 0 && seq < existing.frameSeq) {
+            return // Ignore stale frame on relay
+        }
+        val stream = IncomingScreenStream(
+            senderId = senderId,
+            senderName = (meta["sender_name"] as? String) ?: senderId,
+            senderPlatform = (meta["sender_platform"] as? String) ?: "remote",
+            sessionId = sessionId,
+            frameSeq = seq,
+            width = (meta["frame_width"] as? Number)?.toInt() ?: 0,
+            height = (meta["frame_height"] as? Number)?.toInt() ?: 0,
+            fps = (meta["fps"] as? Number)?.toFloat() ?: 4.0f,
+            routeBadge = (meta["route_badge"] as? String)?.ifBlank { "Remote • Uses Data" } ?: "Remote • Uses Data",
+            timestampMs = System.currentTimeMillis(),
+            frameBytes = jpegBytes
+        )
+        val updated = _incomingScreenStreams.value.toMutableMap()
+        updated[senderId] = stream
+        _incomingScreenStreams.value = updated
+        if (_selectedIncomingSenderId.value == null) {
+            _selectedIncomingSenderId.value = senderId
+        }
+    }
+
     /**
      * Start live screen streaming session via foreground service.
      */
-    fun startScreenShare(resultCode: Int, data: Intent) {
-        SnowForegroundService.startScreenShare(appContext, resultCode, data)
+    fun startScreenShare(resultCode: Int, data: Intent, targetIds: List<String> = _pendingScreenShareTargets.value) {
+        SnowForegroundService.startScreenShare(appContext, resultCode, data, targetIds)
     }
 
     /**
@@ -2113,6 +2427,122 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         return prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "") ?: ""
     }
 
+    /**
+     * Resolve Default Hub HTTP(S) base URL with deterministic precedence:
+     * 1. Persisted user setting (`default_hub_url` or legacy `remote_relay_endpoint`).
+     * 2. Explicit environment / override value when supplied.
+     * 3. Built-in default Render Hub (`https://snow-relay.onrender.com`).
+     * Never overwrites a user's existing custom hub configuration.
+     */
+    fun getDefaultHubUrl(envOverride: String? = null, allowDevLoopback: Boolean = false): String {
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val persistedHub = prefs.getString("default_hub_url", null)?.trim().orEmpty()
+        val persistedRelay = prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, null)?.trim().orEmpty()
+        val candidates = listOf(
+            persistedHub,
+            persistedRelay
+                .replace("wss://", "https://")
+                .replace("ws://", "http://")
+                .removeSuffix("/v1/tunnel")
+                .trimEnd('/'),
+            envOverride?.trim().orEmpty()
+        )
+        for (raw in candidates) {
+            if (raw.isNotEmpty()) {
+                try {
+                    return validateHubUrl(raw, allowDevLoopback = allowDevLoopback)
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return DEFAULT_BUILTIN_HUB_URL
+    }
+
+    fun setDefaultHubUrl(hubUrl: String, allowDevLoopback: Boolean = false): String {
+        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val clean = hubUrl.trim()
+        if (clean.isEmpty()) {
+            prefs.edit().remove("default_hub_url").apply()
+            return getDefaultHubUrl(allowDevLoopback = allowDevLoopback)
+        }
+        val validated = validateHubUrl(clean, allowDevLoopback = allowDevLoopback)
+        prefs.edit().putString("default_hub_url", validated).apply()
+        return validated
+    }
+
+    /**
+     * Join an active Render Hub rendezvous session for unpaired remote onboarding
+     * (never auto-pairs: returns scoped bootstrap material so TLS pinning + E2E verification can run).
+     */
+    fun joinRendezvousOnboarding(
+        snowId: String? = null,
+        pin: String? = null,
+        handshakeToken: String? = null,
+        federationCode: String? = null,
+        allowDevLoopback: Boolean = false,
+        onComplete: (Boolean, Map<String, Any?>?, String?) -> Unit
+    ) {
+        val hubBase = try {
+            getDefaultHubUrl(allowDevLoopback = allowDevLoopback)
+        } catch (e: Exception) {
+            onComplete(false, null, e.message ?: "Invalid Hub URL")
+            return
+        }
+        repoScope.launch(Dispatchers.IO) {
+            try {
+                val payload = org.json.JSONObject().apply {
+                    put("client_device_id", identity.deviceId)
+                    if (!snowId.isNullOrBlank()) put("snow_id", snowId.trim().uppercase())
+                    if (!pin.isNullOrBlank()) put("pin", pin.trim())
+                    if (!handshakeToken.isNullOrBlank()) put("handshake_token", handshakeToken.trim())
+                    if (!federationCode.isNullOrBlank()) put("federation_code", federationCode.trim())
+                }
+                val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+                val req = okhttp3.Request.Builder()
+                    .url("$hubBase/v1/rendezvous/join")
+                    .post(body)
+                    .build()
+                val httpClient = okhttp3.OkHttpClient.Builder()
+                    .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    val rawStr = resp.body?.string() ?: "{}"
+                    val obj = org.json.JSONObject(rawStr)
+                    if (!resp.isSuccessful || !obj.optBoolean("success", false)) {
+                        val err = obj.optString("error", "Rendezvous failed (HTTP ${resp.code})")
+                        kotlinx.coroutines.withContext(Dispatchers.Main) {
+                            onComplete(false, null, err)
+                        }
+                        return@launch
+                    }
+                    val fp = obj.optString("host_cert_fingerprint", "").trim()
+                    if (fp.length == 64 && certPinStorage.getPinnedFingerprint() == null) {
+                        certPinStorage.pinFingerprint(fp)
+                    }
+                    val resultMap = mapOf<String, Any?>(
+                        "rendezvous_id" to obj.optString("rendezvous_id"),
+                        "mode" to obj.optString("mode"),
+                        "network_id" to obj.optString("network_id"),
+                        "host_device_id" to obj.optString("host_device_id"),
+                        "host_snow_id" to obj.optString("host_snow_id"),
+                        "host_cert_fingerprint" to fp,
+                        "relay_ws_url" to obj.optString("relay_ws_url"),
+                        "bootstrap_token" to obj.optString("bootstrap_token"),
+                        "trust_completed" to obj.optBoolean("trust_completed", false),
+                        "requires_end_to_end_verification" to obj.optBoolean("requires_end_to_end_verification", true)
+                    )
+                    kotlinx.coroutines.withContext(Dispatchers.Main) {
+                        onComplete(true, resultMap, null)
+                    }
+                }
+            } catch (e: Exception) {
+                kotlinx.coroutines.withContext(Dispatchers.Main) {
+                    onComplete(false, null, e.message ?: "Rendezvous lookup error")
+                }
+            }
+        }
+    }
+
     fun setRemoteRelayEndpoint(endpoint: String) {
         val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         prefs.edit().putString(PREF_KEY_REMOTE_RELAY_ENDPOINT, endpoint.trim()).apply()
@@ -2126,6 +2556,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         } else {
             serviceRef?.stopRelay()
         }
+    }
+
+    fun refreshDiscovery(resumeUdp: Boolean = true) {
+        val svc = serviceRef ?: return
+        if (resumeUdp) {
+            svc.discoveryManager.startListening()
+        }
+        svc.promoteLocalRouteFromDiscoveryIfAvailable()
     }
 
     fun getRelayTokenStorage(keyStoreManager: org.snow.security.KeyStoreManager? = null): org.snow.security.TokenStorage {

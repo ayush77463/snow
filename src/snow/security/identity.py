@@ -15,9 +15,6 @@ import threading
 from typing import Any, Dict, Optional, Tuple, Union
 import uuid
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
-
 from snow.relay.auth import (
     NETWORK_ID_REGEX,
     SNOW_ID_REGEX,
@@ -29,6 +26,12 @@ from snow.relay.auth import (
     is_valid_snow_id,
     verify_ed25519_signature,
 )
+
+
+def _get_ed25519_signing_types():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat, PublicFormat
+    return Ed25519PrivateKey, Encoding, NoEncryption, PrivateFormat, PublicFormat
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +262,7 @@ class NetworkKeyIdentity:
             )
         if not isinstance(self._private_key_bytes, bytes) or len(self._private_key_bytes) != 32:
             raise NetworkIdentityError("Ed25519 private key must be exactly 32 raw bytes.")
+        Ed25519PrivateKey, Encoding, _, _, PublicFormat = _get_ed25519_signing_types()
         priv_obj = Ed25519PrivateKey.from_private_bytes(self._private_key_bytes)
         derived_pub = priv_obj.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         if derived_pub != raw_pub:
@@ -280,6 +284,7 @@ class NetworkKeyIdentity:
         """Sign raw message bytes using Ed25519 private key; return unpadded URL-safe Base64 signature."""
         if not isinstance(message, (bytes, bytearray)):
             raise ValueError("Message to sign must be bytes.")
+        Ed25519PrivateKey, _, _, _, _ = _get_ed25519_signing_types()
         priv_obj = Ed25519PrivateKey.from_private_bytes(self._private_key_bytes)
         sig = priv_obj.sign(bytes(message))
         return base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
@@ -373,6 +378,7 @@ def load_or_create_network_key_identity(
             return _parse_network_key_file(key_path)
 
         target_dir.mkdir(parents=True, exist_ok=True)
+        Ed25519PrivateKey, Encoding, NoEncryption, PrivateFormat, PublicFormat = _get_ed25519_signing_types()
         priv_obj = Ed25519PrivateKey.generate()
         priv_bytes = priv_obj.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
         pub_bytes = priv_obj.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
