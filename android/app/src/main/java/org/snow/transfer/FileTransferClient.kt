@@ -47,7 +47,8 @@ open class FileTransferClient(
     private val certPinStorage: CertPinStorage? = null,
     private val tokenStorage: TokenStorage? = null,
     private val useTls: Boolean = true,
-    customClient: OkHttpClient? = null
+    customClient: OkHttpClient? = null,
+    private val targetDeviceIdProvider: (() -> String?)? = null
 ) {
     companion object {
         const val TAG = "FileTransferClient"
@@ -138,17 +139,29 @@ open class FileTransferClient(
 
         if (useTls) {
             val storage = certPinStorage ?: EncryptedCertPinStorage(context)
-            val trustManager = SnowTrustManager(pinStorage = storage)
+            val trustManager = SnowTrustManager(
+                pinStorage = storage,
+                targetDeviceIdProvider = targetDeviceIdProvider
+            )
             val sslContext = TlsConfig.createSslContext(trustManager)
             builder.sslSocketFactory(sslContext.socketFactory, trustManager)
-            builder.hostnameVerifier(TlsConfig.createHostnameVerifier(storage))
+            builder.hostnameVerifier(TlsConfig.createHostnameVerifier(storage, targetDeviceIdProvider))
         }
 
         return builder.build()
     }
 
     private fun getAuthToken(): String? {
-        return tokenStorage?.getToken()
+        val storage = tokenStorage ?: return null
+        val targetId = targetDeviceIdProvider?.invoke()?.trim()?.takeIf { it.isNotEmpty() }
+        if (targetId != null) {
+            storage.getTokenForDevice(targetId)?.let { return it }
+            if (storage.listStoredDeviceIds().isEmpty()) {
+                return storage.getToken()
+            }
+            return null
+        }
+        return storage.getToken()
     }
 
     private fun getBaseUrl(serverHost: String, transferPort: Int): String {

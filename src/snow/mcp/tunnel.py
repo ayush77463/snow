@@ -99,6 +99,31 @@ def redact_tunnel_config(config: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def is_remote_ai_link_enabled(
+    config: Optional[dict[str, Any]] = None,
+    config_path: Optional[Path] = None,
+) -> bool:
+    """Return True when Remote AI Link should auto-start (default True unless manually stopped)."""
+    cfg = config if config is not None else load_tunnel_config(config_path=config_path)
+    raw = cfg.get("remote_ai_link_enabled", True)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("0", "false", "no", "off", "disabled")
+    return bool(raw)
+
+
+def set_remote_ai_link_enabled(
+    enabled: bool,
+    config_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Persist explicit Remote AI Link user preference without dropping other tunnel config."""
+    cfg = load_tunnel_config(config_path=config_path)
+    cfg["remote_ai_link_enabled"] = bool(enabled)
+    save_tunnel_config(cfg, config_path=config_path)
+    return cfg
+
+
 def find_cloudflared_binary() -> Optional[str]:
     """Locate cloudflared executable preferring bundled binaries before searching system PATH.
 
@@ -321,10 +346,27 @@ class _TunnelInstance:
                 logger.error(err)
                 return {"success": False, "status": "PORT_RESTRICTED", "error": err}
 
+            provider_lower = provider.strip().lower()
+            existing_status = self.get_status()
+            if (
+                existing_status.get("active")
+                and self._provider == provider_lower
+                and not custom_url
+            ):
+                res: dict[str, Any] = {
+                    "success": True,
+                    "status": "ALREADY_RUNNING",
+                    "purpose": self.purpose,
+                    "provider": self._provider,
+                    "public_url": self._public_url,
+                }
+                if existing_status.get("mcp_endpoint"):
+                    res["mcp_endpoint"] = existing_status["mcp_endpoint"]
+                return res
+
             # 2. Stop any existing tunnel on this instance safely without re-locking
             await self._stop_tunnel_unlocked()
 
-            provider_lower = provider.strip().lower()
             tunnel_cfg = load_tunnel_config()
             if self.purpose == "mcp":
                 resolved_token = (

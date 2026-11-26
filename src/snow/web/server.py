@@ -91,6 +91,9 @@ class SnowWebServer:
         self.gateway_port = 8771
         from snow.mcp.tunnel import TunnelManager
         self.tunnel_manager = TunnelManager(target_port=self.gateway_port)
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._remote_ai_autostart_task: Optional[asyncio.Task[Any]] = None
+        self._remote_ai_link_last_error: Optional[str] = None
 
         # Short-lived APK download tokens: token -> expires_at
         self._apk_download_tokens: dict[str, float] = {}
@@ -109,6 +112,12 @@ class SnowWebServer:
         # Track active dashboard-initiated file transfer tasks for cancellation
         self._active_file_downloads: dict[str, asyncio.Task[Any]] = {}
         self._active_file_downloads_lock = asyncio.Lock()
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """Return a shared, reusable aiohttp ClientSession bound to the running event loop."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
 
     # =========================================================================
     # Security Middleware
@@ -426,18 +435,26 @@ class SnowWebServer:
         if session_token and session_token in self._sessions:
             csrf_token = self._sessions[session_token].get("csrf_token")
 
-        async def _safe_bridge_call(coro_or_val: Any) -> dict[str, Any]:
+        async def _safe_bridge_call(coro_or_val: Any, timeout: float = 2.0) -> dict[str, Any]:
             try:
-                res = await coro_or_val if inspect.isawaitable(coro_or_val) else coro_or_val
+                if inspect.isawaitable(coro_or_val):
+                    res = await asyncio.wait_for(coro_or_val, timeout=timeout)
+                else:
+                    res = coro_or_val
                 return res if isinstance(res, dict) else {}
             except Exception:
                 return {}
 
-        daemon_raw = await _safe_bridge_call(self.bridge.daemon_manager.is_ipc_ready(timeout=0.2)) if hasattr(self.bridge, "daemon_manager") else True
+        dm = getattr(self.bridge, "daemon_manager", None)
+        daemon_raw = await _safe_bridge_call(dm.is_ipc_ready(timeout=0.2), timeout=1.0) if dm is not None else True
         daemon_online = bool(daemon_raw) if not isinstance(daemon_raw, dict) else True
-        telemetry_res = await _safe_bridge_call(self.bridge.windows_system_info())
+        telemetry_res = (
+            await _safe_bridge_call(self.bridge.windows_system_info(), timeout=2.0)
+            if hasattr(self.bridge, "windows_system_info")
+            else {}
+        )
         battery_res = (
-            await _safe_bridge_call(self.bridge.windows_battery())
+            await _safe_bridge_call(self.bridge.windows_battery(), timeout=2.0)
             if hasattr(self.bridge, "windows_battery")
             else {}
         )
@@ -475,10 +492,10 @@ class SnowWebServer:
                 host_telemetry["battery_percent"] = bdata.get("percent")
 
         from snow.core.network import get_active_ip_addresses
-        lan_ips = get_active_ip_addresses()
+        lan_ips = await asyncio.to_thread(get_active_ip_addresses)
         lan_available = bool(lan_ips)
         try:
-            usb_stat = await self._get_cached_usb_status()
+            usb_stat = await asyncio.wait_for(self._get_cached_usb_status(), timeout=2.0)
             usb_connected = bool(usb_stat.get("connected") or usb_stat.get("authorized_count", 0) > 0)
         except Exception:
             usb_connected = False
@@ -704,6 +721,21 @@ class SnowWebServer:
 
         res = await self.bridge.call("device_disconnect", {"device_id": device_id})
         return web.json_response(res)
+
+    async def handle_api_devices_disconnect_all(self, request: web.Request) -> web.Response:
+        """Disconnect all active connected devices while preserving pairings and Core."""
+        try:
+            res = await asyncio.wait_for(self.bridge.disconnect_all_devices(), timeout=5.0)
+            if not isinstance(res, dict):
+                res = {"success": False, "error": "Unexpected response from Core bridge."}
+            return web.json_response(res)
+        except asyncio.TimeoutError:
+            return web.json_response(
+                {"success": False, "status": "TIMEOUT", "error": "Disconnect All timed out waiting for Core."},
+                status=504,
+            )
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
 
     async def handle_api_devices_reconnect(self, request: web.Request) -> web.Response:
         """Clear disconnect lock and trigger reconnection for a paired device."""
@@ -1425,7 +1457,27 @@ class SnowWebServer:
     async def handle_api_notifications(self, request: web.Request) -> web.Response:
         """List active non-sensitive notifications from the connected phone."""
         device_id = request.query.get("device_id", "")
-        res = await self.bridge.android_notifications_list(device_id=device_id)
+        try:
+            res = await asyncio.wait_for(
+                self.bridge.android_notifications_list(device_id=device_id),
+                timeout=2.5,
+            )
+        except asyncio.TimeoutError:
+            return web.json_response({
+                "success": False,
+                "status": "TIMEOUT",
+                "notifications": [],
+                "data": {},
+                "error": "Notifications query timed out.",
+            })
+        except Exception as exc:
+            return web.json_response({
+                "success": False,
+                "status": "ERROR",
+                "notifications": [],
+                "data": {},
+                "error": str(exc),
+            })
         notifications = []
         if isinstance(res.get("data"), dict) and "notifications" in res["data"]:
             notifications = res["data"]["notifications"]
@@ -2017,25 +2069,25 @@ class SnowWebServer:
             }
 
             timeout = aiohttp.ClientTimeout(total=2.0)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=headers, ssl=ssl_ctx) as resp:
-                    if resp.status == 200:
-                        frame_bytes = await resp.read()
-                        if frame_bytes:
-                            return web.Response(
-                                body=frame_bytes,
-                                content_type="image/jpeg",
-                                headers={
-                                    "Cache-Control": "no-store, no-cache, must-revalidate",
-                                    "X-Content-Type-Options": "nosniff",
-                                    "X-Snow-Session-Id": resp.headers.get("X-Snow-Session-Id", ""),
-                                    "X-Snow-Sender-Id": resp.headers.get("X-Snow-Sender-Id", ""),
-                                    "X-Snow-Sender-Name": resp.headers.get("X-Snow-Sender-Name", ""),
-                                    "X-Snow-Frame-Seq": resp.headers.get("X-Snow-Frame-Seq", "0"),
-                                    "X-Snow-Timestamp": resp.headers.get("X-Snow-Timestamp", "0"),
-                                },
-                            )
-                    return web.Response(status=204)
+            session = await self._get_http_session()
+            async with session.get(url, headers=headers, ssl=ssl_ctx, timeout=timeout) as resp:
+                if resp.status == 200:
+                    frame_bytes = await resp.read()
+                    if frame_bytes:
+                        return web.Response(
+                            body=frame_bytes,
+                            content_type="image/jpeg",
+                            headers={
+                                "Cache-Control": "no-store, no-cache, must-revalidate",
+                                "X-Content-Type-Options": "nosniff",
+                                "X-Snow-Session-Id": resp.headers.get("X-Snow-Session-Id", ""),
+                                "X-Snow-Sender-Id": resp.headers.get("X-Snow-Sender-Id", ""),
+                                "X-Snow-Sender-Name": resp.headers.get("X-Snow-Sender-Name", ""),
+                                "X-Snow-Frame-Seq": resp.headers.get("X-Snow-Frame-Seq", "0"),
+                                "X-Snow-Timestamp": resp.headers.get("X-Snow-Timestamp", "0"),
+                            },
+                        )
+                return web.Response(status=204)
         except (aiohttp.ClientSSLError, ssl.SSLError) as ssl_err:
             logger.error("Screen frame proxy TLS verification failed: %s", ssl_err)
             return web.Response(status=502, text=f"TLS verification failed: {ssl_err}")
@@ -2743,7 +2795,7 @@ class SnowWebServer:
 
         # Resolve LAN IP
         from snow.core.network import get_active_ip_addresses
-        ips = get_active_ip_addresses()
+        ips = await asyncio.to_thread(get_active_ip_addresses)
         lan_ip = ips[0] if ips else "127.0.0.1"
 
         # Ensure ephemeral LAN server is running for phone download
@@ -3145,98 +3197,99 @@ class SnowWebServer:
             target_url = f"{hub_url.rstrip('/')}/v1/directory/resolve/{clean_id}"
             try:
                 timeout = aiohttp.ClientTimeout(total=4.0)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    ok_auth, hub_token, auth_status, auth_err = await self._authenticate_hub_session(session, hub_url)
-                    if not ok_auth or not hub_token:
+                session = await self._get_http_session()
+                ok_auth, hub_token, auth_status, auth_err = await self._authenticate_hub_session(session, hub_url)
+                if not ok_auth or not hub_token:
+                    return {
+                        "success": False,
+                        "found": False,
+                        "status": auth_status,
+                        "error": auth_err or "Cloud hub authentication failed.",
+                        "snow_id": clean_id,
+                        "source": "hub_directory",
+                        **({"discovery_error": discovery_error} if discovery_error else {}),
+                    }
+
+                async with session.get(
+                    target_url,
+                    headers={"Authorization": f"Bearer {hub_token}"},
+                    timeout=timeout,
+                ) as resp:
+                    try:
+                        hub_data = await resp.json(content_type=None)
+                    except Exception:
+                        hub_data = {}
+
+                    if resp.status == 401:
                         return {
                             "success": False,
                             "found": False,
-                            "status": auth_status,
-                            "error": auth_err or "Cloud hub authentication failed.",
+                            "status": "HUB_AUTH_FAILED",
+                            "error": str((hub_data or {}).get("error") or "Hub directory authentication failed."),
                             "snow_id": clean_id,
                             "source": "hub_directory",
-                            **({"discovery_error": discovery_error} if discovery_error else {}),
                         }
-
-                    async with session.get(
-                        target_url,
-                        headers={"Authorization": f"Bearer {hub_token}"},
-                    ) as resp:
-                        try:
-                            hub_data = await resp.json(content_type=None)
-                        except Exception:
-                            hub_data = {}
-
-                        if resp.status == 401:
-                            return {
-                                "success": False,
-                                "found": False,
-                                "status": "HUB_AUTH_FAILED",
-                                "error": str((hub_data or {}).get("error") or "Hub directory authentication failed."),
-                                "snow_id": clean_id,
-                                "source": "hub_directory",
-                            }
-                        if resp.status == 403:
-                            return {
-                                "success": False,
-                                "found": False,
-                                "status": "FORBIDDEN",
-                                "error": str((hub_data or {}).get("error") or "Cross-network directory lookup denied."),
-                                "snow_id": clean_id,
-                                "source": "hub_directory",
-                            }
-                        if resp.status == 404:
-                            return {
-                                "success": False,
-                                "found": False,
-                                "status": "REMOTE_DEVICE_NOT_FOUND",
-                                "error": str((hub_data or {}).get("error") or f"Remote device '{clean_id}' not found."),
-                                "snow_id": clean_id,
-                                "source": "hub_directory",
-                            }
-                        if resp.status >= 500 or resp.status != 200 or not isinstance(hub_data, dict):
-                            return {
-                                "success": False,
-                                "found": False,
-                                "status": "HUB_UNAVAILABLE",
-                                "error": str((hub_data or {}).get("error") or f"Cloud hub returned HTTP {resp.status}."),
-                                "snow_id": clean_id,
-                                "source": "hub_directory",
-                            }
-
-                        if "online" in hub_data and not hub_data.get("online"):
-                            return {
-                                "success": False,
-                                "found": False,
-                                "status": "REMOTE_DEVICE_OFFLINE",
-                                "error": f"Remote device '{clean_id}' is currently offline.",
-                                "snow_id": clean_id,
-                                "source": "hub_directory",
-                            }
-
-                        ep_ok, ep_host, ep_port, ep_err = self._extract_valid_hub_endpoints(hub_data)
-                        if not ep_ok:
-                            return {
-                                "success": False,
-                                "found": False,
-                                "status": "INVALID_ENDPOINT",
-                                "error": ep_err,
-                                "snow_id": clean_id,
-                                "source": "hub_directory",
-                            }
-
-                        result: dict[str, Any] = {
-                            "success": True,
-                            "found": True,
-                            "source": "hub_directory",
+                    if resp.status == 403:
+                        return {
+                            "success": False,
+                            "found": False,
+                            "status": "FORBIDDEN",
+                            "error": str((hub_data or {}).get("error") or "Cross-network directory lookup denied."),
                             "snow_id": clean_id,
-                            "hub_url": hub_url,
-                            **hub_data,
+                            "source": "hub_directory",
                         }
-                        if ep_host:
-                            result["host"] = ep_host
-                            result["port"] = ep_port
-                        return result
+                    if resp.status == 404:
+                        return {
+                            "success": False,
+                            "found": False,
+                            "status": "REMOTE_DEVICE_NOT_FOUND",
+                            "error": str((hub_data or {}).get("error") or f"Remote device '{clean_id}' not found."),
+                            "snow_id": clean_id,
+                            "source": "hub_directory",
+                        }
+                    if resp.status >= 500 or resp.status != 200 or not isinstance(hub_data, dict):
+                        return {
+                            "success": False,
+                            "found": False,
+                            "status": "HUB_UNAVAILABLE",
+                            "error": str((hub_data or {}).get("error") or f"Cloud hub returned HTTP {resp.status}."),
+                            "snow_id": clean_id,
+                            "source": "hub_directory",
+                        }
+
+                    if "online" in hub_data and not hub_data.get("online"):
+                        return {
+                            "success": False,
+                            "found": False,
+                            "status": "REMOTE_DEVICE_OFFLINE",
+                            "error": f"Remote device '{clean_id}' is currently offline.",
+                            "snow_id": clean_id,
+                            "source": "hub_directory",
+                        }
+
+                    ep_ok, ep_host, ep_port, ep_err = self._extract_valid_hub_endpoints(hub_data)
+                    if not ep_ok:
+                        return {
+                            "success": False,
+                            "found": False,
+                            "status": "INVALID_ENDPOINT",
+                            "error": ep_err,
+                            "snow_id": clean_id,
+                            "source": "hub_directory",
+                        }
+
+                    result: dict[str, Any] = {
+                        "success": True,
+                        "found": True,
+                        "source": "hub_directory",
+                        "snow_id": clean_id,
+                        "hub_url": hub_url,
+                        **hub_data,
+                    }
+                    if ep_host:
+                        result["host"] = ep_host
+                        result["port"] = ep_port
+                    return result
             except asyncio.TimeoutError:
                 return {
                     "success": False,
@@ -3720,16 +3773,26 @@ class SnowWebServer:
                     except Exception:
                         pass
 
-    async def handle_api_mcp_tunnel_start(self, request: web.Request) -> web.Response:
-        """Start public tunnel for the Remote MCP Gateway with live URL synchronization."""
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        provider = (body.get("provider") or "render").strip().lower()
-        custom_url = body.get("custom_url")
+    async def ensure_remote_ai_link_running(
+        self,
+        *,
+        provider: Optional[str] = None,
+        custom_url: Optional[str] = None,
+        mark_enabled: bool = False,
+    ) -> dict[str, Any]:
+        """Idempotently start Remote MCP Gateway (:8771) and public Render/provider tunnel."""
+        from snow.mcp.tunnel import load_tunnel_config, set_remote_ai_link_enabled
 
-        # 1. Ensure Remote MCP Gateway is running
+        if mark_enabled:
+            try:
+                set_remote_ai_link_enabled(True)
+            except Exception as exc:
+                logger.debug("Could not persist remote_ai_link_enabled=True: %s", exc)
+
+        cfg = load_tunnel_config()
+        resolved_provider = (provider or cfg.get("provider") or "render").strip().lower() or "render"
+
+        # 1. Ensure Remote MCP Gateway is running (deduplicated under lock)
         async with self._mcp_gateway_lock:
             if not self._mcp_gateway_runner:
                 try:
@@ -3742,40 +3805,107 @@ class SnowWebServer:
                     self._mcp_gateway_runner = runner
                     self._mcp_gateway_site = site
                     self._mcp_gateway_instance = gateway
+                except OSError as bind_exc:
+                    # Port 8771 may already be served by another running local gateway instance
+                    logger.warning("Remote MCP Gateway port %d already bound or unavailable: %s", self.gateway_port, bind_exc)
                 except Exception as exc:
                     logger.error("Failed starting Remote MCP Gateway for tunnel: %s", exc)
-                    return web.json_response({
+                    self._remote_ai_link_last_error = f"Could not start Remote MCP Gateway on port {self.gateway_port}: {exc}"
+                    return {
                         "success": False,
                         "status": "GATEWAY_START_FAILED",
-                        "error": f"Could not start Remote MCP Gateway on port {self.gateway_port}: {exc}",
-                    }, status=500)
+                        "error": self._remote_ai_link_last_error,
+                    }
 
-        # 2. Start public tunnel
+        # 2. Deduplicate if tunnel is already active on matching provider and no custom override was requested
+        cur_status = self.tunnel_manager.get_status(port=self.gateway_port)
+        if (
+            cur_status.get("active")
+            and cur_status.get("provider") == resolved_provider
+            and not custom_url
+            and cur_status.get("public_url")
+        ):
+            self._remote_ai_link_last_error = None
+            if self._mcp_gateway_instance:
+                self._mcp_gateway_instance.set_public_url(cur_status["public_url"])
+            return {
+                "success": True,
+                "status": "ALREADY_RUNNING",
+                "purpose": "mcp",
+                "provider": resolved_provider,
+                "public_url": cur_status["public_url"],
+                "mcp_endpoint": cur_status.get("mcp_endpoint") or f"{str(cur_status['public_url']).rstrip('/')}/mcp",
+            }
+
+        # 3. Start public tunnel (transient network failures never clear remote_ai_link_enabled)
         res = await self.tunnel_manager.start_tunnel(
-            provider=provider,
+            provider=resolved_provider,
             port=self.gateway_port,
             custom_url=custom_url,
         )
 
-        # 3. Synchronize live public URL into RemoteMcpGateway instance
+        # 4. Synchronize live public URL into RemoteMcpGateway instance
         if res.get("success") and res.get("public_url"):
+            self._remote_ai_link_last_error = None
             if self._mcp_gateway_instance:
                 self._mcp_gateway_instance.set_public_url(res["public_url"])
         else:
+            self._remote_ai_link_last_error = str(res.get("error") or "Remote AI Link tunnel unavailable.")
             if self._mcp_gateway_instance:
                 self._mcp_gateway_instance.set_public_url(None)
 
+        return res
+
+    async def _autostart_remote_ai_link(self) -> None:
+        """Background startup helper honoring persistent remote_ai_link_enabled without blocking UI bind."""
+        try:
+            res = await self.ensure_remote_ai_link_running(mark_enabled=False)
+            if res.get("success"):
+                logger.info("Remote AI Link auto-started successfully (%s).", res.get("mcp_endpoint") or res.get("public_url"))
+            else:
+                logger.warning("Remote AI Link auto-start deferred (preference preserved): %s", res.get("error"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._remote_ai_link_last_error = str(exc)
+            logger.debug("Remote AI Link auto-start background error: %s", exc)
+
+    async def handle_api_mcp_tunnel_start(self, request: web.Request) -> web.Response:
+        """Start public tunnel for the Remote MCP Gateway with live URL synchronization."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        provider = (body.get("provider") or "render").strip().lower()
+        custom_url = body.get("custom_url")
+
+        res = await self.ensure_remote_ai_link_running(
+            provider=provider,
+            custom_url=custom_url,
+            mark_enabled=True,
+        )
         return web.json_response(res, status=200 if res.get("success") else 400)
 
     async def handle_api_mcp_tunnel_stop(self, request: web.Request) -> web.Response:
-        """Stop any active public tunnel and clear gateway public URL."""
+        """Stop any active public tunnel, clear gateway public URL, and persist manual stop."""
+        from snow.mcp.tunnel import set_remote_ai_link_enabled
+
+        try:
+            set_remote_ai_link_enabled(False)
+        except Exception as exc:
+            logger.debug("Could not persist remote_ai_link_enabled=False: %s", exc)
+        self._remote_ai_link_last_error = None
+        if self._remote_ai_autostart_task and not self._remote_ai_autostart_task.done():
+            self._remote_ai_autostart_task.cancel()
         res = await self.tunnel_manager.stop_tunnel()
         if self._mcp_gateway_instance:
             self._mcp_gateway_instance.set_public_url(None)
-        return web.json_response(res)
+        return web.json_response({**res, "enabled": False})
 
     async def handle_api_mcp_tunnel_status(self, request: web.Request) -> web.Response:
-        """Query current tunnel status plus dynamic configured Render Hub endpoint."""
+        """Query current tunnel status plus dynamic configured Render Hub endpoint and auto-start state."""
+        from snow.mcp.tunnel import is_remote_ai_link_enabled
+
         status = self.tunnel_manager.get_status()
         configured_render_url = ""
         try:
@@ -3792,7 +3922,13 @@ class SnowWebServer:
         except Exception as exc:
             logger.debug("Unable to resolve configured Render Hub route: %s", exc)
         return web.json_response(
-            {"success": True, **status, "configured_render_url": configured_render_url}
+            {
+                "success": True,
+                **status,
+                "enabled": is_remote_ai_link_enabled(),
+                "last_error": None if status.get("active") else self._remote_ai_link_last_error,
+                "configured_render_url": configured_render_url,
+            }
         )
 
     async def handle_api_mcp_tunnel_config_get(self, request: web.Request) -> web.Response:
@@ -3882,15 +4018,86 @@ class SnowWebServer:
     # =========================================================================
 
     async def handle_api_relay_tunnel_start(self, request: web.Request) -> web.Response:
-        """Start public tunnel for the Remote Device Relay (port 8770)."""
+        """Start Remote Access via built-in Render Hub (default) or explicit optional tunnel."""
         body = {}
         try:
             body = await request.json()
         except Exception:
             pass
 
-        provider = body.get("provider", "cloudflared")
+        provider = str(body.get("provider") or "render").strip().lower()
         custom_url = body.get("custom_url")
+
+        if provider in ("", "render", "hub", "auto"):
+            from snow.core.config import resolve_default_hub_url
+            from snow.security.identity import load_or_create_network_key_identity
+
+            cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+            db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
+            if db_mgr is None:
+                daemon_mgr = getattr(getattr(self, "bridge", None), "daemon_manager", None)
+                core_srv = getattr(daemon_mgr, "_core_server", None) or getattr(self.bridge, "core_server", None)
+                db_mgr = getattr(core_srv, "db_manager", None) if core_srv is not None else None
+
+            hub_url = str(custom_url or "").strip() or resolve_default_hub_url(db_manager=db_mgr)
+            ws_url = hub_url
+            if ws_url.startswith("https://"):
+                ws_url = "wss://" + ws_url[len("https://"):]
+            elif ws_url.startswith("http://"):
+                ws_url = "ws://" + ws_url[len("http://"):]
+            ws_url = ws_url.rstrip("/")
+            if not ws_url.endswith("/v1/tunnel"):
+                ws_url = f"{ws_url}/v1/tunnel"
+
+            network_id = "default_group"
+            try:
+                key_ident = load_or_create_network_key_identity()
+                if key_ident and getattr(key_ident, "network_id", ""):
+                    network_id = str(key_ident.network_id)
+            except Exception as exc:
+                logger.debug("Using fallback relay group_id: %s", exc)
+
+            if db_mgr is not None and hasattr(db_mgr, "set_setting"):
+                try:
+                    db_mgr.set_setting("remote_relay_enabled", "true")
+                except Exception:
+                    pass
+
+            res = await self.bridge.set_relay_config(
+                enabled=True,
+                relay_url=ws_url,
+                group_id=network_id,
+                ticket="",
+            )
+            if not res.get("success"):
+                return web.json_response(
+                    {
+                        "success": False,
+                        "status": res.get("status", "CORE_OFFLINE"),
+                        "error": res.get("error") or "Desktop Core is unavailable for Render Hub Remote Access.",
+                        "provider": "render",
+                    },
+                    status=400,
+                )
+
+            data_obj = res.get("data") if isinstance(res.get("data"), dict) else res
+            is_connected = bool(data_obj.get("connected", False))
+            resolved_url = str(data_obj.get("relay_url") or ws_url)
+            return web.json_response({
+                "success": True,
+                "active": is_connected,
+                "enabled": True,
+                "provider": "render",
+                "public_url": resolved_url,
+                "relay_url": resolved_url,
+                "group_id": str(data_obj.get("group_id") or network_id),
+                "status": "CONNECTED" if is_connected else "CONNECTING",
+                "message": (
+                    "Render Hub Remote Access is active."
+                    if is_connected
+                    else "Render Hub Remote Access enabled (establishing hub session)."
+                ),
+            })
 
         res = await self.tunnel_manager.start_relay_tunnel(
             provider=provider,
@@ -3900,14 +4107,75 @@ class SnowWebServer:
         return web.json_response(res, status=200 if res.get("success") else 400)
 
     async def handle_api_relay_tunnel_stop(self, request: web.Request) -> web.Response:
-        """Stop active public tunnel for Remote Device Relay."""
+        """Stop Remote Access Render Hub connection and any optional relay tunnel."""
+        cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+        db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
+        if db_mgr is not None and hasattr(db_mgr, "set_setting"):
+            try:
+                db_mgr.set_setting("remote_relay_enabled", "false")
+            except Exception:
+                pass
+        try:
+            await self.bridge.set_relay_config(enabled=False)
+        except Exception as exc:
+            logger.debug("Best-effort core relay disable returned: %s", exc)
         res = await self.tunnel_manager.stop_tunnel(port=8770)
-        return web.json_response(res, status=200 if res.get("success") else 400)
+        return web.json_response({"success": True, "active": False, "enabled": False, "status": "STOPPED", **res})
 
     async def handle_api_relay_tunnel_status(self, request: web.Request) -> web.Response:
-        """Query current Relay tunnel status."""
-        status = self.tunnel_manager.get_status(port=8770)
-        return web.json_response({"success": True, **status})
+        """Query current Relay tunnel status across Render Hub and optional tunnels."""
+        tm_status = self.tunnel_manager.get_status(port=8770)
+        core_cfg: dict[str, Any] = {}
+        try:
+            res = await self.bridge.get_relay_config()
+            if isinstance(res, dict) and res.get("success"):
+                core_cfg = res.get("data") if isinstance(res.get("data"), dict) else res
+        except Exception:
+            core_cfg = {}
+
+        cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+        db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
+        persisted_enabled = False
+        if db_mgr is not None and hasattr(db_mgr, "get_setting"):
+            try:
+                persisted_enabled = str(db_mgr.get_setting("remote_relay_enabled", "")).strip().lower() == "true"
+            except Exception:
+                persisted_enabled = False
+
+        core_enabled = bool(core_cfg.get("enabled", False))
+        core_connected = bool(core_cfg.get("connected", False))
+        core_relay_url = str(core_cfg.get("relay_url") or "").strip()
+
+        if core_enabled or core_connected:
+            return web.json_response({
+                "success": True,
+                **tm_status,
+                "active": core_connected,
+                "enabled": core_enabled,
+                "provider": "render",
+                "public_url": core_relay_url or tm_status.get("public_url"),
+                "relay_url": core_relay_url,
+                "group_id": core_cfg.get("group_id", ""),
+                "active_tunnels": core_cfg.get("active_tunnels", []),
+                "available_providers": ["render"] + list(tm_status.get("available_providers") or []),
+            })
+
+        if tm_status.get("active"):
+            return web.json_response({
+                "success": True,
+                "enabled": True,
+                **tm_status,
+                "available_providers": ["render"] + list(tm_status.get("available_providers") or []),
+            })
+
+        return web.json_response({
+            "success": True,
+            **tm_status,
+            "active": False,
+            "enabled": persisted_enabled,
+            "provider": "render" if persisted_enabled else tm_status.get("provider"),
+            "available_providers": ["render"] + list(tm_status.get("available_providers") or []),
+        })
 
     async def handle_api_mcp_oauth_pending(self, request: web.Request) -> web.Response:
         """List active pending OAuth authorization requests."""
@@ -4177,26 +4445,32 @@ class SnowWebServer:
         """Initiate coordinated complete desktop power-off under owner authorization."""
         logger.info("Coordinated system shutdown initiated by owner via Web Dashboard.")
 
-        # 1. Stop all public tunnels
+        # 1. Stop all public tunnels (bounded timeout so slow providers cannot wedge shutdown)
         if hasattr(self, "tunnel_manager"):
             try:
-                await self.tunnel_manager.stop_all_tunnels()
+                await asyncio.wait_for(self.tunnel_manager.stop_all_tunnels(), timeout=2.0)
             except Exception as exc:
                 logger.warning("Error stopping tunnels during shutdown: %s", exc)
 
         # 2. Stop Remote MCP Gateway runner
         if getattr(self, "_mcp_gateway_runner", None):
             try:
-                await self._mcp_gateway_runner.cleanup()
+                await asyncio.wait_for(self._mcp_gateway_runner.cleanup(), timeout=2.0)
             except Exception as exc:
                 logger.warning("Error cleaning up MCP gateway during shutdown: %s", exc)
 
         # 3. Request core shutdown via IPC
         try:
             if hasattr(self.bridge, "system_shutdown"):
-                await self.bridge.system_shutdown(reason="Owner power-off via Web Dashboard")
+                await asyncio.wait_for(
+                    self.bridge.system_shutdown(reason="Owner power-off via Web Dashboard"),
+                    timeout=2.0,
+                )
             else:
-                await self.bridge.call("system_shutdown", payload={"reason": "Owner power-off via Web Dashboard"})
+                await asyncio.wait_for(
+                    self.bridge.call("system_shutdown", payload={"reason": "Owner power-off via Web Dashboard"}),
+                    timeout=2.0,
+                )
         except Exception as exc:
             logger.warning("Error sending system_shutdown IPC: %s", exc)
 
@@ -4236,6 +4510,7 @@ class SnowWebServer:
         app.router.add_get("/api/devices", self.handle_api_devices)
         app.router.add_post("/api/devices/revoke", self.handle_api_devices_revoke)
         app.router.add_post("/api/devices/disconnect", self.handle_api_devices_disconnect)
+        app.router.add_post("/api/devices/disconnect-all", self.handle_api_devices_disconnect_all)
         app.router.add_post("/api/devices/reconnect", self.handle_api_devices_reconnect)
         app.router.add_post("/api/devices/connect-peer", self.handle_api_devices_connect_peer)
         app.router.add_post("/api/devices/connection-mode", self.handle_api_devices_connection_mode)
@@ -4406,6 +4681,11 @@ class SnowWebServer:
         print(f"    Secure Bootstrap URL: {launch_url}")
         print("    (Bootstrap token expires in 60s and is consumed upon first browser connection)")
 
+        from snow.mcp.tunnel import is_remote_ai_link_enabled
+        if is_remote_ai_link_enabled():
+            if self._remote_ai_autostart_task is None or self._remote_ai_autostart_task.done():
+                self._remote_ai_autostart_task = asyncio.create_task(self._autostart_remote_ai_link())
+
         if self.auto_open_browser:
             try:
                 webbrowser.open(launch_url)
@@ -4414,6 +4694,14 @@ class SnowWebServer:
 
     async def stop(self) -> None:
         """Gracefully release server listener and invalidate sessions."""
+        if getattr(self, "_remote_ai_autostart_task", None) and not self._remote_ai_autostart_task.done():
+            self._remote_ai_autostart_task.cancel()
+            try:
+                await self._remote_ai_autostart_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._remote_ai_autostart_task = None
+
         # Stop active MCP gateway if one exists
         if self._mcp_gateway_runner:
             try:
@@ -4445,6 +4733,15 @@ class SnowWebServer:
                     self._mcp_gateway_instance.set_public_url(None)
             except Exception as texc:
                 logger.warning("Error stopping tunnels on server stop: %s", texc)
+
+        if getattr(self, "_http_session", None) is not None:
+            try:
+                if not self._http_session.closed:
+                    await self._http_session.close()
+            except Exception as exc:
+                logger.debug("Error closing shared HTTP session: %s", exc)
+            finally:
+                self._http_session = None
 
         if not self._is_running:
             return

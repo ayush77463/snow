@@ -115,7 +115,9 @@ class Stage5V5ReleaseRegressionTest {
     @Test
     fun testPhase2And3BackgroundReliabilityAndSeparatedLaunchers() {
         val manifestText = resolveModuleFile("src/main/AndroidManifest.xml").readText()
-        assertTrue(manifestText.contains("android.permission.SYSTEM_ALERT_WINDOW"))
+        assertFalse(manifestText.contains("android.permission.SYSTEM_ALERT_WINDOW"))
+        assertFalse(manifestText.contains("android.permission.MANAGE_EXTERNAL_STORAGE"))
+        assertFalse(manifestText.contains("android.permission.REQUEST_INSTALL_PACKAGES"))
 
         val fgServiceText = resolveModuleFile("src/main/java/org/snow/service/SnowForegroundService.kt").readText()
         assertTrue(fgServiceText.contains("START_STICKY"))
@@ -187,7 +189,9 @@ class Stage5V5ReleaseRegressionTest {
         assertTrue(connectSrc.contains("pairingQrJson"))
 
         val settingsSrc = resolveModuleFile("src/main/java/org/snow/ui/settings/SettingsScreen.kt").readText()
-        assertTrue(settingsSrc.contains("Background App Launch"))
-        assertTrue(settingsSrc.contains("ACTION_MANAGE_OVERLAY_PERMISSION"))
+        assertFalse(settingsSrc.contains("Background App Launch"))
+        assertFalse(settingsSrc.contains("ACTION_MANAGE_OVERLAY_PERMISSION"))
+        assertFalse(settingsSrc.contains("All Files Access"))
+        assertTrue(settingsSrc.contains("Notification Sync & Listener"))
     }
 }

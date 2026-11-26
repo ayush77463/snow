@@ -59,7 +59,8 @@ sealed class AuthState {
         val peerDeviceType: String? = null,
         val peerDeviceId: String? = null,
         val peerSnowId: String? = null,
-        val permissionProfile: String? = null
+        val permissionProfile: String? = null,
+        val peerNetworkId: String? = null
     ) : AuthState()
     data class AuthFailed(val reason: String) : AuthState()
     data class FingerprintConfirmationRequired(val fingerprint: String) : AuthState()
@@ -103,6 +104,9 @@ class SnowWebSocketClient(
                 ?: (manifest?.get("device_id") as? String)
             val peerSnowId = (data?.get("snow_id") as? String)
                 ?: (manifest?.get("snow_id") as? String)
+            val peerNetworkId = ((data?.get("network_id") as? String)
+                ?: (manifest?.get("network_id") as? String))
+                ?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
             return AuthState.Authenticated(
                 sessionId = sessionId,
                 trustTier = trustTier,
@@ -110,7 +114,8 @@ class SnowWebSocketClient(
                 peerDeviceType = peerType,
                 peerDeviceId = peerDeviceId,
                 peerSnowId = peerSnowId,
-                permissionProfile = permissionProfile
+                permissionProfile = permissionProfile,
+                peerNetworkId = peerNetworkId
             )
         }
     }
@@ -152,8 +157,18 @@ class SnowWebSocketClient(
         peerDeviceType: String? = null,
         peerDeviceId: String? = null,
         peerSnowId: String? = null,
-        permissionProfile: String? = null
+        permissionProfile: String? = null,
+        peerNetworkId: String? = null
     ) {
+        val canonicalPeerId = peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+        if (canonicalPeerId != null) {
+            resolvedTargetDeviceId = canonicalPeerId
+            currentTrustManager?.lastPresentedFingerprint?.let { fp ->
+                if (certPinStorage?.getPinnedFingerprintForDevice(canonicalPeerId) == null) {
+                    certPinStorage?.pinFingerprintForDevice(canonicalPeerId, fp)
+                }
+            }
+        }
         backoffPolicy.reset()
         _authState.value = AuthState.Authenticated(
             sessionId,
@@ -162,7 +177,8 @@ class SnowWebSocketClient(
             peerDeviceType,
             peerDeviceId,
             peerSnowId,
-            permissionProfile
+            permissionProfile,
+            peerNetworkId
         )
     }
 
@@ -172,9 +188,81 @@ class SnowWebSocketClient(
     private val pendingRequests = ConcurrentHashMap<String, (SnowMessage) -> Unit>()
     private var currentTrustManager: SnowTrustManager? = null
 
+    @Volatile
+    var expectedTargetDeviceId: String? = null
+    @Volatile
+    var resolvedTargetDeviceId: String? = null
+    var targetDeviceLookupByEndpoint: ((String, Int) -> String?)? = null
+
     var requestDispatcher: (suspend (action: String, data: Map<String, Any?>?) -> Pair<Map<String, Any?>?, SnowError?>)? = null
     val currentTargetHost: String get() = targetHost
     val currentTargetPort: Int get() = targetPort
+
+    fun activeTargetDeviceId(): String? {
+        return resolvedTargetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            ?: expectedTargetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            ?: currentTrustManager?.lastMatchedDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            ?: targetDeviceLookupByEndpoint?.invoke(targetHost, targetPort)?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun isLoopbackTargetHost(): Boolean =
+        targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
+
+    private fun resolveScopedPinnedFingerprint(presentedFp: String? = null): String? {
+        val storage = certPinStorage ?: return null
+        val targetDev = activeTargetDeviceId()
+        if (targetDev != null) {
+            storage.getPinnedFingerprintForDevice(targetDev)?.let { return it }
+            if (storage.listPinnedDeviceIds().isEmpty()) {
+                return storage.getPinnedFingerprint()
+            }
+            return null
+        }
+        if (isLoopbackTargetHost() && presentedFp != null) {
+            val matchedDev = storage.findDeviceIdByFingerprint(presentedFp)
+            if (matchedDev != null) {
+                return storage.getPinnedFingerprintForDevice(matchedDev)
+            }
+            if (storage.listPinnedDeviceIds().isEmpty()) {
+                return storage.getPinnedFingerprint()
+            }
+            return null
+        }
+        return storage.getPinnedFingerprint()
+    }
+
+    private fun resolveStoredTokenForActiveTarget(): String? {
+        val storage = tokenStorage ?: return null
+        val targetDev = activeTargetDeviceId()
+        if (targetDev != null) {
+            storage.getTokenForDevice(targetDev)?.let { return it }
+            if (storage.listStoredDeviceIds().isEmpty()) {
+                return storage.getToken()
+            }
+            return null
+        }
+        if (isLoopbackTargetHost()) {
+            // Do not blindly send another peer's token if device was not identified yet
+            if (storage.listStoredDeviceIds().isEmpty()) {
+                return storage.getToken()
+            }
+            return null
+        }
+        return storage.getToken()
+    }
+
+    private fun clearStoredTokenForActiveTarget() {
+        val storage = tokenStorage ?: return
+        val targetDev = activeTargetDeviceId()
+        if (targetDev != null) {
+            storage.clearTokenForDevice(targetDev)
+            if (storage.listStoredDeviceIds().isEmpty()) {
+                storage.clearToken()
+            }
+        } else {
+            storage.clearToken()
+        }
+    }
 
     private fun log(message: String) {
         val entry = "[${SnowMessage.currentIsoTimestamp()}] $message"
@@ -183,13 +271,18 @@ class SnowWebSocketClient(
 
     /**
      * Explicitly confirm and pin a server certificate SHA-256 fingerprint (Trust-On-First-Use).
-     *
-     * Saves the verified fingerprint to encrypted storage and immediately triggers connection.
      */
-    fun confirmAndPinCertificate(fingerprint: String) {
+    @JvmOverloads
+    fun confirmAndPinCertificate(fingerprint: String, targetDeviceId: String? = null) {
         val normalized = TlsConfig.formatFingerprint(fingerprint)
-        certPinStorage?.pinFingerprint(normalized)
-        log("Certificate pinned: $normalized. Reconnecting...")
+        val scopedId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: activeTargetDeviceId()
+        if (scopedId != null) {
+            certPinStorage?.pinFingerprintForDevice(scopedId, normalized)
+            expectedTargetDeviceId = scopedId
+        } else {
+            certPinStorage?.pinFingerprint(normalized)
+        }
+        log("Certificate pinned${scopedId?.let { " for [$it]" } ?: ""}: $normalized. Reconnecting...")
         backoffPolicy.reset()
         if (targetHost.isNotBlank()) {
             initiateConnection()
@@ -197,20 +290,29 @@ class SnowWebSocketClient(
     }
 
     /**
-     * Clear the pinned certificate fingerprint (trust reset / certificate rotation).
+     * Clear the pinned certificate fingerprint for the active device (or all if unspecified).
      */
-    fun resetCertificateTrust() {
-        certPinStorage?.clearPinnedFingerprint()
+    @JvmOverloads
+    fun resetCertificateTrust(targetDeviceId: String? = null) {
+        val scopedId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: activeTargetDeviceId()
+        if (scopedId != null) {
+            certPinStorage?.clearPinnedFingerprintForDevice(scopedId)
+        } else {
+            certPinStorage?.clearPinnedFingerprint()
+        }
         log("Certificate trust reset. Next connection will require re-confirmation.")
     }
 
     /**
-     * Connect to the desktop SNOW core server at wss://host:port (or ws:// if useTls is false).
+     * Connect to the SNOW host at wss://host:port (or ws:// if useTls is false).
      */
+    @JvmOverloads
     @Synchronized
-    fun connect(host: String, port: Int = Constants.DEFAULT_PORT) {
+    fun connect(host: String, port: Int = Constants.DEFAULT_PORT, targetDeviceId: String? = null) {
         targetHost = host.trim()
         targetPort = port
+        expectedTargetDeviceId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+        resolvedTargetDeviceId = null
         userInitiatedDisconnect.set(false)
 
         if (_connectionState.value == ConnectionState.CONNECTED || _connectionState.value == ConnectionState.CONNECTING) {
@@ -225,18 +327,18 @@ class SnowWebSocketClient(
     }
 
     /**
-     * Update target endpoint dynamically (e.g. from LAN discovery beacon).
-     *
-     * Triggers immediate reconnection if host/port changed or if in RECONNECTING/DISCONNECTED
-     * state without creating connection storms.
-     *
-     * @return True if a reconnection or connection attempt was initiated; False if no-op.
+     * Update target endpoint dynamically (e.g. from LAN discovery beacon or USB promotion).
      */
+    @JvmOverloads
     @Synchronized
-    fun updateTargetEndpoint(host: String, port: Int = Constants.DEFAULT_PORT): Boolean {
+    fun updateTargetEndpoint(host: String, port: Int = Constants.DEFAULT_PORT, targetDeviceId: String? = null): Boolean {
         val cleanHost = host.trim()
         if (cleanHost.isBlank()) return false
 
+        val cleanDev = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+        if (cleanDev != null) {
+            expectedTargetDeviceId = cleanDev
+        }
         val endpointChanged = cleanHost != targetHost || port != targetPort
         val currentState = _connectionState.value
 
@@ -244,6 +346,7 @@ class SnowWebSocketClient(
             log("Target endpoint changed from $targetHost:$targetPort to $cleanHost:$port. Initiating reconnect...")
             targetHost = cleanHost
             targetPort = port
+            resolvedTargetDeviceId = null
             userInitiatedDisconnect.set(false)
             backoffPolicy.reset()
             reconnectJob?.cancel()
@@ -284,12 +387,20 @@ class SnowWebSocketClient(
                 onUnconfirmedFingerprint = { fp ->
                     _authState.value = AuthState.FingerprintConfirmationRequired(fp)
                     onUnconfirmedFingerprint?.invoke(fp)
-                }
+                },
+                targetDeviceIdProvider = { activeTargetDeviceId() },
+                allowAnyPinnedMatchProvider = { isLoopbackTargetHost() }
             )
             currentTrustManager = trustManager
             val sslContext = TlsConfig.createSslContext(trustManager)
             builder.sslSocketFactory(sslContext.socketFactory, trustManager)
-            builder.hostnameVerifier(TlsConfig.createHostnameVerifier(storage))
+            builder.hostnameVerifier(
+                TlsConfig.createHostnameVerifier(
+                    pinStorage = storage,
+                    targetDeviceIdProvider = { activeTargetDeviceId() },
+                    allowAnyPinnedMatchProvider = { isLoopbackTargetHost() }
+                )
+            )
         }
 
         return builder.build()
@@ -674,9 +785,8 @@ class SnowWebSocketClient(
             // 2. Fallback check: If Conscrypt wrapped or stripped the custom exception,
             // check currentTrustManager's lastPresentedFingerprint against pinned storage.
             val trustMgr = currentTrustManager
-            val storage = certPinStorage ?: InMemoryCertPinStorage()
             val presentedFp = trustMgr?.lastPresentedFingerprint
-            val pinnedFp = storage.getPinnedFingerprint()
+            val pinnedFp = resolveScopedPinnedFingerprint(presentedFp)
 
             if (presentedFp != null) {
                 if (pinnedFp == null) {
@@ -708,7 +818,7 @@ class SnowWebSocketClient(
 
     private fun performPostConnectionHandshake() {
         val devId = identity?.deviceId
-        val token = tokenStorage?.getToken()
+        val token = resolveStoredTokenForActiveTarget()
 
         if (!devId.isNullOrBlank() && !token.isNullOrBlank()) {
             log("Initiating automatic authentication handshake (device_id=${devId.take(8)}...)...")
@@ -727,6 +837,24 @@ class SnowWebSocketClient(
                 if (response.type == MessageType.RESPONSE && response.payload?.get("status") == "success") {
                     val data = (response.payload["data"] as? Map<*, *>) ?: response.payload
                     val authState = parseAuthenticatedState(data)
+                    val canonicalPeerId = authState.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+                        ?: activeTargetDeviceId()
+                    if (canonicalPeerId != null) {
+                        resolvedTargetDeviceId = canonicalPeerId
+                        // Idempotently promote any legacy single-slot credentials to canonical device slot
+                        (tokenStorage as? org.snow.security.SharedPreferencesTokenStorage)
+                            ?.migrateLegacyTokenToDeviceIfKnown(canonicalPeerId)
+                        (certPinStorage as? org.snow.security.EncryptedCertPinStorage)
+                            ?.migrateLegacyPinToDeviceIfKnown(canonicalPeerId)
+                        currentTrustManager?.lastPresentedFingerprint?.let { fp ->
+                            if (certPinStorage?.getPinnedFingerprintForDevice(canonicalPeerId) == null) {
+                                certPinStorage?.pinFingerprintForDevice(canonicalPeerId, fp)
+                            }
+                        }
+                        if (tokenStorage?.getTokenForDevice(canonicalPeerId) == null && !token.isNullOrBlank()) {
+                            tokenStorage?.saveTokenForDevice(canonicalPeerId, token)
+                        }
+                    }
                     backoffPolicy.reset()
                     _authState.value = authState
                     log("Authenticated successfully with peer core [session=${authState.sessionId}, tier=${authState.trustTier}, profile=${authState.permissionProfile ?: "unset"}, type=${authState.peerDeviceType ?: "unknown"}]")
@@ -747,7 +875,7 @@ class SnowWebSocketClient(
                         _connectionState.value = ConnectionState.DISCONNECTED
                     } else if (errCode == ErrorCode.UNAUTHORIZED) {
                         log("Stored token is invalid. Clearing stale token and awaiting user pairing...")
-                        tokenStorage?.clearToken()
+                        clearStoredTokenForActiveTarget()
                         _authState.value = AuthState.ConnectedUnauthenticated
 
                         // Immunize connection from timeout and register unauthenticated pending pairing
@@ -794,7 +922,7 @@ class SnowWebSocketClient(
     }
 
     internal fun handleRemoteRevocation(reason: String? = null) {
-        tokenStorage?.clearToken()
+        clearStoredTokenForActiveTarget()
         userInitiatedDisconnect.set(true)
         disconnectInternal()
         backoffPolicy.reset()

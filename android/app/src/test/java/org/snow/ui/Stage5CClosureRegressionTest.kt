@@ -14,8 +14,6 @@ import org.snow.capabilities.AndroidCapabilityDispatcher
 import org.snow.capabilities.MediaControlHandler
 import org.snow.network.AuthState
 import org.snow.security.PairingState
-import org.snow.service.AutoConnectTileService
-import org.snow.service.ClipSyncTileService
 import java.io.File
 
 /**
@@ -121,20 +119,18 @@ class Stage5CClosureRegressionTest {
 
     @Test
     fun testQuickSettingsTileServicesExistAndInvalidTileRemoved() {
-        assertEquals("org.snow.service.AutoConnectTileService", AutoConnectTileService::class.java.name)
-        assertEquals("org.snow.service.ClipSyncTileService", ClipSyncTileService::class.java.name)
-
         val settingsSource = resolveModuleFile("src/main/java/org/snow/ui/settings/SettingsScreen.kt").readText()
         assertFalse(
             "SettingsScreen.kt must never reference non-existent SnowConnectTileService",
             settingsSource.contains("org.snow.tile.SnowConnectTileService")
         )
-        assertTrue(settingsSource.contains("AutoConnectTileService::class.java"))
-        assertTrue(settingsSource.contains("ClipSyncTileService::class.java"))
+        assertFalse(settingsSource.contains("AutoConnectTileService"))
+        assertFalse(settingsSource.contains("ClipSyncTileService"))
 
         val manifestText = resolveModuleFile("src/main/AndroidManifest.xml").readText()
-        assertTrue(manifestText.contains(".service.AutoConnectTileService"))
-        assertTrue(manifestText.contains(".service.ClipSyncTileService"))
+        assertFalse(manifestText.contains(".service.AutoConnectTileService"))
+        assertFalse(manifestText.contains(".service.ClipSyncTileService"))
+        assertFalse(manifestText.contains("AutoConnectTrampolineActivity"))
     }
 
     @Test

@@ -126,6 +126,9 @@
     let isScreenStatusPolling = false;
     let isScreenFrameInFlight = false;
     let isPollStateInFlight = false;
+    let pollStateSeq = 0;
+    let isHomeWidgetsInFlight = false;
+    let homeWidgetsSeq = 0;
     let screenFrameErrorCount = 0;
     let lastKnownStreamState = "IDLE";
     let isCaptureStreamActive = false;
@@ -181,13 +184,18 @@
     // API Helpers & Identity Classification
     // =========================================================================
 
-    async function apiRequest(endpoint, method = "GET", data = null) {
+    async function apiRequest(endpoint, method = "GET", data = null, reqOpts = {}) {
         const headers = { "Content-Type": "application/json" };
         if (csrfToken && method !== "GET" && method !== "HEAD") {
             headers["X-CSRF-Token"] = csrfToken;
         }
 
+        const timeoutMs = (reqOpts && Number(reqOpts.timeoutMs) > 0) ? Number(reqOpts.timeoutMs) : 5000;
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const timeoutId = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
         const options = { method, headers };
+        if (controller) options.signal = controller.signal;
         if (data !== null && (method === "POST" || method === "PUT" || method === "DELETE")) {
             options.body = JSON.stringify(data);
         }
@@ -207,7 +215,12 @@
             }
             return await resp.json();
         } catch (err) {
+            if (err && err.name === "AbortError") {
+                return { success: false, status: "TIMEOUT", error: "Request timed out" };
+            }
             return { success: false, error: err.message || "Network request failed" };
+        } finally {
+            if (timeoutId !== null) clearTimeout(timeoutId);
         }
     }
 
@@ -412,27 +425,24 @@
             });
         }
 
-        const btnPause = document.getElementById("btn-desktop-pause");
-        if (btnPause) {
-            btnPause.addEventListener("click", async () => {
-                if (isCorePaused) {
-                    const res = await apiRequest("/api/system/resume", "POST", {});
+        const btnDisconnectAll = document.getElementById("btn-desktop-disconnect-all");
+        if (btnDisconnectAll) {
+            btnDisconnectAll.addEventListener("click", async () => {
+                await withButtonLoading(btnDisconnectAll, "Disconnecting...", async () => {
+                    const res = await apiRequest("/api/devices/disconnect-all", "POST", {});
                     if (res && res.success) {
-                        isCorePaused = false;
-                        showNotificationToast("SNOW Core resumed.", "success");
+                        const count = Number(res.disconnected_count ?? res.data?.disconnected_count ?? 0);
+                        showNotificationToast(
+                            count > 0
+                                ? `Disconnected ${count} active session(s). Pairings preserved.`
+                                : "No active remote device sessions.",
+                            "info"
+                        );
+                        refreshAllData();
                     } else {
-                        showNotificationToast(res?.error || "Failed resuming Core", "error");
+                        showNotificationToast(res?.error || "Failed disconnecting devices", "error");
                     }
-                } else {
-                    const res = await apiRequest("/api/system/pause", "POST", { reason: "Owner paused via Web Dashboard" });
-                    if (res && res.success) {
-                        isCorePaused = true;
-                        showNotificationToast("SNOW Core paused.", "warning");
-                    } else {
-                        showNotificationToast(res?.error || "Failed pausing Core", "error");
-                    }
-                }
-                updateCoreStatusBadge();
+                });
             });
         }
 
@@ -465,12 +475,6 @@
     function updateCoreStatusBadge() {
         const dot = document.getElementById("core-status-dot");
         const text = document.getElementById("core-status-text");
-        const btnPause = document.getElementById("btn-desktop-pause");
-
-        if (btnPause) {
-            const label = btnPause.querySelector("span");
-            if (label) label.textContent = isCorePaused ? "Resume" : "Pause";
-        }
 
         if (!dot || !text) return;
         if (!isCoreOnline) {
@@ -830,22 +834,6 @@
                 showNotificationToast(`Instant clipboard sync ${homeSyncToggle.checked ? "triggered" : "paused"}.`, "info");
             });
         }
-
-        // Notifications Clear All (dismisses each active key using real /api/notifications/dismiss contract)
-        document.getElementById("btn-notifications-clear-all")?.addEventListener("click", async () => {
-            if (!activeNotifications || activeNotifications.length === 0) {
-                showNotificationToast("No active notifications to clear.", "info");
-                return;
-            }
-            for (const n of activeNotifications) {
-                const key = n.key || n.id;
-                if (key) {
-                    await apiRequest("/api/notifications/dismiss", "POST", { key, device_id: resolveTargetDeviceId() });
-                }
-            }
-            showNotificationToast("Cleared active notifications.", "info");
-            loadHomeWidgets();
-        });
 
         // Active Transfer Cancel (supports both upload XHR and active downloads)
         document.getElementById("btn-active-transfer-cancel")?.addEventListener("click", cancelActiveTransfer);
@@ -1622,8 +1610,12 @@
     }
 
     async function loadHomeWidgets() {
+        const seq = ++homeWidgetsSeq;
+        isHomeWidgetsInFlight = true;
+        try {
         // 1. Shared Clipboard Preview
         const clipRes = await apiRequest("/api/clipboard/buffer");
+        if (seq !== homeWidgetsSeq) return;
         const clipContainer = document.getElementById("clipboard-items-container");
         const clipBadge = document.getElementById("clipboard-count-badge");
         const clipEmpty = document.getElementById("clipboard-empty-state");
@@ -1713,6 +1705,7 @@
         const targetId = resolveTargetDeviceId();
         const notifUrl = targetId ? "/api/notifications?device_id=" + encodeURIComponent(targetId) : "/api/notifications";
         const notifRes = await apiRequest(notifUrl);
+        if (seq !== homeWidgetsSeq) return;
         const notifContainer = document.getElementById("notifications-container");
         const notifBadge = document.getElementById("notifications-count-badge");
         const notifEmpty = document.getElementById("notifications-empty-state");
@@ -1786,7 +1779,6 @@
                             <div class="flex items-center justify-between gap-2 mt-1">
                                 <div class="flex gap-2">
                                     <button class="btn btn-xs btn-primary btn-toggle-reply">Reply</button>
-                                    <button class="btn btn-xs btn-tonal btn-notif-dismiss">Dismiss</button>
                                 </div>
                             </div>
                             <div class="notif-inline-reply d-none">
@@ -1855,17 +1847,6 @@
                         replyInp?.addEventListener("keydown", (e) => {
                             if (e.key === "Enter") dispatchReply();
                         });
-
-                        card.querySelector(".btn-notif-dismiss").onclick = async () => {
-                            const cKey = card.dataset.notifKey || "";
-                            const actKey = card.dataset.notifActionKey || cKey;
-                            if (!actKey) return;
-                            openNotificationReplyKeys.delete(cKey);
-                            notificationReplyDrafts.delete(cKey);
-                            await apiRequest("/api/notifications/dismiss", "POST", { key: actKey, device_id: resolveTargetDeviceId() });
-                            showNotificationToast("Notification dismissed.", "info");
-                            loadHomeWidgets();
-                        };
                     }
 
                     // Incremental field updates (never recreate active input)
@@ -1910,6 +1891,11 @@
                         }
                     }
                 }
+            }
+        }
+        } finally {
+            if (seq === homeWidgetsSeq) {
+                isHomeWidgetsInFlight = false;
             }
         }
     }
@@ -2032,16 +2018,19 @@
             });
         });
 
-        // Remote Access Toggle (now in AI & Settings)
+        // Remote Access Toggle (Zero-config Render Hub by default)
         const chkRelay = document.getElementById("chk-relay-tunnel-toggle");
         if (chkRelay) {
             chkRelay.addEventListener("change", async () => {
                 chkRelay.disabled = true;
                 try {
                     if (chkRelay.checked) {
-                        const res = await apiRequest("/api/relay/tunnel/start", "POST", { provider: "cloudflared" });
-                        if (res && res.success && res.public_url) {
-                            showNotificationToast("Remote Access tunnel active!", "success");
+                        const res = await apiRequest("/api/relay/tunnel/start", "POST", { provider: "render" });
+                        if (res && res.success) {
+                            showNotificationToast(
+                                res.active ? "Render Hub Remote Access active!" : (res.message || "Render Hub Remote Access enabled."),
+                                "success"
+                            );
                             if (lastPairingSnapshotHasActivePin) loadPairingQR();
                             else refreshPairingState();
                         } else {
@@ -2526,14 +2515,31 @@
             res.active &&
             res.public_url
         );
-        if (chkRelay) chkRelay.checked = isVerifiedActive;
+        const isEnabledConnecting = Boolean(
+            isCoreOnline &&
+            res &&
+            res.success &&
+            res.enabled &&
+            !isVerifiedActive
+        );
+        if (chkRelay) chkRelay.checked = isVerifiedActive || isEnabledConnecting;
         if (isVerifiedActive) {
             if (badge) {
-                badge.textContent = "Active";
+                badge.textContent = res.provider === "render" ? "Active • Render Hub" : "Active";
                 badge.className = "chip chip-sm chip-emerald";
             }
             if (detail) {
-                detail.textContent = "Remote relay access is active and authenticated.";
+                detail.textContent = `Remote relay access active via ${res.public_url}.`;
+            }
+        } else if (isEnabledConnecting) {
+            if (badge) {
+                badge.textContent = "Connecting";
+                badge.className = "chip chip-sm chip-amber";
+            }
+            if (detail) {
+                detail.textContent = res.public_url
+                    ? `Establishing Render Hub connection (${res.public_url})...`
+                    : "Establishing Render Hub connection...";
             }
         } else {
             if (badge) {
@@ -3520,7 +3526,7 @@
                 const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || undefined;
                 const payload = { provider };
                 if (domain) payload.custom_url = domain;
-                const res = await apiRequest("/api/mcp/tunnel/start", "POST", payload);
+                const res = await apiRequest("/api/mcp/tunnel/start", "POST", payload, { timeoutMs: 15000 });
                 if (res && res.success) {
                     showNotificationToast("Remote AI Link online!", "success");
                 } else {
@@ -3640,6 +3646,28 @@
         });
 
         // Diagnostics & Owner IPC Secret
+        document.getElementById("btn-copy-diag-snow-id")?.addEventListener("click", () => {
+            const val = document.getElementById("diag-my-snow-id")?.textContent?.trim() || "";
+            if (val && val !== "--") {
+                navigator.clipboard?.writeText(val).catch(() => {});
+                showNotificationToast("Copied My SNOW ID!", "success");
+            }
+        });
+        document.getElementById("btn-copy-diag-network-id")?.addEventListener("click", () => {
+            const val = document.getElementById("diag-my-network-id")?.textContent?.trim() || "";
+            if (val && val !== "--") {
+                navigator.clipboard?.writeText(val).catch(() => {});
+                showNotificationToast("Copied My Network ID!", "success");
+            }
+        });
+        document.getElementById("btn-copy-diag-ai-url")?.addEventListener("click", () => {
+            const val = document.getElementById("diag-remote-ai-url")?.textContent?.trim() || "";
+            if (val && val !== "--") {
+                navigator.clipboard?.writeText(val).catch(() => {});
+                showNotificationToast("Copied Remote AI Link URL!", "success");
+            }
+        });
+
         document.getElementById("btn-ipc-secret-toggle")?.addEventListener("click", async () => {
             const inp = document.getElementById("diag-ipc-secret-value");
             const btn = document.getElementById("btn-ipc-secret-toggle");
@@ -3782,6 +3810,17 @@
         const selectedProvider = cfg.provider || "render";
         if (providerSel) providerSel.value = selectedProvider;
         if (netBadge && hubRes?.network_id) netBadge.textContent = hubRes.network_id;
+        const diagSnowEl = document.getElementById("diag-my-snow-id");
+        const diagNetEl = document.getElementById("diag-my-network-id");
+        const diagAiEl = document.getElementById("diag-remote-ai-url");
+        if (diagSnowEl) diagSnowEl.textContent = canonicalSnowId || "--";
+        if (diagNetEl && hubRes?.network_id) diagNetEl.textContent = hubRes.network_id;
+        const activeEndpointPreview = (statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url))
+            ? (statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`)
+            : "";
+        if (diagAiEl) {
+            diagAiEl.textContent = activeEndpointPreview || statusRes?.configured_render_url || hubRes?.permanent_mcp_url || "--";
+        }
         if (permUrlInput && document.activeElement !== permUrlInput) {
             permUrlInput.value = cfg.default_hub_url || cfg.mcp_public_url || cfg.public_url || "";
         }
@@ -3797,6 +3836,7 @@
         }
 
         const configuredRenderRoute = statusRes?.configured_render_url || hubRes?.permanent_mcp_url || "";
+        const isPrefEnabled = statusRes?.enabled !== false;
         const isActive = Boolean(statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url));
 
         if (isActive) {
@@ -3813,9 +3853,23 @@
                 urlInput.value = activeEndpoint;
                 urlInput.placeholder = configuredRenderRoute || activeEndpoint;
             }
+        } else if (isPrefEnabled) {
+            const transientErr = statusRes?.last_error ? "Enabled • Reconnecting to Render Hub" : "Starting Remote AI Link...";
+            if (statusBadge) {
+                statusBadge.textContent = transientErr;
+                statusBadge.className = "chip chip-amber";
+            }
+            if (btnStart) btnStart.disabled = false;
+            if (btnStop) btnStop.disabled = false;
+            if (btnCopy) btnCopy.disabled = !configuredRenderRoute;
+            if (btnShowQr) btnShowQr.disabled = true;
+            if (urlInput) {
+                urlInput.value = "";
+                urlInput.placeholder = configuredRenderRoute || "Connecting Remote AI Link to Render Hub...";
+            }
         } else {
             if (statusBadge) {
-                statusBadge.textContent = "Offline";
+                statusBadge.textContent = "Stopped";
                 statusBadge.className = "chip chip-neutral";
             }
             if (btnStart) btnStart.disabled = false;
@@ -4255,6 +4309,7 @@
     async function pollStateUpdates() {
         if (isPollStateInFlight) return;
         isPollStateInFlight = true;
+        const myPollSeq = ++pollStateSeq;
         try {
             // 1. System status & Core health
             const [statusRes, sysStatus, fedRes] = await Promise.all([
@@ -4262,6 +4317,7 @@
                 apiRequest("/api/system/status"),
                 apiRequest("/api/federation/grants"),
             ]);
+            if (myPollSeq !== pollStateSeq) return;
 
             if (statusRes && statusRes.success) {
                 lastStatusSnapshot = statusRes;
@@ -4274,6 +4330,10 @@
                 }
                 const coreIdEl = document.getElementById("core-canonical-id");
                 if (coreIdEl) coreIdEl.textContent = canonicalSnowId;
+                const diagSnowEl = document.getElementById("diag-my-snow-id");
+                if (diagSnowEl && canonicalSnowId && canonicalSnowId !== "SNW-LOCAL") {
+                    diagSnowEl.textContent = canonicalSnowId;
+                }
             } else {
                 isCoreOnline = false;
             }
@@ -4329,7 +4389,9 @@
 
             if (currentTab === "overview") {
                 updateHeroCard(currentDev);
-                loadHomeWidgets();
+                if (!isHomeWidgetsInFlight) {
+                    loadHomeWidgets();
+                }
             }
 
             // 3. Global pending approvals counter & live screen stream status

@@ -193,17 +193,11 @@ class AppLauncherHandler(private val context: Context) {
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
         val inForeground = ClipboardHandler.isAppInForeground
-        val hasOverlay = try {
-            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M &&
-                android.provider.Settings.canDrawOverlays(context)
-        } catch (_: Throwable) {
-            false
-        }
 
-        if (inForeground || hasOverlay) {
+        if (inForeground) {
             try {
                 context.startActivity(launchIntent)
-                val deliveryMode = if (inForeground) "DIRECT_FOREGROUND" else "BACKGROUND_OVERLAY"
+                val deliveryMode = "DIRECT_FOREGROUND"
                 SafeLog.i(TAG, "Successfully launched application '$cleanPackage' ($deliveryMode).")
                 return@withContext mapOf(
                     "success" to true,

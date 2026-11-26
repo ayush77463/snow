@@ -1882,6 +1882,28 @@ class SnowIpcServer:
                 "error": res.get("error"),
             }, now_authed
 
+        if op == "devices_disconnect_all":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            payload_data = payload if isinstance(payload, dict) else {}
+            reason = str(payload_data.get("reason") or "Disconnected all active devices by desktop owner")
+            res = await self.core_server.disconnect_all_devices(reason=reason)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": bool(res.get("success")),
+                "status": res.get("status", "ERROR"),
+                "data": res,
+                "error": res.get("error"),
+            }, now_authed
+
         if op == "device_reconnect":
             if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
                 return {

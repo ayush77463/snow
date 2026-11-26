@@ -407,17 +407,13 @@ class AndroidFileHandler(
     }
 
     /**
-     * Check whether Android 11+ All Files Access (MANAGE_EXTERNAL_STORAGE) is granted.
+     * Check whether direct full-storage mode is overridden (SAF folder mode is used by default).
      */
     fun isAllFilesAccessGranted(): Boolean {
         if (allFilesAccessProvider != null) {
             return allFilesAccessProvider.invoke()
         }
-        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-            Environment.isExternalStorageManager()
-        } else {
-            false
-        }
+        return false
     }
 
     /**

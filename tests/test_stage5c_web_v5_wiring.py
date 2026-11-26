@@ -306,8 +306,10 @@ class TestStage5CJsSyntaxAndBalancing(unittest.TestCase):
         self.assertEqual(len(stray), 0, f"Stray showNotification calls: {stray}")
 
     def test_cloudflared_provider_naming(self):
-        """Cloudflared provider identifier must be used."""
-        self.assertIn('"cloudflared"', self.js_content)
+        """Valid provider identifiers ('render' default in JS, optional 'cloudflared' in HTML) must be used without typo."""
+        self.assertIn('"render"', self.js_content)
+        html_content = Path("src/snow/web/static/index.html").read_text(encoding="utf-8")
+        self.assertIn('"cloudflared"', html_content)
         self.assertNotIn('provider: "cloudflare"', self.js_content)
 
 

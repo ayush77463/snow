@@ -37,7 +37,7 @@ fun isTlsServerRole(localId: String, remoteId: String): Boolean = localId > remo
  * Android client managing connection to an untrusted SNOW Remote Relay
  * and maintaining an End-to-End TLS 1.3 tunnel to the Desktop Core.
  */
-class RelayClient(
+class RelayClient @JvmOverloads constructor(
     val relayUrl: String,
     val deviceId: String,
     val groupId: String,
@@ -46,13 +46,50 @@ class RelayClient(
     var certPinStorage: CertPinStorage? = null,
     val expectedPeerFingerprint: String? = null,
     val isClientMode: Boolean = (deviceId < targetPeerId),
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    val bootstrapToken: String = "",
+    val hubToken: String = "",
+    val networkId: String = ""
 ) {
     companion object {
         private const val TAG = "RelayClient"
         private val TUNNEL_INIT_SIGNAL = "SNOW_TUNNEL_INIT".toByteArray(Charsets.UTF_8)
         private val MEDIA_FRAME_MAGIC = "SNOW_MEDIA_JPG\u0000".toByteArray(Charsets.UTF_8)
         const val MAX_RELAY_MEDIA_FRAME_BYTES = 524288
+
+        /**
+         * Build Render Hub / legacy relay `hello` authentication payload.
+         * Prefers Ed25519 hubToken or rendezvous bootstrapToken over legacy static HMAC tickets.
+         */
+        @JvmStatic
+        fun buildHelloPayload(
+            deviceId: String,
+            groupId: String,
+            ticket: String = "",
+            bootstrapToken: String = "",
+            hubToken: String = "",
+            networkId: String = ""
+        ): JSONObject {
+            return JSONObject().apply {
+                put("type", "hello")
+                val effectiveNetId = networkId.trim().ifEmpty { groupId.trim() }
+                when {
+                    hubToken.isNotBlank() -> {
+                        put("hub_token", hubToken.trim())
+                        if (effectiveNetId.isNotEmpty()) put("network_id", effectiveNetId)
+                        put("device_id", deviceId)
+                    }
+                    bootstrapToken.isNotBlank() -> {
+                        put("bootstrap_token", bootstrapToken.trim())
+                        if (effectiveNetId.isNotEmpty()) put("network_id", effectiveNetId)
+                        put("device_id", deviceId)
+                    }
+                    else -> {
+                        put("ticket", ticket)
+                    }
+                }
+            }
+        }
     }
 
     private var webSocket: WebSocket? = null
@@ -220,13 +257,15 @@ class RelayClient(
 
     private inner class RelayWebSocketListener : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            SafeLog.i(TAG, "Relay WebSocket open. Sending hello ticket...")
-            val hello = JSONObject().apply {
-                put("type", "hello")
-                put("ticket", ticket)
-                put("device_id", deviceId)
-                put("group_id", groupId)
-            }
+            SafeLog.i(TAG, "Relay WebSocket open. Sending hello authentication...")
+            val hello = buildHelloPayload(
+                deviceId = deviceId,
+                groupId = groupId,
+                ticket = ticket,
+                bootstrapToken = bootstrapToken,
+                hubToken = hubToken,
+                networkId = networkId
+            )
             webSocket.send(hello.toString())
         }
 

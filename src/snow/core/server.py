@@ -249,7 +249,15 @@ class SnowCoreServer:
         sess_mgr = getattr(self, "session_manager", None) or getattr(self.ws_server, "session_manager", None)
         conn_mgr = getattr(self, "connection_manager", None) or getattr(self.ws_server, "connection_manager", None)
         if sess_mgr and conn_mgr:
-            for s in sess_mgr.all_sessions() if hasattr(sess_mgr, "all_sessions") else []:
+            if hasattr(sess_mgr, "list_active_sessions"):
+                raw_sessions = sess_mgr.list_active_sessions()
+            elif hasattr(sess_mgr, "all_sessions"):
+                raw_sessions = sess_mgr.all_sessions()
+            elif hasattr(sess_mgr, "get_all_sessions"):
+                raw_sessions = list(sess_mgr.get_all_sessions().values())
+            else:
+                raw_sessions = []
+            for s in raw_sessions:
                 did = getattr(s, "device_id", None)
                 cid = getattr(s, "connection_id", None)
                 if not did or did == local_id or did in seen_ids:
@@ -262,8 +270,20 @@ class SnowCoreServer:
                 node = self.node_registry.get_node(did) if getattr(self, "node_registry", None) else None
                 paired = self.db_manager.get_paired_device(did) if self.db_manager else None
                 from snow.network.router import classify_transport_badge
-                tr = getattr(node, "transport", None) or "wifi_lan"
-                host = getattr(node, "host", None) or getattr(paired, "last_known_host", None)
+                conn_remote = getattr(conn, "remote_address", None)
+                conn_is_loopback = isinstance(conn_remote, str) and (
+                    "127.0.0.1" in conn_remote or "::1" in conn_remote or "localhost" in conn_remote.lower()
+                )
+                host = (
+                    "127.0.0.1"
+                    if conn_is_loopback
+                    else (
+                        getattr(node, "host", None)
+                        or getattr(paired, "last_known_host", None)
+                        or conn_remote
+                    )
+                )
+                tr = "usb" if conn_is_loopback else (getattr(node, "transport", None) or "wifi_lan")
                 badge = classify_transport_badge(transport=tr, host=host)
                 eligible.append({
                     "device_id": did,
@@ -1176,6 +1196,82 @@ class SnowCoreServer:
             "was_connected": bool(closed_inbound or closed_peer),
         }
 
+    async def disconnect_all_devices(self, reason: str = "Disconnected by desktop owner") -> dict[str, Any]:
+        """Disconnect all currently active device/relay sessions while preserving pairings and Core."""
+        local_id = getattr(self.device_identity, "device_id", "") if getattr(self, "device_identity", None) else ""
+        candidate_ids: list[str] = []
+        seen: set[str] = set()
+
+        session_mgr = getattr(self, "session_manager", None) or getattr(self.ws_server, "session_manager", None)
+        if session_mgr and hasattr(session_mgr, "list_active_sessions"):
+            for sess in session_mgr.list_active_sessions():
+                did = (getattr(sess, "device_id", None) or "").strip()
+                if did and did not in ("local", "desktop-core", local_id) and did not in seen:
+                    seen.add(did)
+                    candidate_ids.append(did)
+
+        for did in list(getattr(self, "peer_clients", {}).keys()):
+            clean = (did or "").strip()
+            if clean and clean not in ("local", "desktop-core", local_id) and clean not in seen:
+                seen.add(clean)
+                candidate_ids.append(clean)
+
+        relay_tunnels_closed: list[str] = []
+        if getattr(self, "relay_client", None) is not None:
+            for did, tun in list(getattr(self.relay_client, "_tunnels", {}).items()):
+                clean = (did or "").strip()
+                if not clean or clean in ("local", "desktop-core", local_id):
+                    continue
+                if clean not in seen:
+                    seen.add(clean)
+                    candidate_ids.append(clean)
+                try:
+                    if hasattr(self.relay_client, "close_tunnel"):
+                        res_t = self.relay_client.close_tunnel(clean)
+                        if asyncio.iscoroutine(res_t) or hasattr(res_t, "__await__"):
+                            await asyncio.wait_for(res_t, timeout=1.5)
+                    elif hasattr(self.relay_client, "_tunnels"):
+                        self.relay_client._tunnels.pop(clean, None)
+                    relay_tunnels_closed.append(clean)
+                except Exception as exc:
+                    logger.debug("Error closing relay tunnel for %s: %s", clean, exc)
+
+        disconnected: list[str] = []
+        errors: dict[str, str] = {}
+        for did in candidate_ids:
+            try:
+                res = await asyncio.wait_for(self.disconnect_device(did), timeout=2.5)
+                if res.get("success"):
+                    disconnected.append(did)
+                elif res.get("status") != "DEVICE_NOT_FOUND":
+                    errors[did] = str(res.get("error") or res.get("status") or "error")
+            except Exception as exc:
+                errors[did] = str(exc)
+
+        if self.db_manager:
+            try:
+                self.db_manager.log_audit_event(
+                    event_type="ALL_DEVICES_DISCONNECTED",
+                    device_id=None,
+                    details={
+                        "reason": reason,
+                        "disconnected_count": len(disconnected),
+                        "device_ids": disconnected,
+                        "relay_tunnels_closed": relay_tunnels_closed,
+                    },
+                )
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "status": "DISCONNECTED_ALL",
+            "disconnected_count": len(disconnected),
+            "disconnected_device_ids": disconnected,
+            "relay_tunnels_closed": relay_tunnels_closed,
+            "errors": errors,
+        }
+
     async def reconnect_device(self, device_id: str) -> dict[str, Any]:
         """Clear manual disconnect hold and trigger clean reconnection for a paired device."""
         target_id = (device_id or "").strip()
@@ -1262,6 +1358,88 @@ class SnowCoreServer:
             "tunnel_count": len(tunnels),
         }
 
+    @staticmethod
+    def _normalize_relay_ws_and_http_urls(raw_url: str) -> tuple[str, str]:
+        """Convert a Render Hub HTTPS/HTTP/WSS URL into (ws_url, hub_http_base)."""
+        clean = (raw_url or "").strip()
+        if not clean:
+            return "", ""
+        if clean.startswith("https://"):
+            ws_base = "wss://" + clean[len("https://"):]
+            http_base = clean
+        elif clean.startswith("http://"):
+            ws_base = "ws://" + clean[len("http://"):]
+            http_base = clean
+        elif clean.startswith("wss://"):
+            ws_base = clean
+            http_base = "https://" + clean[len("wss://"):]
+        elif clean.startswith("ws://"):
+            ws_base = clean
+            http_base = "http://" + clean[len("ws://"):]
+        else:
+            ws_base = f"wss://{clean}"
+            http_base = f"https://{clean}"
+
+        ws_clean = ws_base.rstrip("/")
+        if not ws_clean.endswith("/v1/tunnel"):
+            ws_clean = f"{ws_clean}/v1/tunnel"
+
+        http_clean = http_base.rstrip("/")
+        if http_clean.endswith("/v1/tunnel"):
+            http_clean = http_clean[: -len("/v1/tunnel")].rstrip("/")
+        return ws_clean, http_clean
+
+    async def _acquire_relay_hub_session(self, hub_http_url: str, timeout: float = 8.0) -> tuple[bool, str, str, str]:
+        """Acquire a short-lived Ed25519 hub-session token for Render Hub /v1/tunnel."""
+        import aiohttp
+        from snow.security.identity import load_or_create_device_identity, load_or_create_network_key_identity
+
+        try:
+            net_ident = load_or_create_network_key_identity()
+            dev_ident = load_or_create_device_identity()
+        except Exception as exc:
+            return False, "", "", f"Failed loading Ed25519 identity: {exc}"
+
+        base = hub_http_url.rstrip("/")
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as sess:
+                async with sess.post(
+                    f"{base}/v1/hub/challenge",
+                    json={
+                        "network_id": net_ident.network_id,
+                        "public_key": net_ident.public_key_b64,
+                        "device_id": dev_ident.device_id,
+                        "snow_id": dev_ident.snow_id,
+                    },
+                ) as ch_resp:
+                    ch_data = await ch_resp.json(content_type=None)
+                    if ch_resp.status != 200 or not isinstance(ch_data, dict) or not ch_data.get("challenge_id"):
+                        return False, "", "", str(
+                            (ch_data or {}).get("error") or f"Hub challenge failed (HTTP {ch_resp.status})."
+                        )
+
+                sig_b64 = net_ident.sign_hub_challenge(ch_data, device_id=dev_ident.device_id)
+                async with sess.post(
+                    f"{base}/v1/hub/session",
+                    json={
+                        "challenge_id": ch_data["challenge_id"],
+                        "network_id": net_ident.network_id,
+                        "public_key": net_ident.public_key_b64,
+                        "signature": sig_b64,
+                        "device_id": dev_ident.device_id,
+                        "snow_id": dev_ident.snow_id,
+                    },
+                ) as sess_resp:
+                    sess_data = await sess_resp.json(content_type=None)
+                    token = str((sess_data or {}).get("token") or "").strip()
+                    if sess_resp.status != 200 or not (sess_data or {}).get("success") or not token:
+                        return False, "", "", str(
+                            (sess_data or {}).get("error") or f"Hub session rejected (HTTP {sess_resp.status})."
+                        )
+                    return True, token, net_ident.network_id, ""
+        except Exception as exc:
+            return False, "", "", f"Hub session request failed: {exc}"
+
     async def configure_relay(
         self,
         enabled: bool,
@@ -1284,8 +1462,13 @@ class SnowCoreServer:
             if clean_ticket:
                 self.relay_ticket = clean_ticket
 
-        # Update SessionRouter relay state
+        # Update SessionRouter relay state & persist enabled toggle when DB is attached
         self.session_router.relay_enabled = self.relay_enabled
+        if getattr(self, "db_manager", None) is not None and hasattr(self.db_manager, "set_setting"):
+            try:
+                self.db_manager.set_setting("remote_relay_enabled", "true" if self.relay_enabled else "false")
+            except Exception:
+                pass
 
         if not self.relay_enabled:
             # Drain and disconnect active relay client
@@ -1306,9 +1489,30 @@ class SnowCoreServer:
                 pass
             self.relay_client = None
 
-        if not self.relay_url or not self.relay_ticket:
-            logger.warning("Relay enabled but missing relay_url or ticket.")
+        # Zero-config Render Hub fallback when relay_url is unset
+        if not (self.relay_url or "").strip():
+            from snow.core.config import resolve_default_hub_url
+            default_hub = resolve_default_hub_url(config=self.config, db_manager=self.db_manager)
+            ws_default, _ = self._normalize_relay_ws_and_http_urls(default_hub)
+            if ws_default:
+                self.relay_url = ws_default
+
+        if not (self.relay_url or "").strip():
+            logger.warning("Relay enabled but missing relay_url.")
             return self.get_relay_status()
+
+        resolved_ws_url, hub_http_base = self._normalize_relay_ws_and_http_urls(self.relay_url)
+        self.relay_url = resolved_ws_url
+
+        hub_token = ""
+        network_id = ""
+        if not (self.relay_ticket or "").strip():
+            ok_hub, hub_token, network_id, err_hub = await self._acquire_relay_hub_session(hub_http_base)
+            if not ok_hub or not hub_token:
+                logger.warning("Render Hub session acquisition failed (%s): %s", hub_http_base, err_hub)
+                return self.get_relay_status()
+            if network_id and (not getattr(self, "relay_group_id", "") or self.relay_group_id == "default_group"):
+                self.relay_group_id = network_id
 
         # Resolve cert & key paths safely using config attributes
         from snow.security.tls import DEFAULT_CERT_FILE, DEFAULT_KEY_FILE, DEFAULT_TLS_DIR
@@ -1341,10 +1545,12 @@ class SnowCoreServer:
         client = RelayTunnelClient(
             relay_url=self.relay_url,
             device_id=local_dev_id,
-            group_id=self.relay_group_id or "default_group",
+            group_id=network_id or self.relay_group_id or "default_group",
             ticket=self.relay_ticket,
             cert_path=cert_path,
             key_path=key_path,
+            hub_token=hub_token,
+            network_id=network_id,
         )
 
         # Pin fingerprints for all paired devices
@@ -1594,6 +1800,18 @@ class SnowCoreServer:
                 await self.usb_watcher.start()
             except Exception as exc:
                 logger.debug("UsbWatcher failed to start: %s", exc)
+
+        # Restore persisted Render Hub Remote Access cleanly in background if enabled
+        try:
+            persisted_relay = (
+                self.db_manager.get_setting("remote_relay_enabled", "")
+                if getattr(self, "db_manager", None)
+                else ""
+            )
+            if str(persisted_relay or "").strip().lower() == "true" or self.relay_enabled:
+                asyncio.create_task(self.configure_relay(enabled=True))
+        except Exception as exc:
+            logger.debug("Deferred Render Hub relay auto-start skipped: %s", exc)
 
         self._is_running = True
         actual_port = self.ws_server.bound_port or self.config.port

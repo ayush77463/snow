@@ -109,7 +109,8 @@ class SnowForegroundService : Service() {
             deviceId = identity.deviceId,
             certPinStorage = certPinStorage,
             tokenStorage = tokenStorage,
-            useTls = true
+            useTls = true,
+            targetDeviceIdProvider = { client.activeTargetDeviceId() }
         )
     }
 
@@ -128,7 +129,7 @@ class SnowForegroundService : Service() {
     }
 
     val peerHostManager: org.snow.network.AndroidPeerHostManager by lazy {
-        org.snow.network.AndroidPeerHostManager()
+        org.snow.network.AndroidPeerHostManager(applicationContext)
     }
 
     var relayClient: org.snow.network.RelayClient? = null
@@ -141,41 +142,76 @@ class SnowForegroundService : Service() {
         autoConnectJob = null
     }
 
+    @Volatile
+    private var lastUsbProbeAttemptMs: Long = 0L
+
+    private var usbPromotionJob: kotlinx.coroutines.Job? = null
+    private var usbFallbackJob: kotlinx.coroutines.Job? = null
+
+    internal var clockMsProvider: () -> Long = { System.currentTimeMillis() }
+
+    internal var usbReachableProbe: suspend () -> Boolean = {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                java.net.Socket().use { sock ->
+                    sock.connect(java.net.InetSocketAddress("127.0.0.1", Constants.DEFAULT_PORT), 350)
+                    true
+                }
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
     fun startRelay(endpoint: String) {
-        if (endpoint.isBlank()) return
+        val effectiveEndpoint = resolveEffectiveRelayEndpoint(endpoint)
+        if (effectiveEndpoint.isBlank()) return
         stopRelay()
         val deviceId = org.snow.security.DeviceIdentity.getOrCreate(applicationContext).deviceId
         val certPinStorage = EncryptedCertPinStorage(applicationContext)
+        val relaySecurityPrefs = getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE)
         val relayTokenStorage = SharedPreferencesTokenStorage(
             applicationContext,
             prefName = "snow_relay_security"
         )
-        val ticket = relayTokenStorage.getToken()
-        if (ticket.isNullOrBlank()) {
-            SafeLog.e("SnowForegroundService", "Relay connection aborted: missing or unauthenticatable relay ticket in snow_relay_security")
+        val authMaterial = resolveEffectiveRelayAuth(
+            ticket = relayTokenStorage.getToken(),
+            bootstrapToken = relaySecurityPrefs.getString(PREF_RELAY_BOOTSTRAP_TOKEN, null),
+            hubToken = relaySecurityPrefs.getString(PREF_RELAY_HUB_TOKEN, null)
+        )
+        if (authMaterial == null) {
+            SafeLog.i("SnowForegroundService", "Remote relay standby: awaiting Render Hub rendezvous or Desktop relay credentials.")
             return
         }
         val prefs = getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val groupId = prefs.getString("remote_relay_group_id", null) ?: "default_group"
+        val savedNetId = relaySecurityPrefs.getString(PREF_RELAY_NETWORK_ID, null)
+            ?: prefs.getString("last_known_network_id", null)
+            ?: ""
+        val groupId = prefs.getString("remote_relay_group_id", null)
+            ?: savedNetId.takeIf { it.isNotBlank() }
+            ?: "default_group"
         val targetPeerId = prefs.getString("remote_relay_target_peer", null) ?: "desktop-core"
         val expectedFingerprint = certPinStorage.getPinnedFingerprint()
         val isClientMode = (deviceId < targetPeerId)
 
         relayClient = org.snow.network.RelayClient(
-            relayUrl = endpoint,
+            relayUrl = effectiveEndpoint,
             deviceId = deviceId,
             groupId = groupId,
-            ticket = ticket,
+            ticket = authMaterial.ticket,
             targetPeerId = targetPeerId,
             certPinStorage = certPinStorage,
             expectedPeerFingerprint = expectedFingerprint,
-            isClientMode = isClientMode
+            isClientMode = isClientMode,
+            bootstrapToken = authMaterial.bootstrapToken,
+            hubToken = authMaterial.hubToken,
+            networkId = savedNetId
         ).apply {
             requestDispatcher = { action, data ->
                 capabilityDispatcher.dispatch(
                     action = action,
                     data = data,
-                    serverHost = endpoint,
+                    serverHost = effectiveEndpoint,
                     defaultTransferPort = 8766
                 )
             }
@@ -246,6 +282,8 @@ class SnowForegroundService : Service() {
 
     fun startPeerHost() {
         peerHostManager.setHostModeSettingEnabled(true)
+        val identity = DeviceIdentity.getOrCreate(applicationContext)
+        val repo = SnowUiRepository.getInstance(applicationContext)
         val tokenStorage = SharedPreferencesTokenStorage(
             applicationContext,
             prefName = SharedPreferencesTokenStorage.PEER_HOST_PREFS_NAME
@@ -254,10 +292,12 @@ class SnowForegroundService : Service() {
             port = org.snow.network.AndroidPeerHostManager.DEFAULT_HOST_PORT,
             tokenStorage = tokenStorage,
             dispatcher = capabilityDispatcher,
-            localDeviceId = org.snow.security.DeviceIdentity.getOrCreate(applicationContext).deviceId,
+            localDeviceId = identity.deviceId,
             manifestProvider = { org.snow.network.DeviceNode.buildAndroidManifest(applicationContext).toMap() },
             parentScope = serviceScope,
-            mediaPort = 8766
+            mediaPort = 8766,
+            snowId = SnowUiRepository.deriveCanonicalSnowId(identity.deviceId),
+            networkId = repo.getEffectiveNetworkId()
         )
         if (success) {
             updateNotification("Peer Host Active on Port ${peerHostManager.activePort}")
@@ -348,6 +388,7 @@ class SnowForegroundService : Service() {
                 autoConnectJob?.cancel()
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, Constants.DEFAULT_PORT)
+                val targetDeviceId = intent.getStringExtra(EXTRA_DEVICE_ID)
 
                 // In Android 8.0+ (and strictly enforced in Android 14/16), any service
                 // invoked via startForegroundService MUST call startForeground() synchronously
@@ -363,7 +404,7 @@ class SnowForegroundService : Service() {
                 startObservingState()
                 startObservingDiscovery()
                 startObservingAuth()
-                client.connect(host, port)
+                client.connect(host, port, targetDeviceId)
             }
             ACTION_START_SCREEN_SHARE -> {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, android.app.Activity.RESULT_CANCELED)
@@ -582,11 +623,117 @@ class SnowForegroundService : Service() {
         }
     }
 
+    internal fun getTargetConnectionMode(): String {
+        return try {
+            val targetId = client.activeTargetDeviceId() ?: ""
+            val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
+            if (targetId.isNotBlank()) {
+                repo.savedDevices.value.find { it.deviceId.equals(targetId, ignoreCase = true) }?.connectionMode ?: "auto"
+            } else {
+                repo.savedDevices.value.firstOrNull {
+                    it.host.equals(client.currentTargetHost, ignoreCase = true)
+                }?.connectionMode ?: "auto"
+            }
+        } catch (_: Throwable) {
+            "auto"
+        }
+    }
+
+    internal suspend fun tryPromoteUsbIfReachable(force: Boolean = false): Boolean {
+        val isConn = client.connectionState.value == ConnectionState.CONNECTED
+        val isAuth = client.authState.value is AuthState.Authenticated
+        val nowMs = clockMsProvider()
+        val effectiveLastAttempt = if (force) Long.MIN_VALUE / 2 else lastUsbProbeAttemptMs
+        if (!shouldProbeUsbPromotion(
+                connectionMode = getTargetConnectionMode(),
+                userDisconnected = userDisconnected,
+                isConnected = isConn,
+                isAuthenticated = isAuth,
+                currentHost = client.currentTargetHost,
+                nowMs = nowMs,
+                lastAttemptMs = effectiveLastAttempt
+            )
+        ) {
+            return false
+        }
+        lastUsbProbeAttemptMs = nowMs
+        if (!usbReachableProbe()) {
+            return false
+        }
+        // Preserve active Wi-Fi host before switching socket target to USB 127.0.0.1
+        val currentHost = client.currentTargetHost.trim()
+        val currentPort = client.currentTargetPort
+        if (currentHost.isNotBlank() && !isLoopbackHost(currentHost) && !DiscoveryManager.isRelayEndpoint(currentHost)) {
+            getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+                .edit()
+                .putString(PREF_LAST_WIFI_HOST, currentHost)
+                .putInt(PREF_LAST_WIFI_PORT, currentPort)
+                .apply()
+        }
+        SafeLog.i("SnowForegroundService", "USB reverse tunnel detected on 127.0.0.1:${Constants.DEFAULT_PORT}; promoting active session...")
+        return client.updateTargetEndpoint("127.0.0.1", Constants.DEFAULT_PORT, client.activeTargetDeviceId())
+    }
+
+    private fun startUsbPromotionLoop() {
+        usbPromotionJob?.cancel()
+        usbPromotionJob = serviceScope.launch {
+            while (kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]?.isActive == true && !userDisconnected) {
+                delay(USB_PROBE_INTERVAL_MS)
+                if (userDisconnected) break
+                try {
+                    tryPromoteUsbIfReachable(force = false)
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        if (usbFallbackJob?.isActive != true) {
+            usbFallbackJob = serviceScope.launch {
+                var wasLoopbackConnected = isLoopbackHost(client.currentTargetHost) &&
+                    client.connectionState.value != ConnectionState.DISCONNECTED
+                client.connectionState.collectLatest { state ->
+                    val currentHost = client.currentTargetHost
+                    if (isLoopbackHost(currentHost) &&
+                        (state == ConnectionState.CONNECTED || state == ConnectionState.CONNECTING)
+                    ) {
+                        wasLoopbackConnected = true
+                    } else if (state == ConnectionState.DISCONNECTED && wasLoopbackConnected && !userDisconnected) {
+                        wasLoopbackConnected = false
+                        if (getTargetConnectionMode() != "remote_only") {
+                            val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+                            val fallback = resolveUsbFallbackTarget(
+                                lastWifiHost = prefs.getString(PREF_LAST_WIFI_HOST, null),
+                                lastWifiPort = prefs.getInt(PREF_LAST_WIFI_PORT, Constants.DEFAULT_PORT),
+                                savedHost = prefs.getString(PREF_SAVED_HOST, null),
+                                savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
+                            )
+                            if (fallback != null) {
+                                SafeLog.i("SnowForegroundService", "USB disconnected; falling back smoothly to Wi-Fi ${fallback.first}:${fallback.second}.")
+                                prefs.edit()
+                                    .putString(PREF_SAVED_HOST, fallback.first)
+                                    .putInt(PREF_SAVED_PORT, fallback.second)
+                                    .apply()
+                                client.connect(fallback.first, fallback.second, client.activeTargetDeviceId())
+                            } else {
+                                executeAutoConnectCascade()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fun promoteLocalRouteFromDiscoveryIfAvailable(): Boolean {
         if (userDisconnected) return false
+        if (getTargetConnectionMode() == "remote_only") return false
         val currentHost = client.currentTargetHost.trim().lowercase()
-        if (currentHost in setOf("127.0.0.1", "localhost", "::1")) {
+        if (isLoopbackHost(currentHost)) {
             return false
+        }
+        // Kick off immediate USB loopback check alongside LAN discovery promotion
+        serviceScope.launch {
+            tryPromoteUsbIfReachable(force = true)
         }
         val candidate = discoveryManager.getCandidateForPairedDesktop() ?: return false
         val isLocalAuth = client.connectionState.value == ConnectionState.CONNECTED &&
@@ -633,11 +780,18 @@ class SnowForegroundService : Service() {
                     val port = client.currentTargetPort
                     if (host.isNotBlank()) {
                         val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
-                        prefs.edit()
-                            .putString(PREF_SAVED_HOST, host)
-                            .putInt(PREF_SAVED_PORT, port)
-                            .apply()
+                        val editor = prefs.edit()
+                        if (!isLoopbackHost(host)) {
+                            editor.putString(PREF_SAVED_HOST, host)
+                                .putInt(PREF_SAVED_PORT, port)
+                            if (!DiscoveryManager.isRelayEndpoint(host)) {
+                                editor.putString(PREF_LAST_WIFI_HOST, host)
+                                    .putInt(PREF_LAST_WIFI_PORT, port)
+                            }
+                        }
+                        editor.apply()
                     }
+                    startUsbPromotionLoop()
                 }
             }
         }
@@ -652,6 +806,10 @@ class SnowForegroundService : Service() {
             .apply()
         autoConnectJob?.cancel()
         autoConnectJob = null
+        usbPromotionJob?.cancel()
+        usbPromotionJob = null
+        usbFallbackJob?.cancel()
+        usbFallbackJob = null
 
         // 0. Stop live screen sharing if active
         liveScreenHandler.stopStreaming(client.currentTargetHost, 8766)
@@ -755,18 +913,23 @@ class SnowForegroundService : Service() {
 
             if (userDisconnected) return@launch
 
-            // Step 4: Saved Remote Relay endpoint fallback
+            // Step 4: Saved Remote Relay or Built-in Render Hub fallback
             val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
             val relayEnabled = settingsPrefs.getBoolean("remote_relay_enabled", false)
-            val relayEndpoint = settingsPrefs.getString("remote_relay_endpoint", null)
+            val relayEndpoint = resolveEffectiveRelayEndpoint(settingsPrefs.getString("remote_relay_endpoint", null))
+            val relaySecurityPrefs = getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE)
             val relayTokenStorage = SharedPreferencesTokenStorage(applicationContext, prefName = "snow_relay_security")
-            val relayTicket = relayTokenStorage.getToken()
+            val authMaterial = resolveEffectiveRelayAuth(
+                ticket = relayTokenStorage.getToken(),
+                bootstrapToken = relaySecurityPrefs.getString(PREF_RELAY_BOOTSTRAP_TOKEN, null),
+                hubToken = relaySecurityPrefs.getString(PREF_RELAY_HUB_TOKEN, null)
+            )
 
-            if (relayEnabled && !relayEndpoint.isNullOrBlank() && !relayTicket.isNullOrBlank()) {
-                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Falling back to saved Remote Relay endpoint $relayEndpoint...")
+            if (relayEnabled && relayEndpoint.isNotBlank() && authMaterial != null) {
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Falling back to Render Hub / Remote Relay endpoint $relayEndpoint...")
                 startRelay(relayEndpoint)
             } else {
-                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: No remote relay configured or enabled.")
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Remote relay disabled or awaiting hub credentials.")
             }
 
             // Passive NetworkCallback remains registered (via registerNetworkCallback in onCreate)
@@ -883,6 +1046,10 @@ class SnowForegroundService : Service() {
         discoveryObserverJob = null
         authObserverJob?.cancel()
         authObserverJob = null
+        usbPromotionJob?.cancel()
+        usbPromotionJob = null
+        usbFallbackJob?.cancel()
+        usbFallbackJob = null
         discoveryManager.stopListening()
         client.disconnect()
         client.teardown()
@@ -915,11 +1082,96 @@ class SnowForegroundService : Service() {
         }
     }
 
+    data class RelayAuthMaterial(
+        val ticket: String = "",
+        val bootstrapToken: String = "",
+        val hubToken: String = ""
+    )
+
     companion object {
         const val PREFS_ENDPOINT = "snow_endpoint_prefs"
         const val PREF_SAVED_HOST = "saved_host"
         const val PREF_SAVED_PORT = "saved_port"
+        const val PREF_LAST_WIFI_HOST = "last_wifi_host"
+        const val PREF_LAST_WIFI_PORT = "last_wifi_port"
         const val PREF_USER_DISCONNECTED = "user_disconnected"
+
+        const val PREF_RELAY_BOOTSTRAP_TOKEN = "relay_bootstrap_token"
+        const val PREF_RELAY_HUB_TOKEN = "relay_hub_token"
+        const val PREF_RELAY_NETWORK_ID = "relay_network_id"
+
+        const val USB_PROMOTION_COOLDOWN_MS = 5000L
+        const val USB_PROBE_INTERVAL_MS = 4000L
+
+        @JvmStatic
+        fun isLoopbackHost(host: String?): Boolean {
+            val clean = host?.trim()?.lowercase() ?: return false
+            return clean in setOf("127.0.0.1", "localhost", "::1")
+        }
+
+        @JvmStatic
+        fun shouldProbeUsbPromotion(
+            connectionMode: String?,
+            userDisconnected: Boolean,
+            isConnected: Boolean,
+            isAuthenticated: Boolean,
+            currentHost: String?,
+            nowMs: Long,
+            lastAttemptMs: Long,
+            cooldownMs: Long = USB_PROMOTION_COOLDOWN_MS
+        ): Boolean {
+            if (userDisconnected) return false
+            if (connectionMode?.trim()?.lowercase() == "remote_only") return false
+            if (!isConnected || !isAuthenticated) return false
+            if (isLoopbackHost(currentHost)) return false
+            if (lastAttemptMs != Long.MIN_VALUE / 2 && (nowMs - lastAttemptMs) < cooldownMs) return false
+            return true
+        }
+
+        @JvmStatic
+        fun resolveUsbFallbackTarget(
+            lastWifiHost: String?,
+            lastWifiPort: Int,
+            savedHost: String?,
+            savedPort: Int
+        ): Pair<String, Int>? {
+            val cleanLastWifi = lastWifiHost?.trim()?.takeIf { it.isNotBlank() && !isLoopbackHost(it) }
+            if (cleanLastWifi != null) {
+                return cleanLastWifi to (if (lastWifiPort in 1..65535) lastWifiPort else Constants.DEFAULT_PORT)
+            }
+            val cleanSaved = savedHost?.trim()?.takeIf { it.isNotBlank() && !isLoopbackHost(it) }
+            if (cleanSaved != null) {
+                return cleanSaved to (if (savedPort in 1..65535) savedPort else Constants.DEFAULT_PORT)
+            }
+            return null
+        }
+
+        @JvmStatic
+        fun resolveEffectiveRelayEndpoint(
+            savedEndpoint: String?,
+            defaultHubUrl: String = SnowUiRepository.DEFAULT_BUILTIN_HUB_URL
+        ): String {
+            val cleanSaved = savedEndpoint?.trim().orEmpty()
+            if (cleanSaved.isNotBlank()) {
+                return SnowUiRepository.normalizeRelayUrl(cleanSaved)
+            }
+            return SnowUiRepository.normalizeRelayUrl(defaultHubUrl)
+        }
+
+        @JvmStatic
+        fun resolveEffectiveRelayAuth(
+            ticket: String?,
+            bootstrapToken: String?,
+            hubToken: String?
+        ): RelayAuthMaterial? {
+            val cleanHub = hubToken?.trim().orEmpty()
+            if (cleanHub.isNotBlank()) return RelayAuthMaterial(hubToken = cleanHub)
+            val cleanBootstrap = bootstrapToken?.trim().orEmpty()
+            if (cleanBootstrap.isNotBlank()) return RelayAuthMaterial(bootstrapToken = cleanBootstrap)
+            val cleanTicket = ticket?.trim().orEmpty()
+            if (cleanTicket.isNotBlank()) return RelayAuthMaterial(ticket = cleanTicket)
+            return null
+        }
 
         const val CHANNEL_ID = "snow_connection_channel"
         const val NOTIFICATION_ID = 1001
@@ -934,6 +1186,7 @@ class SnowForegroundService : Service() {
         const val ACTION_STOP_PEER_HOST = "org.snow.action.STOP_PEER_HOST"
         const val EXTRA_HOST = "org.snow.extra.HOST"
         const val EXTRA_PORT = "org.snow.extra.PORT"
+        const val EXTRA_DEVICE_ID = "org.snow.extra.DEVICE_ID"
         const val EXTRA_RESULT_CODE = "org.snow.extra.RESULT_CODE"
         const val EXTRA_RESULT_DATA = "org.snow.extra.RESULT_DATA"
         const val EXTRA_TARGET_IDS = "org.snow.extra.TARGET_IDS"

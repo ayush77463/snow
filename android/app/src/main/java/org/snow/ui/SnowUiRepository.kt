@@ -45,6 +45,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+fun formatApplyClipboardFeedback(success: Boolean, msg: String?): String {
+    return if (success) {
+        msg?.trim()?.takeIf { it.isNotEmpty() } ?: "Applied to clipboard!"
+    } else {
+        "Failed: ${msg?.trim()?.takeIf { it.isNotEmpty() } ?: "Unknown error"}"
+    }
+}
+
 /**
  * Central state and capability repository for the SNOW UI layer.
  *
@@ -62,6 +70,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         const val PREF_KEY_AUTO_CONNECT_ENABLED = "auto_connect_nearby"
         const val PREF_KEY_REMOTE_RELAY_ENABLED = "remote_relay_enabled"
         const val PREF_KEY_REMOTE_RELAY_ENDPOINT = "remote_relay_endpoint"
+        const val PREF_KEY_ADOPTED_NETWORK_ID = "adopted_network_id"
         const val PREF_KEY_PERMISSION_PROFILE = "permission_profile"
         const val PREFS_CLIPBOARD_ACK = "snow_clipboard_ack_prefs"
         const val PREF_KEY_CLIP_LAST_ACKED_SEQ = "clip_last_acked_seq"
@@ -773,9 +782,40 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     // Phase 27 Direct Phone-to-Phone Peer Host state
     private val _peerHostState = MutableStateFlow(org.snow.network.PeerHostState())
     val peerHostState: StateFlow<org.snow.network.PeerHostState> = _peerHostState.asStateFlow()
+    private val _adoptedNetworkId = MutableStateFlow(
+        appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getString(PREF_KEY_ADOPTED_NETWORK_ID, null)
+            ?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+    )
+    val adoptedNetworkId: StateFlow<String?> = _adoptedNetworkId.asStateFlow()
     private val _permissionProfileState = MutableStateFlow("full_control")
     val permissionProfileState: StateFlow<String> = _permissionProfileState.asStateFlow()
     private var peerHostJob: Job? = null
+    private var snowIdResolveJob: Job? = null
+
+    fun adoptNetworkId(networkId: String?) {
+        val clean = networkId?.trim()?.uppercase()?.takeIf {
+            it.isNotBlank() && it != "SNW-LOCAL" && it != "LOCAL-NETWORK"
+        } ?: return
+        appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .edit().putString(PREF_KEY_ADOPTED_NETWORK_ID, clean).apply()
+        _adoptedNetworkId.value = clean
+    }
+
+    fun getEffectiveNetworkId(): String? = _adoptedNetworkId.value
+
+    fun getRemoteAiLinkDiagnostics(): Pair<String?, String> {
+        val netId = _adoptedNetworkId.value?.trim()?.takeIf { it.isNotBlank() }
+        if (netId != null) {
+            val hubBase = getDefaultHubUrl().trimEnd('/')
+            return "$hubBase/u/$netId/mcp" to "Linked PC network MCP endpoint (active when PC host is online)"
+        }
+        return if (isPeerHostEnabled() || isPeerHostActive()) {
+            null to "Not linked to a PC host yet (Peer Host mode only)"
+        } else {
+            null to "Not linked to a PC host yet"
+        }
+    }
 
     // Bounded retries tracking
     private var connectionAttemptCount = 0
@@ -840,6 +880,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private fun observeClientFlows(client: SnowWebSocketClient) {
         val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
         client.autoReconnectEnabled = prefs.getBoolean(PREF_KEY_AUTO_CONNECT_ENABLED, true)
+        client.targetDeviceLookupByEndpoint = { h, p ->
+            val clean = h.trim()
+            if (clean == "127.0.0.1" || clean == "localhost" || clean == "::1") {
+                null
+            } else {
+                _savedDevices.value.firstOrNull { dev ->
+                    (dev.host == clean && dev.port == p) ||
+                        dev.recentEndpoints.any { ep -> ep.host == clean && ep.port == p }
+                }?.deviceId
+            }
+        }
         client.onDeviceRevoked = { reason ->
             onDeviceRevokedReceived(reason)
         }
@@ -888,8 +939,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         deviceId = identity.deviceId,
                         certPinStorage = certPinStorage,
                         tokenStorage = tokenStorage,
-                        useTls = true
+                        useTls = true,
+                        targetDeviceIdProvider = {
+                            client.activeTargetDeviceId()
+                                ?: auth.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+                        }
                     )
+                    adoptNetworkId(auth.peerNetworkId)
                     // Auto-restore Instant Sync (enabled by default unless user explicitly disabled)
                     val sPrefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
                     if (sPrefs.getBoolean(PREF_KEY_INSTANT_SYNC, true)) {
@@ -912,7 +968,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         peerDeviceType = auth.peerDeviceType,
                         peerDeviceId = auth.peerDeviceId,
                         peerSnowId = auth.peerSnowId,
-                        peerPermissionProfile = auth.permissionProfile
+                        peerPermissionProfile = auth.permissionProfile,
+                        peerNetworkId = auth.peerNetworkId
                     )
                 } else {
                     _fileTransferClient = null
@@ -943,14 +1000,22 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // --- Device Connection & Discovery Actions ---
 
-    fun connect(host: String, port: Int) {
+    @Volatile
+    internal var lastConnectRequestForTest: Triple<String, Int, String?>? = null
+    internal val connectRequestsForTest = java.util.concurrent.CopyOnWriteArrayList<Triple<String, Int, String?>>()
+
+    @JvmOverloads
+    fun connect(host: String, port: Int, targetDeviceId: String? = null) {
         val cleanHost = host.trim()
         if (cleanHost.isEmpty() || port !in 1..65535) {
             appendLog("ERROR", TAG, "Invalid host or port: $cleanHost:$port")
             return
         }
 
-        val matchingDevice = _savedDevices.value.find { it.host == cleanHost && it.port == port }
+        val matchingDevice = _savedDevices.value.find {
+            (targetDeviceId != null && it.deviceId == targetDeviceId) || (it.host == cleanHost && it.port == port)
+        }
+        val resolvedTargetId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: matchingDevice?.deviceId
         if (matchingDevice?.connectionMode == "remote_only") {
             appendLog("WARNING", TAG, "Cannot connect locally: Policy for '${matchingDevice.deviceName}' is set to remote_only.")
             _connectionState.value = ConnectionState.DISCONNECTED
@@ -965,6 +1030,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         serviceRef?.client?.autoReconnectEnabled = prefs.getBoolean(PREF_KEY_AUTO_CONNECT_ENABLED, true)
         connectionAttemptCount = 0
         connectedHost = cleanHost
+        Triple(cleanHost, port, resolvedTargetId).also {
+            lastConnectRequestForTest = it
+            connectRequestsForTest.add(it)
+        }
         _connectedEndpoint.value = null
         _connectionState.value = ConnectionState.CONNECTING
         _uiConnectionState.value = ConnectionState.CONNECTING
@@ -974,6 +1043,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             action = SnowForegroundService.ACTION_CONNECT
             putExtra(SnowForegroundService.EXTRA_HOST, cleanHost)
             putExtra(SnowForegroundService.EXTRA_PORT, port)
+            if (!resolvedTargetId.isNullOrBlank()) {
+                putExtra(SnowForegroundService.EXTRA_DEVICE_ID, resolvedTargetId)
+            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1099,6 +1171,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun pairDeviceWithHandshakeToken(
         handshakeToken: String,
         networkId: String? = null,
+        targetDeviceId: String? = null,
         onStateChanged: ((PairingState) -> Unit)? = null
     ) {
         val client = serviceRef?.client
@@ -1107,17 +1180,21 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             onStateChanged?.invoke(PairingState.Error("WebSocket client not connected."))
             return
         }
+        val activeTarget = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: client.activeTargetDeviceId()
         appendLog("INFO", TAG, "Submitting single-use QR handshake token...")
-        pairingFlow.submitHandshakeToken(handshakeToken, networkId, client) { state ->
+        pairingFlow.submitHandshakeToken(handshakeToken, networkId, client, activeTarget) { state ->
             appendLog("INFO", TAG, "QR handshake pairing state changed: $state")
             if (state is PairingState.Paired) {
+                adoptNetworkId(state.peerNetworkId ?: networkId)
                 client.setAuthenticated(
                     sessionId = state.sessionId,
                     trustTier = state.trustTier,
                     peerDeviceName = state.desktopName,
                     peerDeviceType = state.deviceType,
                     peerDeviceId = state.desktopId,
-                    permissionProfile = state.permissionProfile
+                    peerSnowId = state.peerSnowId,
+                    permissionProfile = state.permissionProfile,
+                    peerNetworkId = state.peerNetworkId ?: networkId
                 )
                 _authState.value = AuthState.Authenticated(
                     sessionId = state.sessionId,
@@ -1125,7 +1202,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     peerDeviceName = state.desktopName,
                     peerDeviceType = state.deviceType,
                     peerDeviceId = state.desktopId,
-                    permissionProfile = state.permissionProfile
+                    peerSnowId = state.peerSnowId,
+                    permissionProfile = state.permissionProfile,
+                    peerNetworkId = state.peerNetworkId ?: networkId
                 )
             }
             onStateChanged?.invoke(state)
@@ -1145,17 +1224,21 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             onStateChanged?.invoke(PairingState.Error("PIN must be exactly 6 numeric digits."))
             return
         }
+        val activeTarget = client.activeTargetDeviceId()
         appendLog("INFO", TAG, "Submitting pairing request...")
-        pairingFlow.submitPin(cleanPin, client) { state ->
+        pairingFlow.submitPin(cleanPin, client, activeTarget) { state ->
             appendLog("INFO", TAG, "Pairing state changed: $state")
             if (state is PairingState.Paired) {
+                adoptNetworkId(state.peerNetworkId)
                 client.setAuthenticated(
                     sessionId = state.sessionId,
                     trustTier = state.trustTier,
                     peerDeviceName = state.desktopName,
                     peerDeviceType = state.deviceType,
                     peerDeviceId = state.desktopId,
-                    permissionProfile = state.permissionProfile
+                    peerSnowId = state.peerSnowId,
+                    permissionProfile = state.permissionProfile,
+                    peerNetworkId = state.peerNetworkId
                 )
                 _authState.value = AuthState.Authenticated(
                     sessionId = state.sessionId,
@@ -1163,7 +1246,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     peerDeviceName = state.desktopName,
                     peerDeviceType = state.deviceType,
                     peerDeviceId = state.desktopId,
-                    permissionProfile = state.permissionProfile
+                    peerSnowId = state.peerSnowId,
+                    permissionProfile = state.permissionProfile,
+                    peerNetworkId = state.peerNetworkId
                 )
             }
             onStateChanged?.invoke(state)
@@ -1173,9 +1258,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun unpairDevice(targetDevice: SavedDevice? = null) {
         appendLog("INFO", TAG, "Unpairing device${targetDevice?.let { " [${it.deviceId}]" } ?: ""} and clearing auth token.")
         val client = serviceRef?.client
-        val currentToken = tokenStorage.getToken()
         val devId = identity.deviceId
         val activeAuth = _authState.value as? AuthState.Authenticated
+        val currentToken = targetDevice?.let {
+            tokenStorage.getTokenForDevice(it.deviceId)
+                ?: it.snowId?.let { sid -> tokenStorage.getTokenForDevice(sid) }
+                ?: if (tokenStorage.listStoredDeviceIds().isEmpty()) tokenStorage.getToken() else null
+        } ?: tokenStorage.getToken()
         val shouldDisconnectCurrent = targetDevice == null ||
             (activeAuth?.peerSnowId != null && targetDevice.snowId == activeAuth.peerSnowId) ||
             (activeAuth?.peerDeviceId != null && targetDevice.deviceId == activeAuth.peerDeviceId) ||
@@ -1193,14 +1282,27 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
         if (targetDevice != null) {
             removeSavedDevice(targetDevice.deviceId)
+            tokenStorage.clearTokenForDevice(targetDevice.deviceId)
+            certPinStorage.clearPinnedFingerprintForDevice(targetDevice.deviceId)
+            targetDevice.snowId?.let {
+                tokenStorage.clearTokenForDevice(it)
+                certPinStorage.clearPinnedFingerprintForDevice(it)
+            }
         } else {
             clearSavedDevices()
+            tokenStorage.clearAllTokens()
+            certPinStorage.clearAllPinnedFingerprints()
+            appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                .edit().remove(PREF_KEY_ADOPTED_NETWORK_ID).apply()
+            _adoptedNetworkId.value = null
         }
 
         if (shouldDisconnectCurrent) {
             SnowForegroundService.setDisconnectedByUser(appContext, true)
             serviceRef?.cancelAutoConnect()
-            tokenStorage.clearToken()
+            if (targetDevice == null) {
+                tokenStorage.clearAllTokens()
+            }
             _connectedEndpoint.value = null
             connectedHost = ""
             _pcTelemetry.value = PcTelemetry.UNAVAILABLE
@@ -1212,11 +1314,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     fun resetTrust() {
-        appendLog("INFO", TAG, "Resetting all cryptographic trust (clearing certificates and auth tokens).")
+        appendLog("INFO", TAG, "Resetting all cryptographic trust (clearing certificates, keys, and auth tokens).")
         SnowForegroundService.setDisconnectedByUser(appContext, true)
         serviceRef?.cancelAutoConnect()
-        certPinStorage.clearPinnedFingerprint()
-        tokenStorage.clearToken()
+        certPinStorage.clearAllPinnedFingerprints()
+        tokenStorage.clearAllTokens()
+        serviceRef?.peerHostManager?.resetPersistedIdentity()
+        appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .edit().remove(PREF_KEY_ADOPTED_NETWORK_ID).apply()
+        _adoptedNetworkId.value = null
         _connectedEndpoint.value = null
         connectedHost = ""
         _authState.value = AuthState.Disconnected
@@ -1249,8 +1355,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 val validHost = if (savedHost.isNotBlank() && savedHost != "127.0.0.1") savedHost else ""
                 val endpoints = if (validHost.isNotBlank()) listOf(DeviceEndpoint(validHost, savedPort)) else emptyList()
                 val canonicalId = when {
-                    !pinnedFp.isNullOrBlank() -> deriveCanonicalSnowId("fp:${pinnedFp.replace(":", "").lowercase()}")
-                    validHost.isNotBlank() -> deriveCanonicalSnowId("host:$validHost:$savedPort")
+                    validHost.isNotBlank() -> "peer-$validHost:$savedPort"
                     else -> "paired-desktop-legacy"
                 }
                 val migrated = SavedDevice(
@@ -1262,7 +1367,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     trustTier = "owner",
                     certFingerprint = pinnedFp,
                     recentEndpoints = endpoints,
-                    snowId = canonicalId.takeIf { it.startsWith("SNW-") },
+                    snowId = null,
                     permissionProfile = "not_allowed"
                 )
                 val list = listOf(migrated)
@@ -1283,22 +1388,41 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         peerDeviceType: String? = null,
         peerDeviceId: String? = null,
         peerSnowId: String? = null,
-        peerPermissionProfile: String? = null
+        peerPermissionProfile: String? = null,
+        peerNetworkId: String? = null
     ) {
         val cleanHost = host.trim()
-        val pinnedFp = certPinStorage.getPinnedFingerprint()
         val cleanSnowId = peerSnowId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
         val cleanPeerId = peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
-        val canonicalKey = cleanSnowId
-            ?: cleanPeerId
-            ?: pinnedFp?.takeIf { it.isNotBlank() }?.let { deriveCanonicalSnowId("fp:${it.replace(":", "").lowercase()}") }
+        adoptNetworkId(peerNetworkId)
+
+        val matchedDiscovered = _discoveredPeers.value.find {
+            (!cleanPeerId.isNullOrBlank() && it.deviceId.equals(cleanPeerId, ignoreCase = true)) ||
+                (!cleanSnowId.isNullOrBlank() && it.snowId.equals(cleanSnowId, ignoreCase = true)) ||
+                (cleanHost.isNotBlank() && cleanHost != "127.0.0.1" && it.ipAddress == cleanHost)
+        }
+        val canonicalKey = cleanPeerId
+            ?: cleanSnowId
+            ?: matchedDiscovered?.deviceId?.takeIf { it.isNotBlank() }
+            ?: run {
+                val fallbackFp = if (certPinStorage.listPinnedDeviceIds().isEmpty()) {
+                    certPinStorage.getPinnedFingerprint()
+                } else null
+                fallbackFp?.takeIf { it.isNotBlank() }?.let { "peer-fp-${it.replace(":", "").lowercase().take(16)}" }
+            }
             ?: if (cleanHost.isNotBlank()) "peer-$cleanHost:$port" else "peer-$sessionId"
+
+        val pinnedFp = (cleanPeerId?.let { certPinStorage.getPinnedFingerprintForDevice(it) })
+            ?: (cleanSnowId?.let { certPinStorage.getPinnedFingerprintForDevice(it) })
+            ?: matchedDiscovered?.certFingerprint?.takeIf { it.isNotBlank() }
+            ?: certPinStorage.getPinnedFingerprintForDevice(canonicalKey)
+            ?: if (certPinStorage.listPinnedDeviceIds().isEmpty()) certPinStorage.getPinnedFingerprint() else null
+
         val nowStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
 
-        val matchedDiscovered = _discoveredPeers.value.find { it.ipAddress == cleanHost }
         val resolvedSnowId = cleanSnowId
             ?: matchedDiscovered?.snowId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
-            ?: (if (canonicalKey.startsWith("SNW-")) canonicalKey else null)
+            ?: cleanPeerId?.takeIf { it.startsWith("SNW-", ignoreCase = true) }?.uppercase()
         val rawType = peerDeviceType?.takeIf { it.isNotBlank() }
             ?: matchedDiscovered?.deviceType?.takeIf { it.isNotBlank() }
         val resolvedType = when {
@@ -1348,7 +1472,18 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 normalizedIncomingTier
             }
             val effectiveType = resolvedType ?: existing.deviceType
-            val effectiveName = resolvedName ?: existing.deviceName
+            val isIncomingGenericName = resolvedName == null ||
+                resolvedName.equals("Desktop Core", ignoreCase = true) ||
+                resolvedName.equals("SNOW Desktop", ignoreCase = true) ||
+                resolvedName.equals("Android Peer", ignoreCase = true)
+            val existingCustom = existing.deviceName.trim().takeIf {
+                it.isNotEmpty() && !it.equals("Desktop Core", ignoreCase = true) && !it.equals("Paired Desktop Core", ignoreCase = true)
+            }
+            val effectiveName = if (isIncomingGenericName && existingCustom != null) {
+                existingCustom
+            } else {
+                resolvedName ?: existing.deviceName
+            }
             val (_, preservedProfile) = resolveSeparatedTrustAndProfile(
                 existing.trustTier,
                 existing.permissionProfile
@@ -1358,12 +1493,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             } else {
                 preservedProfile
             }
+            val nextCanonicalId = if (!isWeakSyntheticDeviceId(canonicalKey)) canonicalKey else existing.deviceId
             current[existingIdx] = existing.copy(
-                deviceId = canonicalKey,
+                deviceId = nextCanonicalId,
                 deviceName = effectiveName,
                 deviceType = effectiveType,
                 host = if (cleanHost != "127.0.0.1" || existing.host.isBlank()) cleanHost else existing.host,
-                port = port,
+                port = if (cleanHost != "127.0.0.1" || existing.host.isBlank()) port else existing.port,
                 lastSeen = nowStr,
                 trustTier = effectiveTier,
                 certFingerprint = pinnedFp ?: existing.certFingerprint,
@@ -1451,6 +1587,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
 
         val nodeId = payload.optString("id", "").trim()
+        val qrSnowId = payload.optString("snow_id", "").trim().uppercase().takeIf { it.isNotBlank() }
         val port = payload.optInt("port", 8765)
         val pin = payload.optString("pin", "").trim()
         val hasHandshakeField = payload.has("handshake_token") && !payload.isNull("handshake_token")
@@ -1500,21 +1637,29 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             return
         }
 
-        // Pinned certificate verification
-        val pinnedFp = certPinStorage.getPinnedFingerprint()
+        // Per-device pinned certificate verification (multi-device safe: different nodeIds never collide)
+        val existingPinForNode = certPinStorage.getPinnedFingerprintForDevice(nodeId)
+        val savedMatchForNode = _savedDevices.value.find { it.deviceId.equals(nodeId, ignoreCase = true) }
+        val pinnedFp = existingPinForNode ?: savedMatchForNode?.certFingerprint?.takeIf { it.isNotBlank() }
         if (pinnedFp != null) {
             val cleanPinned = pinnedFp.replace(":", "").replace(" ", "").trim()
             if (!cleanPinned.equals(fp, ignoreCase = true)) {
-                val err = "CRITICAL: Certificate fingerprint in QR does not match existing pinned certificate! Mismatch blocked."
+                val err = "CRITICAL: Certificate fingerprint in QR does not match existing pinned certificate for device '$nodeId'! Mismatch blocked."
                 appendLog("ERROR", TAG, err)
                 _authState.value = AuthState.FingerprintMismatch(pinnedFp, fp)
                 onComplete(false, err)
                 return
             }
+            if (existingPinForNode == null) {
+                certPinStorage.pinFingerprintForDevice(nodeId, fp)
+            }
         } else {
-            // TOFU initial trust from scanned QR code
-            certPinStorage.pinFingerprint(fp)
-            appendLog("INFO", TAG, "Pinned TLS certificate fingerprint from scanned QR code.")
+            // TOFU initial trust scoped strictly to this QR host nodeId
+            certPinStorage.pinFingerprintForDevice(nodeId, fp)
+            appendLog("INFO", TAG, "Pinned TLS certificate fingerprint for device '$nodeId' from scanned QR code.")
+        }
+        if (networkId.isNotBlank()) {
+            adoptNetworkId(networkId)
         }
 
         // Master QR: provision remote relay credentials if included
@@ -1540,10 +1685,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             }
         }
 
-        // Connect to first candidate IP and proceed with pairing
+        // Connect to first candidate IP and proceed with pairing scoped to host nodeId
         val targetIp = candidateIps.first()
-        appendLog("INFO", TAG, "Initiating QR onboarding connection to $targetIp:$port...")
-        connect(targetIp, port)
+        appendLog("INFO", TAG, "Initiating QR onboarding connection to $targetIp:$port (device=$nodeId)...")
+        connect(targetIp, port, targetDeviceId = nodeId)
 
         // Schedule pairing submission once WebSocket establishes connection (strict token vs PIN separation)
         repoScope.launch {
@@ -1561,7 +1706,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 val state = _connectionState.value
                 val auth = _authState.value
                 if (state == ConnectionState.CONNECTED && auth is AuthState.Authenticated) {
-                    appendLog("INFO", TAG, "Device already authenticated with desktop. Onboarding complete.")
+                    appendLog("INFO", TAG, "Device already authenticated with host. Onboarding complete.")
                     recordSuccessfulConnection(
                         host = targetIp,
                         port = port,
@@ -1569,9 +1714,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         tier = auth.trustTier,
                         peerDeviceName = auth.peerDeviceName,
                         peerDeviceType = auth.peerDeviceType,
-                        peerDeviceId = auth.peerDeviceId,
-                        peerSnowId = auth.peerSnowId,
-                        peerPermissionProfile = auth.permissionProfile
+                        peerDeviceId = auth.peerDeviceId?.takeIf { it.isNotBlank() } ?: nodeId,
+                        peerSnowId = auth.peerSnowId ?: qrSnowId,
+                        peerPermissionProfile = auth.permissionProfile,
+                        peerNetworkId = auth.peerNetworkId ?: networkId.takeIf { it.isNotBlank() }
                     )
                     finishQr(true, null)
                     return@launch
@@ -1587,8 +1733,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                     tier = pState.trustTier,
                                     peerDeviceName = pState.desktopName,
                                     peerDeviceType = pState.deviceType,
-                                    peerDeviceId = pState.desktopId,
-                                    peerPermissionProfile = pState.permissionProfile
+                                    peerDeviceId = pState.desktopId.takeIf { it.isNotBlank() && it != "unknown" } ?: nodeId,
+                                    peerSnowId = pState.peerSnowId ?: qrSnowId,
+                                    peerPermissionProfile = pState.permissionProfile,
+                                    peerNetworkId = pState.peerNetworkId ?: networkId.takeIf { it.isNotBlank() }
                                 )
                                 finishQr(true, null)
                             }
@@ -1598,7 +1746,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                 finishQr(false, msg)
                             }
                             is PairingState.Expired -> {
-                                val msg = pState.message.ifBlank { "QR pairing credential has expired. Generate a fresh QR code on PC." }
+                                val msg = pState.message.ifBlank { "QR pairing credential has expired. Generate a fresh QR code on host." }
                                 appendLog("ERROR", TAG, "QR pairing failed: $msg")
                                 finishQr(false, msg)
                             }
@@ -1620,7 +1768,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     }
                     if (hasValidHandshake) {
                         appendLog("INFO", TAG, "Connection established; submitting single-use QR handshake token...")
-                        pairDeviceWithHandshakeToken(handshakeToken, networkId, onQrPairingResult)
+                        pairDeviceWithHandshakeToken(handshakeToken, networkId, nodeId, onQrPairingResult)
                     } else if (hasHandshakeField) {
                         finishQr(false, "QR handshake token missing or invalid.")
                     } else {
@@ -1660,6 +1808,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         appendLog("INFO", TAG, "Configured remote relay endpoint: $normalizedRelayUrl")
     }
 
+    internal var snowIdDiscoveryBurstMs: Long = 2500L
+    internal var allowDevLoopbackForTest: Boolean = false
+    internal var hubBearerTokenProvider: (() -> String?)? = null
+
     fun connectByInput(raw: String, onResult: (Boolean, String, String?) -> Unit) {
         val input = raw.trim()
         if (input.isEmpty()) {
@@ -1673,94 +1825,204 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             return
         }
 
-        // 1. Check SNOW ID / Network ID: Full (SNW-XXXX-XXXX), Network (SNW-NET-XXXXXXXX), or Short
+        // 1. Check optional "SNOW_ID 6DIGIT_PIN" (or bare SNOW ID / Network ID)
+        val snowPinParts = Regex("^(\\S+)(?:\\s+|#)(\\d{6})$").matchEntire(input)
+        val snowCandidate = (snowPinParts?.groupValues?.get(1) ?: input).trim()
+        val pairedPinCandidate = snowPinParts?.groupValues?.get(2)?.takeIf { it.length == 6 }
+
         val snowIdRegex = Regex("^(SNW-NET-[A-F0-9]{8}|SNW-[A-Z0-9]{4}-[A-Z0-9]{4}|SNW-[A-Z0-9]{4}|DEV-[A-Z0-9]{4})$", RegexOption.IGNORE_CASE)
-        if (snowIdRegex.matches(input)) {
-            val upperSnowId = input.uppercase()
+        if (snowIdRegex.matches(snowCandidate)) {
+            val upperSnowId = snowCandidate.uppercase()
             appendLog("INFO", TAG, "Resolving connection for SNOW ID: $upperSnowId")
 
-            val matchedPeer = _discoveredPeers.value.find { peer ->
+            fun findDiscoveredPeer(): DiscoveredPeer? = _discoveredPeers.value.find { peer ->
                 peer.snowId.equals(upperSnowId, ignoreCase = true) ||
-                peer.deviceId.equals(upperSnowId, ignoreCase = true) ||
-                (upperSnowId.length == 8 && (peer.snowId?.startsWith(upperSnowId, ignoreCase = true) == true || peer.deviceId.startsWith(upperSnowId, ignoreCase = true)))
+                    peer.deviceId.equals(upperSnowId, ignoreCase = true) ||
+                    (upperSnowId.length == 8 && (
+                        peer.snowId?.startsWith(upperSnowId, ignoreCase = true) == true ||
+                            peer.deviceId.startsWith(upperSnowId, ignoreCase = true)
+                        ))
             }
-            if (matchedPeer != null) {
+
+            // Step 1: Immediate live LAN peer match
+            findDiscoveredPeer()?.let { matchedPeer ->
                 appendLog("INFO", TAG, "Found discovered peer for $upperSnowId at ${matchedPeer.ipAddress}:${matchedPeer.port}")
-                connect(matchedPeer.ipAddress, matchedPeer.port)
+                connect(matchedPeer.ipAddress, matchedPeer.port, targetDeviceId = matchedPeer.deviceId)
                 onResult(true, "Connecting to discovered peer for $upperSnowId", "lan")
                 return
             }
 
+            // Step 2: Saved-device canonical lookup (only when reachable LAN/direct endpoint exists & not remote_only)
             val savedDev = _savedDevices.value.find { dev ->
                 dev.snowId?.equals(upperSnowId, ignoreCase = true) == true ||
-                dev.deviceId.equals(upperSnowId, ignoreCase = true) ||
-                (upperSnowId.length == 8 && (dev.snowId?.startsWith(upperSnowId, ignoreCase = true) == true || dev.deviceId.startsWith(upperSnowId, ignoreCase = true)))
+                    dev.deviceId.equals(upperSnowId, ignoreCase = true) ||
+                    (upperSnowId.length == 8 && (
+                        dev.snowId?.startsWith(upperSnowId, ignoreCase = true) == true ||
+                            dev.deviceId.startsWith(upperSnowId, ignoreCase = true)
+                        ))
             }
-            if (savedDev != null) {
-                val targetHost = savedDev.recentEndpoints.firstOrNull()?.host ?: savedDev.host
-                val targetPort = savedDev.recentEndpoints.firstOrNull()?.port ?: savedDev.port
-                appendLog("INFO", TAG, "Found saved device for $upperSnowId: $targetHost:$targetPort")
-                connect(targetHost, targetPort)
-                onResult(true, "Connecting to saved device for $upperSnowId", "saved")
-                return
-            }
-
-            // Fail-closed: never silently fall back to 127.0.0.1:8765 for an unresolved remote SNOW ID
-            val hubBase = getDefaultHubUrl()
-            if (hubBase.startsWith("https://") || hubBase.startsWith("http://")) {
-                repoScope.launch(Dispatchers.IO) {
-                    var resolvedOnline = false
-                    var failureReason = "Could not resolve $upperSnowId on local network or cloud hub."
-                    var failureTag = "not_found"
-                    try {
-                        val req = okhttp3.Request.Builder()
-                            .url("$hubBase/v1/directory/resolve/${java.net.URLEncoder.encode(upperSnowId, "UTF-8")}")
-                            .get()
-                            .build()
-                        val httpClient = okhttp3.OkHttpClient.Builder()
-                            .callTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-                            .build()
-                        httpClient.newCall(req).execute().use { resp ->
-                            if (resp.isSuccessful) {
-                                val bodyStr = resp.body?.string() ?: "{}"
-                                val obj = org.json.JSONObject(bodyStr)
-                                resolvedOnline = obj.optBoolean("online", false)
-                                if (!resolvedOnline) {
-                                    failureReason = "Remote device $upperSnowId is offline."
-                                    failureTag = "offline"
-                                }
-                            } else if (resp.code == 401 || resp.code == 403) {
-                                failureReason = "Hub directory lookup requires authentication (HTTP ${resp.code}). Pair via QR code or enter direct LAN host:port."
-                                failureTag = "hub_auth_failed"
-                            } else if (resp.code == 404) {
-                                failureReason = "Device $upperSnowId not found on LAN or cloud hub."
-                                failureTag = "not_found"
-                            } else {
-                                failureReason = "Cloud hub directory unavailable (HTTP ${resp.code})."
-                                failureTag = "hub_unavailable"
-                            }
-                        }
-                    } catch (e: Exception) {
-                        appendLog("WARN", TAG, "Hub directory lookup failed for $upperSnowId: ${e.message}")
-                        failureReason = "Cloud hub unreachable while resolving $upperSnowId: ${e.message ?: "network error"}"
-                        failureTag = "hub_unavailable"
-                    }
-                    kotlinx.coroutines.withContext(Dispatchers.Main) {
-                        val relayEp = getRemoteRelayEndpoint()
-                        if (resolvedOnline && relayEp.isNotBlank()) {
-                            connectRelay(relayEp)
-                            onResult(true, "Connecting to $upperSnowId via Cloud Hub Directory", "hub_directory")
-                        } else {
-                            appendLog("WARN", TAG, "Unresolved SNOW ID $upperSnowId ($failureTag): $failureReason")
-                            onResult(false, failureReason, failureTag)
-                        }
-                    }
+            if (savedDev != null && savedDev.connectionMode != "remote_only") {
+                val targetHost = savedDev.recentEndpoints.firstOrNull { it.host.isNotBlank() }?.host
+                    ?: savedDev.host.takeIf { it.isNotBlank() }
+                val targetPort = savedDev.recentEndpoints.firstOrNull { it.host.isNotBlank() }?.port ?: savedDev.port
+                if (!targetHost.isNullOrBlank()) {
+                    appendLog("INFO", TAG, "Found saved device for $upperSnowId: $targetHost:$targetPort")
+                    connect(targetHost, targetPort, targetDeviceId = savedDev.deviceId)
+                    onResult(true, "Connecting to saved device for $upperSnowId", "saved")
+                    return
                 }
-                return
             }
 
-            appendLog("WARN", TAG, "Unresolved SNOW ID $upperSnowId: no LAN peer, saved device, or hub endpoint found.")
-            onResult(false, "Could not resolve $upperSnowId on local network.", "not_found")
+            // Step 3: Cancellable ~2.5s active non-blocking LAN discovery burst, then authenticated Hub rendezvous
+            snowIdResolveJob?.cancel()
+            snowIdResolveJob = repoScope.launch {
+                val dm = serviceRef?.discoveryManager
+                try {
+                    dm?.startListening()
+                } catch (_: Exception) {}
+
+                val burstDeadline = System.currentTimeMillis() + snowIdDiscoveryBurstMs.coerceAtLeast(0L)
+                var lanMatched: DiscoveredPeer? = findDiscoveredPeer()
+                while (lanMatched == null && System.currentTimeMillis() < burstDeadline) {
+                    val remaining = (burstDeadline - System.currentTimeMillis()).coerceAtLeast(10L)
+                    kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        kotlinx.coroutines.delay(minOf(100L, remaining))
+                    }
+                    lanMatched = findDiscoveredPeer()
+                }
+
+                if (lanMatched != null) {
+                    appendLog("INFO", TAG, "LAN burst resolved $upperSnowId at ${lanMatched.ipAddress}:${lanMatched.port}")
+                    connect(lanMatched.ipAddress, lanMatched.port, targetDeviceId = lanMatched.deviceId)
+                    onResult(true, "Connecting to $upperSnowId on local Wi-Fi", "lan")
+                    return@launch
+                }
+
+                // Step 4: If user included 6-digit pairing PIN, redeem via authenticated /v1/rendezvous/join
+                if (!pairedPinCandidate.isNullOrBlank()) {
+                    joinRendezvousOnboarding(
+                        snowId = upperSnowId,
+                        pin = pairedPinCandidate,
+                        allowDevLoopback = allowDevLoopbackForTest
+                    ) { ok, rdvData, err ->
+                        if (ok && rdvData != null) {
+                            val hostDevId = (rdvData["host_device_id"] as? String)?.trim().orEmpty()
+                            val fp = (rdvData["host_cert_fingerprint"] as? String)?.trim().orEmpty()
+                            val netId = (rdvData["network_id"] as? String)?.trim().orEmpty()
+                            val relayWs = (rdvData["relay_ws_url"] as? String)?.trim().orEmpty()
+                            if (hostDevId.isNotBlank() && fp.length == 64) {
+                                certPinStorage.pinFingerprintForDevice(hostDevId, fp)
+                            }
+                            if (netId.isNotBlank()) adoptNetworkId(netId)
+                            if (relayWs.isNotBlank()) {
+                                val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+                                prefs.edit().apply {
+                                    if (netId.isNotBlank()) putString("remote_relay_group_id", netId)
+                                    if (hostDevId.isNotBlank()) putString("remote_relay_target_peer", hostDevId)
+                                }.apply()
+                                onResult(true, "Connecting to $upperSnowId via Render Hub rendezvous", "rendezvous")
+                            } else {
+                                onResult(false, "Rendezvous returned no relay endpoint for $upperSnowId.", "hub_unavailable")
+                            }
+                        } else {
+                            onResult(false, err ?: "Render Hub rendezvous failed for $upperSnowId.", "hub_auth_failed")
+                        }
+                    }
+                    return@launch
+                }
+
+                // Step 5: Credentialed Hub directory resolution ONLY when caller holds an authenticated Bearer token;
+                // never call unauthenticated /v1/directory/resolve and never fall back to 127.0.0.1:8765.
+                val bearerToken = hubBearerTokenProvider?.invoke()?.trim()?.takeIf { it.isNotBlank() }
+                val hubBase = try {
+                    getDefaultHubUrl(allowDevLoopback = allowDevLoopbackForTest)
+                } catch (_: Exception) {
+                    ""
+                }
+                if (bearerToken != null && (hubBase.startsWith("https://") || hubBase.startsWith("http://"))) {
+                    val outcome = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        var resolvedOnline = false
+                        var resolvedRelayWs = ""
+                        var resolvedHostId = ""
+                        var resolvedNetId = ""
+                        var failureReason = "Could not resolve $upperSnowId on local network or cloud hub."
+                        var failureTag = "not_found"
+                        try {
+                            val req = okhttp3.Request.Builder()
+                                .url("$hubBase/v1/directory/resolve/${java.net.URLEncoder.encode(upperSnowId, "UTF-8")}")
+                                .addHeader("Authorization", "Bearer $bearerToken")
+                                .get()
+                                .build()
+                            val httpClient = okhttp3.OkHttpClient.Builder()
+                                .callTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+                                .build()
+                            httpClient.newCall(req).execute().use { resp ->
+                                val bodyStr = resp.body?.string() ?: "{}"
+                                val obj = try { org.json.JSONObject(bodyStr) } catch (_: Exception) { org.json.JSONObject() }
+                                when {
+                                    resp.isSuccessful -> {
+                                        resolvedOnline = obj.optBoolean("online", false)
+                                        resolvedRelayWs = obj.optString("relay_ws_url", "").trim()
+                                        resolvedHostId = obj.optString("device_id", "").trim()
+                                        resolvedNetId = obj.optString("network_id", "").trim()
+                                        if (!resolvedOnline) {
+                                            failureReason = "Remote device $upperSnowId is offline."
+                                            failureTag = "offline"
+                                        }
+                                    }
+                                    resp.code == 401 -> {
+                                        failureReason = obj.optString("error").ifBlank { "Hub session expired or unauthorized (HTTP 401)." }
+                                        failureTag = "hub_auth_failed"
+                                    }
+                                    resp.code == 403 -> {
+                                        failureReason = obj.optString("error").ifBlank { "Cross-network directory lookup denied (HTTP 403)." }
+                                        failureTag = "forbidden"
+                                    }
+                                    resp.code == 404 -> {
+                                        failureReason = "Device $upperSnowId not found on LAN or cloud hub."
+                                        failureTag = "not_found"
+                                    }
+                                    else -> {
+                                        failureReason = "Cloud hub directory unavailable (HTTP ${resp.code})."
+                                        failureTag = "hub_unavailable"
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            failureReason = "Cloud hub unreachable while resolving $upperSnowId: ${e.message ?: "network error"}"
+                            failureTag = "hub_unavailable"
+                        }
+                        listOf(resolvedOnline.toString(), resolvedRelayWs, resolvedHostId, resolvedNetId, failureReason, failureTag)
+                    }
+                    val okOnline = outcome[0] == "true"
+                    val relayWs = outcome[1]
+                    val hostDev = outcome[2]
+                    val netId = outcome[3]
+                    val errReason = outcome[4]
+                    val errTag = outcome[5]
+                    if (okOnline) {
+                        if (netId.isNotBlank()) adoptNetworkId(netId)
+                        val relayEp = relayWs.ifBlank { getEffectiveRelayEndpointForHub() }
+                        if (relayEp.isNotBlank()) {
+                            connectRelay(relayEp)
+                            onResult(true, "Connecting to $upperSnowId via Cloud Hub", "hub_directory")
+                        } else {
+                            onResult(false, "Relay endpoint unavailable for $upperSnowId.", "hub_unavailable")
+                        }
+                    } else {
+                        appendLog("WARN", TAG, "Unresolved SNOW ID $upperSnowId ($errTag): $errReason")
+                        onResult(false, errReason, errTag)
+                    }
+                    return@launch
+                }
+
+                val guidance = "Device $upperSnowId not found on local network. Pair via QR code or enter '$upperSnowId <6-digit PIN>' to connect over Render Hub."
+                appendLog("WARN", TAG, "Unresolved SNOW ID $upperSnowId: $guidance")
+                onResult(false, guidance, "rendezvous_required")
+            }
+            return
+        } else if (snowCandidate.startsWith("SNW-", ignoreCase = true) || snowCandidate.startsWith("DEV-", ignoreCase = true)) {
+            onResult(false, "Invalid SNOW ID format: $snowCandidate", "INVALID_SNOW_ID")
             return
         }
 
@@ -1949,17 +2211,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 }
                 "remote_only" -> {
                     serviceRef?.client?.disconnect()
-                    val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                    val endpoint = prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "") ?: ""
-                    if (endpoint.isNotBlank()) {
-                        serviceRef?.startRelay(endpoint)
-                    }
+                    val endpoint = getEffectiveRelayEndpointForHub()
+                    updateRemoteRelayConfig(true, endpoint)
+                    serviceRef?.startRelay(endpoint)
                 }
                 "auto" -> {
                     if (_connectionState.value == ConnectionState.DISCONNECTED) {
-                        val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                        val endpoint = prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "") ?: ""
-                        if (endpoint.isNotBlank()) {
+                        val endpoint = getEffectiveRelayEndpointForHub()
+                        if (isRemoteRelayEnabled() && endpoint.isNotBlank()) {
                             serviceRef?.startRelay(endpoint)
                         }
                     }
@@ -2289,6 +2548,56 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     private var lastClipboardHash: String? = null
+    private val imageClipboardLock = Any()
+    @Volatile
+    private var lastImageClipboardSha256: String? = null
+
+    fun recordIncomingClipboardImageSha256(sha256: String?) {
+        val normalized = sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return
+        synchronized(imageClipboardLock) {
+            lastImageClipboardSha256 = normalized
+        }
+    }
+
+    fun getLastImageClipboardSha256(): String? = synchronized(imageClipboardLock) {
+        lastImageClipboardSha256
+    }
+
+    fun isDuplicateImageClipboard(sha256: String?): Boolean {
+        val normalized = sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+        return synchronized(imageClipboardLock) {
+            lastImageClipboardSha256 == normalized
+        }
+    }
+
+    fun resetImageClipboardEchoGuard() {
+        synchronized(imageClipboardLock) {
+            lastImageClipboardSha256 = null
+        }
+    }
+
+    fun isOwnFileProviderAuthority(scheme: String?, authority: String?): Boolean {
+        val ownAuthority = "${appContext.packageName}.fileprovider"
+        return scheme.equals("content", ignoreCase = true) && authority.equals(ownAuthority, ignoreCase = true)
+    }
+
+    fun isOwnFileProviderUriString(uriString: String?): Boolean {
+        val clean = uriString?.trim() ?: return false
+        val expectedPrefix = "content://${appContext.packageName}.fileprovider"
+        return clean.equals(expectedPrefix, ignoreCase = true) ||
+            clean.startsWith("$expectedPrefix/", ignoreCase = true) ||
+            clean.startsWith("$expectedPrefix?", ignoreCase = true)
+    }
+
+    fun isOwnFileProviderUri(uri: Uri?): Boolean {
+        if (uri == null) return false
+        val scheme = try { uri.scheme } catch (_: Exception) { null }
+        val authority = try { uri.authority } catch (_: Exception) { null }
+        if (!scheme.isNullOrBlank() || !authority.isNullOrBlank()) {
+            return isOwnFileProviderAuthority(scheme, authority)
+        }
+        return isOwnFileProviderUriString(try { uri.toString() } catch (_: Exception) { null })
+    }
 
     private fun clipboardAckPrefs() =
         appContext.getSharedPreferences(PREFS_CLIPBOARD_ACK, Context.MODE_PRIVATE)
@@ -2530,6 +2839,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
             val item = clip.getItemAt(0)
             val uri = item.uri
+            if (isOwnFileProviderUri(uri)) {
+                appendLog("DEBUG", TAG, "Skipping foreground clipboard sync for own FileProvider URI.")
+                return
+            }
             val clipDescriptionMime = clip.description?.let { desc ->
                 (0 until desc.mimeTypeCount).map { desc.getMimeType(it) }.firstOrNull { it.startsWith("image/") }
             }
@@ -2537,7 +2850,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             val isImage = (resolvedMime?.startsWith("image/") == true) || (uri != null && (clipDescriptionMime != null || appContext.contentResolver.getType(uri)?.startsWith("image/") == true))
 
             if (isImage && uri != null) {
-                // Image on clipboard
+                // Image on clipboard (own FileProvider URI already excluded above; push checks content SHA-256)
                 pushCurrentClipboard { success, _ ->
                     if (success) {
                         appendLog("INFO", TAG, "Auto-synced foreground image to PC clipboard.")
@@ -2658,7 +2971,6 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
                 when (upRes) {
                     is FileTransferClient.TransferResult.Success -> {
-                        recordIncomingClipboardText(upRes.sha256)
                         client.sendRequest(
                             "desktop_clipboard_set",
                             mapOf(
@@ -2670,6 +2982,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         ) { resp ->
                             repoScope.launch(Dispatchers.Main) {
                                 if (resp.isSuccess) {
+                                    recordIncomingClipboardImageSha256(upRes.sha256)
                                     appendLog("INFO", TAG, "Screenshot synced to PC clipboard: $safeName")
                                     Toast.makeText(appContext, "Screenshot synced to PC clipboard ❄️", Toast.LENGTH_SHORT).show()
                                     onComplete?.invoke(true, safeName)
@@ -2682,7 +2995,6 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         }
                     }
                     is FileTransferClient.TransferResult.Duplicate -> {
-                        recordIncomingClipboardText(upRes.sha256)
                         client.sendRequest(
                             "desktop_clipboard_set",
                             mapOf(
@@ -2693,6 +3005,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         ) { resp ->
                             repoScope.launch(Dispatchers.Main) {
                                 if (resp.isSuccess) {
+                                    recordIncomingClipboardImageSha256(upRes.sha256)
                                     appendLog("INFO", TAG, "Screenshot synced to PC clipboard: $safeName")
                                     Toast.makeText(appContext, "Screenshot synced to PC clipboard ❄️", Toast.LENGTH_SHORT).show()
                                     onComplete?.invoke(true, safeName)
@@ -3175,7 +3488,18 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     fun getRemoteRelayEndpoint(): String {
         val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-        return prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "") ?: ""
+        return prefs.getString(PREF_KEY_REMOTE_RELAY_ENDPOINT, "")?.trim().orEmpty()
+    }
+
+    /**
+     * Resolve effective WSS relay URL, defaulting to built-in Render Hub when no custom endpoint is set.
+     */
+    fun getEffectiveRelayEndpointForHub(): String {
+        val custom = getRemoteRelayEndpoint()
+        if (custom.isNotBlank()) {
+            return normalizeRelayUrl(custom)
+        }
+        return normalizeRelayUrl(getDefaultHubUrl())
     }
 
     /**
@@ -3267,8 +3591,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         return@launch
                     }
                     val fp = obj.optString("host_cert_fingerprint", "").trim()
-                    if (fp.length == 64 && certPinStorage.getPinnedFingerprint() == null) {
+                    val hostDevId = obj.optString("host_device_id", "").trim()
+                    val netId = obj.optString("network_id", "").trim()
+                    if (fp.length == 64 && hostDevId.isNotBlank()) {
+                        if (certPinStorage.getPinnedFingerprintForDevice(hostDevId) == null) {
+                            certPinStorage.pinFingerprintForDevice(hostDevId, fp)
+                        }
+                    } else if (fp.length == 64 && certPinStorage.listPinnedDeviceIds().isEmpty() && certPinStorage.getPinnedFingerprint() == null) {
                         certPinStorage.pinFingerprint(fp)
+                    }
+                    if (netId.isNotBlank()) {
+                        adoptNetworkId(netId)
                     }
                     val resultMap = mapOf<String, Any?>(
                         "rendezvous_id" to obj.optString("rendezvous_id"),
@@ -3385,6 +3718,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val isImage = (resolvedMime?.startsWith("image/") == true) || (uri != null && (clipDescriptionMime != null || appContext.contentResolver.getType(uri)?.startsWith("image/") == true))
 
         // 1. If it's an image
+        if (isImage && uri != null && isOwnFileProviderUri(uri)) {
+            appendLog("DEBUG", TAG, "Ignoring push for own SNOW clipboard FileProvider URI.")
+            onComplete(false, "Image already originated from SNOW clipboard.")
+            return
+        }
         if (isImage && uri != null && transferClient != null && targetHost.isNotBlank()) {
             appendLog("INFO", TAG, "Uploading clipboard image to PC...")
             repoScope.launch(Dispatchers.IO) {
@@ -3413,44 +3751,25 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         }
                         return@launch
                     }
+                    val localSha256 = FileTransferClient.computeSha256(stagedFile)
+                    if (isDuplicateImageClipboard(localSha256)) {
+                        appendLog("DEBUG", TAG, "Skipping clipboard image upload (matches last synced SHA-256).")
+                        repoScope.launch(Dispatchers.Main) {
+                            onComplete(true, "Image already synced")
+                        }
+                        return@launch
+                    }
                     val upRes = transferClient.uploadFile(
                         serverHost = targetHost,
                         transferPort = 8766,
                         file = stagedFile
                     )
-                    when (upRes) {
-                        is FileTransferClient.TransferResult.Success -> {
-                            recordIncomingClipboardText(upRes.sha256)
-                            client.sendRequest(
-                                "desktop_clipboard_set",
-                                mapOf(
-                                    "type" to "image",
-                                    "sha256" to upRes.sha256,
-                                    "file_name" to stagedFile.name
-                                )
-                            ) { resp ->
-                                repoScope.launch(Dispatchers.Main) {
-                                    if (resp.isSuccess) {
-                                        appendLog("INFO", TAG, "Image pushed to PC clipboard.")
-                                        onComplete(true, "Image pushed to PC")
-                                    } else {
-                                        val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
-                                        onComplete(false, err)
-                                    }
-                                }
-                            }
-                        }
-                        is FileTransferClient.TransferResult.Error -> {
-                            repoScope.launch(Dispatchers.Main) {
-                                onComplete(false, "Upload failed: ${upRes.message}")
-                            }
-                        }
-                        else -> {
-                            repoScope.launch(Dispatchers.Main) {
-                                onComplete(false, "Upload did not succeed.")
-                            }
-                        }
-                    }
+                    handleUploadedClipboardImage(
+                        upRes = upRes,
+                        stagedName = stagedFile.name,
+                        client = client,
+                        onComplete = onComplete
+                    )
                 } catch (e: Exception) {
                     repoScope.launch(Dispatchers.Main) {
                         onComplete(false, "Failed pushing image: ${e.message}")
@@ -3468,6 +3787,99 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             pushClipboard(text, onComplete)
         } else {
             onComplete(false, "Clipboard content is not text or a supported image.")
+        }
+    }
+
+    internal var clipboardRequestDispatchOverrideForTest: ((String, Map<String, Any?>, (org.snow.protocol.SnowMessage) -> Unit) -> Unit)? = null
+
+    internal fun pushStagedImageFileToDesktop(
+        stagedFile: java.io.File,
+        transferClient: FileTransferClient,
+        targetHost: String,
+        client: org.snow.network.SnowWebSocketClient,
+        onComplete: (Boolean, String?) -> Unit
+    ) {
+        val localSha256 = FileTransferClient.computeSha256(stagedFile)
+        if (isDuplicateImageClipboard(localSha256)) {
+            appendLog("DEBUG", TAG, "Skipping clipboard image upload (matches last synced SHA-256).")
+            repoScope.launch(Dispatchers.Main) {
+                onComplete(true, "Image already synced")
+            }
+            return
+        }
+        val upRes = kotlinx.coroutines.runBlocking {
+            transferClient.uploadFile(
+                serverHost = targetHost,
+                transferPort = 8766,
+                file = stagedFile
+            )
+        }
+        handleUploadedClipboardImage(upRes, stagedFile.name, client, onComplete)
+    }
+
+    private fun handleUploadedClipboardImage(
+        upRes: FileTransferClient.TransferResult,
+        stagedName: String,
+        client: org.snow.network.SnowWebSocketClient,
+        onComplete: (Boolean, String?) -> Unit
+    ) {
+        val sendReq: (String, Map<String, Any?>, (org.snow.protocol.SnowMessage) -> Unit) -> Unit = { action, data, cb ->
+            val override = clipboardRequestDispatchOverrideForTest
+            if (override != null) {
+                override.invoke(action, data, cb)
+            } else {
+                client.sendRequest(action, data, cb)
+            }
+        }
+        when (upRes) {
+            is FileTransferClient.TransferResult.Success -> {
+                sendReq(
+                    "desktop_clipboard_set",
+                    mapOf(
+                        "type" to "image",
+                        "transfer_id" to upRes.transferId,
+                        "sha256" to upRes.sha256,
+                        "file_name" to stagedName
+                    )
+                ) { resp ->
+                    repoScope.launch(Dispatchers.Main) {
+                        if (resp.isSuccess) {
+                            recordIncomingClipboardImageSha256(upRes.sha256)
+                            appendLog("INFO", TAG, "Image pushed to PC clipboard.")
+                            onComplete(true, "Image pushed to PC")
+                        } else {
+                            val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
+                            onComplete(false, err)
+                        }
+                    }
+                }
+            }
+            is FileTransferClient.TransferResult.Duplicate -> {
+                sendReq(
+                    "desktop_clipboard_set",
+                    mapOf(
+                        "type" to "image",
+                        "sha256" to upRes.sha256,
+                        "file_name" to stagedName
+                    )
+                ) { resp ->
+                    repoScope.launch(Dispatchers.Main) {
+                        if (resp.isSuccess) {
+                            recordIncomingClipboardImageSha256(upRes.sha256)
+                            appendLog("INFO", TAG, "Image pushed to PC clipboard.")
+                            onComplete(true, "Image pushed to PC")
+                        } else {
+                            val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
+                            onComplete(false, err)
+                        }
+                    }
+                }
+            }
+            is FileTransferClient.TransferResult.Error -> {
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete(false, "Upload failed: ${upRes.message}")
+                }
+            }
         }
     }
 
@@ -3527,7 +3939,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                             "image/png",
                                             isUserInitiated = true
                                         )
-                                        recordIncomingClipboardText(sha256)
+                                        recordIncomingClipboardImageSha256(sha256.ifBlank { dlRes.sha256 })
                                         appendLog("INFO", TAG, "Pulled image from PC to clipboard.")
                                         onComplete(true, "Image pulled to phone clipboard.")
                                     } catch (e: Exception) {
@@ -3629,7 +4041,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         repoScope.launch(Dispatchers.Main) {
                             if (result.isSuccess) {
                                 val saved = result.getOrNull().orEmpty()
-                                val msg = if (saved.isEmpty()) "Files saved" else "Saved: ${saved.joinToString(", ")}"
+                                val msg = when {
+                                    saved.isEmpty() -> "Saved to SAF folder"
+                                    saved.size == 1 -> "Saved ${saved[0]} to SAF folder"
+                                    else -> "Saved ${saved.size} files to SAF folder (${saved.take(3).joinToString(", ")})"
+                                }
                                 onComplete(true, msg)
                             } else {
                                 onComplete(false, result.exceptionOrNull()?.message ?: "Failed saving clipboard files")
@@ -3704,7 +4120,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                         org.snow.capabilities.ClipboardHandler.grantImeUriPermission(appContext, contentUri)
                                         org.snow.capabilities.ClipboardHandler.postShareFallbackNotification(appContext, contentUri, resolvedMime, isUserInitiated = true)
 
-                                        recordIncomingClipboardText(sha256)
+                                        recordIncomingClipboardImageSha256(sha256.ifBlank { dlRes.sha256 })
                                         if (seq > 0L && eventId.isNotBlank()) {
                                             sendClipboardAck(seq, eventId, client)
                                         }
@@ -4948,17 +5364,47 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     fun launchApkInstaller(apkFile: File) {
-        val uri = androidx.core.content.FileProvider.getUriForFile(
-            appContext,
-            "org.snow.fileprovider",
-            apkFile
-        )
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            if (safFolderManager.getDestinationUri() != null) {
+                try {
+                    val tempCopy = File(apkFile.parentFile ?: appContext.cacheDir, "saf_copy_${apkFile.name}")
+                    apkFile.copyTo(tempCopy, overwrite = true)
+                    safFolderManager.commitVerifiedDownload(tempCopy, apkFile.name)
+                    appendLog("INFO", TAG, "Copied verified update APK '${apkFile.name}' to your configured SNOW SAF folder.")
+                } catch (e: Exception) {
+                    appendLog("WARN", TAG, "Optional SAF copy of update APK skipped: ${e.message}")
+                }
+            }
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                appContext,
+                "org.snow.fileprovider",
+                apkFile
+            )
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            appContext.startActivity(intent)
+        } catch (e: SecurityException) {
+            appendLog("WARN", TAG, "Android blocked direct in-app APK installer launch: ${e.message}")
+            repoScope.launch {
+                Toast.makeText(
+                    appContext,
+                    "Verified update saved as '${apkFile.name}'. Open it in your Files app to install.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        } catch (e: android.content.ActivityNotFoundException) {
+            appendLog("WARN", TAG, "No package installer activity available for APK: ${e.message}")
+            repoScope.launch {
+                Toast.makeText(
+                    appContext,
+                    "Verified update saved as '${apkFile.name}'. Open it in your Files app to install.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
-        appContext.startActivity(intent)
     }
 }
 

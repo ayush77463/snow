@@ -4,7 +4,6 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.provider.Settings
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.compose.foundation.background
@@ -26,15 +25,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.FolderShared
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.LockReset
 import androidx.compose.material.icons.filled.Notifications
@@ -42,7 +38,6 @@ import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SettingsBrightness
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.SystemUpdate
-import androidx.compose.material.icons.filled.ViewQuilt
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
@@ -74,8 +69,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import org.snow.service.AutoConnectTileService
-import org.snow.service.ClipSyncTileService
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
 import org.snow.ui.components.SnowFilterChip
@@ -110,6 +103,9 @@ fun SettingsScreen(
     onToggleAutoConnectNearby: (Boolean) -> Unit,
     mySnowId: String,
     myDeviceId: String,
+    myNetworkId: String = "",
+    remoteAiLinkUrl: String? = null,
+    remoteAiLinkStatus: String = "Not linked to a PC host yet",
     relayEndpoint: String,
     onUpdateRelayEndpoint: (String) -> Unit,
     onCheckAppUpdate: () -> Unit,
@@ -139,34 +135,12 @@ fun SettingsScreen(
     fun queryNotificationAccess(): Boolean =
         androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
 
-    fun queryAllFilesAccess(): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
-
-    fun queryBatteryOptIgnored(): Boolean {
-        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-        return powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
-    }
-
-    fun queryOverlayGranted(): Boolean {
-        return try {
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
     var isNotificationAccessGranted by remember { mutableStateOf(queryNotificationAccess()) }
-    var isAllFilesGranted by remember { mutableStateOf(queryAllFilesAccess()) }
-    var isBatteryOptIgnored by remember { mutableStateOf(queryBatteryOptIgnored()) }
-    var isOverlayGranted by remember { mutableStateOf(queryOverlayGranted()) }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 isNotificationAccessGranted = queryNotificationAccess()
-                isAllFilesGranted = queryAllFilesAccess()
-                isBatteryOptIgnored = queryBatteryOptIgnored()
-                isOverlayGranted = queryOverlayGranted()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -271,123 +245,10 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.Notifications,
                         title = "Notification Sync & Listener",
+                        subtitle = "App launching from background & folder transfers use Android Notifications & SAF folders.",
                         statusText = if (isNotificationAccessGranted) "GRANTED" else "SETUP",
                         isGranted = isNotificationAccessGranted,
                         onClick = { showNotificationGuide = true }
-                    )
-
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
-
-                    PermissionRowItem(
-                        icon = Icons.Default.FolderShared,
-                        title = "All Files Access",
-                        statusText = if (isAllFilesGranted) "GRANTED" else "SETUP",
-                        isGranted = isAllFilesGranted,
-                        onClick = {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                try {
-                                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                                        data = Uri.parse("package:${context.packageName}")
-                                    }
-                                    context.startActivity(intent)
-                                } catch (_: Exception) {
-                                    context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                                }
-                            }
-                        }
-                    )
-
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
-
-                    PermissionRowItem(
-                        icon = Icons.Default.BatteryAlert,
-                        title = "Battery Optimization Exemption",
-                        statusText = if (isBatteryOptIgnored) "GRANTED" else "ALLOW",
-                        isGranted = isBatteryOptIgnored,
-                        onClick = {
-                            org.snow.ui.SnowUiRepository.openBatteryOptimizationSettings(context)
-                        }
-                    )
-
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
-
-                    PermissionRowItem(
-                        icon = Icons.Default.Layers,
-                        title = "Background App Launch",
-                        statusText = if (isOverlayGranted) "GRANTED" else "ALLOW",
-                        isGranted = isOverlayGranted,
-                        onClick = {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                                try {
-                                    val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
-                                        data = Uri.parse("package:${context.packageName}")
-                                    }
-                                    context.startActivity(intent)
-                                } catch (_: Exception) {
-                                    try {
-                                        context.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION))
-                                    } catch (_: Exception) { }
-                                }
-                            }
-                        }
-                    )
-
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
-
-                    fun requestQuickSettingsTile(serviceClass: Class<*>, label: String, iconRes: Int) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            try {
-                                val statusBarManager = context.getSystemService(android.app.StatusBarManager::class.java)
-                                statusBarManager?.requestAddTileService(
-                                    android.content.ComponentName(context, serviceClass),
-                                    label,
-                                    android.graphics.drawable.Icon.createWithResource(context, iconRes),
-                                    context.mainExecutor
-                                ) { _ -> }
-                            } catch (_: Exception) {
-                                android.widget.Toast.makeText(
-                                    context,
-                                    "Open Quick Settings edit mode to add the $label tile.",
-                                    android.widget.Toast.LENGTH_LONG
-                                ).show()
-                            }
-                        } else {
-                            android.widget.Toast.makeText(
-                                context,
-                                "Swipe down Quick Settings and tap edit pencil to add $label",
-                                android.widget.Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    }
-
-                    PermissionRowItem(
-                        icon = Icons.Default.ViewQuilt,
-                        title = "Quick Settings: SNOW Connect",
-                        statusText = "ADD",
-                        isGranted = false,
-                        onClick = {
-                            requestQuickSettingsTile(
-                                AutoConnectTileService::class.java,
-                                "SNOW Connect",
-                                org.snow.R.drawable.ic_qs_snow
-                            )
-                        }
-                    )
-
-                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
-
-                    PermissionRowItem(
-                        icon = Icons.Default.ContentCopy,
-                        title = "Quick Settings: SNOW Clip",
-                        statusText = "ADD",
-                        isGranted = false,
-                        onClick = {
-                            requestQuickSettingsTile(
-                                ClipSyncTileService::class.java,
-                                "SNOW Clip",
-                                org.snow.R.drawable.ic_qs_clip
-                            )
-                        }
                     )
                 }
             }
@@ -497,6 +358,58 @@ fun SettingsScreen(
                                     clipboardManager.setText(AnnotatedString(mySnowId.ifBlank { myDeviceId }))
                                 }
                             )
+                        }
+
+                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(text = "My Network ID", style = SnowTypography.labelSmall, color = colors.textMuted)
+                                Text(
+                                    text = myNetworkId.ifBlank { "Not linked to a PC host yet" },
+                                    style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = if (myNetworkId.isNotBlank()) colors.accentCyan else colors.textSecondary
+                                )
+                            }
+                            if (myNetworkId.isNotBlank()) {
+                                SnowTonalButton(
+                                    text = "Copy",
+                                    icon = Icons.Default.ContentCopy,
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(myNetworkId))
+                                    }
+                                )
+                            }
+                        }
+
+                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(text = "Remote AI Link (MCP URL)", style = SnowTypography.labelSmall, color = colors.textMuted)
+                                Text(
+                                    text = remoteAiLinkUrl ?: remoteAiLinkStatus,
+                                    style = SnowTypography.monospaceSmall,
+                                    color = if (!remoteAiLinkUrl.isNullOrBlank()) colors.textPrimary else colors.textSecondary
+                                )
+                            }
+                            if (!remoteAiLinkUrl.isNullOrBlank()) {
+                                SnowTonalButton(
+                                    text = "Copy",
+                                    icon = Icons.Default.ContentCopy,
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(remoteAiLinkUrl))
+                                    }
+                                )
+                            }
                         }
 
                         Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))

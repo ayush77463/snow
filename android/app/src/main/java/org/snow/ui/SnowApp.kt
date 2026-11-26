@@ -119,6 +119,7 @@ fun SnowApp(
     val clipboardItems by repository.clipboardBufferItems.collectAsState()
     val clipboardThumbnailVersion by repository.clipboardThumbnailVersion.collectAsState()
     val peerHostState by repository.peerHostState.collectAsState()
+    val adoptedNetworkId by repository.adoptedNetworkId.collectAsState()
     val desktopWallpaper by repository.desktopWallpaper.collectAsState()
     val activePermissionProfile by repository.permissionProfileState.collectAsState()
     val cameraDelivery by repository.cameraDelivery.collectAsState()
@@ -471,7 +472,11 @@ fun SnowApp(
                                 busyClipboardItemId = item.itemId
                                 repository.applyBufferItemToClipboard(item) { success, msg ->
                                     if (busyClipboardItemId == item.itemId) busyClipboardItemId = null
-                                    Toast.makeText(context, if (success) "Applied to clipboard!" else "Failed: $msg", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(
+                                        context,
+                                        formatApplyClipboardFeedback(success, msg),
+                                        Toast.LENGTH_SHORT
+                                    ).show()
                                 }
                             },
                             onShareClipboardItem = { item ->
@@ -724,17 +729,15 @@ fun SnowApp(
                             },
                             alwaysOnRemoteAccess = alwaysOnRemoteAccess,
                             onToggleAlwaysOnRemoteAccess = { enabled ->
-                                val ep = repository.getRemoteRelayEndpoint()
-                                if (enabled && ep.isBlank()) {
-                                    alwaysOnRemoteAccess = false
+                                val ep = repository.getEffectiveRelayEndpointForHub()
+                                alwaysOnRemoteAccess = enabled
+                                repository.updateRemoteRelayConfig(enabled, ep)
+                                if (enabled) {
                                     Toast.makeText(
                                         context,
-                                        "Configure Remote Relay endpoint in Advanced Diagnostics first.",
-                                        Toast.LENGTH_LONG
+                                        "Render Hub remote access enabled.",
+                                        Toast.LENGTH_SHORT
                                     ).show()
-                                } else {
-                                    alwaysOnRemoteAccess = enabled
-                                    repository.updateRemoteRelayConfig(enabled, ep)
                                 }
                             },
                             instantClipboardSync = instantClipboardSync,
@@ -779,6 +782,9 @@ fun SnowApp(
                             },
                             mySnowId = repository.canonicalSnowId,
                             myDeviceId = repository.identity.deviceId,
+                            myNetworkId = adoptedNetworkId.orEmpty(),
+                            remoteAiLinkUrl = repository.getRemoteAiLinkDiagnostics().first,
+                            remoteAiLinkStatus = repository.getRemoteAiLinkDiagnostics().second,
                             relayEndpoint = repository.getRemoteRelayEndpoint(),
                             onUpdateRelayEndpoint = { ep ->
                                 repository.setRemoteRelayEndpoint(ep)

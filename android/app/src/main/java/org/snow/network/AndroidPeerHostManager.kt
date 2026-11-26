@@ -1,15 +1,20 @@
 package org.snow.network
 
+import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.snow.capabilities.AndroidCapabilityDispatcher
 import org.snow.security.AndroidSelfSignedCertGenerator
+import org.snow.security.EncryptedFilePeerHostCertStorage
+import org.snow.security.PeerHostCertStorage
 import org.snow.security.SafeLog
 import org.snow.security.TokenStorage
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.security.MessageDigest
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -23,7 +28,8 @@ data class PeerHostState(
     val peerCount: Int = 0,
     val pairingPin: String? = null,
     val pinExpiresInSeconds: Long = 0L,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val networkId: String? = null
 )
 
 /**
@@ -31,18 +37,20 @@ data class PeerHostState(
  *
  * Guarantees:
  * - Thread-safe state transitions.
- * - Does not claim availability or host mode when stopped.
- * - Advertises ReachabilityProfile.FOREGROUND_HOST only when actively listening.
+ * - Persists TLS keypair & X.509 certificate across restarts via [PeerHostCertStorage] (fails closed on corruption).
+ * - Supports both single-use 6-digit pairing PIN and single-use QR `handshake_token` + `network_id`.
  * - Shuts down server sockets cleanly upon app/service lifecycle transitions.
- * - Exposes reactive [hostState] Flow for UI observation.
- * - Enforces mandatory TLS 1.2+ WSS via [AndroidSelfSignedCertGenerator].
  */
-class AndroidPeerHostManager {
+class AndroidPeerHostManager(
+    private val certStorage: PeerHostCertStorage? = null
+) {
+    constructor(context: Context) : this(EncryptedFilePeerHostCertStorage(context))
 
     companion object {
         private const val TAG = "AndroidPeerHostManager"
         const val DEFAULT_HOST_PORT = 8767
         const val PIN_VALIDITY_MS = 300_000L // 5 minutes
+        const val HANDSHAKE_TOKEN_VALIDITY_MS = 300_000L // 5 minutes
         const val IS_QUARANTINED = false
     }
 
@@ -52,11 +60,21 @@ class AndroidPeerHostManager {
         var isConsumed: Boolean = false
     )
 
+    data class EphemeralHandshakeToken(
+        val token: String,
+        val expiresAtMillis: Long,
+        val networkId: String? = null,
+        var isConsumed: Boolean = false
+    )
+
     private val hostModeSettingEnabled = AtomicBoolean(false)
     private val isRunning = AtomicBoolean(false)
     private var server: AndroidPeerHostServer? = null
     private var mediaServer: AndroidPeerMediaServer? = null
     private var currentEphemeralPin: EphemeralPin? = null
+    private var currentHandshakeToken: EphemeralHandshakeToken? = null
+    private var configuredSnowId: String? = null
+    private var configuredNetworkId: String? = null
     private val secureRandom = java.security.SecureRandom()
 
     private val _hostState = MutableStateFlow(PeerHostState())
@@ -130,10 +148,85 @@ class AndroidPeerHostManager {
     }
 
     /**
-     * Generate standard SNOW Device Protocol v1 QR pairing payload for peer devices.
+     * Generate a cryptographically random, single-use QR handshake token valid for 5 minutes.
      */
     @Synchronized
-    fun generatePairingQrJson(localDeviceId: String, snowId: String? = null): String? {
+    fun generateHandshakeToken(networkId: String? = configuredNetworkId): String {
+        val raw = ByteArray(24)
+        secureRandom.nextBytes(raw)
+        val tok = Base64.getUrlEncoder().withoutPadding().encodeToString(raw)
+        currentHandshakeToken = EphemeralHandshakeToken(
+            token = tok,
+            expiresAtMillis = System.currentTimeMillis() + HANDSHAKE_TOKEN_VALIDITY_MS,
+            networkId = networkId?.trim()?.uppercase()?.takeIf { it.isNotBlank() },
+            isConsumed = false
+        )
+        SafeLog.i(TAG, "Generated ephemeral single-use QR handshake token (valid for 5 minutes)")
+        return tok
+    }
+
+    @Synchronized
+    fun getCurrentHandshakeTokenInfo(): Pair<String, Long>? {
+        val t = currentHandshakeToken ?: return null
+        if (t.isConsumed || System.currentTimeMillis() > t.expiresAtMillis) {
+            return null
+        }
+        return t.token to (t.expiresAtMillis - System.currentTimeMillis())
+    }
+
+    /**
+     * Verify and consume a single-use QR handshake token with optional network_id enforcement.
+     */
+    @Synchronized
+    fun verifyAndConsumeHandshakeToken(inputToken: String?, networkId: String? = null): Boolean {
+        val presented = inputToken?.trim() ?: return false
+        if (presented.length < 16) return false
+        val tokObj = currentHandshakeToken ?: return false
+        if (tokObj.isConsumed) {
+            SafeLog.w(TAG, "QR handshake token has already been consumed.")
+            return false
+        }
+        if (System.currentTimeMillis() > tokObj.expiresAtMillis) {
+            SafeLog.w(TAG, "QR handshake token has expired.")
+            currentHandshakeToken = null
+            return false
+        }
+        val expectedNet = tokObj.networkId ?: configuredNetworkId
+        val cleanPresentedNet = networkId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+        if (!expectedNet.isNullOrBlank() && !cleanPresentedNet.isNullOrBlank() && cleanPresentedNet != expectedNet) {
+            SafeLog.w(TAG, "QR handshake network_id mismatch: expected=$expectedNet presented=$cleanPresentedNet")
+            return false
+        }
+        val matches = MessageDigest.isEqual(
+            presented.toByteArray(Charsets.UTF_8),
+            tokObj.token.toByteArray(Charsets.UTF_8)
+        )
+        if (matches) {
+            tokObj.isConsumed = true
+            SafeLog.i(TAG, "QR handshake token successfully verified and consumed.")
+            return true
+        }
+        SafeLog.w(TAG, "QR handshake token mismatch.")
+        return false
+    }
+
+    @Synchronized
+    fun resetPersistedIdentity() {
+        try {
+            certStorage?.clear()
+        } catch (_: Exception) {}
+    }
+
+    /**
+     * Generate standard SNOW Device Protocol v1 QR pairing payload for peer devices,
+     * including both desktop-compatible single-use `handshake_token` + `network_id` and ephemeral `pin`.
+     */
+    @Synchronized
+    fun generatePairingQrJson(
+        localDeviceId: String,
+        snowId: String? = null,
+        networkId: String? = null
+    ): String? {
         val state = _hostState.value
         val cleanFp = state.certFingerprint.replace(":", "").replace(" ", "").trim()
         if (cleanFp.isBlank() || cleanFp == "--") return null
@@ -141,17 +234,26 @@ class AndroidPeerHostManager {
         val hostIp = if (state.ipAddress != "--" && state.ipAddress.isNotBlank()) state.ipAddress else getLocalIpv4Address()
         if (hostIp.isNullOrBlank()) return null
 
+        val effectiveNetId = networkId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            ?: configuredNetworkId
+            ?: state.networkId
         val activePin = getCurrentEphemeralPinInfo()?.first ?: generatePairingPin()
+        val activeHandshakeToken = getCurrentHandshakeTokenInfo()?.first ?: generateHandshakeToken(effectiveNetId)
         val json = org.json.JSONObject().apply {
             put("v", 1)
             put("id", localDeviceId)
-            if (!snowId.isNullOrBlank()) {
-                put("snow_id", snowId)
+            val effectiveSnowId = snowId?.trim()?.uppercase()?.takeIf { it.isNotBlank() } ?: configuredSnowId
+            if (!effectiveSnowId.isNullOrBlank()) {
+                put("snow_id", effectiveSnowId)
+            }
+            if (!effectiveNetId.isNullOrBlank()) {
+                put("network_id", effectiveNetId)
             }
             put("ips", org.json.JSONArray().put(hostIp))
             put("port", activePort)
             put("fp", cleanFp)
             put("pin", activePin)
+            put("handshake_token", activeHandshakeToken)
         }
         return json.toString()
     }
@@ -193,8 +295,8 @@ class AndroidPeerHostManager {
     }
 
     /**
-     * Enable foreground peer host mode, starting the listening server with mandatory TLS.
-     * Requires hostModeSettingEnabled == true.
+     * Enable foreground peer host mode, starting the listening server with mandatory persisted TLS.
+     * Fails closed if persisted keystore material is corrupt.
      */
     @Synchronized
     fun enableHostMode(
@@ -205,7 +307,9 @@ class AndroidPeerHostManager {
         manifestProvider: () -> Map<String, Any?> = { emptyMap() },
         peerTokenValidator: ((String) -> Boolean)? = null,
         parentScope: CoroutineScope? = null,
-        mediaPort: Int = 0
+        mediaPort: Int = 0,
+        snowId: String? = null,
+        networkId: String? = null
     ): Boolean {
         if (!hostModeSettingEnabled.get()) {
             SafeLog.w(
@@ -222,12 +326,21 @@ class AndroidPeerHostManager {
         }
 
         disableHostMode()
+        configuredSnowId = snowId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+        configuredNetworkId = networkId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
 
         val certResult = try {
-            AndroidSelfSignedCertGenerator.generate()
+            AndroidSelfSignedCertGenerator.loadOrCreate(
+                storage = certStorage,
+                regenerateOnCorruption = false
+            )
         } catch (e: Exception) {
-            SafeLog.e(TAG, "Failed generating TLS certificate for peer host: ${e.message}", e)
-            _hostState.value = _hostState.value.copy(isActive = false, errorMessage = "TLS generation failed: ${e.message}")
+            SafeLog.e(TAG, "Peer Host TLS keystore load failed (failing closed): ${e.message}", e)
+            _hostState.value = _hostState.value.copy(
+                isActive = false,
+                certFingerprint = "--",
+                errorMessage = "Persisted TLS keystore error: ${e.message}"
+            )
             return false
         }
 
@@ -240,7 +353,10 @@ class AndroidPeerHostManager {
             peerTokenValidator = peerTokenValidator,
             pinVerifier = { verifyAndConsumePairingPin(it) },
             parentScope = parentScope,
-            sslContext = certResult.sslContext
+            sslContext = certResult.sslContext,
+            handshakeTokenVerifier = { tok, net -> verifyAndConsumeHandshakeToken(tok, net) },
+            hostSnowId = configuredSnowId,
+            hostNetworkId = configuredNetworkId
         )
 
         val success = newServer.start()
@@ -269,7 +385,8 @@ class AndroidPeerHostManager {
                 peerCount = 0,
                 pairingPin = currentEphemeralPin?.pin,
                 pinExpiresInSeconds = if (currentEphemeralPin != null) 300L else 0L,
-                errorMessage = null
+                errorMessage = null,
+                networkId = configuredNetworkId
             )
             SafeLog.i(TAG, "Foreground host mode enabled on $ip:$activePort (TLS WSS)")
         } else {
@@ -288,6 +405,7 @@ class AndroidPeerHostManager {
     @Synchronized
     fun disableHostMode() {
         currentEphemeralPin = null
+        currentHandshakeToken = null
         if (!isRunning.getAndSet(false) && server == null) {
             _hostState.value = PeerHostState(isActive = false, ipAddress = "--", port = activePort)
             return
@@ -311,7 +429,8 @@ class AndroidPeerHostManager {
             peerCount = 0,
             pairingPin = null,
             pinExpiresInSeconds = 0L,
-            errorMessage = null
+            errorMessage = null,
+            networkId = configuredNetworkId
         )
         SafeLog.i(TAG, "Foreground peer host mode disabled.")
     }

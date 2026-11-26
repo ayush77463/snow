@@ -2426,22 +2426,33 @@ class SnowWebSocketServer:
                 "has_unacked_latest": eligible is not None,
             }
 
+        host_network_id = None
+        try:
+            from snow.security.identity import load_or_create_network_key_identity
+            host_network_id = load_or_create_network_key_identity().network_id
+        except Exception:
+            host_network_id = None
+
+        auth_data = {
+            "device_id": device_id,
+            "server_device_id": self.device_identity.device_id,
+            "snow_id": self.device_identity.snow_id,
+            "device_name": self.device_identity.device_name,
+            "session_id": session.session_id,
+            "trust_tier": device_record.trust_tier,
+            "permission_profile": auth_profile,
+            "clipboard_state": clipboard_state,
+            "manifest": build_windows_manifest().to_dict(),
+        }
+        if host_network_id:
+            auth_data["network_id"] = host_network_id
+
         response = SnowMessage.create_response(
             correlation_id=message.id,
             payload={
                 "status": "success",
                 "action": "auth_request",
-                "data": {
-                    "device_id": device_id,
-                    "server_device_id": self.device_identity.device_id,
-                    "snow_id": self.device_identity.snow_id,
-                    "device_name": self.device_identity.device_name,
-                    "session_id": session.session_id,
-                    "trust_tier": device_record.trust_tier,
-                    "permission_profile": auth_profile,
-                    "clipboard_state": clipboard_state,
-                    "manifest": build_windows_manifest().to_dict(),
-                },
+                "data": auth_data,
             },
         )
         await client.websocket.send(response.to_json())
@@ -2606,22 +2617,31 @@ class SnowWebSocketServer:
                 from snow.network.node import build_windows_manifest
                 pair_profile = self._resolve_authoritative_permission_profile(client_device_id)
 
+                pair_data = {
+                    "device_id": self.device_identity.device_id,
+                    "server_device_id": self.device_identity.device_id,
+                    "snow_id": self.device_identity.snow_id,
+                    "device_name": self.device_identity.device_name,
+                    "session_id": result.session_id,
+                    "auth_token": auth_token,
+                    "trust_tier": assigned_tier,
+                    "permission_profile": pair_profile,
+                    "manifest": build_windows_manifest().to_dict(),
+                }
+                try:
+                    from snow.security.identity import load_or_create_network_key_identity
+                    net_id_val = load_or_create_network_key_identity().network_id
+                    if net_id_val:
+                        pair_data["network_id"] = net_id_val
+                except Exception:
+                    pass
+
                 response = SnowMessage.create_response(
                     correlation_id=message.id,
                     payload={
                         "status": "success",
                         "action": action,
-                        "data": {
-                            "device_id": self.device_identity.device_id,
-                            "server_device_id": self.device_identity.device_id,
-                            "snow_id": self.device_identity.snow_id,
-                            "device_name": self.device_identity.device_name,
-                            "session_id": result.session_id,
-                            "auth_token": auth_token,
-                            "trust_tier": assigned_tier,
-                            "permission_profile": pair_profile,
-                            "manifest": build_windows_manifest().to_dict(),
-                        },
+                        "data": pair_data,
                     },
                 )
                 await client.websocket.send(response.to_json())
@@ -3566,6 +3586,56 @@ class SnowWebSocketServer:
                     correlation_id=message.id,
                 )
                 await client.websocket.send(error_response.to_json())
+                return
+
+            cb_buf = getattr(self, "clipboard_buffer", None) or getattr(
+                getattr(self, "capability_engine", None), "clipboard_buffer", None
+            )
+            canonical_digest: Optional[str] = None
+            try:
+                from snow.capabilities.windows.clipboard import compute_canonical_image_digest
+                canonical_digest, _, _ = compute_canonical_image_digest(img_bytes)
+            except Exception:
+                canonical_digest = None
+
+            duplicate_top_item: Optional[dict[str, Any]] = None
+            if cb_buf is not None:
+                try:
+                    with cb_buf._lock:
+                        top_item = cb_buf._items[0] if cb_buf._items else None
+                        if top_item is not None and top_item.content_type == "image":
+                            top_sha = (top_item.sha256 or "").lower()
+                            top_canon = (top_item.canonical_sha256 or "").lower()
+                            if (
+                                top_sha == computed_sha256.lower()
+                                or (canonical_digest and top_canon and top_canon == canonical_digest.lower())
+                            ):
+                                duplicate_top_item = top_item.to_metadata()
+                except Exception:
+                    duplicate_top_item = None
+
+            if duplicate_top_item is not None:
+                self._last_processed_clipboard_hash = computed_sha256
+                self._last_processed_clipboard_at = time.monotonic()
+                for cid in self._active_sync_connections:
+                    self._last_synced_clipboard_hash[cid] = computed_sha256
+                    if duplicate_top_item.get("event_id"):
+                        self._last_synced_clipboard_event[cid] = duplicate_top_item["event_id"]
+                response = SnowMessage.create_response(
+                    correlation_id=message.id,
+                    payload={
+                        "status": "success",
+                        "action": "desktop_clipboard_set",
+                        "error": None,
+                        "data": {
+                            "success": True,
+                            "deduplicated": True,
+                            "item_id": duplicate_top_item.get("item_id"),
+                            "item": duplicate_top_item,
+                        },
+                    },
+                )
+                await client.websocket.send(response.to_json())
                 return
 
             detected_mime = data.get("mime_type") or (

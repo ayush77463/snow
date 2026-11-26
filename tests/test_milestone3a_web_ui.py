@@ -127,6 +127,20 @@ class TestMilestone3AWebServerRenderAndClipboardEndpoints(AioHTTPTestCase):
     """Verify server endpoints for Render Hub default and 15-item multi-format clipboard."""
 
     async def get_application(self):
+        import os
+        import shutil
+        import tempfile
+
+        self._tmp_data = Path(tempfile.mkdtemp(prefix="snow_m3a_web_"))
+        self._prev_data_dir = os.environ.get("SNOW_DATA_DIR")
+        os.environ["SNOW_DATA_DIR"] = str(self._tmp_data)
+        self.addCleanup(shutil.rmtree, self._tmp_data, True)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("SNOW_DATA_DIR", self._prev_data_dir)
+            if self._prev_data_dir is not None
+            else os.environ.pop("SNOW_DATA_DIR", None)
+        )
+
         self.bridge = MagicMock()
         self.bridge.capability_engine = MagicMock(db_manager=None)
         self.bridge.daemon_manager = MagicMock()

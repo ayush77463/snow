@@ -263,8 +263,10 @@ class TestStage4BJsSyntaxAndBalancing(unittest.TestCase):
         self.assertEqual(len(stray), 0, f"Found stray undefined showNotification calls: {stray}")
 
     def test_cloudflared_provider_used(self):
-        """Web UI must send 'cloudflared' provider identifier for tunnels."""
-        self.assertIn('"cloudflared"', self.js_content)
+        """Web UI must default Remote Access to 'render' while avoiding 'cloudflare' typo and preserving optional cloudflared option."""
+        self.assertIn('"render"', self.js_content)
+        html_content = Path("src/snow/web/static/index.html").read_text(encoding="utf-8")
+        self.assertIn('"cloudflared"', html_content)
         self.assertNotIn('provider: "cloudflare"', self.js_content)
 
 

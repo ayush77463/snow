@@ -1474,6 +1474,24 @@ class SnowMcpBridge:
             return {"success": True, "status": "DISCONNECTED", "device_id": device_id}
         return {"success": False, "status": "NOT_CONNECTED", "error": f"Peer '{device_id}' is not connected."}
 
+    async def disconnect_all_devices(self, reason: str = "Disconnected by desktop owner") -> dict[str, Any]:
+        """Disconnect all currently active device sessions while preserving pairings and Core daemon."""
+        if await self.daemon_manager.is_ipc_ready(timeout=0.15):
+            res = await self.call(
+                "devices_disconnect_all",
+                payload={"reason": reason},
+                timeout=5.0,
+            )
+            if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                return res
+        return {
+            "success": True,
+            "status": "DISCONNECTED_ALL",
+            "disconnected_count": 0,
+            "disconnected_device_ids": [],
+            "data": {"disconnected_count": 0, "disconnected_device_ids": []},
+        }
+
     # =========================================================================
     # Phase 26B: Shared Clipboard Buffer Methods
     # =========================================================================

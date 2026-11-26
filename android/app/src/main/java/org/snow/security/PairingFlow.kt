@@ -26,7 +26,9 @@ sealed class PairingState {
         val authToken: String? = null,
         val trustTier: String = "peer",
         val deviceType: String? = null,
-        val permissionProfile: String? = null
+        val permissionProfile: String? = null,
+        val peerSnowId: String? = null,
+        val peerNetworkId: String? = null
     ) : PairingState()
 
     data class WrongPin(
@@ -83,6 +85,7 @@ class PairingFlow(
     fun submitPin(
         pin: String,
         client: SnowWebSocketClient,
+        targetDeviceId: String? = null,
         onStateChanged: ((PairingState) -> Unit)? = null
     ): Boolean {
         // Enforce 6-digit format validation
@@ -142,7 +145,7 @@ class PairingFlow(
             data = requestData
         ) { message ->
             isSubmitting.set(false)
-            val newState = handlePairingResponse(message)
+            val newState = handlePairingResponse(message, fallbackDeviceId = targetDeviceId)
             _state.value = newState
             onStateChanged?.invoke(newState)
         }
@@ -157,6 +160,7 @@ class PairingFlow(
         handshakeToken: String,
         networkId: String? = null,
         client: SnowWebSocketClient,
+        targetDeviceId: String? = null,
         onStateChanged: ((PairingState) -> Unit)? = null
     ): Boolean {
         val cleanToken = handshakeToken.trim()
@@ -202,7 +206,7 @@ class PairingFlow(
             data = requestData
         ) { message ->
             isSubmitting.set(false)
-            val newState = handlePairingResponse(message)
+            val newState = handlePairingResponse(message, fallbackDeviceId = targetDeviceId)
             _state.value = newState
             onStateChanged?.invoke(newState)
         }
@@ -345,25 +349,40 @@ class PairingFlow(
         _state.value = newState
     }
 
-    internal fun handlePairingResponse(message: SnowMessage): PairingState {
+    internal fun handlePairingResponse(
+        message: SnowMessage,
+        fallbackDeviceId: String? = null
+    ): PairingState {
         return when (message.type) {
             MessageType.RESPONSE -> {
                 val payload = message.payload ?: emptyMap()
                 val data = (payload["data"] as? Map<*, *>) ?: payload
-                val desktopId = data?.get("device_id") as? String ?: "unknown"
+                val manifest = data?.get("manifest") as? Map<*, *>
+                val desktopId = (data?.get("server_device_id") as? String)?.trim()?.takeIf { it.isNotBlank() }
+                    ?: (data?.get("device_id") as? String)?.trim()?.takeIf { it.isNotBlank() }
+                    ?: (manifest?.get("device_id") as? String)?.trim()?.takeIf { it.isNotBlank() }
+                    ?: fallbackDeviceId?.trim()?.takeIf { it.isNotBlank() }
+                    ?: "unknown"
                 val desktopName = data?.get("device_name") as? String ?: "SNOW Desktop"
                 val sessionId = data?.get("session_id") as? String ?: "session-active"
                 val authToken = data?.get("auth_token") as? String
                 val trustTier = data?.get("trust_tier") as? String ?: "peer"
                 val permissionProfile = data?.get("permission_profile") as? String
-                val manifest = data?.get("manifest") as? Map<*, *>
+                val peerSnowId = ((data?.get("snow_id") as? String) ?: (manifest?.get("snow_id") as? String))
+                    ?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+                val peerNetworkId = ((data?.get("network_id") as? String) ?: (manifest?.get("network_id") as? String))
+                    ?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
                 val deviceType = (data?.get("device_type") as? String)
                     ?: (data?.get("platform") as? String)
                     ?: (manifest?.get("platform") as? String)
                     ?: (manifest?.get("device_type") as? String)
 
                 if (!authToken.isNullOrBlank()) {
-                    tokenStorage?.saveToken(authToken)
+                    if (desktopId != "unknown") {
+                        tokenStorage?.saveTokenForDevice(desktopId, authToken)
+                    } else {
+                        tokenStorage?.saveToken(authToken)
+                    }
                 }
 
                 PairingState.Paired(
@@ -373,7 +392,9 @@ class PairingFlow(
                     authToken = authToken,
                     trustTier = trustTier,
                     deviceType = deviceType,
-                    permissionProfile = permissionProfile
+                    permissionProfile = permissionProfile,
+                    peerSnowId = peerSnowId,
+                    peerNetworkId = peerNetworkId
                 )
             }
 

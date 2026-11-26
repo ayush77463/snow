@@ -45,7 +45,10 @@ class AndroidPeerHostServer(
     private val peerTokenValidator: ((String) -> Boolean)? = null,
     private val pinVerifier: ((String) -> Boolean)? = null,
     private val parentScope: CoroutineScope? = null,
-    private val sslContext: SSLContext? = null
+    private val sslContext: SSLContext? = null,
+    private val handshakeTokenVerifier: ((String, String?) -> Boolean)? = null,
+    private val hostSnowId: String? = null,
+    private val hostNetworkId: String? = null
 ) {
     companion object {
         private const val TAG = "AndroidPeerHostServer"
@@ -194,48 +197,93 @@ class AndroidPeerHostServer(
         val data = message.payload?.get("data") as? Map<String, Any?> ?: emptyMap()
 
         if (action == "pair_request") {
+            val rawHandshakeToken = data["handshake_token"] as? String
+            val presentedNetworkId = (data["network_id"] as? String)?.trim()?.uppercase()
             val pin = (data["pin"] as? String) ?: (data["pairing_pin"] as? String)
-            val peerId = (data["device_id"] as? String) ?: "unknown_peer"
-            val isPinValid = pin != null && pinVerifier != null && pinVerifier.invoke(pin)
+            val peerId = (data["device_id"] as? String)?.trim()
 
-            if (isPinValid) {
+            if (peerId.isNullOrBlank()) {
+                val err = SnowMessage.createError(
+                    code = ErrorCode.INVALID_PAYLOAD,
+                    message = "Missing valid device_id in pairing request.",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                conn.close(1008, "Invalid pairing request")
+                return
+            }
+
+            // Mutual exclusion matching Desktop Core: when handshake_token is supplied, verify ONLY it.
+            val isAuthorized = if (rawHandshakeToken != null) {
+                handshakeTokenVerifier?.invoke(rawHandshakeToken, presentedNetworkId) == true
+            } else {
+                pin != null && pinVerifier != null && pinVerifier.invoke(pin)
+            }
+
+            if (isAuthorized) {
                 val newToken = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")
-                tokenStorage.saveToken(newToken)
+                tokenStorage.saveTokenForDevice(peerId, newToken)
                 val newSessionId = UUID.randomUUID().toString()
                 session.isAuthenticated = true
                 session.peerDeviceId = peerId
                 session.sessionId = newSessionId
 
+                val respPayload = mutableMapOf<String, Any?>(
+                    "status" to "success",
+                    "action" to "pair_response",
+                    "session_id" to newSessionId,
+                    "device_id" to localDeviceId,
+                    "server_device_id" to localDeviceId,
+                    "device_type" to "android",
+                    "device_name" to (android.os.Build.MODEL ?: "Android Peer"),
+                    "auth_token" to newToken,
+                    "permission_profile" to dispatcher.activePermissionProfile,
+                    "manifest" to manifestProvider()
+                )
+                if (!hostSnowId.isNullOrBlank()) respPayload["snow_id"] = hostSnowId
+                if (!hostNetworkId.isNullOrBlank()) respPayload["network_id"] = hostNetworkId
+
                 val resp = SnowMessage.createResponse(
                     correlationId = message.id,
-                    payload = mapOf(
-                        "status" to "success",
-                        "action" to "pair_response",
-                        "session_id" to newSessionId,
-                        "device_id" to localDeviceId,
-                        "device_type" to "android",
-                        "device_name" to (android.os.Build.MODEL ?: "Android Peer"),
-                        "auth_token" to newToken,
-                        "manifest" to manifestProvider()
-                    )
+                    payload = respPayload
                 )
                 conn.send(JsonSerialization.toJson(resp))
-                SafeLog.i(TAG, "Peer successfully paired via PIN: device_id=$peerId session=$newSessionId")
+                SafeLog.i(TAG, "Peer paired (${if (rawHandshakeToken != null) "QR handshake" else "PIN"}): device_id=$peerId session=$newSessionId")
             } else {
+                val errCode = if (rawHandshakeToken != null) ErrorCode.UNAUTHORIZED else ErrorCode.UNAUTHORIZED
+                val errMsg = if (rawHandshakeToken != null) {
+                    "Invalid, expired, or already used QR handshake token."
+                } else {
+                    "Invalid or expired pairing PIN."
+                }
                 val err = SnowMessage.createError(
-                    code = ErrorCode.UNAUTHORIZED,
-                    message = "Invalid or expired pairing PIN.",
+                    code = errCode,
+                    message = errMsg,
                     correlationId = message.id
                 )
                 conn.send(JsonSerialization.toJson(err))
                 conn.close(1008, "Pairing unauthorized")
-                SafeLog.w(TAG, "Peer pairing rejected for device_id=$peerId: invalid/expired PIN")
+                SafeLog.w(TAG, "Peer pairing rejected for device_id=$peerId")
             }
         } else if (action == "auth_request") {
             val presentedToken = data["auth_token"] as? String
-            val peerId = data["device_id"] as? String
+            val rawPeerId = (data["device_id"] as? String)?.trim()
+            val storedDeviceIds = tokenStorage.listStoredDeviceIds()
+            val peerId = if (!rawPeerId.isNullOrBlank()) {
+                rawPeerId
+            } else if (storedDeviceIds.isEmpty()) {
+                // Legacy single-device/validator callers that omit device_id before per-device pairing
+                "legacy-peer"
+            } else {
+                null
+            }
 
-            val storedToken = tokenStorage.getToken()
+            val storedToken = if (!peerId.isNullOrBlank()) {
+                tokenStorage.getTokenForDevice(peerId)
+                    ?: if (storedDeviceIds.isEmpty()) tokenStorage.getToken() else null
+            } else {
+                null
+            }
             val isValid = when {
                 storedToken != null && presentedToken != null -> {
                     MessageDigest.isEqual(
@@ -249,22 +297,28 @@ class AndroidPeerHostServer(
                 else -> false
             }
 
-            if (isValid) {
+            if (isValid && !peerId.isNullOrBlank()) {
                 val newSessionId = UUID.randomUUID().toString()
                 session.isAuthenticated = true
                 session.peerDeviceId = peerId
                 session.sessionId = newSessionId
 
+                val respPayload = mutableMapOf<String, Any?>(
+                    "status" to "success",
+                    "session_id" to newSessionId,
+                    "device_id" to localDeviceId,
+                    "server_device_id" to localDeviceId,
+                    "device_type" to "android",
+                    "device_name" to (android.os.Build.MODEL ?: "Android Peer"),
+                    "permission_profile" to dispatcher.activePermissionProfile,
+                    "manifest" to manifestProvider()
+                )
+                if (!hostSnowId.isNullOrBlank()) respPayload["snow_id"] = hostSnowId
+                if (!hostNetworkId.isNullOrBlank()) respPayload["network_id"] = hostNetworkId
+
                 val resp = SnowMessage.createResponse(
                     correlationId = message.id,
-                    payload = mapOf(
-                        "status" to "success",
-                        "session_id" to newSessionId,
-                        "device_id" to localDeviceId,
-                        "device_type" to "android",
-                        "device_name" to (android.os.Build.MODEL ?: "Android Peer"),
-                        "manifest" to manifestProvider()
-                    )
+                    payload = respPayload
                 )
                 conn.send(JsonSerialization.toJson(resp))
                 SafeLog.i(TAG, "Peer authenticated successfully: device_id=$peerId session=$newSessionId")

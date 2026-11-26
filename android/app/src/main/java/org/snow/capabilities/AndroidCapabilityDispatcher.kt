@@ -191,18 +191,12 @@ class AndroidCapabilityDispatcher(
                 }
             }
             "launch_app" -> {
-                val hasOverlay = try {
-                    android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M &&
-                        android.provider.Settings.canDrawOverlays(context)
-                } catch (_: Throwable) {
-                    false
-                }
-                if (!ClipboardHandler.isAppInForeground && !hasOverlay && !ActionNotificationHelper.canPostNotifications(context)) {
+                if (!ClipboardHandler.isAppInForeground && !ActionNotificationHelper.canPostNotifications(context)) {
                     return mapOf(
                         "success" to false,
                         "status" to "FOREGROUND_REQUIRED",
-                        "error" to "Background activity launch restricted by Android OS. Grant Background App Launch or Notification permission.",
-                        "remediation_hint" to "Enable Background App Launch (Display over other apps) or Notifications in SNOW Settings."
+                        "error" to "Background activity launch requires Notification permission for tap-to-open delivery.",
+                        "remediation_hint" to "Enable Notifications for SNOW to open requested apps via tap-to-open notification."
                     )
                 }
             }
@@ -616,7 +610,7 @@ class AndroidCapabilityDispatcher(
                         isUserInitiated = isUserInitiated
                     )
                 }
-                repo?.recordIncomingClipboardText(sha256)
+                repo?.recordIncomingClipboardImageSha256(sha256)
                 if (seq > 0L && eventId.isNotBlank()) {
                     repo?.sendClipboardAck(seq, eventId)
                 }

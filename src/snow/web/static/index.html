@@ -69,9 +69,9 @@
                     <span id="core-canonical-id" class="chip chip-sm chip-cyan mono" style="margin-left: auto;">SNW-LOCAL</span>
                 </div>
                 <div class="sidebar-core-actions">
-                    <button id="btn-desktop-pause" class="btn btn-xs btn-tonal w-full" title="Pause background daemon activities">
-                        <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="16" rx="1" width="4" x="6" y="4"></rect><rect height="16" rx="1" width="4" x="14" y="4"></rect></svg>
-                        <span>Pause</span>
+                    <button id="btn-desktop-disconnect-all" class="btn btn-xs btn-tonal w-full" title="Disconnect all active device sessions without unpairing">
+                        <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="2" x2="22" y1="2" y2="22"></line></svg>
+                        <span>Disconnect All</span>
                     </button>
                     <button id="btn-desktop-poweroff" class="btn btn-xs btn-danger w-full" title="Power off SNOW desktop daemon">
                         <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" x2="12" y1="2" y2="12"></line></svg>
@@ -410,7 +410,6 @@
                                         <h3 class="card-title">Phone Notifications</h3>
                                         <span id="notifications-count-badge" class="chip chip-sm chip-neutral mono">0</span>
                                     </div>
-                                    <button id="btn-notifications-clear-all" class="btn btn-xs btn-tonal">Clear All</button>
                                 </div>
                                 <div id="notifications-container" class="notifications-list"></div>
                                 <div id="notifications-empty-state" class="empty-state">
@@ -854,6 +853,30 @@
                                     <button id="btn-diag-reset-override" class="btn btn-xs btn-danger btn-radius-md" style="margin-left: auto;">Reset to Bundled UI</button>
                                 </div>
                                 <div id="update-status-banner" class="text-xs text-muted d-none"></div>
+
+                                <div class="flex flex-col gap-2 p-2" style="background-color: var(--snow-bg-nested); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
+                                    <div class="flex items-center justify-between gap-2">
+                                        <div class="flex flex-col min-w-0">
+                                            <span class="text-xs text-muted">My SNOW ID</span>
+                                            <strong id="diag-my-snow-id" class="text-xs mono text-primary truncate">--</strong>
+                                        </div>
+                                        <button id="btn-copy-diag-snow-id" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-2">
+                                        <div class="flex flex-col min-w-0">
+                                            <span class="text-xs text-muted">My Network ID</span>
+                                            <strong id="diag-my-network-id" class="text-xs mono text-cyan truncate">--</strong>
+                                        </div>
+                                        <button id="btn-copy-diag-network-id" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-2">
+                                        <div class="flex flex-col min-w-0">
+                                            <span class="text-xs text-muted">Remote AI Link (MCP URL)</span>
+                                            <strong id="diag-remote-ai-url" class="text-xs mono text-primary truncate">--</strong>
+                                        </div>
+                                        <button id="btn-copy-diag-ai-url" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
+                                    </div>
+                                </div>
 
                                 <div class="flex flex-col gap-2 p-2" style="background-color: var(--snow-bg-nested); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
                                     <div class="flex items-center justify-between gap-2">

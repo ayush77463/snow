@@ -154,6 +154,11 @@ class SessionManager:
         with self._lock:
             return list(self._sessions.values())
 
+    def get_all_sessions(self) -> Dict[str, SessionRecord]:
+        """Return a shallow mapping of session_id -> SessionRecord for active sessions."""
+        with self._lock:
+            return dict(self._sessions)
+
     def clear_all(self) -> None:
         """Clear all active sessions (e.g. on shutdown)."""
         with self._lock:

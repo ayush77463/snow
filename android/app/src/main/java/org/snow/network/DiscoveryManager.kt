@@ -209,13 +209,17 @@ class DiscoveryManager(
      * Ingest a valid parsed peer record, determine pairing status, and emit updated flow.
      */
     fun handleDiscoveredPeer(peer: DiscoveredPeer) {
-        val pinnedFp = certPinStorage?.getPinnedFingerprint()
-        val hasToken = tokenStorage?.hasToken() == true
+        val pinnedFp = certPinStorage?.getPinnedFingerprintForDevice(peer.deviceId)
+            ?: if (certPinStorage?.listPinnedDeviceIds().isNullOrEmpty()) certPinStorage?.getPinnedFingerprint() else null
+        val hasToken = (tokenStorage?.hasTokenForDevice(peer.deviceId) == true) ||
+            (tokenStorage?.listStoredDeviceIds().isNullOrEmpty() && tokenStorage?.hasToken() == true)
 
         val isPaired = if (!pinnedFp.isNullOrBlank() && peer.certFingerprint.isNotBlank()) {
             peer.certFingerprint.replace(":", "").equals(pinnedFp.replace(":", ""), ignoreCase = true)
-        } else {
+        } else if (!pinnedFp.isNullOrBlank()) {
             hasToken
+        } else {
+            hasToken && certPinStorage?.listPinnedDeviceIds().isNullOrEmpty()
         }
 
         val enriched = peer.copy(isPaired = isPaired)
@@ -253,13 +257,21 @@ class DiscoveryManager(
      * Check if an active discovered peer matches the saved desktop certificate fingerprint or deviceId.
      */
     fun getCandidateForPairedDesktop(pairedDeviceId: String? = null): DiscoveredPeer? {
-        val pinnedFp = certPinStorage?.getPinnedFingerprint()
-        val normalizedPin = pinnedFp?.replace(":", "")?.lowercase()
+        val explicitPin = pairedDeviceId?.let { certPinStorage?.getPinnedFingerprintForDevice(it) }
+            ?.replace(":", "")?.lowercase()
+        val legacyPin = if (certPinStorage?.listPinnedDeviceIds().isNullOrEmpty()) {
+            certPinStorage?.getPinnedFingerprint()?.replace(":", "")?.lowercase()
+        } else null
         return peerMap.values.firstOrNull { peer ->
             if (peer.isStale) return@firstOrNull false
-            val fpMatch = !normalizedPin.isNullOrBlank() && peer.certFingerprint.replace(":", "").lowercase() == normalizedPin
+            val peerFpClean = peer.certFingerprint.replace(":", "").lowercase()
+            val perDevPin = certPinStorage?.getPinnedFingerprintForDevice(peer.deviceId)
+                ?.replace(":", "")?.lowercase()
+            val expectedPin = explicitPin ?: perDevPin ?: legacyPin
+            val fpMatch = !expectedPin.isNullOrBlank() && peerFpClean == expectedPin
+            val matchedByFpIndex = peerFpClean.isNotBlank() && certPinStorage?.findDeviceIdByFingerprint(peer.certFingerprint) != null
             val idMatch = !pairedDeviceId.isNullOrBlank() && peer.deviceId == pairedDeviceId
-            fpMatch || idMatch
+            fpMatch || matchedByFpIndex || idMatch
         }
     }
 
