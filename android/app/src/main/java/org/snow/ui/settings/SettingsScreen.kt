@@ -1,10 +1,15 @@
 package org.snow.ui.settings
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -25,11 +30,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.LockReset
@@ -50,6 +57,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,8 +75,11 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import org.snow.capabilities.ActionNotificationHelper
+import org.snow.service.SnowForegroundService
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
 import org.snow.ui.components.SnowFilterChip
@@ -77,6 +88,7 @@ import org.snow.ui.components.SnowOutlinedButton
 import org.snow.ui.components.SnowSectionHeader
 import org.snow.ui.components.SnowStatusBadge
 import org.snow.ui.components.SnowTonalButton
+import org.snow.ui.files.SafFolderManager
 import org.snow.ui.theme.LocalSnowColors
 import org.snow.ui.theme.SnowTypography
 
@@ -135,12 +147,40 @@ fun SettingsScreen(
     fun queryNotificationAccess(): Boolean =
         androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
 
-    var isNotificationAccessGranted by remember { mutableStateOf(queryNotificationAccess()) }
+    fun refreshPermissionSnapshot(): SettingsPermissionSnapshot =
+        SettingsPermissionInspector.inspect(
+            context = context,
+            listenerGranted = queryNotificationAccess()
+        )
+
+    var permSnapshot by remember { mutableStateOf(refreshPermissionSnapshot()) }
+    var isNotificationAccessGranted by remember { mutableStateOf(permSnapshot.notificationListenerGranted) }
+    val isServiceRunning by SnowForegroundService.isServiceRunningFlow.collectAsState()
+
+    val safPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { pickedUri ->
+        if (pickedUri != null) {
+            val saved = SafFolderManager(context).persistFolderUri(pickedUri)
+            permSnapshot = refreshPermissionSnapshot()
+            isNotificationAccessGranted = permSnapshot.notificationListenerGranted
+            val msg = if (saved) {
+                "Transfer folder updated: ${permSnapshot.safFolderName}"
+            } else {
+                "Could not persist folder permission. Previous folder kept."
+            }
+            try {
+                android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                isNotificationAccessGranted = queryNotificationAccess()
+                permSnapshot = refreshPermissionSnapshot()
+                isNotificationAccessGranted = permSnapshot.notificationListenerGranted
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -244,11 +284,59 @@ fun SettingsScreen(
                 Column {
                     PermissionRowItem(
                         icon = Icons.Default.Notifications,
+                        title = "Post Notifications",
+                        subtitle = if (permSnapshot.postNotificationsGranted) {
+                            "Foreground bridge status & background tap-to-open notifications ready."
+                        } else {
+                            "Required for persistent foreground bridge & tap-to-open app notifications."
+                        },
+                        statusText = if (permSnapshot.postNotificationsGranted) "GRANTED" else "REQUIRED",
+                        isGranted = permSnapshot.postNotificationsGranted,
+                        onClick = {
+                            context.startActivity(createAppNotificationSettingsIntent(context.packageName))
+                        }
+                    )
+
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
+
+                    PermissionRowItem(
+                        icon = Icons.Default.Notifications,
                         title = "Notification Sync & Listener",
                         subtitle = "App launching from background & folder transfers use Android Notifications & SAF folders.",
                         statusText = if (isNotificationAccessGranted) "GRANTED" else "SETUP",
                         isGranted = isNotificationAccessGranted,
                         onClick = { showNotificationGuide = true }
+                    )
+
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
+
+                    PermissionRowItem(
+                        icon = Icons.Default.FolderOpen,
+                        title = "Transfer Folder (SAF)",
+                        subtitle = if (permSnapshot.safFolderConfigured) {
+                            "Active folder: ${permSnapshot.safFolderName}"
+                        } else {
+                            "Default: Downloads/SNOW (Tap to authorize a custom folder)"
+                        },
+                        statusText = if (permSnapshot.safFolderConfigured) "CONFIGURED" else "DEFAULT",
+                        isGranted = permSnapshot.safFolderConfigured,
+                        onClick = {
+                            safPickerLauncher.launch(SafFolderManager(context).getDestinationUri())
+                        }
+                    )
+
+                    Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
+
+                    val liveBg = permSnapshot.copy(isForegroundServiceRunning = isServiceRunning || permSnapshot.isForegroundServiceRunning)
+                    PermissionRowItem(
+                        icon = Icons.Default.BatteryChargingFull,
+                        title = "Background Activity & Service",
+                        subtitle = liveBg.backgroundSummaryText(),
+                        statusText = liveBg.backgroundBadgeText(),
+                        isGranted = liveBg.isBackgroundFullyHealthy(),
+                        onClick = {
+                            context.startActivity(createBatteryOptimizationSettingsIntent())
+                        }
                     )
                 }
             }
@@ -584,6 +672,95 @@ fun SettingsScreen(
 
 fun createNotificationListenerSettingsIntent(): Intent =
     Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+
+fun createAppNotificationSettingsIntent(packageName: String): Intent =
+    Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+    }
+
+fun createBatteryOptimizationSettingsIntent(): Intent =
+    Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+
+data class SettingsPermissionSnapshot(
+    val postNotificationsGranted: Boolean,
+    val notificationListenerGranted: Boolean,
+    val safFolderConfigured: Boolean,
+    val safFolderName: String,
+    val isBatteryUnrestricted: Boolean,
+    val isForegroundServiceRunning: Boolean
+) {
+    fun backgroundBadgeText(): String = when {
+        isBatteryUnrestricted && isForegroundServiceRunning -> "UNRESTRICTED"
+        isBatteryUnrestricted || isForegroundServiceRunning -> "PARTIAL"
+        else -> "OPTIMIZED"
+    }
+
+    fun isBackgroundFullyHealthy(): Boolean =
+        isBatteryUnrestricted && postNotificationsGranted && isForegroundServiceRunning
+
+    fun backgroundSummaryText(): String {
+        val bat = if (isBatteryUnrestricted) "Battery: Unrestricted" else "Battery: Optimized"
+        val svc = if (isForegroundServiceRunning) "Service: Running" else "Service: Stopped"
+        val notif = if (postNotificationsGranted) "Notifications: Ready" else "Notifications: Off"
+        return "$bat • $svc • $notif"
+    }
+}
+
+object SettingsPermissionInspector {
+    fun inspect(
+        context: Context,
+        listenerGranted: Boolean? = null,
+        postNotificationsOverride: Boolean? = null,
+        safConfiguredOverride: Boolean? = null,
+        safFolderNameOverride: String? = null,
+        batteryUnrestrictedOverride: Boolean? = null,
+        serviceRunningOverride: Boolean? = null
+    ): SettingsPermissionSnapshot {
+        val postGranted = postNotificationsOverride ?: try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else {
+                ActionNotificationHelper.canPostNotifications(context)
+            }
+        } catch (_: Throwable) {
+            false
+        }
+
+        val listenerOk = listenerGranted ?: try {
+            androidx.core.app.NotificationManagerCompat
+                .getEnabledListenerPackages(context)
+                .contains(context.packageName)
+        } catch (_: Throwable) {
+            false
+        }
+
+        val safManager = try {
+            SafFolderManager(context)
+        } catch (_: Throwable) {
+            null
+        }
+        val safOk = safConfiguredOverride ?: (safManager?.hasValidPersistedFolderUri() == true)
+        val safName = safFolderNameOverride ?: (safManager?.getDestinationDisplayName() ?: "Default: Downloads/SNOW")
+
+        val batUnrestricted = batteryUnrestrictedOverride ?: try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+        } catch (_: Throwable) {
+            false
+        }
+
+        val svcRunning = serviceRunningOverride ?: SnowForegroundService.isServiceRunning()
+
+        return SettingsPermissionSnapshot(
+            postNotificationsGranted = postGranted,
+            notificationListenerGranted = listenerOk,
+            safFolderConfigured = safOk,
+            safFolderName = safName,
+            isBatteryUnrestricted = batUnrestricted,
+            isForegroundServiceRunning = svcRunning
+        )
+    }
+}
 
 @Composable
 private fun ThemeOptionPill(

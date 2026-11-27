@@ -299,6 +299,9 @@ class SnowTrayApp:
         self._stop_event = threading.Event()
         self._dashboard_spawn_lock = threading.Lock()
         self._dashboard_proc: Optional[Any] = None
+        self._status_lock = threading.Lock()
+        self._monitor_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._monitor_loop_thread_id: Optional[int] = None
 
     @property
     def dashboard_url(self) -> str:
@@ -325,11 +328,12 @@ class SnowTrayApp:
                 target_url = f"{self.dashboard_url}{path_suffix}"
             if not self.is_dashboard_listening():
                 logger.info("Web dashboard offline on port %d; spawning background daemon...", self.dashboard_port)
-                detached = 0x00000008 if sys.platform == "win32" else 0
+                import subprocess
+                create_new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                detached = (0x00000008 | create_new_group) if sys.platform == "win32" else 0
                 no_win_kwargs = get_no_window_subprocess_kwargs(extra_creationflags=detached)
 
                 try:
-                    import subprocess
                     if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
                         exe_path = Path(sys.executable).resolve()
                         sibling_snow = exe_path.with_name("snow.exe")
@@ -411,7 +415,27 @@ class SnowTrayApp:
             tip = f"SNOW Core: {core_status}\nDevices: {dev_text}"
         return tip[:127]
 
-    def refresh_status(self) -> dict[str, Any]:
+    def _run_ipc_status_query(
+        self, active_loop: Optional[asyncio.AbstractEventLoop] = None
+    ) -> Optional[dict[str, Any]]:
+        """Query Core connected device count over IPC reusing an active loop when provided."""
+
+        async def _query() -> dict[str, Any]:
+            return await asyncio.wait_for(
+                self.bridge.call("get_device_status"),
+                timeout=1.0,
+            )
+
+        if active_loop is not None and not active_loop.is_closed():
+            return active_loop.run_until_complete(_query())
+
+        return asyncio.run(_query())
+
+    def refresh_status(
+        self,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> dict[str, Any]:
         """Poll daemon status and database device count synchronously."""
         # 1. Daemon check
         pid = self.daemon_manager.get_tracked_pid()
@@ -427,39 +451,45 @@ class SnowTrayApp:
         except Exception:
             pass
 
-        self._core_online = is_alive
-
         # 2. Database devices check
         try:
             devices = self.db_manager.list_paired_devices()
-            self._device_count = len(devices)
+            device_count = len(devices)
         except Exception as exc:
             logger.debug("Failed querying devices: %s", exc)
-            self._device_count = 0
+            device_count = 0
 
         # 3. Active connected devices count via loopback IPC
-        self._connected_count = 0
-        if self._core_online:
+        connected_count = 0
+        if is_alive:
+            selected_loop = loop
+            if (
+                selected_loop is None
+                and self._monitor_loop is not None
+                and self._monitor_loop_thread_id == threading.get_ident()
+                and not self._monitor_loop.is_closed()
+            ):
+                selected_loop = self._monitor_loop
+
             try:
-                import asyncio
-                loop = asyncio.new_event_loop()
-                try:
-                    res = loop.run_until_complete(
-                        asyncio.wait_for(self.bridge.call("get_device_status"), timeout=1.0)
-                    )
-                    if isinstance(res, dict) and res.get("success"):
-                        payload = res.get("payload") or res.get("data") or {}
-                        self._connected_count = self.extract_connected_count(payload)
-                finally:
-                    loop.close()
+                res = self._run_ipc_status_query(selected_loop)
+                if isinstance(res, dict) and res.get("success"):
+                    payload = res.get("payload") or res.get("data") or {}
+                    connected_count = self.extract_connected_count(payload)
             except Exception as exc:
                 logger.debug("Failed querying connected device count over IPC: %s", exc)
 
+        with self._status_lock:
+            self._core_online = is_alive
+            self._device_count = device_count
+            self._connected_count = connected_count
+            tooltip = self.compute_tooltip()
+
         return {
-            "core_online": self._core_online,
-            "device_count": self._device_count,
-            "connected_count": self._connected_count,
-            "tooltip": self.compute_tooltip(),
+            "core_online": is_alive,
+            "device_count": device_count,
+            "connected_count": connected_count,
+            "tooltip": tooltip,
         }
 
     def dispatch_command(self, cmd_id: int) -> None:
@@ -692,12 +722,49 @@ class SnowTrayApp:
         fallback_icon = _user32.LoadIconW(0, ctypes.c_wchar_p(IDI_APPLICATION))
         return int(fallback_icon) if fallback_icon else 0
 
+    @staticmethod
+    def _shutdown_monitor_loop(loop: Optional[asyncio.AbstractEventLoop]) -> None:
+        """Cancel remaining tasks, shut down async generators, and close the monitor loop cleanly."""
+        if loop is None or loop.is_closed():
+            return
+        try:
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception as exc:
+            logger.debug("Error during tray monitor loop teardown: %s", exc)
+        finally:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+            try:
+                loop.close()
+            except Exception as exc:
+                logger.debug("Error closing tray monitor loop: %s", exc)
+
     def _background_monitor(self) -> None:
-        """Periodically refresh core status and tooltip in the background."""
-        while not self._stop_event.is_set():
-            self.refresh_status()
-            self._update_icon()
-            self._stop_event.wait(timeout=3.0)
+        """Periodically refresh core status and tooltip using one persistent event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._monitor_loop = loop
+        self._monitor_loop_thread_id = threading.get_ident()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self.refresh_status(loop=loop)
+                    self._update_icon()
+                except Exception as exc:
+                    logger.warning("Tray monitor iteration failed cleanly: %s", exc)
+                self._stop_event.wait(timeout=3.0)
+        finally:
+            self._shutdown_monitor_loop(loop)
+            if self._monitor_loop is loop:
+                self._monitor_loop = None
+                self._monitor_loop_thread_id = None
 
     def run(self) -> int:
         """Main entry point. Initializes system tray icon and pumps message loop."""
@@ -822,10 +889,24 @@ class SnowTrayApp:
         return 0
 
     def stop(self) -> None:
-        """Signal exit and clean up Win32 resources."""
+        """Signal exit, wait for monitor loop teardown, and clean up Win32 resources."""
         self._stop_event.set()
         self._is_running = False
         if self._hwnd and sys.platform == "win32":
-            ctypes.windll.user32.PostMessageW(self._hwnd, 0x0010, 0, 0)
+            try:
+                ctypes.windll.user32.PostMessageW(self._hwnd, 0x0010, 0, 0)
+            except Exception:
+                pass
             self._hwnd = None
+
+        status_thread = getattr(self, "_status_thread", None)
+        if (
+            status_thread is not None
+            and status_thread.is_alive()
+            and threading.current_thread() is not status_thread
+        ):
+            status_thread.join(timeout=5.0)
+        if status_thread is not None and not status_thread.is_alive():
+            self._status_thread = None
+
         self._cleanup_icon()

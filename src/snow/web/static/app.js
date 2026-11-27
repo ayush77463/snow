@@ -107,6 +107,14 @@
     let federationGrants = [];
     let activeNotifications = [];
     let pollIntervalTimer = null;
+    let consecutivePollFailures = 0;
+    const BASE_POLL_INTERVAL_MS = 3000;
+    const OFFLINE_BACKOFF_STEPS_MS = [3000, 6000, 12000, 15000];
+    let isLifecycleInitialized = false;
+    let isPageTearingDown = false;
+    let activeScreenCaptureState = null;
+    let visibilityChangeHandlerRef = null;
+    let unloadCleanupHandlerRef = null;
     let qrCountdownTimer = null;
     let currentDeviceFilter = "all";
     let currentFilesSegment = "files";
@@ -118,6 +126,7 @@
     let localHostTelemetry = {};
     let canonicalSnowId = "SNW-LOCAL";
     let activeUploadXhr = null;
+    let activeUploadTransferId = null;
     let activeDownloadController = null;
     let pcTransfersDestDir = "";
     let pendingUpdateMeta = null;
@@ -321,6 +330,200 @@
         }
     }
 
+    function clearDashboardPollTimer() {
+        if (pollIntervalTimer) {
+            clearTimeout(pollIntervalTimer);
+            pollIntervalTimer = null;
+        }
+    }
+
+    function getCurrentPollDelayMs() {
+        if (consecutivePollFailures <= 0) {
+            return BASE_POLL_INTERVAL_MS;
+        }
+        const idx = Math.min(consecutivePollFailures - 1, OFFLINE_BACKOFF_STEPS_MS.length - 1);
+        return OFFLINE_BACKOFF_STEPS_MS[idx];
+    }
+
+    function scheduleNextPoll(explicitDelayMs = null) {
+        clearDashboardPollTimer();
+        if (isPageTearingDown || document.hidden || isPollStateInFlight) {
+            return;
+        }
+        const delayMs = explicitDelayMs !== null ? explicitDelayMs : getCurrentPollDelayMs();
+        pollIntervalTimer = setTimeout(() => {
+            pollIntervalTimer = null;
+            if (!isPageTearingDown && !document.hidden) {
+                pollStateUpdates().catch(() => {});
+            }
+        }, delayMs);
+    }
+
+    function stopScreenCapturePolling(clearStatusText = false) {
+        const state = activeScreenCaptureState;
+        if (!state) return;
+        state.active = false;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        if (state.abortController) {
+            try {
+                state.abortController.abort();
+            } catch (e) {}
+            state.abortController = null;
+        }
+        activeScreenCaptureState = null;
+        if (clearStatusText && state.statusText) {
+            state.statusText.textContent = "Screen capture stopped.";
+        }
+    }
+
+    function pauseScreenCapturePolling() {
+        const state = activeScreenCaptureState;
+        if (!state || !state.active) return;
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        if (state.abortController) {
+            try {
+                state.abortController.abort();
+            } catch (e) {}
+            state.abortController = null;
+        }
+    }
+
+    function scheduleNextScreenCaptureTick(delayMs = 1000) {
+        const state = activeScreenCaptureState;
+        if (!state || !state.active || isPageTearingDown || document.hidden || state.inFlight) {
+            return;
+        }
+        if (state.timerId) {
+            clearTimeout(state.timerId);
+            state.timerId = null;
+        }
+        state.timerId = setTimeout(() => {
+            state.timerId = null;
+            runScreenCapturePollStep().catch(() => {});
+        }, delayMs);
+    }
+
+    async function runScreenCapturePollStep() {
+        const state = activeScreenCaptureState;
+        if (!state || !state.active || isPageTearingDown || document.hidden || state.inFlight) {
+            return;
+        }
+        if (Date.now() >= state.deadlineAt) {
+            const stText = state.statusText;
+            stopScreenCapturePolling(false);
+            if (stText) stText.textContent = "Screen capture consent timed out or was cancelled.";
+            showNotificationToast("Screen capture consent timed out or was cancelled.", "warning");
+            return;
+        }
+
+        state.inFlight = true;
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        state.abortController = controller;
+        try {
+            state.attempts++;
+            const fetchOpts = controller ? { signal: controller.signal } : {};
+            const capResp = await fetch(`/api/screen/capture-latest?t=${Date.now()}`, fetchOpts);
+            if (!state.active || isPageTearingDown) {
+                return;
+            }
+            if (capResp.status === 200) {
+                const fname = capResp.headers.get("X-Snow-Filename") || "";
+                if (fname && fname !== state.baselineFilename) {
+                    stopScreenCapturePolling(false);
+                    showCapturePreview(`/api/captures/${encodeURIComponent(fname)}?t=${Date.now()}`, "Remote Screen Capture");
+                    showNotificationToast("Screen capture received!", "success");
+                    return;
+                }
+            }
+            if (state.attempts >= state.maxAttempts || Date.now() >= state.deadlineAt) {
+                const stText = state.statusText;
+                stopScreenCapturePolling(false);
+                if (stText) stText.textContent = "Screen capture consent timed out or was cancelled.";
+                showNotificationToast("Screen capture consent timed out or was cancelled.", "warning");
+                return;
+            }
+        } catch (err) {
+            if (!state.active || isPageTearingDown || (err && err.name === "AbortError")) {
+                return;
+            }
+        } finally {
+            state.inFlight = false;
+            if (state.abortController === controller) {
+                state.abortController = null;
+            }
+            if (activeScreenCaptureState === state && state.active && !isPageTearingDown && !document.hidden) {
+                scheduleNextScreenCaptureTick(1000);
+            }
+        }
+    }
+
+    function teardownDashboardLifecycle() {
+        if (isPageTearingDown) return;
+        isPageTearingDown = true;
+        clearDashboardPollTimer();
+        stopScreenFramePolling();
+        stopScreenCapturePolling(false);
+        if (qrCountdownTimer) {
+            clearInterval(qrCountdownTimer);
+            qrCountdownTimer = null;
+        }
+        if (activeDownloadController) {
+            try {
+                activeDownloadController.abort();
+            } catch (e) {}
+            activeDownloadController = null;
+        }
+        if (visibilityChangeHandlerRef) {
+            document.removeEventListener("visibilitychange", visibilityChangeHandlerRef);
+            visibilityChangeHandlerRef = null;
+        }
+        if (unloadCleanupHandlerRef) {
+            window.removeEventListener("beforeunload", unloadCleanupHandlerRef);
+            window.removeEventListener("pagehide", unloadCleanupHandlerRef);
+            unloadCleanupHandlerRef = null;
+        }
+        isLifecycleInitialized = false;
+    }
+
+    function initDashboardLifecycle() {
+        if (isLifecycleInitialized) return;
+        isLifecycleInitialized = true;
+        isPageTearingDown = false;
+
+        visibilityChangeHandlerRef = () => {
+            if (isPageTearingDown) return;
+            if (document.hidden) {
+                clearDashboardPollTimer();
+                stopScreenFramePolling();
+                pauseScreenCapturePolling();
+            } else {
+                if (!isPollStateInFlight && !pollIntervalTimer) {
+                    pollStateUpdates().catch(() => {});
+                }
+                if (isCaptureStreamActive) {
+                    pollScreenStreamStatus().catch(() => {});
+                }
+                if (activeScreenCaptureState && activeScreenCaptureState.active && !activeScreenCaptureState.inFlight) {
+                    runScreenCapturePollStep().catch(() => {});
+                }
+            }
+        };
+
+        unloadCleanupHandlerRef = () => {
+            teardownDashboardLifecycle();
+        };
+
+        document.addEventListener("visibilitychange", visibilityChangeHandlerRef);
+        window.addEventListener("beforeunload", unloadCleanupHandlerRef);
+        window.addEventListener("pagehide", unloadCleanupHandlerRef);
+    }
+
     function startDashboard() {
         initTheming();
         initSidebar();
@@ -333,10 +536,9 @@
         initClipboardView();
         initAiSettingsView();
         initModals();
+        initDashboardLifecycle();
 
-        refreshAllData();
-        if (pollIntervalTimer) clearInterval(pollIntervalTimer);
-        pollIntervalTimer = setInterval(pollStateUpdates, 3000);
+        refreshAllData().catch(() => {});
     }
 
     // =========================================================================
@@ -859,11 +1061,6 @@
             screenFrameErrorCount = 0;
             pollScreenStreamStatus();
         });
-        document.addEventListener("visibilitychange", () => {
-            if (!document.hidden && isCaptureStreamActive) {
-                fetchNextScreenFrame();
-            }
-        });
 
         document.getElementById("btn-hero-refresh-wallpaper")?.addEventListener("click", () => {
             const img = document.getElementById("desktop-wallpaper-img");
@@ -934,32 +1131,21 @@
             showNotificationToast("Tap the Screen Capture notification on your phone to capture.", "info");
         }
 
-        let attempts = 0;
-        let inFlight = false;
-        const pollTimer = setInterval(async () => {
-            if (inFlight) return;
-            inFlight = true;
-            try {
-                attempts++;
-                const capResp = await fetch(`/api/screen/capture-latest?t=${Date.now()}`);
-                if (capResp.status === 200) {
-                    const fname = capResp.headers.get("X-Snow-Filename") || "";
-                    if (fname && fname !== baselineFilename) {
-                        clearInterval(pollTimer);
-                        showCapturePreview(`/api/captures/${encodeURIComponent(fname)}?t=${Date.now()}`, "Remote Screen Capture");
-                        showNotificationToast("Screen capture received!", "success");
-                        return;
-                    }
-                }
-                if (attempts >= 25) {
-                    clearInterval(pollTimer);
-                    if (statusText) statusText.textContent = "Screen capture consent timed out or was cancelled.";
-                    showNotificationToast("Screen capture consent timed out or was cancelled.", "warning");
-                }
-            } finally {
-                inFlight = false;
-            }
-        }, 1000);
+        stopScreenCapturePolling(false);
+        activeScreenCaptureState = {
+            active: true,
+            attempts: 0,
+            maxAttempts: 25,
+            deadlineAt: Date.now() + 25000,
+            inFlight: false,
+            timerId: null,
+            abortController: null,
+            baselineFilename,
+            statusText,
+        };
+        if (!isPageTearingDown && !document.hidden) {
+            scheduleNextScreenCaptureTick(1000);
+        }
     }
 
     function setScreenViewerState(mode, subtitle = "") {
@@ -2822,6 +3008,12 @@
             activeUploadXhr = null;
             didCancel = true;
         }
+        if (activeUploadTransferId) {
+            const tid = activeUploadTransferId;
+            activeUploadTransferId = null;
+            didCancel = true;
+            apiRequest("/api/files/transfer/cancel", "POST", { transfer_id: tid }).catch(() => {});
+        }
         if (activeDownloadController) {
             activeDownloadController.abort();
             activeDownloadController = null;
@@ -3056,6 +3248,7 @@
             const file = files[idx];
             const formData = new FormData();
             formData.append("device_id", targetId);
+            formData.append("async_transfer", "true");
             formData.append("file", file);
 
             updateTransferProgressUi({
@@ -3072,7 +3265,8 @@
             const startTime = performance.now();
             const xhr = new XMLHttpRequest();
             activeUploadXhr = xhr;
-            xhr.open("POST", "/api/files/upload", true);
+            activeUploadTransferId = null;
+            xhr.open("POST", "/api/files/upload?async=1", true);
             if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
 
             xhr.upload.onprogress = (e) => {
@@ -3093,10 +3287,42 @@
                 }
             };
 
-            xhr.onload = () => {
+            xhr.onload = async () => {
+                activeUploadXhr = null;
                 try {
                     const data = JSON.parse(xhr.responseText || "{}");
-                    if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+                    const tid = data.transfer_id || data.data?.transfer_id;
+                    if ((xhr.status === 202 || data.status === "ACCEPTED") && tid) {
+                        activeUploadTransferId = tid;
+                        while (activeUploadTransferId === tid) {
+                            await new Promise(r => setTimeout(r, 750));
+                            if (activeUploadTransferId !== tid) break;
+                            const st = await apiRequest(`/api/files/transfer/${encodeURIComponent(tid)}/status`);
+                            const stData = st?.data || {};
+                            const state = String(stData.state || stData.transfer_status || "").toUpperCase();
+                            if (state === "COMPLETED") {
+                                showNotificationToast(`Sent ${file.name}!`, "success");
+                                break;
+                            } else if (state === "CANCELLED" || state === "FAILED" || !st?.success) {
+                                showNotificationToast(stData.error_message || st?.error || `Failed sending ${file.name}`, "error");
+                                break;
+                            } else {
+                                const curOff = Number(stData.current_offset || 0);
+                                const tot = Number(stData.file_size || file.size || 0);
+                                const pct = tot > 0 ? Math.min(99, Math.round((curOff / tot) * 100)) : 50;
+                                updateTransferProgressUi({
+                                    visible: true,
+                                    title: `Delivering ${file.name} to phone...`,
+                                    loaded: curOff,
+                                    total: tot,
+                                    pct,
+                                    indeterminate: tot === 0,
+                                    routeBadge,
+                                });
+                            }
+                        }
+                        if (activeUploadTransferId === tid) activeUploadTransferId = null;
+                    } else if (xhr.status >= 200 && xhr.status < 300 && data.success) {
                         const savedPath = data.data?.saved_path || data.saved_path;
                         showNotificationToast(
                             savedPath ? `Sent ${file.name} -> ${savedPath}` : `Sent ${file.name}!`,
@@ -4307,9 +4533,11 @@
     // =========================================================================
 
     async function pollStateUpdates() {
-        if (isPollStateInFlight) return;
+        if (isPageTearingDown || isPollStateInFlight) return;
+        clearDashboardPollTimer();
         isPollStateInFlight = true;
         const myPollSeq = ++pollStateSeq;
+        let pollRecorded = false;
         try {
             // 1. System status & Core health
             const [statusRes, sysStatus, fedRes] = await Promise.all([
@@ -4317,11 +4545,13 @@
                 apiRequest("/api/system/status"),
                 apiRequest("/api/federation/grants"),
             ]);
-            if (myPollSeq !== pollStateSeq) return;
+            if (myPollSeq !== pollStateSeq || isPageTearingDown) return;
 
+            let pollSucceeded = false;
             if (statusRes && statusRes.success) {
                 lastStatusSnapshot = statusRes;
                 isCoreOnline = Boolean(statusRes.daemon_online ?? true);
+                pollSucceeded = isCoreOnline;
                 if (statusRes.snow_id) canonicalSnowId = statusRes.snow_id;
                 if (statusRes.device_id) localHostDeviceId = statusRes.device_id;
                 if (statusRes.device_name) localHostIdentity = statusRes.device_name;
@@ -4336,7 +4566,15 @@
                 }
             } else {
                 isCoreOnline = false;
+                pollSucceeded = false;
             }
+
+            if (pollSucceeded) {
+                consecutivePollFailures = 0;
+            } else {
+                consecutivePollFailures++;
+            }
+            pollRecorded = true;
 
             if (sysStatus && sysStatus.success) {
                 isCorePaused = Boolean(sysStatus.is_paused ?? sysStatus.data?.is_paused);
@@ -4349,6 +4587,7 @@
 
             // 2. Registered & Connected Devices (preserve non-empty telemetry across transient misses)
             const devRes = await apiRequest("/api/devices");
+            if (myPollSeq !== pollStateSeq || isPageTearingDown) return;
             if (devRes && Array.isArray(devRes.devices)) {
                 const prevById = new Map(registeredDevices.map(d => [d.device_id, d]));
                 const normalized = [];
@@ -4396,8 +4635,15 @@
 
             // 3. Global pending approvals counter & live screen stream status
             await Promise.all([loadApprovals(), pollScreenStreamStatus()]);
+        } catch (err) {
+            if (!pollRecorded && !isPageTearingDown && myPollSeq === pollStateSeq) {
+                consecutivePollFailures++;
+            }
         } finally {
             isPollStateInFlight = false;
+            if (!isPageTearingDown && !document.hidden) {
+                scheduleNextPoll();
+            }
         }
     }
 

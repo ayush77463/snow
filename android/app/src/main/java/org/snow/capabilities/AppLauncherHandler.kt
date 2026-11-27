@@ -262,12 +262,12 @@ class AppLauncherHandler(private val context: Context) {
             }
         }
 
-        SafeLog.w(TAG, "Background launch rejected for '$cleanPackage': overlay/notifications unavailable.")
+        SafeLog.w(TAG, "Background launch rejected for '$cleanPackage': notifications unavailable.")
         return@withContext mapOf(
             "success" to false,
             "status" to "FOREGROUND_REQUIRED",
-            "error" to "Background activity launch blocked by Android OS. Notification or Background App Launch permission is required.",
-            "remediation_hint" to "Enable Background App Launch (Display over other apps) or Notifications in SNOW Settings."
+            "error" to "Background activity launch restricted by Android OS. Notification permission is required for tap-to-open launch.",
+            "remediation_hint" to "Enable Notifications for SNOW in Android Settings to open requested apps via tap-to-open notification."
         )
     }
 }

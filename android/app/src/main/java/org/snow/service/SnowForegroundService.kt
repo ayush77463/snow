@@ -23,6 +23,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
@@ -71,6 +74,7 @@ class SnowForegroundService : Service() {
             onDeviceRevoked = { _ ->
                 userDisconnected = true
                 isUserDisconnected = true
+                _isServiceRunningFlow.value = false
                 setDisconnectedByUser(applicationContext, true)
                 cancelAutoConnect()
                 discoveryManager.stopListening()
@@ -118,7 +122,11 @@ class SnowForegroundService : Service() {
         AndroidCapabilityDispatcher(
             context = applicationContext,
             transferClientProvider = { transferClient }
-        )
+        ).apply {
+            transferStatusReporter = { payload ->
+                client.sendRequest("file_transfer_update", payload) {}
+            }
+        }
     }
 
     val liveScreenHandler: org.snow.capabilities.LiveScreenStreamHandler by lazy {
@@ -254,7 +262,7 @@ class SnowForegroundService : Service() {
                     val savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
                     if (!savedHost.isNullOrBlank()) {
                         SafeLog.i("SnowForegroundService", "Network restored: triggering reconnect to $savedHost:$savedPort")
-                        client.connect(savedHost, savedPort)
+                        client.onNetworkRestored(savedHost, savedPort)
                     }
                 } else if (relayClient != null || DiscoveryManager.isRelayEndpoint(client.currentTargetHost)) {
                     // Network transition while on Remote Relay: scan briefly for local promotion without dropping relay first.
@@ -324,6 +332,7 @@ class SnowForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
+        _isServiceRunningFlow.value = true
         createNotificationChannel()
         registerNetworkCallback()
         val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
@@ -358,6 +367,7 @@ class SnowForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_AUTO_CONNECT -> {
+                _isServiceRunningFlow.value = true
                 userDisconnected = false
                 isUserDisconnected = false
                 getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
@@ -379,6 +389,7 @@ class SnowForegroundService : Service() {
                 executeAutoConnectCascade()
             }
             ACTION_CONNECT -> {
+                _isServiceRunningFlow.value = true
                 userDisconnected = false
                 isUserDisconnected = false
                 getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
@@ -800,6 +811,7 @@ class SnowForegroundService : Service() {
     internal fun handleDisconnect() {
         userDisconnected = true
         isUserDisconnected = true
+        _isServiceRunningFlow.value = false
         getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
             .edit()
             .putBoolean(PREF_USER_DISCONNECTED, true)
@@ -1035,6 +1047,7 @@ class SnowForegroundService : Service() {
         if (activeInstance === this) {
             activeInstance = null
         }
+        _isServiceRunningFlow.value = false
         super.onDestroy()
         unregisterNetworkCallback()
         liveScreenHandler.stopStreaming()
@@ -1193,6 +1206,18 @@ class SnowForegroundService : Service() {
 
         @Volatile
         var isUserDisconnected: Boolean = false
+
+        private val _isServiceRunningFlow = MutableStateFlow(false)
+
+        @JvmStatic
+        val isServiceRunningFlow: StateFlow<Boolean> = _isServiceRunningFlow.asStateFlow()
+
+        @JvmStatic
+        fun isServiceRunning(): Boolean = _isServiceRunningFlow.value
+
+        internal fun setServiceRunningForTest(running: Boolean) {
+            _isServiceRunningFlow.value = running
+        }
 
         @Volatile
         private var activeInstance: SnowForegroundService? = null

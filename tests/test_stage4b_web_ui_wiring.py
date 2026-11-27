@@ -391,7 +391,7 @@ class TestStage4BBackendHandlers(AioHTTPTestCase):
         self.bridge.android_file_list.assert_called_with(
             subpath="",
             device_id="",
-            scope="full",
+            scope="auto",
             show_hidden=False,
         )
 

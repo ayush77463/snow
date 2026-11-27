@@ -953,9 +953,29 @@ class CapabilityEngine:
                             ws_srv._last_local_write_seq = _ctypes.windll.user32.GetClipboardSequenceNumber()
                         except Exception:
                             pass
-                    if item.get("sha256"):
-                        ws_srv._last_processed_clipboard_hash = item["sha256"]
-                        ws_srv._last_processed_clipboard_at = __import__("time").monotonic()
+                    canon_hash = item.get("canonical_sha256")
+                    if c_type == "image" and not canon_hash:
+                        try:
+                            img_path_obj = self.clipboard_buffer.get_image_path(target_id)
+                            if img_path_obj and img_path_obj.is_file():
+                                from snow.capabilities.windows.clipboard import compute_canonical_image_digest
+
+                                raw_bytes = img_path_obj.read_bytes()
+                                canon_hash, _, _ = compute_canonical_image_digest(raw_bytes)
+                                del raw_bytes
+                        except Exception:
+                            canon_hash = None
+                    if hasattr(ws_srv, "_record_snow_clipboard_write"):
+                        ws_srv._record_snow_clipboard_write(
+                            sha256=item.get("sha256") or "",
+                            canonical_sha256=(canon_hash or item.get("sha256") or "") if c_type == "image" else "",
+                        )
+                    else:
+                        if item.get("sha256"):
+                            ws_srv._last_processed_clipboard_hash = item["sha256"]
+                            ws_srv._last_processed_clipboard_at = __import__("time").monotonic()
+                        if c_type == "image" and (canon_hash or item.get("sha256")):
+                            ws_srv._last_processed_canonical_hash = canon_hash or item["sha256"]
 
                 return CapabilityResponse(
                     success=is_ok,
@@ -1104,8 +1124,8 @@ class CapabilityEngine:
                         try:
                             dest_path = self.storage_manager.resolve_destination_path(img_path.name)
                             if dest_path.resolve() != img_path.resolve():
-                                import shutil
-                                shutil.copy2(img_path, dest_path)
+                                from snow.transfer.storage import stream_copy_file
+                                await asyncio.to_thread(stream_copy_file, img_path, dest_path)
                         except Exception as sc_err:
                             logger.warning("Failed staging clipboard transfer file '%s': %s", img_path.name, sc_err)
 
@@ -1126,6 +1146,15 @@ class CapabilityEngine:
                         import secrets
                         transfer_id = secrets.token_hex(16)
 
+                    canon_hash = item.get("canonical_sha256")
+                    if not canon_hash:
+                        try:
+                            from snow.capabilities.windows.clipboard import compute_canonical_image_digest
+
+                            canon_hash, _, _ = compute_canonical_image_digest(img_path.read_bytes())
+                        except Exception:
+                            canon_hash = None
+
                     push_data = {
                         "type": "image",
                         "item_id": target_id,
@@ -1136,6 +1165,8 @@ class CapabilityEngine:
                         "transfer_port": transfer_port,
                         "transfer_url": f"/api/v1/transfers/download/{transfer_id}",
                         "sha256": file_sha256,
+                        "canonical_sha256": canon_hash or "",
+                        "user_initiated": True,
                         "mime_type": item.get("mime_type") or "image/png",
                         "file_name": img_path.name,
                         "size": file_size,
@@ -1389,18 +1420,15 @@ class CapabilityEngine:
                 )
 
             file_size = safe_path.stat().st_size
-            hasher = hashlib.sha256()
+            from snow.transfer.storage import compute_stream_sha256, stream_copy_file
             try:
-                with open(safe_path, "rb") as f:
-                    while chunk := f.read(65536):
-                        hasher.update(chunk)
+                file_sha256 = await asyncio.to_thread(compute_stream_sha256, safe_path)
             except Exception as read_err:
                 return CapabilityResponse(
                     success=False,
                     status="READ_ERROR",
                     error=f"Failed reading file for transfer: {read_err}",
                 )
-            file_sha256 = hasher.hexdigest()
 
             # Dynamic resolution of target Android device ID if generic
             if target_device in ("android", "phone", ""):
@@ -1452,8 +1480,7 @@ class CapabilityEngine:
                 try:
                     dest_path = self.storage_manager.resolve_destination_path(safe_path.name)
                     if dest_path.resolve() != safe_path.resolve():
-                        import shutil
-                        shutil.copy2(safe_path, dest_path)
+                        await asyncio.to_thread(stream_copy_file, safe_path, dest_path)
                 except Exception as sc_err:
                     logger.warning("Failed staging transfer file '%s': %s", safe_path.name, sc_err)
 

@@ -2551,11 +2551,32 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val imageClipboardLock = Any()
     @Volatile
     private var lastImageClipboardSha256: String? = null
+    @Volatile
+    private var lastImageClipboardCanonicalSha256: String? = null
 
-    fun recordIncomingClipboardImageSha256(sha256: String?) {
-        val normalized = sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return
+    internal var canonicalDigestComputerOverrideForTest: ((File) -> String?)? = null
+
+    internal fun computeCanonicalImageDigestForFile(file: File?): String? {
+        if (file == null || !file.isFile || file.length() <= 0L) return null
+        val override = canonicalDigestComputerOverrideForTest
+        if (override != null) {
+            return override.invoke(file)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        }
+        return org.snow.capabilities.CanonicalImageDigest.computeFromFile(file)
+    }
+
+    @JvmOverloads
+    fun recordIncomingClipboardImageSha256(sha256: String?, canonicalSha256: String? = null) {
+        val normSha = sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        val normCanon = canonicalSha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (normSha == null && normCanon == null) return
         synchronized(imageClipboardLock) {
-            lastImageClipboardSha256 = normalized
+            if (normSha != null) {
+                lastImageClipboardSha256 = normSha
+                lastImageClipboardCanonicalSha256 = normCanon
+            } else {
+                lastImageClipboardCanonicalSha256 = normCanon
+            }
         }
     }
 
@@ -2563,16 +2584,25 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         lastImageClipboardSha256
     }
 
-    fun isDuplicateImageClipboard(sha256: String?): Boolean {
-        val normalized = sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+    fun getLastImageClipboardCanonicalSha256(): String? = synchronized(imageClipboardLock) {
+        lastImageClipboardCanonicalSha256
+    }
+
+    @JvmOverloads
+    fun isDuplicateImageClipboard(sha256: String?, canonicalSha256: String? = null): Boolean {
+        val normSha = sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        val normCanon = canonicalSha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (normSha == null && normCanon == null) return false
         return synchronized(imageClipboardLock) {
-            lastImageClipboardSha256 == normalized
+            (normSha != null && lastImageClipboardSha256 == normSha) ||
+                (normCanon != null && lastImageClipboardCanonicalSha256 == normCanon)
         }
     }
 
     fun resetImageClipboardEchoGuard() {
         synchronized(imageClipboardLock) {
             lastImageClipboardSha256 = null
+            lastImageClipboardCanonicalSha256 = null
         }
     }
 
@@ -2850,8 +2880,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             val isImage = (resolvedMime?.startsWith("image/") == true) || (uri != null && (clipDescriptionMime != null || appContext.contentResolver.getType(uri)?.startsWith("image/") == true))
 
             if (isImage && uri != null) {
-                // Image on clipboard (own FileProvider URI already excluded above; push checks content SHA-256)
-                pushCurrentClipboard { success, _ ->
+                // Image on clipboard (own FileProvider URI already excluded above; push checks raw + canonical SHA-256)
+                pushCurrentClipboard(userInitiated = false) { success, _ ->
                     if (success) {
                         appendLog("INFO", TAG, "Auto-synced foreground image to PC clipboard.")
                     }
@@ -2919,7 +2949,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
-    fun uploadScreenshot(uri: Uri, displayName: String, size: Long, onComplete: ((Boolean, String?) -> Unit)? = null) {
+    @JvmOverloads
+    fun uploadScreenshot(
+        uri: Uri,
+        displayName: String,
+        size: Long,
+        userInitiated: Boolean = false,
+        onComplete: ((Boolean, String?) -> Unit)? = null
+    ) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
         val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (isConnectedAndAuthenticated()) {
@@ -2958,72 +2995,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     }
                     return@launch
                 }
-                val safeName = stagedFile.name
-                appendLog("INFO", TAG, "Uploading screenshot '$safeName' ($actualSize bytes) to PC...")
-                val upRes = transferClient.uploadFile(
-                    serverHost = targetHost,
-                    transferPort = 8766,
-                    file = stagedFile
+                uploadStagedScreenshotFile(
+                    stagedFile = stagedFile,
+                    transferClient = transferClient,
+                    targetHost = targetHost,
+                    client = client,
+                    userInitiated = userInitiated,
+                    onComplete = onComplete
                 )
-                // Remove staged file immediately once transferClient finishes uploading
-                SafeStagingManager.cleanupStagedFile(stagedFile)
                 toCleanup = null
-
-                when (upRes) {
-                    is FileTransferClient.TransferResult.Success -> {
-                        client.sendRequest(
-                            "desktop_clipboard_set",
-                            mapOf(
-                                "type" to "image",
-                                "transfer_id" to upRes.transferId,
-                                "sha256" to upRes.sha256,
-                                "file_name" to safeName
-                            )
-                        ) { resp ->
-                            repoScope.launch(Dispatchers.Main) {
-                                if (resp.isSuccess) {
-                                    recordIncomingClipboardImageSha256(upRes.sha256)
-                                    appendLog("INFO", TAG, "Screenshot synced to PC clipboard: $safeName")
-                                    Toast.makeText(appContext, "Screenshot synced to PC clipboard ❄️", Toast.LENGTH_SHORT).show()
-                                    onComplete?.invoke(true, safeName)
-                                } else {
-                                    val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
-                                    appendLog("WARN", TAG, "Failed setting screenshot on PC clipboard: $err")
-                                    onComplete?.invoke(false, err)
-                                }
-                            }
-                        }
-                    }
-                    is FileTransferClient.TransferResult.Duplicate -> {
-                        client.sendRequest(
-                            "desktop_clipboard_set",
-                            mapOf(
-                                "type" to "image",
-                                "sha256" to upRes.sha256,
-                                "file_name" to safeName
-                            )
-                        ) { resp ->
-                            repoScope.launch(Dispatchers.Main) {
-                                if (resp.isSuccess) {
-                                    recordIncomingClipboardImageSha256(upRes.sha256)
-                                    appendLog("INFO", TAG, "Screenshot synced to PC clipboard: $safeName")
-                                    Toast.makeText(appContext, "Screenshot synced to PC clipboard ❄️", Toast.LENGTH_SHORT).show()
-                                    onComplete?.invoke(true, safeName)
-                                } else {
-                                    val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
-                                    appendLog("WARN", TAG, "Failed setting screenshot on PC clipboard: $err")
-                                    onComplete?.invoke(false, err)
-                                }
-                            }
-                        }
-                    }
-                    is FileTransferClient.TransferResult.Error -> {
-                        repoScope.launch(Dispatchers.Main) {
-                            appendLog("ERROR", TAG, "Screenshot upload failed: ${upRes.message}")
-                            onComplete?.invoke(false, upRes.message)
-                        }
-                    }
-                }
             } catch (e: Exception) {
                 repoScope.launch(Dispatchers.Main) {
                     appendLog("ERROR", TAG, "Screenshot upload exception: ${e.message}")
@@ -3032,6 +3012,110 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             } finally {
                 SafeStagingManager.cleanupStagedFile(toCleanup)
             }
+        }
+    }
+
+    internal suspend fun uploadStagedScreenshotFile(
+        stagedFile: File,
+        transferClient: FileTransferClient,
+        targetHost: String,
+        client: org.snow.network.SnowWebSocketClient,
+        userInitiated: Boolean = false,
+        onComplete: ((Boolean, String?) -> Unit)? = null
+    ) {
+        try {
+            val safeName = stagedFile.name
+            val actualSize = stagedFile.length()
+            val localSha256 = FileTransferClient.computeSha256(stagedFile)
+            val localCanonical = computeCanonicalImageDigestForFile(stagedFile)
+            if (!userInitiated && isDuplicateImageClipboard(localSha256, localCanonical)) {
+                appendLog("DEBUG", TAG, "Skipping duplicate screenshot upload (matches last synced raw/canonical SHA-256).")
+                repoScope.launch(Dispatchers.Main) {
+                    onComplete?.invoke(true, "Screenshot already synced")
+                }
+                return
+            }
+
+            appendLog("INFO", TAG, "Uploading screenshot '$safeName' ($actualSize bytes) to PC...")
+            val upRes = transferClient.uploadFile(
+                serverHost = targetHost,
+                transferPort = 8766,
+                file = stagedFile
+            )
+            SafeStagingManager.cleanupStagedFile(stagedFile)
+
+            val dispatchReq: (String, Map<String, Any?>, (org.snow.protocol.SnowMessage) -> Unit) -> Unit = { action, payload, cb ->
+                val override = clipboardRequestDispatchOverrideForTest
+                if (override != null) {
+                    override.invoke(action, payload, cb)
+                } else {
+                    client.sendRequest(action, payload, cb)
+                }
+            }
+
+            when (upRes) {
+                is FileTransferClient.TransferResult.Success -> {
+                    val reqPayload = buildMap<String, Any?> {
+                        put("type", "image")
+                        put("transfer_id", upRes.transferId)
+                        put("sha256", upRes.sha256)
+                        put("file_name", safeName)
+                        if (!localCanonical.isNullOrBlank()) put("canonical_sha256", localCanonical)
+                        if (userInitiated) put("user_initiated", true)
+                    }
+                    dispatchReq("desktop_clipboard_set", reqPayload) { resp ->
+                        repoScope.launch(Dispatchers.Main) {
+                            if (resp.isSuccess) {
+                                recordIncomingClipboardImageSha256(upRes.sha256, localCanonical)
+                                appendLog("INFO", TAG, "Screenshot synced to PC clipboard: $safeName")
+                                try {
+                                    Toast.makeText(appContext, "Screenshot synced to PC clipboard ❄️", Toast.LENGTH_SHORT).show()
+                                } catch (_: Exception) {
+                                }
+                                onComplete?.invoke(true, safeName)
+                            } else {
+                                val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
+                                appendLog("WARN", TAG, "Failed setting screenshot on PC clipboard: $err")
+                                onComplete?.invoke(false, err)
+                            }
+                        }
+                    }
+                }
+                is FileTransferClient.TransferResult.Duplicate -> {
+                    val reqPayload = buildMap<String, Any?> {
+                        put("type", "image")
+                        put("sha256", upRes.sha256)
+                        put("file_name", safeName)
+                        if (!localCanonical.isNullOrBlank()) put("canonical_sha256", localCanonical)
+                        if (userInitiated) put("user_initiated", true)
+                    }
+                    dispatchReq("desktop_clipboard_set", reqPayload) { resp ->
+                        repoScope.launch(Dispatchers.Main) {
+                            if (resp.isSuccess) {
+                                recordIncomingClipboardImageSha256(upRes.sha256, localCanonical)
+                                appendLog("INFO", TAG, "Screenshot synced to PC clipboard: $safeName")
+                                try {
+                                    Toast.makeText(appContext, "Screenshot synced to PC clipboard ❄️", Toast.LENGTH_SHORT).show()
+                                } catch (_: Exception) {
+                                }
+                                onComplete?.invoke(true, safeName)
+                            } else {
+                                val err = resp.payload?.get("error") as? String ?: "Failed setting image on PC"
+                                appendLog("WARN", TAG, "Failed setting screenshot on PC clipboard: $err")
+                                onComplete?.invoke(false, err)
+                            }
+                        }
+                    }
+                }
+                is FileTransferClient.TransferResult.Error -> {
+                    repoScope.launch(Dispatchers.Main) {
+                        appendLog("ERROR", TAG, "Screenshot upload failed: ${upRes.message}")
+                        onComplete?.invoke(false, upRes.message)
+                    }
+                }
+            }
+        } finally {
+            SafeStagingManager.cleanupStagedFile(stagedFile)
         }
     }
 
@@ -3103,7 +3187,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 }
 
                 if (foundUri != null && foundName != null) {
-                    uploadScreenshot(foundUri!!, foundName!!, foundSize, onComplete)
+                    uploadScreenshot(foundUri!!, foundName!!, foundSize, userInitiated = true, onComplete = onComplete)
                 } else {
                     repoScope.launch(Dispatchers.Main) { onComplete(false, "No recent screenshot found.") }
                 }
@@ -3684,7 +3768,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
-    fun pushCurrentClipboard(onComplete: (Boolean, String?) -> Unit) {
+    @JvmOverloads
+    fun pushCurrentClipboard(userInitiated: Boolean = false, onComplete: (Boolean, String?) -> Unit) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
         val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (_authState.value is AuthState.Authenticated && _connectionState.value == ConnectionState.CONNECTED) {
@@ -3718,7 +3803,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val isImage = (resolvedMime?.startsWith("image/") == true) || (uri != null && (clipDescriptionMime != null || appContext.contentResolver.getType(uri)?.startsWith("image/") == true))
 
         // 1. If it's an image
-        if (isImage && uri != null && isOwnFileProviderUri(uri)) {
+        if (!userInitiated && isImage && uri != null && isOwnFileProviderUri(uri)) {
             appendLog("DEBUG", TAG, "Ignoring push for own SNOW clipboard FileProvider URI.")
             onComplete(false, "Image already originated from SNOW clipboard.")
             return
@@ -3752,8 +3837,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         return@launch
                     }
                     val localSha256 = FileTransferClient.computeSha256(stagedFile)
-                    if (isDuplicateImageClipboard(localSha256)) {
-                        appendLog("DEBUG", TAG, "Skipping clipboard image upload (matches last synced SHA-256).")
+                    val localCanonical = computeCanonicalImageDigestForFile(stagedFile)
+                    if (!userInitiated && isDuplicateImageClipboard(localSha256, localCanonical)) {
+                        appendLog("DEBUG", TAG, "Skipping clipboard image upload (matches last synced raw/canonical SHA-256).")
                         repoScope.launch(Dispatchers.Main) {
                             onComplete(true, "Image already synced")
                         }
@@ -3768,6 +3854,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         upRes = upRes,
                         stagedName = stagedFile.name,
                         client = client,
+                        canonicalSha256 = localCanonical,
+                        userInitiated = userInitiated,
                         onComplete = onComplete
                     )
                 } catch (e: Exception) {
@@ -3797,11 +3885,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         transferClient: FileTransferClient,
         targetHost: String,
         client: org.snow.network.SnowWebSocketClient,
+        userInitiated: Boolean = false,
         onComplete: (Boolean, String?) -> Unit
     ) {
         val localSha256 = FileTransferClient.computeSha256(stagedFile)
-        if (isDuplicateImageClipboard(localSha256)) {
-            appendLog("DEBUG", TAG, "Skipping clipboard image upload (matches last synced SHA-256).")
+        val localCanonical = computeCanonicalImageDigestForFile(stagedFile)
+        if (!userInitiated && isDuplicateImageClipboard(localSha256, localCanonical)) {
+            appendLog("DEBUG", TAG, "Skipping clipboard image upload (matches last synced raw/canonical SHA-256).")
             repoScope.launch(Dispatchers.Main) {
                 onComplete(true, "Image already synced")
             }
@@ -3814,13 +3904,22 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 file = stagedFile
             )
         }
-        handleUploadedClipboardImage(upRes, stagedFile.name, client, onComplete)
+        handleUploadedClipboardImage(
+            upRes = upRes,
+            stagedName = stagedFile.name,
+            client = client,
+            canonicalSha256 = localCanonical,
+            userInitiated = userInitiated,
+            onComplete = onComplete
+        )
     }
 
     private fun handleUploadedClipboardImage(
         upRes: FileTransferClient.TransferResult,
         stagedName: String,
         client: org.snow.network.SnowWebSocketClient,
+        canonicalSha256: String? = null,
+        userInitiated: Boolean = false,
         onComplete: (Boolean, String?) -> Unit
     ) {
         val sendReq: (String, Map<String, Any?>, (org.snow.protocol.SnowMessage) -> Unit) -> Unit = { action, data, cb ->
@@ -3833,18 +3932,18 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
         when (upRes) {
             is FileTransferClient.TransferResult.Success -> {
-                sendReq(
-                    "desktop_clipboard_set",
-                    mapOf(
-                        "type" to "image",
-                        "transfer_id" to upRes.transferId,
-                        "sha256" to upRes.sha256,
-                        "file_name" to stagedName
-                    )
-                ) { resp ->
+                val payload = buildMap<String, Any?> {
+                    put("type", "image")
+                    put("transfer_id", upRes.transferId)
+                    put("sha256", upRes.sha256)
+                    put("file_name", stagedName)
+                    if (!canonicalSha256.isNullOrBlank()) put("canonical_sha256", canonicalSha256)
+                    if (userInitiated) put("user_initiated", true)
+                }
+                sendReq("desktop_clipboard_set", payload) { resp ->
                     repoScope.launch(Dispatchers.Main) {
                         if (resp.isSuccess) {
-                            recordIncomingClipboardImageSha256(upRes.sha256)
+                            recordIncomingClipboardImageSha256(upRes.sha256, canonicalSha256)
                             appendLog("INFO", TAG, "Image pushed to PC clipboard.")
                             onComplete(true, "Image pushed to PC")
                         } else {
@@ -3855,17 +3954,17 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 }
             }
             is FileTransferClient.TransferResult.Duplicate -> {
-                sendReq(
-                    "desktop_clipboard_set",
-                    mapOf(
-                        "type" to "image",
-                        "sha256" to upRes.sha256,
-                        "file_name" to stagedName
-                    )
-                ) { resp ->
+                val payload = buildMap<String, Any?> {
+                    put("type", "image")
+                    put("sha256", upRes.sha256)
+                    put("file_name", stagedName)
+                    if (!canonicalSha256.isNullOrBlank()) put("canonical_sha256", canonicalSha256)
+                    if (userInitiated) put("user_initiated", true)
+                }
+                sendReq("desktop_clipboard_set", payload) { resp ->
                     repoScope.launch(Dispatchers.Main) {
                         if (resp.isSuccess) {
-                            recordIncomingClipboardImageSha256(upRes.sha256)
+                            recordIncomingClipboardImageSha256(upRes.sha256, canonicalSha256)
                             appendLog("INFO", TAG, "Image pushed to PC clipboard.")
                             onComplete(true, "Image pushed to PC")
                         } else {
@@ -3922,6 +4021,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                 expectedSha256 = sha256
                             )
                             if (dlRes is FileTransferClient.TransferResult.Success) {
+                                val pulledCanonical = computeCanonicalImageDigestForFile(dlRes.file)
+                                    ?: (data["canonical_sha256"] as? String)
                                 repoScope.launch(Dispatchers.Main) {
                                     try {
                                         val contentUri = androidx.core.content.FileProvider.getUriForFile(
@@ -3939,7 +4040,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                             "image/png",
                                             isUserInitiated = true
                                         )
-                                        recordIncomingClipboardImageSha256(sha256.ifBlank { dlRes.sha256 })
+                                        recordIncomingClipboardImageSha256(sha256.ifBlank { dlRes.sha256 }, pulledCanonical)
                                         appendLog("INFO", TAG, "Pulled image from PC to clipboard.")
                                         onComplete(true, "Image pulled to phone clipboard.")
                                     } catch (e: Exception) {
@@ -4103,6 +4204,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                     }
                                     return@launch
                                 }
+                                val appliedCanonical = computeCanonicalImageDigestForFile(dlRes.file)
+                                    ?: (data?.get("canonical_sha256") as? String)
                                 repoScope.launch(Dispatchers.Main) {
                                     try {
                                         val contentUri = androidx.core.content.FileProvider.getUriForFile(
@@ -4120,7 +4223,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                                         org.snow.capabilities.ClipboardHandler.grantImeUriPermission(appContext, contentUri)
                                         org.snow.capabilities.ClipboardHandler.postShareFallbackNotification(appContext, contentUri, resolvedMime, isUserInitiated = true)
 
-                                        recordIncomingClipboardImageSha256(sha256.ifBlank { dlRes.sha256 })
+                                        recordIncomingClipboardImageSha256(sha256.ifBlank { dlRes.sha256 }, appliedCanonical)
                                         if (seq > 0L && eventId.isNotBlank()) {
                                             sendClipboardAck(seq, eventId, client)
                                         }

@@ -26,6 +26,7 @@ VALID_LOG_LEVELS: FrozenSet[str] = frozenset(
 )
 _LOOPBACK_HUB_HOSTS: FrozenSet[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 DEFAULT_BUILTIN_HUB_URL: str = "https://snow-relay.onrender.com"
+MAX_SUPPORTED_TRANSFER_SIZE: int = 16 * 1024 * 1024 * 1024  # 16 GiB
 
 
 def validate_hub_url(url: str, allow_dev_loopback: Optional[bool] = None) -> str:
@@ -126,6 +127,7 @@ class CoreConfig:
     auth_required: bool = True
     transfer_port: int = 8766
     transfer_root: str | None = None
+    max_transfer_size: int = MAX_SUPPORTED_TRANSFER_SIZE
     tls_cert_path: str | None = None
     tls_key_path: str | None = None
     ipc_host: str = "127.0.0.1"
@@ -211,6 +213,16 @@ class CoreConfig:
         if self.transfer_root is not None:
             if not isinstance(self.transfer_root, str) or not self.transfer_root.strip():
                 raise ValueError("transfer_root must be a non-empty string or None")
+
+        # Validate max_transfer_size (> 0, <= 16 GiB)
+        if not isinstance(self.max_transfer_size, int) or isinstance(self.max_transfer_size, bool):
+            raise ValueError(
+                f"max_transfer_size must be an integer, got {type(self.max_transfer_size).__name__}: {self.max_transfer_size!r}"
+            )
+        if self.max_transfer_size <= 0 or self.max_transfer_size > MAX_SUPPORTED_TRANSFER_SIZE:
+            raise ValueError(
+                f"max_transfer_size must be between 1 and {MAX_SUPPORTED_TRANSFER_SIZE} bytes, got {self.max_transfer_size}"
+            )
 
         # Validate TLS cert/key paths if provided
         if self.tls_cert_path is not None:
@@ -552,6 +564,22 @@ class CoreConfig:
             else DEFAULT_BUILTIN_HUB_URL
         )
 
+        # Parse SNOW_MAX_TRANSFER_SIZE
+        raw_max_transfer = os.getenv("SNOW_MAX_TRANSFER_SIZE")
+        if raw_max_transfer is not None:
+            try:
+                max_transfer_size = int(raw_max_transfer)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Invalid SNOW_MAX_TRANSFER_SIZE '{raw_max_transfer}': must be an integer."
+                ) from None
+            if max_transfer_size <= 0 or max_transfer_size > MAX_SUPPORTED_TRANSFER_SIZE:
+                raise ValueError(
+                    f"Invalid SNOW_MAX_TRANSFER_SIZE '{raw_max_transfer}': must be between 1 and {MAX_SUPPORTED_TRANSFER_SIZE} bytes."
+                )
+        else:
+            max_transfer_size = MAX_SUPPORTED_TRANSFER_SIZE
+
         return cls(
             app_name=app_name,
             version="7.0.0",
@@ -567,6 +595,7 @@ class CoreConfig:
             auth_required=auth_required,
             transfer_port=transfer_port,
             transfer_root=transfer_root,
+            max_transfer_size=max_transfer_size,
             tls_cert_path=tls_cert_path,
             tls_key_path=tls_key_path,
             ipc_host=ipc_host,

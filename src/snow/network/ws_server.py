@@ -174,6 +174,7 @@ class SnowWebSocketServer:
         self._last_processed_clipboard_hash: str = ""
         self._last_processed_canonical_hash: str = ""
         self._last_processed_clipboard_at: float = 0.0
+        self._last_snow_write_hydrated: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Phase 21: Live in-memory notification cache (strictly never persisted to disk)
         self.live_notifications: dict[str, list[dict[str, Any]]] = {}
@@ -693,6 +694,8 @@ class SnowWebSocketServer:
                 await self._handle_file_list_transfers(client, message, data, session)
             elif action == "file_transfer_status":
                 await self._handle_file_transfer_status(client, message, data, session)
+            elif action == "file_transfer_update":
+                await self._handle_file_transfer_update(client, message, data, session)
             elif action == "file_transfer_cancel":
                 await self._handle_file_transfer_cancel(client, message, data, session)
             elif action == "desktop_status":
@@ -3066,6 +3069,61 @@ class SnowWebSocketServer:
         )
         await client.websocket.send(response.to_json())
 
+    async def _handle_file_transfer_update(
+        self, client, message: SnowMessage, data: dict[str, Any], session
+    ) -> None:
+        """Handle async completion/progress/error updates from Android peer for an active transfer."""
+        transfer_id = str(data.get("transfer_id") or "").strip()
+        if not transfer_id:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="transfer_id is required.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        device_id = session.device_id if session else data.get("device_id", "anonymous")
+        record = self.transfer_manager.get_transfer_for_device(transfer_id, device_id)
+        if not record:
+            error_response = SnowMessage.create_error(
+                code=ErrorCode.TRANSFER_NOT_FOUND,
+                message="Transfer record not found or not owned by device.",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(error_response.to_json())
+            return
+
+        state_str = str(data.get("status") or "").strip().upper()
+        if state_str in ("COMPLETED", "SUCCESS"):
+            if record.status != TransferState.CANCELLED:
+                self.transfer_manager.mark_completed(transfer_id)
+        elif state_str in ("FAILED", "ERROR"):
+            if record.status != TransferState.CANCELLED:
+                self.transfer_manager.mark_failed(transfer_id, str(data.get("error") or "Transfer failed on target device."))
+        elif state_str == "CANCELLED":
+            self.transfer_manager.cancel_transfer(transfer_id, device_id)
+            part_path = self.storage_manager.get_part_path(transfer_id)
+            self.storage_manager.delete_part_file(part_path)
+        elif "current_offset" in data:
+            try:
+                self.transfer_manager.update_offset(transfer_id, int(data["current_offset"]))
+            except (TypeError, ValueError):
+                pass
+
+        response = SnowMessage.create_response(
+            correlation_id=message.id,
+            payload={
+                "status": "success",
+                "action": "file_transfer_update",
+                "data": {
+                    "transfer_id": record.transfer_id,
+                    "status": record.status.value,
+                },
+            },
+        )
+        await client.websocket.send(response.to_json())
+
     async def _handle_file_transfer_cancel(
         self, client, message: SnowMessage, data: dict[str, Any], session
     ) -> None:
@@ -3301,6 +3359,50 @@ class SnowWebSocketServer:
         )
         await client.websocket.send(response.to_json())
 
+    def _record_snow_clipboard_write(self, sha256: str = "", canonical_sha256: str = "") -> None:
+        """Remember the latest SNOW-processed clipboard content across bursts and Core restarts."""
+        clean_sha = str(sha256 or "").strip().lower()
+        clean_canon = str(canonical_sha256 or "").strip().lower()
+        self._last_processed_clipboard_hash = clean_sha
+        self._last_processed_canonical_hash = clean_canon
+        self._last_processed_clipboard_at = time.monotonic()
+        self._last_snow_write_hydrated = True
+        db = getattr(self, "db_manager", None)
+        if db is not None and hasattr(db, "set_setting"):
+            try:
+                db.set_setting(
+                    "clip_last_snow_write",
+                    json.dumps(
+                        {
+                            "sha256": clean_sha,
+                            "canonical_sha256": clean_canon,
+                            "written_at": time.time(),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            except Exception as exc:
+                logger.debug("Failed persisting clip_last_snow_write: %s", exc)
+
+    def _load_persisted_snow_clipboard_write(self) -> tuple[str, str, float]:
+        """Load the last persisted SNOW clipboard write from SQLite app_settings."""
+        db = getattr(self, "db_manager", None)
+        if db is None or not hasattr(db, "get_setting"):
+            return "", "", 0.0
+        try:
+            raw = db.get_setting("clip_last_snow_write")
+            if not raw or not isinstance(raw, str):
+                return "", "", 0.0
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return "", "", 0.0
+            sha = str(parsed.get("sha256") or "").strip().lower()
+            canon = str(parsed.get("canonical_sha256") or "").strip().lower()
+            written_at = float(parsed.get("written_at") or 0.0)
+            return sha, canon, written_at
+        except Exception:
+            return "", "", 0.0
+
     def _resolve_session_device_identity(self, session: Any) -> tuple[str, str]:
         """Resolve authoritative device_id and friendly device_name from paired DB record."""
         device_id = (getattr(session, "device_id", None) or "").strip() if session else ""
@@ -3328,6 +3430,7 @@ class SnowWebSocketServer:
         image_bytes: Optional[bytes] = None,
         mime_type: Optional[str] = None,
         files: Optional[list[dict[str, Any]]] = None,
+        user_initiated: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Persist validated clipboard item into shared ring buffer and broadcast metadata event."""
         cb_buf = getattr(self, "clipboard_buffer", None) or getattr(
@@ -3335,6 +3438,7 @@ class SnowWebSocketServer:
         )
         if not cb_buf:
             return None
+        extra_kwargs: dict[str, Any] = {"bypass_debounce": True} if user_initiated else {}
         buf_res: Optional[dict[str, Any]] = None
         if content_type in ("file", "file_bundle") and files:
             buf_res = cb_buf.add_files(
@@ -3348,12 +3452,14 @@ class SnowWebSocketServer:
                 mime_type=mime_type or "image/png",
                 source_device_id=source_device_id,
                 source_device_name=source_device_name,
+                **extra_kwargs,
             )
         elif content_type == "text" and text is not None:
             buf_res = cb_buf.add_text(
                 text=text,
                 source_device_id=source_device_id,
                 source_device_name=source_device_name,
+                **extra_kwargs,
             )
         if buf_res and buf_res.get("success") and buf_res.get("item"):
             item_meta = buf_res["item"]
@@ -3371,6 +3477,7 @@ class SnowWebSocketServer:
     ) -> None:
         """Handle request to write text, image, or verified file/bundle to Windows clipboard."""
         source_device_id, source_device_name = self._resolve_session_device_identity(session)
+        user_initiated = bool(data.get("user_initiated") or data.get("explicit"))
 
         # 0. Single file or multi-file bundle clipboard set (CF_HDROP after port 8766 SHA-256 verify)
         if data.get("type") in ("file", "file_bundle"):
@@ -3531,10 +3638,13 @@ class SnowWebSocketServer:
                     source_device_id=source_device_id,
                     source_device_name=source_device_name,
                     files=buffer_specs,
+                    user_initiated=user_initiated,
                 )
                 if item_meta and item_meta.get("sha256"):
-                    self._last_processed_clipboard_hash = item_meta["sha256"]
-                    self._last_processed_clipboard_at = time.monotonic()
+                    self._record_snow_clipboard_write(
+                        sha256=item_meta["sha256"],
+                        canonical_sha256="",
+                    )
                     for cid in self._active_sync_connections:
                         self._last_synced_clipboard_hash[cid] = item_meta["sha256"]
                         if item_meta.get("event_id"):
@@ -3597,26 +3707,50 @@ class SnowWebSocketServer:
                 canonical_digest, _, _ = compute_canonical_image_digest(img_bytes)
             except Exception:
                 canonical_digest = None
+            if canonical_digest is None:
+                decl_canon = str(data.get("canonical_sha256") or "").strip().lower()
+                if len(decl_canon) == 64:
+                    canonical_digest = decl_canon
 
             duplicate_top_item: Optional[dict[str, Any]] = None
-            if cb_buf is not None:
-                try:
-                    with cb_buf._lock:
-                        top_item = cb_buf._items[0] if cb_buf._items else None
-                        if top_item is not None and top_item.content_type == "image":
-                            top_sha = (top_item.sha256 or "").lower()
-                            top_canon = (top_item.canonical_sha256 or "").lower()
-                            if (
-                                top_sha == computed_sha256.lower()
-                                or (canonical_digest and top_canon and top_canon == canonical_digest.lower())
-                            ):
-                                duplicate_top_item = top_item.to_metadata()
-                except Exception:
-                    duplicate_top_item = None
+            if not user_initiated:
+                if cb_buf is not None and hasattr(cb_buf, "hydrate_latest_image_canonical"):
+                    try:
+                        cb_buf.hydrate_latest_image_canonical()
+                    except Exception:
+                        pass
+                if cb_buf is not None:
+                    try:
+                        with cb_buf._lock:
+                            top_item = cb_buf._items[0] if cb_buf._items else None
+                            if top_item is not None and top_item.content_type == "image":
+                                top_sha = (top_item.sha256 or "").lower()
+                                top_canon = (top_item.canonical_sha256 or "").lower()
+                                if (
+                                    top_sha == computed_sha256.lower()
+                                    or (canonical_digest and top_canon and top_canon == canonical_digest.lower())
+                                ):
+                                    duplicate_top_item = top_item.to_metadata()
+                    except Exception:
+                        duplicate_top_item = None
+
+                if duplicate_top_item is None:
+                    persisted_sha, persisted_canon, _ = self._load_persisted_snow_clipboard_write()
+                    last_sha = (getattr(self, "_last_processed_clipboard_hash", "") or persisted_sha).lower()
+                    last_canon = (getattr(self, "_last_processed_canonical_hash", "") or persisted_canon).lower()
+                    if (last_sha and last_sha == computed_sha256.lower()) or (
+                        canonical_digest and last_canon and last_canon == canonical_digest.lower()
+                    ):
+                        duplicate_top_item = {
+                            "item_id": None,
+                            "canonical_sha256": canonical_digest or last_canon,
+                        }
 
             if duplicate_top_item is not None:
-                self._last_processed_clipboard_hash = computed_sha256
-                self._last_processed_clipboard_at = time.monotonic()
+                self._record_snow_clipboard_write(
+                    sha256=computed_sha256,
+                    canonical_sha256=canonical_digest or "",
+                )
                 for cid in self._active_sync_connections:
                     self._last_synced_clipboard_hash[cid] = computed_sha256
                     if duplicate_top_item.get("event_id"):
@@ -3649,8 +3783,10 @@ class SnowWebSocketServer:
                         self._last_local_write_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
                     except Exception:
                         pass
-                self._last_processed_clipboard_hash = computed_sha256
-                self._last_processed_clipboard_at = time.monotonic()
+                self._record_snow_clipboard_write(
+                    sha256=computed_sha256,
+                    canonical_sha256=canonical_digest or "",
+                )
                 for cid in self._active_sync_connections:
                     self._last_synced_clipboard_hash[cid] = computed_sha256
                 item_meta = await self._persist_and_broadcast_clipboard_buffer(
@@ -3659,6 +3795,7 @@ class SnowWebSocketServer:
                     source_device_name=source_device_name,
                     image_bytes=img_bytes,
                     mime_type=detected_mime,
+                    user_initiated=user_initiated,
                 )
                 if item_meta and item_meta.get("event_id"):
                     for cid in self._active_sync_connections:
@@ -3705,8 +3842,7 @@ class SnowWebSocketServer:
                 except Exception:
                     pass
             h = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            self._last_processed_clipboard_hash = h
-            self._last_processed_clipboard_at = time.monotonic()
+            self._record_snow_clipboard_write(sha256=h, canonical_sha256="")
             for cid in self._active_sync_connections:
                 self._last_synced_clipboard_hash[cid] = h
             item_meta = await self._persist_and_broadcast_clipboard_buffer(
@@ -3714,6 +3850,7 @@ class SnowWebSocketServer:
                 source_device_id=source_device_id,
                 source_device_name=source_device_name,
                 text=text,
+                user_initiated=user_initiated,
             )
             if item_meta and item_meta.get("event_id"):
                 for cid in self._active_sync_connections:
@@ -3892,6 +4029,7 @@ class SnowWebSocketServer:
                 "transfer_id": record.transfer_id,
                 "file_name": img_path.name,
                 "sha256": c_hash,
+                "canonical_sha256": item_meta.get("canonical_sha256") or "",
                 "size": file_size,
                 "transfer_port": bound_port,
                 "transfer_url": f"/api/v1/transfers/download/{record.transfer_id}",
@@ -4163,20 +4301,39 @@ class SnowWebSocketServer:
 
             cb_buf = getattr(self, "clipboard_buffer", None) or getattr(self.capability_engine, "clipboard_buffer", None)
             debounce_win = getattr(cb_buf, "debounce_seconds", 0.5) if cb_buf else 0.5
+            effective_win = (
+                cb_buf._effective_image_burst_window()
+                if c_type == "image" and cb_buf and hasattr(cb_buf, "_effective_image_burst_window")
+                else (max(debounce_win, 1.0) if c_type == "image" and debounce_win >= 0.5 else debounce_win)
+            )
+            if (
+                getattr(self, "_last_processed_clipboard_at", 0.0) == 0.0
+                and not getattr(self, "_last_snow_write_hydrated", False)
+                and not getattr(self, "_last_processed_clipboard_hash", "")
+                and not getattr(self, "_last_processed_canonical_hash", "")
+            ):
+                p_sha, p_canon, p_at = self._load_persisted_snow_clipboard_write()
+                self._last_snow_write_hydrated = True
+                if p_at > 0.0 and (time.time() - p_at) <= 300.0:
+                    if p_sha:
+                        self._last_processed_clipboard_hash = p_sha
+                    if p_canon:
+                        self._last_processed_canonical_hash = p_canon
             last_hash = getattr(self, "_last_processed_clipboard_hash", "")
             last_canon = getattr(self, "_last_processed_canonical_hash", "")
             last_at = getattr(self, "_last_processed_clipboard_at", 0.0)
-            within_debounce_or_mock = (last_at == 0.0) or ((time.monotonic() - last_at) <= debounce_win)
+            within_debounce_or_mock = (last_at == 0.0) or ((time.monotonic() - last_at) <= effective_win)
 
-            # Echo / duplicate suppression check within debounce window
+            # Echo / duplicate suppression check within debounce/burst window
             if within_debounce_or_mock and (
-                c_hash == last_hash or (c_type == "image" and c_canon == last_canon)
+                (last_hash and c_hash.lower() == last_hash.lower())
+                or (c_type == "image" and last_canon and c_canon and c_canon.lower() == last_canon.lower())
             ):
                 return
-            self._last_processed_clipboard_hash = c_hash
-            self._last_processed_clipboard_at = time.monotonic()
-            if c_type == "image":
-                self._last_processed_canonical_hash = c_canon
+            self._record_snow_clipboard_write(
+                sha256=c_hash or "",
+                canonical_sha256=(c_canon if c_type == "image" else "") or "",
+            )
 
             # Add to shared clipboard buffer
             buffer_item = None
@@ -4203,6 +4360,10 @@ class SnowWebSocketServer:
                             buffer_item = res["item"]
                             c_hash = buffer_item.get("sha256") or c_hash
                             c_canon = buffer_item.get("canonical_sha256") or c_canon
+                            self._record_snow_clipboard_write(
+                                sha256=c_hash or "",
+                                canonical_sha256=c_canon or "",
+                            )
                 elif c_type in ("file", "file_bundle") and content.get("files"):
                     res = cb_buf.add_files(
                         files=content["files"],
@@ -4311,6 +4472,7 @@ class SnowWebSocketServer:
                             "transfer_id": record.transfer_id,
                             "file_name": file_name,
                             "sha256": c_hash,
+                            "canonical_sha256": c_canon or "",
                             "size": file_size,
                             "transfer_port": bound_port,
                             "transfer_url": f"/api/v1/transfers/download/{record.transfer_id}",

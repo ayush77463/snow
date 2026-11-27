@@ -21,6 +21,7 @@ class AndroidCapabilityDispatcher(
     private val context: Context,
     private val transferClientProvider: () -> FileTransferClient?
 ) {
+    var transferStatusReporter: ((Map<String, Any?>) -> Unit)? = null
     companion object {
         private const val TAG = "CapabilityDispatcher"
     }
@@ -48,7 +49,8 @@ class AndroidCapabilityDispatcher(
         )
         val files = setOf(
             "file_list", "android_file_list", "file_send_request",
-            "file_receive_request", "android_file_receive", "ring_phone", "android_ring"
+            "file_receive_request", "android_file_receive", "ring_phone", "android_ring",
+            "transfer_cancel", "file_transfer_cancel"
         )
         return when (norm) {
             "not_allowed" -> false
@@ -322,11 +324,25 @@ class AndroidCapabilityDispatcher(
                 }
             }
             "file_send_request" -> {
-                val res = fileHandler.handleFileSendRequest(data, serverHost, defaultTransferPort)
-                if (res["status"] == "success" || res["success"] == true) {
+                val res = fileHandler.handleFileSendRequest(
+                    data = data,
+                    serverHost = serverHost,
+                    defaultTransferPort = defaultTransferPort,
+                    completionNotifier = transferStatusReporter
+                )
+                if (res["status"] == "success" || res["status"] == "accepted" || res["success"] == true) {
                     Pair(res, null)
                 } else {
                     Pair(null, SnowError(code = ErrorCode.INTERNAL_ERROR, message = res["error"] as? String ?: "File receive failed"))
+                }
+            }
+            "transfer_cancel", "file_transfer_cancel" -> {
+                val transferId = (data?.get("transfer_id") as? String)?.trim().orEmpty()
+                if (transferId.isBlank()) {
+                    Pair(null, SnowError(code = ErrorCode.INVALID_PAYLOAD, message = "transfer_id is required"))
+                } else {
+                    val cancelled = fileHandler.cancelTransfer(transferId)
+                    Pair(mapOf("status" to "cancelled", "transfer_id" to transferId, "cancelled" to cancelled), null)
                 }
             }
             "file_receive_request" -> {
@@ -610,7 +626,12 @@ class AndroidCapabilityDispatcher(
                         isUserInitiated = isUserInitiated
                     )
                 }
-                repo?.recordIncomingClipboardImageSha256(sha256)
+                val computedCanonical = CanonicalImageDigest.computeFromFile(dlRes.file)
+                    ?: (data?.get("canonical_sha256") as? String)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+                repo?.recordIncomingClipboardImageSha256(
+                    sha256.ifBlank { dlRes.sha256 },
+                    computedCanonical
+                )
                 if (seq > 0L && eventId.isNotBlank()) {
                     repo?.sendClipboardAck(seq, eventId)
                 }

@@ -239,7 +239,12 @@ class SnowMcpBridge:
         self.local_clipboard = self.capability_engine.clipboard
 
         # Daemon lifecycle manager for cross-device requests
-        self.daemon_manager = CoreDaemonManager(host=self.host, port=self.port)
+        self.daemon_manager = CoreDaemonManager(
+            host=self.host,
+            port=self.port,
+            secret=secret,
+            secret_path=secret_path,
+        )
 
         # Idempotent clipboard sync state: (device_id, direction) -> last_synced_sha256
         self._clipboard_sync_hashes: dict[tuple[str, str], str] = {}
@@ -738,6 +743,33 @@ class SnowMcpBridge:
             "android_file_send",
             payload={"file_path": file_path, "device_id": target_id or ""},
             timeout=60.0,
+        )
+
+    async def android_file_send_async(self, file_path: str, device_id: str = "") -> dict[str, Any]:
+        """Initiate an async decoupled Desktop -> Android file transfer returning ACCEPTED + transfer_id."""
+        target_id, err = await self._resolve_android_target(device_id)
+        if not target_id:
+            return err
+        return await self.call_cross_device(
+            "android_file_send",
+            payload={"file_path": file_path, "device_id": target_id or "", "async_transfer": True},
+            timeout=30.0,
+        )
+
+    async def transfer_status(self, transfer_id: str, device_id: str = "") -> dict[str, Any]:
+        """Query Core transfer progress and lifecycle status."""
+        return await self.call_cross_device(
+            "transfer_status",
+            payload={"transfer_id": transfer_id, "device_id": device_id or ""},
+            timeout=15.0,
+        )
+
+    async def transfer_cancel(self, transfer_id: str, device_id: str = "") -> dict[str, Any]:
+        """Cancel an in-flight Core/Android transfer and clean partial staging."""
+        return await self.call_cross_device(
+            "transfer_cancel",
+            payload={"transfer_id": transfer_id, "device_id": device_id or ""},
+            timeout=15.0,
         )
 
     async def android_file_receive(

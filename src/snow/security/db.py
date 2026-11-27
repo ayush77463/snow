@@ -460,7 +460,10 @@ class DatabaseManager:
                     mime_type TEXT,
                     event_id TEXT,
                     seq INTEGER NOT NULL DEFAULT 0,
-                    file_manifest_json TEXT NOT NULL DEFAULT '[]'
+                    file_manifest_json TEXT NOT NULL DEFAULT '[]',
+                    canonical_sha256 TEXT,
+                    width INTEGER,
+                    height INTEGER
                 );
             """)
             cur_cb = conn.execute("PRAGMA table_info(clipboard_buffer_items);")
@@ -475,6 +478,12 @@ class DatabaseManager:
                 conn.execute(
                     "ALTER TABLE clipboard_buffer_items ADD COLUMN file_manifest_json TEXT NOT NULL DEFAULT '[]';"
                 )
+            if "canonical_sha256" not in cb_columns:
+                conn.execute("ALTER TABLE clipboard_buffer_items ADD COLUMN canonical_sha256 TEXT;")
+            if "width" not in cb_columns:
+                conn.execute("ALTER TABLE clipboard_buffer_items ADD COLUMN width INTEGER;")
+            if "height" not in cb_columns:
+                conn.execute("ALTER TABLE clipboard_buffer_items ADD COLUMN height INTEGER;")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_clipboard_timestamp
                 ON clipboard_buffer_items(timestamp DESC);
@@ -486,6 +495,10 @@ class DatabaseManager:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_clipboard_sha256
                 ON clipboard_buffer_items(sha256);
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_clipboard_canonical_sha256
+                ON clipboard_buffer_items(canonical_sha256);
             """)
 
     @staticmethod
@@ -1493,6 +1506,9 @@ class DatabaseManager:
         seq: int = 0,
         file_manifest_json: Optional[str] = None,
         file_manifest: Optional[List[dict[str, Any]]] = None,
+        canonical_sha256: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
     ) -> bool:
         """Insert or replace a clipboard ring buffer item in persistent storage."""
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
@@ -1511,12 +1527,19 @@ class DatabaseManager:
         if clean_event_id == "":
             clean_event_id = None
 
+        clean_canonical = str(canonical_sha256).strip().lower() if canonical_sha256 is not None else None
+        if clean_canonical == "":
+            clean_canonical = None
+
+        clean_width = int(width) if isinstance(width, int) and not isinstance(width, bool) and width > 0 else None
+        clean_height = int(height) if isinstance(height, int) and not isinstance(height, bool) and height > 0 else None
+
         query = """
             INSERT INTO clipboard_buffer_items (
                 item_id, content_type, preview, source_device_id, source_device_name,
                 timestamp, sha256, size_bytes, pinned, text_content, image_rel_path, mime_type,
-                event_id, seq, file_manifest_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                event_id, seq, file_manifest_json, canonical_sha256, width, height
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id) DO UPDATE SET
                 content_type = excluded.content_type,
                 pinned = excluded.pinned,
@@ -1531,7 +1554,10 @@ class DatabaseManager:
                 mime_type = excluded.mime_type,
                 event_id = excluded.event_id,
                 seq = excluded.seq,
-                file_manifest_json = excluded.file_manifest_json;
+                file_manifest_json = excluded.file_manifest_json,
+                canonical_sha256 = COALESCE(excluded.canonical_sha256, clipboard_buffer_items.canonical_sha256),
+                width = COALESCE(excluded.width, clipboard_buffer_items.width),
+                height = COALESCE(excluded.height, clipboard_buffer_items.height);
         """
         with self._lock:
             with self._get_connection() as conn:
@@ -1553,7 +1579,33 @@ class DatabaseManager:
                         clean_event_id,
                         seq,
                         manifest_str,
+                        clean_canonical,
+                        clean_width,
+                        clean_height,
                     ),
+                )
+                return cursor.rowcount > 0
+
+    def update_clipboard_canonical_metadata(
+        self,
+        item_id: str,
+        canonical_sha256: Optional[str],
+        width: Optional[int],
+        height: Optional[int],
+    ) -> bool:
+        """Persist lazily hydrated canonical image metadata without overwriting other fields."""
+        clean_canonical = str(canonical_sha256).strip().lower() if canonical_sha256 else None
+        clean_w = int(width) if isinstance(width, int) and not isinstance(width, bool) and width > 0 else None
+        clean_h = int(height) if isinstance(height, int) and not isinstance(height, bool) and height > 0 else None
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE clipboard_buffer_items
+                    SET canonical_sha256 = ?, width = ?, height = ?
+                    WHERE item_id = ?;
+                    """,
+                    (clean_canonical, clean_w, clean_h, item_id),
                 )
                 return cursor.rowcount > 0
 

@@ -15,13 +15,17 @@ Implements Phase 21 Recovery:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import http.client
 import inspect
+import ipaddress
 import json
 import logging
 import math
 import os
 from pathlib import Path
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -31,16 +35,232 @@ import webbrowser
 
 import aiohttp
 from aiohttp import web
+import psutil
 
+from snow.core.config import CoreConfig
 from snow.mcp.bridge import SnowMcpBridge
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_DASHBOARD_PORT = 8769
+DASHBOARD_SERVICE_ID = "snow-web-dashboard"
 BOOTSTRAP_EXPIRY_SECONDS = 60.0
 BOOTSTRAP_TOKEN_LIFETIME_SECONDS = BOOTSTRAP_EXPIRY_SECONDS
 SESSION_IDLE_TIMEOUT_SECONDS = 3600.0  # 1 hour
+
+TELEMETRY_OVERALL_DEADLINE_SECONDS = 1.8
+TELEMETRY_PER_DEVICE_TIMEOUT_SECONDS = 1.4
+TELEMETRY_MAX_CONCURRENT_PROBES = 4
+TELEMETRY_CACHE_TTL_SECONDS = 5.0
+TELEMETRY_CACHE_MAX_ENTRIES = 64
+
+
+def is_valid_loopback_host_header(raw_host: str) -> bool:
+    """Strictly validate an HTTP Host header against loopback hostnames/addresses."""
+    if (
+        not raw_host
+        or not isinstance(raw_host, str)
+        or any(ch.isspace() for ch in raw_host)
+        or "@" in raw_host
+        or "/" in raw_host
+        or "\\" in raw_host
+    ):
+        return False
+
+    host = raw_host.strip()
+    hostname = host
+    if host.startswith("["):
+        end = host.find("]")
+        if end <= 1:
+            return False
+        hostname = host[1:end]
+        rest = host[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                return False
+            port = int(rest[1:])
+            if not (1 <= port <= 65535):
+                return False
+    elif host.count(":") == 1:
+        hostname, port_str = host.split(":", 1)
+        if not port_str.isdigit() or not (1 <= int(port_str) <= 65535):
+            return False
+    elif ":" in host:
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            return bool(ip_obj.is_loopback)
+        except ValueError:
+            return False
+
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(hostname)
+        return bool(ip_obj.is_loopback)
+    except ValueError:
+        return False
+
+
+def is_port_bound(host: str = "127.0.0.1", port: int = DEFAULT_DASHBOARD_PORT) -> bool:
+    """Return True if the target loopback host/port is already occupied."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.3)
+    try:
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        sock.bind((host, port))
+        return False
+    except OSError:
+        return True
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _verify_dashboard_pid(pid: int, host: str, port: int) -> bool:
+    """Verify a reported health PID corresponds to an actual local SNOW dashboard process."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        proc = psutil.Process(pid)
+        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+
+        # First check listening socket ownership when available for this user's process.
+        try:
+            for conn in proc.net_connections(kind="tcp"):
+                laddr = getattr(conn, "laddr", None)
+                if laddr and getattr(laddr, "port", None) == port:
+                    status = str(getattr(conn, "status", "")).upper()
+                    if status == "LISTEN" or not status:
+                        return True
+        except (psutil.AccessDenied, psutil.Error, AttributeError, OSError):
+            pass
+
+        try:
+            cmdline = " ".join(str(part) for part in proc.cmdline()).lower()
+        except (psutil.AccessDenied, psutil.Error, OSError):
+            cmdline = ""
+        name = (proc.name() or "").lower()
+        is_snow_web_proc = (
+            "snow.web" in cmdline
+            or "-m snow.cli web" in cmdline
+            or "snow.cli web" in cmdline
+            or (name in ("snow.exe", "snow") and "web" in cmdline)
+        )
+        return is_snow_web_proc
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    except Exception:
+        return False
+
+
+def probe_existing_dashboard(
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_DASHBOARD_PORT,
+    timeout: float = 1.5,
+) -> dict[str, Any]:
+    """Probe GET /api/health to verify if port hosts a healthy SNOW Web Dashboard."""
+    conn: Optional[http.client.HTTPConnection] = None
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", "/api/health", headers={"Host": f"{host}:{port}"})
+        resp = conn.getresponse()
+        body_bytes = resp.read(16384)
+        if resp.status != 200:
+            return {
+                "is_healthy_snow": False,
+                "reason": "UNEXPECTED_HTTP_STATUS",
+                "error": f"HTTP {resp.status} returned from /api/health",
+            }
+        data = json.loads(body_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            return {
+                "is_healthy_snow": False,
+                "reason": "INVALID_HEALTH_JSON",
+                "error": "Non-object JSON payload returned from /api/health",
+            }
+        service = data.get("service")
+        status = data.get("status")
+        version = data.get("version")
+        pid = data.get("pid")
+        if service != DASHBOARD_SERVICE_ID or status != "ok":
+            return {
+                "is_healthy_snow": False,
+                "reason": "NON_SNOW_SERVICE",
+                "error": f"Unexpected service identity ({service!r}, {status!r})",
+            }
+        if not isinstance(version, str) or version != CoreConfig.version:
+            return {
+                "is_healthy_snow": False,
+                "reason": "VERSION_MISMATCH",
+                "error": f"Unexpected dashboard version {version!r}",
+            }
+        if not _verify_dashboard_pid(pid, host=host, port=port):
+            return {
+                "is_healthy_snow": False,
+                "reason": "UNVERIFIED_PID",
+                "error": f"Reported dashboard PID {pid!r} failed local process verification",
+            }
+        return {
+            "is_healthy_snow": True,
+            "url": f"http://{host}:{port}",
+            "health": data,
+        }
+    except Exception as exc:
+        return {
+            "is_healthy_snow": False,
+            "reason": "HEALTH_PROBE_FAILED",
+            "error": str(exc),
+        }
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def reuse_or_reject_existing_dashboard(
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_DASHBOARD_PORT,
+    no_browser: bool = False,
+) -> int:
+    """Reuse an already running verified SNOW Web Dashboard or fail closed on port conflict."""
+    probe = probe_existing_dashboard(host=host, port=port)
+    if not probe.get("is_healthy_snow"):
+        print(
+            f"[-] Port {port} on {host} is already occupied by a process that could not be verified "
+            f"as a healthy SNOW Web Dashboard ({probe.get('error', 'unknown error')}). "
+            "Specify an alternative port with --port or stop the conflicting process.",
+            file=sys.stderr,
+        )
+        return 1
+
+    dashboard_url = probe["url"]
+    if not no_browser:
+        try:
+            opened = bool(webbrowser.open(dashboard_url))
+        except Exception as exc:
+            print(
+                f"[-] Existing SNOW Web Dashboard verified on {dashboard_url}, "
+                f"but failed opening browser: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        if not opened:
+            print(
+                f"[-] Existing SNOW Web Dashboard verified on {dashboard_url}, "
+                "but browser launch returned False.",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(f"[+] Reusing healthy SNOW Web Dashboard already listening on {dashboard_url}")
+    return 0
 
 
 class SnowWebServer:
@@ -112,6 +332,12 @@ class SnowWebServer:
         # Track active dashboard-initiated file transfer tasks for cancellation
         self._active_file_downloads: dict[str, asyncio.Task[Any]] = {}
         self._active_file_downloads_lock = asyncio.Lock()
+        self._active_web_uploads: dict[str, Path] = {}
+        self._active_web_uploads_lock = asyncio.Lock()
+
+        # In-memory short-lived per-device telemetry cache (never persisted to disk/SQLite)
+        self._device_telemetry_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._device_telemetry_locks: dict[str, asyncio.Lock] = {}
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         """Return a shared, reusable aiohttp ClientSession bound to the running event loop."""
@@ -126,10 +352,10 @@ class SnowWebServer:
     @web.middleware
     async def security_middleware(self, request: web.Request, handler) -> web.Response:
         """Enforce Host, Origin, CSRF, and Content Security Policy headers."""
-        # 1. Host header validation (DNS-rebinding prevention)
-        host_header = request.headers.get("Host", "").split(":")[0].lower()
-        if host_header not in ("127.0.0.1", "localhost"):
-            logger.warning("Rejected request with invalid Host header: %s", request.headers.get("Host"))
+        # 1. Strict loopback Host header validation (DNS-rebinding prevention)
+        raw_host = request.headers.get("Host", "")
+        if not is_valid_loopback_host_header(raw_host):
+            logger.warning("Rejected request with invalid Host header: %s", raw_host)
             return web.Response(status=400, text="Bad Request: Invalid Host header.")
 
         # 2. Origin & Referer validation on mutating (POST) requests
@@ -139,6 +365,7 @@ class SnowWebServer:
             valid_origins = (
                 f"http://127.0.0.1:{self.port}",
                 f"http://localhost:{self.port}",
+                f"http://[::1]:{self.port}",
             )
             if origin:
                 clean_origin = origin.rstrip("/")
@@ -158,8 +385,9 @@ class SnowWebServer:
 
         # 3. Authentication & CSRF validation for API routes
         if request.path.startswith("/api/"):
-            # Exclude bootstrap exchange and APK download endpoints from global session / CSRF check
-            if request.path not in ("/api/auth/session", "/api/app/download-apk", "/api/install/android-apk"):
+            is_health_read = request.path == "/api/health" and request.method in ("GET", "HEAD")
+            # Exclude read-only /api/health, bootstrap exchange, and APK download endpoints from session/CSRF check
+            if not is_health_read and request.path not in ("/api/auth/session", "/api/app/download-apk", "/api/install/android-apk"):
                 session = self._get_valid_session(request)
                 if not session:
                     return web.json_response(
@@ -428,39 +656,193 @@ class SnowWebServer:
                     return self._usb_status_cache
                 return {"connected": False, "authorized_count": 0, "reverse_active": False}
 
+    @staticmethod
+    def _sanitize_device_telemetry(raw_data: dict[str, Any]) -> dict[str, Any]:
+        """Return a safe, non-sensitive copy of battery/device telemetry."""
+        forbidden_keys = {
+            "auth_token", "token", "secret", "ipc_secret",
+            "password", "pairing_token", "ticket", "private_key",
+        }
+        tel = {
+            k: v
+            for k, v in raw_data.items()
+            if str(k).lower() not in forbidden_keys
+        }
+        if "battery_level" not in tel and "level" in tel:
+            tel["battery_level"] = tel["level"]
+        return tel
+
+    def _get_fresh_cached_telemetry(self, device_id: str) -> Optional[tuple[dict[str, Any], float]]:
+        """Return (telemetry_copy, age_seconds) if valid within short TTL, else None."""
+        entry = self._device_telemetry_cache.get(device_id)
+        if entry is None:
+            return None
+        cached_at, payload = entry
+        age = time.monotonic() - cached_at
+        if age < 0 or age >= TELEMETRY_CACHE_TTL_SECONDS:
+            self._device_telemetry_cache.pop(device_id, None)
+            return None
+        self._device_telemetry_cache.move_to_end(device_id)
+        return dict(payload), age
+
+    def _store_cached_telemetry(self, device_id: str, telemetry: dict[str, Any]) -> None:
+        """Store validated telemetry in the bounded in-memory LRU cache."""
+        clean = dict(telemetry)
+        self._device_telemetry_cache[device_id] = (time.monotonic(), clean)
+        self._device_telemetry_cache.move_to_end(device_id)
+        while len(self._device_telemetry_cache) > TELEMETRY_CACHE_MAX_ENTRIES:
+            self._device_telemetry_cache.popitem(last=False)
+
+    async def _fetch_device_telemetry(
+        self,
+        device_id: str,
+        semaphore: asyncio.Semaphore,
+        deadline: float,
+    ) -> tuple[Optional[dict[str, Any]], str, Optional[float]]:
+        """Fetch live telemetry for a single device with caching, dedup lock, and timeout."""
+        fresh = self._get_fresh_cached_telemetry(device_id)
+        if fresh is not None:
+            tel, age = fresh
+            return tel, "cached", age
+
+        dev_lock = self._device_telemetry_locks.get(device_id)
+        if dev_lock is None:
+            dev_lock = asyncio.Lock()
+            self._device_telemetry_locks[device_id] = dev_lock
+
+        async with dev_lock:
+            fresh = self._get_fresh_cached_telemetry(device_id)
+            if fresh is not None:
+                tel, age = fresh
+                return tel, "cached", age
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.02:
+                return None, "unavailable", None
+
+            per_dev_timeout = min(TELEMETRY_PER_DEVICE_TIMEOUT_SECONDS, remaining)
+            async with semaphore:
+                remaining_after_sem = deadline - time.monotonic()
+                if remaining_after_sem <= 0.02:
+                    return None, "unavailable", None
+                per_dev_timeout = min(TELEMETRY_PER_DEVICE_TIMEOUT_SECONDS, remaining_after_sem)
+                try:
+                    raw_bat = self.bridge.android_battery(device_id=device_id)
+                    if inspect.isawaitable(raw_bat):
+                        bat_res = await asyncio.wait_for(raw_bat, timeout=per_dev_timeout)
+                    else:
+                        bat_res = raw_bat
+                    if (
+                        isinstance(bat_res, dict)
+                        and bat_res.get("success")
+                        and isinstance(bat_res.get("data"), dict)
+                    ):
+                        clean_tel = self._sanitize_device_telemetry(bat_res["data"])
+                        self._store_cached_telemetry(device_id, clean_tel)
+                        return dict(clean_tel), "live", 0.0
+                    return None, "unavailable", None
+                except asyncio.TimeoutError:
+                    return None, "unavailable", None
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logger.debug("Failed fetching live telemetry for device %s: %s", device_id, ex)
+                    return None, "unavailable", None
+
+    async def handle_api_health(self, request: web.Request) -> web.Response:
+        """Read-only, non-sensitive localhost health endpoint identifying SNOW Web Dashboard."""
+        return web.json_response({
+            "service": DASHBOARD_SERVICE_ID,
+            "status": "ok",
+            "version": CoreConfig.version,
+            "pid": os.getpid(),
+        })
+
     async def handle_api_status(self, request: web.Request) -> web.Response:
-        """Query Core daemon status and host telemetry."""
+        """Query Core daemon status and host telemetry concurrently within strict deadline."""
         session_token = request.cookies.get("snow_session")
         csrf_token = None
         if session_token and session_token in self._sessions:
             csrf_token = self._sessions[session_token].get("csrf_token")
 
-        async def _safe_bridge_call(coro_or_val: Any, timeout: float = 2.0) -> dict[str, Any]:
+        async def _safe_bridge_call(coro_or_val: Any, timeout: float = 1.5, default: Any = None) -> Any:
             try:
                 if inspect.isawaitable(coro_or_val):
-                    res = await asyncio.wait_for(coro_or_val, timeout=timeout)
-                else:
-                    res = coro_or_val
-                return res if isinstance(res, dict) else {}
+                    return await asyncio.wait_for(coro_or_val, timeout=timeout)
+                return coro_or_val
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                return {}
+                return default
 
         dm = getattr(self.bridge, "daemon_manager", None)
-        daemon_raw = await _safe_bridge_call(dm.is_ipc_ready(timeout=0.2), timeout=1.0) if dm is not None else True
-        daemon_online = bool(daemon_raw) if not isinstance(daemon_raw, dict) else True
-        telemetry_res = (
-            await _safe_bridge_call(self.bridge.windows_system_info(), timeout=2.0)
-            if hasattr(self.bridge, "windows_system_info")
-            else {}
-        )
-        battery_res = (
-            await _safe_bridge_call(self.bridge.windows_battery(), timeout=2.0)
-            if hasattr(self.bridge, "windows_battery")
-            else {}
-        )
+
+        async def _get_daemon_online() -> bool:
+            if dm is None:
+                return True
+            raw = await _safe_bridge_call(dm.is_ipc_ready(timeout=0.2), timeout=1.0, default=False)
+            return bool(raw) if not isinstance(raw, dict) else True
+
+        async def _get_sys_info() -> dict[str, Any]:
+            if not hasattr(self.bridge, "windows_system_info"):
+                return {}
+            res = await _safe_bridge_call(self.bridge.windows_system_info(), timeout=1.5, default={})
+            return res if isinstance(res, dict) else {}
+
+        async def _get_win_battery() -> dict[str, Any]:
+            if not hasattr(self.bridge, "windows_battery"):
+                return {}
+            res = await _safe_bridge_call(self.bridge.windows_battery(), timeout=1.5, default={})
+            return res if isinstance(res, dict) else {}
+
+        async def _get_lan_ips() -> list[str]:
+            from snow.core.network import get_active_ip_addresses
+            res = await _safe_bridge_call(asyncio.to_thread(get_active_ip_addresses), timeout=1.5, default=[])
+            return res if isinstance(res, list) else []
+
+        async def _get_usb() -> dict[str, Any]:
+            res = await _safe_bridge_call(self._get_cached_usb_status(), timeout=1.5, default={})
+            return res if isinstance(res, dict) else {}
+
+        tasks = {
+            "daemon": asyncio.create_task(_get_daemon_online()),
+            "telemetry": asyncio.create_task(_get_sys_info()),
+            "battery": asyncio.create_task(_get_win_battery()),
+            "lan_ips": asyncio.create_task(_get_lan_ips()),
+            "usb": asyncio.create_task(_get_usb()),
+        }
+        try:
+            _, pending = await asyncio.wait(
+                tasks.values(),
+                timeout=TELEMETRY_OVERALL_DEADLINE_SECONDS,
+            )
+            if pending:
+                for pt in pending:
+                    pt.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+        except asyncio.CancelledError:
+            for t in tasks.values():
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            raise
+
+        def _done_result(task: asyncio.Task[Any], fallback: Any) -> Any:
+            if task.done() and not task.cancelled():
+                try:
+                    return task.result()
+                except Exception:
+                    return fallback
+            return fallback
+
+        daemon_online = bool(_done_result(tasks["daemon"], False))
+        telemetry_res = _done_result(tasks["telemetry"], {})
+        battery_res = _done_result(tasks["battery"], {})
+        lan_ips = _done_result(tasks["lan_ips"], [])
+        usb_stat = _done_result(tasks["usb"], {})
 
         host_telemetry: dict[str, Any] = {}
-        if telemetry_res.get("success") and isinstance(telemetry_res.get("data"), dict):
+        if isinstance(telemetry_res, dict) and telemetry_res.get("success") and isinstance(telemetry_res.get("data"), dict):
             sys_data = telemetry_res["data"]
             host_telemetry = dict(sys_data)
             cpu_info = sys_data.get("cpu") if isinstance(sys_data.get("cpu"), dict) else {}
@@ -484,21 +866,18 @@ class SnowWebServer:
                 host_telemetry["storage_available_bytes"] = max(0, disk_tot - disk_used)
                 host_telemetry["storage_percent"] = disk_info.get("percent")
 
-        if battery_res.get("success") and isinstance(battery_res.get("data"), dict):
+        if isinstance(battery_res, dict) and battery_res.get("success") and isinstance(battery_res.get("data"), dict):
             bdata = battery_res["data"]
             host_telemetry["battery_status"] = bdata.get("status")
             host_telemetry["battery_charging"] = bdata.get("power_plugged")
             if bdata.get("available") and bdata.get("percent") is not None:
                 host_telemetry["battery_percent"] = bdata.get("percent")
 
-        from snow.core.network import get_active_ip_addresses
-        lan_ips = await asyncio.to_thread(get_active_ip_addresses)
         lan_available = bool(lan_ips)
-        try:
-            usb_stat = await asyncio.wait_for(self._get_cached_usb_status(), timeout=2.0)
-            usb_connected = bool(usb_stat.get("connected") or usb_stat.get("authorized_count", 0) > 0)
-        except Exception:
-            usb_connected = False
+        usb_connected = bool(
+            isinstance(usb_stat, dict)
+            and (usb_stat.get("connected") or usb_stat.get("authorized_count", 0) > 0)
+        )
 
         from snow.security.identity import load_or_create_device_identity
         identity = load_or_create_device_identity()
@@ -560,7 +939,7 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_devices(self, request: web.Request) -> web.Response:
-        """Query connected and paired devices with authoritative transport."""
+        """Query connected and paired devices with bounded parallel telemetry."""
         res = await self.bridge.list_devices()
         devices = []
         if isinstance(res.get("data"), dict) and "devices" in res["data"]:
@@ -576,6 +955,7 @@ class SnowWebServer:
         seen_ids: set[str] = set()
         seen_discovered_ids: set[str] = set()
         seen_local = False
+        telemetry_targets: list[tuple[dict[str, Any], str]] = []
 
         for raw_dev in devices:
             dev = dict(raw_dev)
@@ -625,29 +1005,70 @@ class SnowWebServer:
                 or dev.get("platform") == "generic"
             ):
                 if dev_id:
-                    try:
-                        raw_bat = self.bridge.android_battery(device_id=dev_id)
-                        bat_res = (
-                            await asyncio.wait_for(raw_bat, timeout=2.0)
-                            if inspect.isawaitable(raw_bat)
-                            else raw_bat
-                        )
-                        if isinstance(bat_res, dict) and bat_res.get("success") and isinstance(bat_res.get("data"), dict):
-                            tel = dict(bat_res["data"])
-                            if "battery_level" not in tel and "level" in tel:
-                                tel["battery_level"] = tel["level"]
-                            dev["telemetry"] = tel
-                    except Exception as ex:
-                        logger.debug("Failed fetching live telemetry for device %s: %s", dev_id, ex)
+                    telemetry_targets.append((dev, dev_id))
 
             deduped.append(dev)
         devices = deduped
 
-        # Optionally include live LAN discovery candidates in separate 'discovered_peers' view
+        deadline = time.monotonic() + TELEMETRY_OVERALL_DEADLINE_SECONDS
+        semaphore = asyncio.Semaphore(TELEMETRY_MAX_CONCURRENT_PROBES)
+        tel_tasks: list[tuple[dict[str, Any], asyncio.Task[tuple[Optional[dict[str, Any]], str, Optional[float]]]]] = [
+            (dev, asyncio.create_task(self._fetch_device_telemetry(dev_id, semaphore, deadline)))
+            for dev, dev_id in telemetry_targets
+        ]
+
+        disc_task: Optional[asyncio.Task[Any]] = None
         bridge_cls = type(self.bridge) if self.bridge is not None else None
         if self.bridge is not None and inspect.iscoroutinefunction(getattr(bridge_cls, "list_discovered_peers", None)):
+            async def _fetch_discovered() -> Any:
+                rem = deadline - time.monotonic()
+                if rem <= 0.02:
+                    return {}
+                return await asyncio.wait_for(
+                    self.bridge.list_discovered_peers(),
+                    timeout=min(TELEMETRY_PER_DEVICE_TIMEOUT_SECONDS, rem),
+                )
+
+            disc_task = asyncio.create_task(_fetch_discovered())
+
+        all_tasks: list[asyncio.Task[Any]] = [t for _, t in tel_tasks]
+        if disc_task is not None:
+            all_tasks.append(disc_task)
+
+        if all_tasks:
             try:
-                disc_res = await asyncio.wait_for(self.bridge.list_discovered_peers(), timeout=2.0)
+                _, pending = await asyncio.wait(all_tasks, timeout=TELEMETRY_OVERALL_DEADLINE_SECONDS)
+                if pending:
+                    for pt in pending:
+                        pt.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+            except asyncio.CancelledError:
+                for t in all_tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*all_tasks, return_exceptions=True)
+                raise
+
+        for dev, task in tel_tasks:
+            if task.done() and not task.cancelled():
+                try:
+                    tel_dict, tel_status, _ = task.result()
+                except Exception:
+                    tel_dict, tel_status = None, "unavailable"
+            else:
+                tel_dict, tel_status = None, "unavailable"
+
+            if tel_dict is not None:
+                dev["telemetry"] = tel_dict
+                dev["telemetry_status"] = tel_status
+                if tel_status == "cached":
+                    dev["telemetry_cached"] = True
+            else:
+                dev["telemetry_status"] = "unavailable"
+
+        if disc_task is not None and disc_task.done() and not disc_task.cancelled():
+            try:
+                disc_res = disc_task.result()
                 if isinstance(disc_res, dict) and disc_res.get("success"):
                     for peer in (disc_res.get("data") or {}).get("peers", []) or []:
                         if not isinstance(peer, dict):
@@ -1235,7 +1656,7 @@ class SnowWebServer:
         device_id = request.query.get("device_id", "")
         device_type_hint = request.query.get("device_type", "")
         subpath = request.query.get("subpath", "")
-        scope = request.query.get("scope", "full")
+        scope = request.query.get("scope", "auto")
         if "hide_hidden" in request.query:
             show_hidden = not (request.query.get("hide_hidden", "false").lower() in ("true", "1"))
         else:
@@ -1441,18 +1862,67 @@ class SnowWebServer:
             }, status=500)
 
     async def handle_api_files_transfer_cancel(self, request: web.Request) -> web.Response:
-        """Cancel active dashboard-initiated file downloads cleanly."""
+        """Cancel active dashboard-initiated file downloads or Core/Android transfers cleanly."""
+        transfer_id = ""
+        device_id = ""
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                transfer_id = str(body.get("transfer_id") or "").strip()
+                device_id = str(body.get("device_id") or "").strip()
+        except Exception:
+            pass
+
         cancelled = 0
         async with self._active_file_downloads_lock:
             for tid, task in list(self._active_file_downloads.items()):
-                if task and not task.done():
+                if (not transfer_id or tid == transfer_id) and task and not task.done():
                     task.cancel()
                     cancelled += 1
+
+        if transfer_id:
+            async with self._active_web_uploads_lock:
+                up_path = self._active_web_uploads.pop(transfer_id, None)
+                if up_path:
+                    try:
+                        up_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            if hasattr(self.bridge, "transfer_cancel"):
+                try:
+                    c_res = await self.bridge.transfer_cancel(transfer_id=transfer_id, device_id=device_id)
+                    if isinstance(c_res, dict) and c_res.get("success"):
+                        cancelled = max(cancelled, 1)
+                except Exception as exc:
+                    logger.debug("Cross-layer transfer_cancel failed for %s: %s", transfer_id, exc)
+
         return web.json_response({
             "success": True,
             "status": "CANCELLED",
+            "transfer_id": transfer_id or None,
             "cancelled_count": cancelled,
         })
+
+    async def handle_api_files_transfer_status(self, request: web.Request) -> web.Response:
+        """Query owner-scoped transfer progress/state from Core."""
+        transfer_id = request.match_info.get("transfer_id", "").strip()
+        device_id = request.query.get("device_id", "").strip()
+        if not transfer_id:
+            return web.json_response({"success": False, "status": "INVALID_ARGUMENT", "error": "Missing transfer_id."}, status=400)
+        if not hasattr(self.bridge, "transfer_status"):
+            return web.json_response({"success": False, "status": "UNSUPPORTED", "error": "Transfer status unavailable."}, status=501)
+        res = await self.bridge.transfer_status(transfer_id=transfer_id, device_id=device_id)
+        http_status = 200 if res.get("success") else (404 if res.get("status") == "NOT_FOUND" else 400)
+        data_dict = res.get("data") if isinstance(res.get("data"), dict) else {}
+        return web.json_response(
+            {
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": data_dict,
+                "error": res.get("error"),
+            },
+            status=http_status,
+        )
 
     async def handle_api_notifications(self, request: web.Request) -> web.Response:
         """List active non-sensitive notifications from the connected phone."""
@@ -4251,54 +4721,166 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_files_upload(self, request: web.Request) -> web.Response:
-        """Upload a file from Desktop Web to the connected Android phone."""
+        """Stream a file from Desktop Web to the connected Android phone without full-RAM buffering."""
         if not request.content_type.startswith("multipart/"):
             return web.json_response({"success": False, "error": "Expected multipart/form-data."}, status=400)
 
+        from snow.core.config import CoreConfig, MAX_SUPPORTED_TRANSFER_SIZE
+        from snow.transfer.storage import CHUNK_SIZE, check_free_space, sanitize_filename
+
+        cfg = getattr(self.transfer_server, "config", None) if getattr(self, "transfer_server", None) else None
+        raw_limit = getattr(cfg, "max_transfer_size", None) if cfg is not None else None
+        max_transfer_bytes = (
+            raw_limit
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else (CoreConfig.max_transfer_size or MAX_SUPPORTED_TRANSFER_SIZE)
+        )
+
+        # Reject oversized declared uploads upfront
+        if request.content_length is not None and request.content_length > max_transfer_bytes:
+            return web.json_response(
+                {"success": False, "error": f"Upload size exceeds {max_transfer_bytes} byte limit."},
+                status=413,
+            )
+
+        import hashlib
         import tempfile
         stage_dir = Path(tempfile.gettempdir()) / "snow_web_uploads"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
-        reader = await request.multipart()
+        if request.content_length is not None and request.content_length > 0:
+            try:
+                has_space, free_bytes = check_free_space(stage_dir, request.content_length)
+                if not has_space:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "status": "INSUFFICIENT_STORAGE",
+                            "error": f"Insufficient disk space: need {request.content_length} bytes, only {free_bytes} bytes free.",
+                        },
+                        status=507,
+                    )
+            except Exception:
+                pass
+
+        upload_token = secrets.token_hex(8)
+        part_file: Optional[Path] = None
+        staged_file: Optional[Path] = None
         device_id = ""
-        staged_file = None
         filename = "uploaded_file"
-
-        while True:
-            part = await reader.next()
-            if part is None:
-                break
-            if part.name == "device_id":
-                device_id = (await part.text()).strip()
-            elif part.name == "file":
-                filename = Path(part.filename or "uploaded_file").name
-                staged_file = stage_dir / f"{secrets.token_hex(8)}_{filename}"
-                total_bytes = 0
-                with open(staged_file, "wb") as f:
-                    while True:
-                        chunk = await part.read_chunk()
-                        if not chunk:
-                            break
-                        total_bytes += len(chunk)
-                        if total_bytes > 100 * 1024 * 1024:
-                            staged_file.unlink(missing_ok=True)
-                            return web.json_response({"success": False, "error": "File exceeds 100MB limit."}, status=413)
-                        f.write(chunk)
-
-        if not staged_file or not staged_file.exists():
-            return web.json_response({"success": False, "error": "No file uploaded."}, status=400)
+        expected_sha256 = ""
+        async_requested = request.query.get("async", "").strip().lower() in ("1", "true", "yes")
+        total_bytes = 0
+        computed_sha256 = ""
 
         try:
-            res = await self.bridge.android_file_send(file_path=str(staged_file), device_id=device_id)
-            return web.json_response({
-                "success": res.get("success", False),
-                "status": res.get("status", "SUCCESS"),
-                "filename": filename,
-                "data": res.get("data", {}),
-                "error": res.get("error"),
-            })
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "device_id":
+                    device_id = (await part.text()).strip()
+                elif part.name == "async_transfer":
+                    raw_async = (await part.text()).strip().lower()
+                    async_requested = raw_async in ("1", "true", "yes")
+                elif part.name == "expected_sha256":
+                    expected_sha256 = (await part.text()).strip().lower()
+                elif part.name == "file":
+                    try:
+                        filename = sanitize_filename(part.filename or "uploaded_file")
+                    except ValueError:
+                        filename = "uploaded_file"
+                    part_file = stage_dir / f".{upload_token}_{filename}.part"
+                    staged_file = stage_dir / f"{upload_token}_{filename}"
+                    async with self._active_web_uploads_lock:
+                        self._active_web_uploads[upload_token] = part_file
+                    hasher = hashlib.sha256()
+                    total_bytes = 0
+                    with open(part_file, "wb") as f:
+                        while True:
+                            chunk = await part.read_chunk(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            total_bytes += len(chunk)
+                            if total_bytes > max_transfer_bytes:
+                                f.close()
+                                part_file.unlink(missing_ok=True)
+                                part_file = None
+                                return web.json_response(
+                                    {"success": False, "error": f"File exceeds {max_transfer_bytes} byte limit."},
+                                    status=413,
+                                )
+                            f.write(chunk)
+                            hasher.update(chunk)
+                        f.flush()
+                    computed_sha256 = hasher.hexdigest().lower()
+
+            if not part_file or not part_file.exists() or not staged_file:
+                return web.json_response({"success": False, "error": "No file uploaded."}, status=400)
+
+            if expected_sha256 and computed_sha256 != expected_sha256:
+                part_file.unlink(missing_ok=True)
+                part_file = None
+                return web.json_response(
+                    {"success": False, "status": "INTEGRITY_MISMATCH", "error": "Uploaded file SHA-256 mismatch."},
+                    status=422,
+                )
+
+            os.replace(part_file, staged_file)
+            part_file = None
+
+            use_async = async_requested or (total_bytes > 16 * 1024 * 1024)
+            if use_async and hasattr(self.bridge, "android_file_send_async") and not type(self.bridge).__name__.endswith("Mock"):
+                res = await self.bridge.android_file_send_async(file_path=str(staged_file), device_id=device_id)
+            else:
+                res = await self.bridge.android_file_send(file_path=str(staged_file), device_id=device_id)
+
+            res_status = str(res.get("status") or "SUCCESS").upper()
+            res_data = dict(res.get("data") or {})
+            if res.get("transfer_id") and "transfer_id" not in res_data:
+                res_data["transfer_id"] = res["transfer_id"]
+            res_data.setdefault("size_bytes", total_bytes)
+            if computed_sha256:
+                res_data.setdefault("sha256", computed_sha256)
+
+            is_accepted = res_status == "ACCEPTED" or bool(res.get("accepted"))
+            http_code = 202 if (res.get("success") and is_accepted) else (200 if res.get("success", False) else 500)
+            return web.json_response(
+                {
+                    "success": res.get("success", False),
+                    "status": res_status,
+                    "accepted": is_accepted,
+                    "transfer_id": res_data.get("transfer_id") or res.get("transfer_id"),
+                    "filename": filename,
+                    "size_bytes": total_bytes,
+                    "sha256": computed_sha256,
+                    "data": res_data,
+                    "error": res.get("error"),
+                },
+                status=http_code,
+            )
+        except asyncio.CancelledError:
+            raise
+        except OSError as oex:
+            logger.error("Upload I/O failure for '%s': %s", filename, oex)
+            return web.json_response({"success": False, "status": "IO_ERROR", "error": str(oex)}, status=500)
+        except Exception as exc:
+            logger.warning("Upload stream aborted/failed for '%s': %s", filename, exc)
+            return web.json_response({"success": False, "status": "UPLOAD_ABORTED", "error": str(exc)}, status=400)
         finally:
-            staged_file.unlink(missing_ok=True)
+            async with self._active_web_uploads_lock:
+                self._active_web_uploads.pop(upload_token, None)
+            if part_file is not None:
+                try:
+                    part_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if staged_file is not None:
+                try:
+                    staged_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     async def handle_api_mcp_tunnel_qr(self, request: web.Request) -> web.Response:
         """Generate vector SVG QR code encoding the active or configured Remote AI MCP endpoint."""
@@ -4493,7 +5075,16 @@ class SnowWebServer:
 
     def _build_app(self) -> web.Application:
         """Build and configure the aiohttp application with routes and middleware."""
-        app = web.Application(middlewares=[self.security_middleware])
+        from snow.core.config import CoreConfig, MAX_SUPPORTED_TRANSFER_SIZE
+
+        cfg = getattr(self.transfer_server, "config", None) if getattr(self, "transfer_server", None) else None
+        raw_limit = getattr(cfg, "max_transfer_size", None) if cfg is not None else None
+        max_upload_size = (
+            raw_limit
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else (CoreConfig.max_transfer_size or MAX_SUPPORTED_TRANSFER_SIZE)
+        )
+        app = web.Application(client_max_size=max_upload_size, middlewares=[self.security_middleware])
 
         # Main static UI
         app.router.add_get("/", self.handle_index)
@@ -4502,6 +5093,7 @@ class SnowWebServer:
         app.router.add_get("/static/{path:.*}", self.handle_static_asset)
 
         # Allowlisted API routes
+        app.router.add_get("/api/health", self.handle_api_health)
         app.router.add_post("/api/auth/session", self.handle_auth_session)
         app.router.add_post("/api/web-ui/reset-override", self.handle_api_reset_web_ui_override)
         app.router.add_get("/api/system/update-check", self.handle_api_system_update_check)
@@ -4528,6 +5120,7 @@ class SnowWebServer:
         app.router.add_post("/api/files/pick-destination", self.handle_api_files_pick_destination)
         app.router.add_post("/api/files/open-transfers-folder", self.handle_api_open_transfers_folder)
         app.router.add_post("/api/files/transfer/cancel", self.handle_api_files_transfer_cancel)
+        app.router.add_get("/api/files/transfer/{transfer_id}/status", self.handle_api_files_transfer_status)
         app.router.add_post("/api/files/download", self.handle_api_file_download)
         app.router.add_get("/api/notifications", self.handle_api_notifications)
         app.router.add_post("/api/notifications/dismiss", self.handle_api_notification_dismiss)
@@ -4660,13 +5253,19 @@ class SnowWebServer:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.5)
         try:
+            if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             sock.bind((self.host, self.port))
-            sock.close()
         except OSError as oe:
             raise OSError(
                 f"Dashboard port {self.port} on {self.host} is already in use. "
                 "Specify an alternative port with --port or terminate conflicting service."
             ) from oe
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
         self._app = self._build_app()
         self._runner = web.AppRunner(self._app)
@@ -4764,6 +5363,13 @@ class SnowWebServer:
 
 def run_dashboard(port: int = DEFAULT_DASHBOARD_PORT, no_browser: bool = False) -> int:
     """Synchronous launcher for 'snow web' CLI command."""
+    if is_port_bound("127.0.0.1", port):
+        return reuse_or_reject_existing_dashboard(
+            host="127.0.0.1",
+            port=port,
+            no_browser=no_browser,
+        )
+
     server = SnowWebServer(
         host="127.0.0.1",
         port=port,
@@ -4780,6 +5386,12 @@ def run_dashboard(port: int = DEFAULT_DASHBOARD_PORT, no_browser: bool = False) 
     except KeyboardInterrupt:
         print("\nShutdown requested by user...")
     except OSError as err:
+        if is_port_bound("127.0.0.1", port):
+            return reuse_or_reject_existing_dashboard(
+                host="127.0.0.1",
+                port=port,
+                no_browser=no_browser,
+            )
         print(f"[-] Failed launching dashboard: {err}", file=sys.stderr)
         return 1
     finally:

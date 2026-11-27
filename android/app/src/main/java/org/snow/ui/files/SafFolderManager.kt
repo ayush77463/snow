@@ -13,7 +13,9 @@ import java.io.File
  */
 class SafFolderManager(
     private val context: Context,
-    private val fallbackDownloadDirOverride: File? = null
+    private val fallbackDownloadDirOverride: File? = null,
+    private val persistUriPermissionHandler: ((Uri, Int) -> Unit)? = null,
+    private val uriAccessValidator: ((Uri) -> Boolean)? = null
 ) {
 
     companion object {
@@ -25,29 +27,78 @@ class SafFolderManager(
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    /**
-     * Persist the selected tree URI permission and store it across app restarts.
-     */
-    fun persistFolderUri(uri: Uri): Boolean {
-        return try {
-            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, flags)
-            } catch (e: SecurityException) {
-                SafeLog.w(TAG, "Failed taking persistable permission: ${e.message}")
+    private fun isTreeUriAccessible(uri: Uri): Boolean {
+        val validator = uriAccessValidator
+        if (validator != null) {
+            return try {
+                validator.invoke(uri)
+            } catch (_: Throwable) {
+                false
             }
-
-            val displayName = resolveFolderDisplayName(uri)
-            prefs.edit()
-                .putString(KEY_DESTINATION_URI, uri.toString())
-                .putString(KEY_DESTINATION_NAME, displayName)
-                .apply()
-            SafeLog.i(TAG, "Persisted SAF destination folder: $displayName ($uri)")
-            true
-        } catch (e: Exception) {
-            SafeLog.e(TAG, "Error persisting SAF destination URI: ${e.message}")
+        }
+        return try {
+            val doc = DocumentFile.fromTreeUri(context, uri)
+            if (doc == null || !doc.exists() || !doc.canRead() || !doc.canWrite()) {
+                return false
+            }
+            val persisted = try {
+                context.contentResolver?.persistedUriPermissions
+            } catch (_: Throwable) {
+                null
+            }
+            if (persisted != null) {
+                persisted.any { it.uri == uri && it.isReadPermission && it.isWritePermission }
+            } else {
+                true
+            }
+        } catch (_: Throwable) {
             false
         }
+    }
+
+    /**
+     * Persist the selected tree URI permission and verify persisted read/write access.
+     * Preserves any prior valid selection intact if persistence or verification fails.
+     */
+    fun persistFolderUri(uri: Uri): Boolean {
+        if (!uri.scheme.equals("content", ignoreCase = true) || uri.toString().isBlank()) {
+            SafeLog.w(TAG, "Refusing non-content SAF URI: $uri")
+            return false
+        }
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        try {
+            if (persistUriPermissionHandler != null) {
+                persistUriPermissionHandler.invoke(uri, flags)
+            } else {
+                val cr = context.contentResolver
+                    ?: throw SecurityException("ContentResolver unavailable to persist SAF permission.")
+                cr.takePersistableUriPermission(uri, flags)
+            }
+        } catch (se: SecurityException) {
+            SafeLog.w(TAG, "Failed taking persistable SAF permission: ${se.message}")
+            return false
+        } catch (e: Exception) {
+            SafeLog.e(TAG, "Error taking persistable SAF permission: ${e.message}")
+            return false
+        }
+
+        if (!isTreeUriAccessible(uri)) {
+            SafeLog.w(TAG, "Selected SAF URI lacks persisted read/write access: $uri")
+            return false
+        }
+
+        val displayName = resolveFolderDisplayName(uri)
+        prefs.edit()
+            .putString(KEY_DESTINATION_URI, uri.toString())
+            .putString(KEY_DESTINATION_NAME, displayName)
+            .apply()
+        SafeLog.i(TAG, "Persisted SAF destination folder: $displayName ($uri)")
+        return true
+    }
+
+    fun hasValidPersistedFolderUri(): Boolean {
+        val uri = getDestinationUri() ?: return false
+        return isTreeUriAccessible(uri)
     }
 
     /**

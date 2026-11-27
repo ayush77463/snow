@@ -43,6 +43,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -125,6 +126,12 @@ class SnowWebSocketClient(
         Thread(r, "SnowWsClientTimeout").apply { isDaemon = true }
     }
 
+    private val socketGeneration = AtomicLong(0L)
+    internal val currentGeneration: Long
+        get() = socketGeneration.get()
+
+    internal var webSocketFactory: ((Request, WebSocketListener) -> WebSocket)? = null
+
     private var webSocket: WebSocket? = null
     private var reconnectJob: Job? = null
     private var heartbeatJob: Job? = null
@@ -138,6 +145,8 @@ class SnowWebSocketClient(
     var autoReconnectEnabled: Boolean = true
     var heartbeatIntervalMs: Long = Constants.HEARTBEAT_INTERVAL_MS
     var heartbeatTimeoutMs: Long = Constants.HEARTBEAT_TIMEOUT_MS
+    @Volatile
+    internal var requestTimeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_SECONDS * 1000L
     var onDeviceRevoked: ((String?) -> Unit)? = null
     @Volatile
     private var pendingHeartbeatId: String? = null
@@ -160,32 +169,40 @@ class SnowWebSocketClient(
         permissionProfile: String? = null,
         peerNetworkId: String? = null
     ) {
-        val canonicalPeerId = peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
-        if (canonicalPeerId != null) {
-            resolvedTargetDeviceId = canonicalPeerId
-            currentTrustManager?.lastPresentedFingerprint?.let { fp ->
-                if (certPinStorage?.getPinnedFingerprintForDevice(canonicalPeerId) == null) {
-                    certPinStorage?.pinFingerprintForDevice(canonicalPeerId, fp)
+        synchronized(this) {
+            val canonicalPeerId = peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            if (canonicalPeerId != null) {
+                resolvedTargetDeviceId = canonicalPeerId
+                currentTrustManager?.lastPresentedFingerprint?.let { fp ->
+                    if (certPinStorage?.getPinnedFingerprintForDevice(canonicalPeerId) == null) {
+                        certPinStorage?.pinFingerprintForDevice(canonicalPeerId, fp)
+                    }
                 }
             }
+            backoffPolicy.reset()
+            _authState.value = AuthState.Authenticated(
+                sessionId,
+                trustTier,
+                peerDeviceName,
+                peerDeviceType,
+                peerDeviceId,
+                peerSnowId,
+                permissionProfile,
+                peerNetworkId
+            )
         }
-        backoffPolicy.reset()
-        _authState.value = AuthState.Authenticated(
-            sessionId,
-            trustTier,
-            peerDeviceName,
-            peerDeviceType,
-            peerDeviceId,
-            peerSnowId,
-            permissionProfile,
-            peerNetworkId
-        )
     }
 
     private val _logs = MutableSharedFlow<String>(replay = 50, extraBufferCapacity = 100)
     val logs: SharedFlow<String> = _logs.asSharedFlow()
 
-    private val pendingRequests = ConcurrentHashMap<String, (SnowMessage) -> Unit>()
+    private data class PendingRequestEntry(
+        val generation: Long,
+        val callback: (SnowMessage) -> Unit
+    )
+
+    private val pendingRequests = ConcurrentHashMap<String, PendingRequestEntry>()
+    @Volatile
     private var currentTrustManager: SnowTrustManager? = null
 
     @Volatile
@@ -273,6 +290,7 @@ class SnowWebSocketClient(
      * Explicitly confirm and pin a server certificate SHA-256 fingerprint (Trust-On-First-Use).
      */
     @JvmOverloads
+    @Synchronized
     fun confirmAndPinCertificate(fingerprint: String, targetDeviceId: String? = null) {
         val normalized = TlsConfig.formatFingerprint(fingerprint)
         val scopedId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: activeTargetDeviceId()
@@ -293,6 +311,7 @@ class SnowWebSocketClient(
      * Clear the pinned certificate fingerprint for the active device (or all if unspecified).
      */
     @JvmOverloads
+    @Synchronized
     fun resetCertificateTrust(targetDeviceId: String? = null) {
         val scopedId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: activeTargetDeviceId()
         if (scopedId != null) {
@@ -307,103 +326,175 @@ class SnowWebSocketClient(
      * Connect to the SNOW host at wss://host:port (or ws:// if useTls is false).
      */
     @JvmOverloads
-    @Synchronized
     fun connect(host: String, port: Int = Constants.DEFAULT_PORT, targetDeviceId: String? = null) {
-        targetHost = host.trim()
-        targetPort = port
-        expectedTargetDeviceId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
-        resolvedTargetDeviceId = null
-        userInitiatedDisconnect.set(false)
+        val stalePending: List<PendingRequestEntry>
+        synchronized(this) {
+            targetHost = host.trim()
+            targetPort = port
+            expectedTargetDeviceId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            resolvedTargetDeviceId = null
+            userInitiatedDisconnect.set(false)
+            backoffPolicy.reset()
 
-        if (_connectionState.value == ConnectionState.CONNECTED || _connectionState.value == ConnectionState.CONNECTING) {
-            log("Already connected or connecting. Disconnecting prior session first.")
-            disconnectInternal()
+            stalePending = if (_connectionState.value == ConnectionState.CONNECTED ||
+                _connectionState.value == ConnectionState.CONNECTING ||
+                webSocket != null
+            ) {
+                log("Disconnecting prior session before deliberate connect().")
+                disconnectLocked(advanceGeneration = true)
+            } else {
+                reconnectJob?.cancel()
+                reconnectJob = null
+                emptyList()
+            }
+
+            initiateConnection()
         }
+        deliverPendingError(stalePending, "Client reconnecting via explicit connect().")
+    }
 
-        reconnectJob?.cancel()
-        reconnectJob = null
+    /**
+     * Recover connection when OS network connectivity is restored, resetting exhausted backoff.
+     */
+    @JvmOverloads
+    fun onNetworkRestored(
+        host: String = targetHost,
+        port: Int = targetPort,
+        targetDeviceId: String? = expectedTargetDeviceId
+    ): Boolean {
+        val stalePending: List<PendingRequestEntry>
+        val cleanHost = host.trim()
+        val initiated: Boolean
+        synchronized(this) {
+            if (userInitiatedDisconnect.get()) return false
+            backoffPolicy.reset()
+            if (!autoReconnectEnabled || cleanHost.isBlank()) return false
 
-        initiateConnection()
+            val endpointMatches = cleanHost == targetHost && port == targetPort
+            if (_connectionState.value == ConnectionState.CONNECTED && webSocket != null && endpointMatches) {
+                return false
+            }
+
+            targetHost = cleanHost
+            targetPort = port
+            if (!targetDeviceId.isNullOrBlank()) {
+                expectedTargetDeviceId = targetDeviceId.trim()
+            }
+            resolvedTargetDeviceId = null
+            log("Network restored: backoff reset, initiating recovery connection to $cleanHost:$port ...")
+            stalePending = disconnectLocked(advanceGeneration = true)
+            initiateConnection()
+            initiated = true
+        }
+        deliverPendingError(stalePending, "Client reconnecting after network restoration.")
+        return initiated
     }
 
     /**
      * Update target endpoint dynamically (e.g. from LAN discovery beacon or USB promotion).
      */
     @JvmOverloads
-    @Synchronized
     fun updateTargetEndpoint(host: String, port: Int = Constants.DEFAULT_PORT, targetDeviceId: String? = null): Boolean {
         val cleanHost = host.trim()
         if (cleanHost.isBlank()) return false
 
-        val cleanDev = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
-        if (cleanDev != null) {
-            expectedTargetDeviceId = cleanDev
-        }
-        val endpointChanged = cleanHost != targetHost || port != targetPort
-        val currentState = _connectionState.value
+        val stalePending: List<PendingRequestEntry>
+        val result: Boolean
+        synchronized(this) {
+            val cleanDev = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            if (cleanDev != null) {
+                expectedTargetDeviceId = cleanDev
+            }
+            val endpointChanged = cleanHost != targetHost || port != targetPort
+            val currentState = _connectionState.value
 
-        if (endpointChanged) {
-            log("Target endpoint changed from $targetHost:$targetPort to $cleanHost:$port. Initiating reconnect...")
-            targetHost = cleanHost
-            targetPort = port
-            resolvedTargetDeviceId = null
-            userInitiatedDisconnect.set(false)
-            backoffPolicy.reset()
-            reconnectJob?.cancel()
-            reconnectJob = null
-            disconnectInternal()
-            initiateConnection()
-            return true
+            if (endpointChanged) {
+                log("Target endpoint changed from $targetHost:$targetPort to $cleanHost:$port. Initiating reconnect...")
+                targetHost = cleanHost
+                targetPort = port
+                resolvedTargetDeviceId = null
+                userInitiatedDisconnect.set(false)
+                backoffPolicy.reset()
+                stalePending = disconnectLocked(advanceGeneration = true)
+                initiateConnection()
+                result = true
+            } else if (currentState == ConnectionState.CONNECTED || currentState == ConnectionState.CONNECTING) {
+                stalePending = emptyList()
+                result = false
+            } else if (!userInitiatedDisconnect.get()) {
+                log("Target endpoint confirmed ($cleanHost:$port) while state=$currentState. Accelerating reconnect...")
+                backoffPolicy.reset()
+                reconnectJob?.cancel()
+                reconnectJob = null
+                stalePending = emptyList()
+                initiateConnection()
+                result = true
+            } else {
+                stalePending = emptyList()
+                result = false
+            }
         }
-
-        // Endpoint is identical. Avoid reconnect storms if already CONNECTED or CONNECTING.
-        if (currentState == ConnectionState.CONNECTED || currentState == ConnectionState.CONNECTING) {
-            return false
-        }
-
-        // If RECONNECTING or DISCONNECTED (and not explicitly user-stopped), fast-reconnect.
-        if (!userInitiatedDisconnect.get()) {
-            log("Target endpoint confirmed ($cleanHost:$port) while state=$currentState. Accelerating reconnect...")
-            backoffPolicy.reset()
-            reconnectJob?.cancel()
-            reconnectJob = null
-            initiateConnection()
-            return true
-        }
-
-        return false
+        deliverPendingError(stalePending, "Endpoint updated; previous requests aborted.")
+        return result
     }
 
-    private fun buildOkHttpClient(): OkHttpClient {
-        val builder = OkHttpClient.Builder()
+    internal fun isCurrentGeneration(expectedGeneration: Long, incomingSocket: WebSocket? = null): Boolean {
+        synchronized(this) {
+            if (expectedGeneration != socketGeneration.get()) return false
+            if (incomingSocket != null && this.webSocket !== incomingSocket) return false
+            return true
+        }
+    }
+
+    internal fun handleUnconfirmedFingerprintCallback(expectedGeneration: Long, fingerprint: String) {
+        val active = synchronized(this) {
+            if (expectedGeneration != socketGeneration.get() || userInitiatedDisconnect.get()) {
+                false
+            } else {
+                _authState.value = AuthState.FingerprintConfirmationRequired(fingerprint)
+                true
+            }
+        }
+        if (!active) {
+            log("Ignoring stale unconfirmed-fingerprint callback from generation=$expectedGeneration (active=${socketGeneration.get()}).")
+            return
+        }
+        onUnconfirmedFingerprint?.invoke(fingerprint)
+    }
+
+    private fun buildClientForGeneration(generation: Long): Pair<OkHttpClient, SnowTrustManager?> {
+        val baseClient = okHttpClient ?: OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(0, TimeUnit.SECONDS)
+            .build()
+            .also { okHttpClient = it }
 
-        if (useTls) {
-            val storage = certPinStorage ?: InMemoryCertPinStorage()
-            val trustManager = SnowTrustManager(
-                pinStorage = storage,
-                onUnconfirmedFingerprint = { fp ->
-                    _authState.value = AuthState.FingerprintConfirmationRequired(fp)
-                    onUnconfirmedFingerprint?.invoke(fp)
-                },
-                targetDeviceIdProvider = { activeTargetDeviceId() },
-                allowAnyPinnedMatchProvider = { isLoopbackTargetHost() }
-            )
-            currentTrustManager = trustManager
-            val sslContext = TlsConfig.createSslContext(trustManager)
-            builder.sslSocketFactory(sslContext.socketFactory, trustManager)
-            builder.hostnameVerifier(
+        if (!useTls) {
+            return baseClient to null
+        }
+
+        val storage = certPinStorage ?: InMemoryCertPinStorage()
+        val trustManager = SnowTrustManager(
+            pinStorage = storage,
+            onUnconfirmedFingerprint = { fp ->
+                handleUnconfirmedFingerprintCallback(generation, fp)
+            },
+            targetDeviceIdProvider = { activeTargetDeviceId() },
+            allowAnyPinnedMatchProvider = { isLoopbackTargetHost() }
+        )
+        val sslContext = TlsConfig.createSslContext(trustManager)
+        val scopedClient = baseClient.newBuilder()
+            .sslSocketFactory(sslContext.socketFactory, trustManager)
+            .hostnameVerifier(
                 TlsConfig.createHostnameVerifier(
                     pinStorage = storage,
                     targetDeviceIdProvider = { activeTargetDeviceId() },
                     allowAnyPinnedMatchProvider = { isLoopbackTargetHost() }
                 )
             )
-        }
-
-        return builder.build()
+            .build()
+        return scopedClient to trustManager
     }
 
     @Synchronized
@@ -414,17 +505,26 @@ class SnowWebSocketClient(
             return
         }
 
+        val newGeneration = socketGeneration.incrementAndGet()
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        pendingHeartbeatId = null
+        missedHeartbeatAcks.set(0)
+
         // Clean up previous socket instance before opening a new one to prevent connection leaks
-        try {
-            webSocket?.close(1000, "Opening new connection")
-        } catch (_: Exception) {
-            webSocket?.cancel()
-        }
+        val previousWs = webSocket
         webSocket = null
+        if (previousWs != null) {
+            try {
+                previousWs.close(1000, "Opening new connection")
+            } catch (_: Exception) {
+                previousWs.cancel()
+            }
+        }
 
         val scheme = if (useTls) "wss" else "ws"
         val wsUrl = "$scheme://$targetHost:$targetPort"
-        log("Connecting to $wsUrl ...")
+        log("Connecting to $wsUrl (gen=$newGeneration) ...")
         _connectionState.value = ConnectionState.CONNECTING
         _authState.value = AuthState.Connecting
 
@@ -432,54 +532,89 @@ class SnowWebSocketClient(
             .url(wsUrl)
             .build()
 
-        val client = okHttpClient ?: buildOkHttpClient().also { okHttpClient = it }
-        webSocket = client.newWebSocket(request, SnowListener())
+        val (client, genTrustManager) = buildClientForGeneration(newGeneration)
+        currentTrustManager = genTrustManager
+        val listener = SnowListener(newGeneration, genTrustManager)
+        val createdWs = webSocketFactory?.invoke(request, listener) ?: client.newWebSocket(request, listener)
+        if (socketGeneration.get() == newGeneration && !userInitiatedDisconnect.get()) {
+            webSocket = createdWs
+        } else {
+            try {
+                createdWs.cancel()
+            } catch (_: Exception) {}
+        }
     }
 
-    private fun failPendingRequests(errorMessage: String) {
-        if (pendingRequests.isEmpty()) return
+    private fun drainPendingRequestsLocked(): List<PendingRequestEntry> {
+        if (pendingRequests.isEmpty()) return emptyList()
+        val entries = pendingRequests.values.toList()
+        pendingRequests.clear()
+        return entries
+    }
+
+    private fun deliverPendingError(entries: List<PendingRequestEntry>, errorMessage: String) {
+        if (entries.isEmpty()) return
         val errResponse = SnowMessage.createError(
             code = ErrorCode.INTERNAL_ERROR,
             message = errorMessage
         )
-        val callbacks = pendingRequests.values.toList()
-        pendingRequests.clear()
-        for (cb in callbacks) {
+        for (entry in entries) {
             try {
-                cb.invoke(errResponse)
+                entry.callback.invoke(errResponse)
             } catch (e: Exception) {
                 SafeLog.e(TAG, "Error notifying pending request callback: ${e.message}", e)
             }
         }
     }
 
+    private fun failPendingRequests(errorMessage: String) {
+        deliverPendingError(drainPendingRequestsLocked(), errorMessage)
+    }
+
     /**
      * Gracefully disconnect the client and prevent automatic reconnection.
      */
-    @Synchronized
     fun disconnect() {
-        userInitiatedDisconnect.set(true)
-        disconnectInternal()
-        backoffPolicy.reset()
-        _connectionState.value = ConnectionState.DISCONNECTED
-        _authState.value = AuthState.Disconnected
-        log("Client disconnected by user.")
+        val pending: List<PendingRequestEntry>
+        synchronized(this) {
+            userInitiatedDisconnect.set(true)
+            pending = disconnectLocked(advanceGeneration = true)
+            backoffPolicy.reset()
+            _connectionState.value = ConnectionState.DISCONNECTED
+            _authState.value = AuthState.Disconnected
+            log("Client disconnected by user.")
+        }
+        deliverPendingError(pending, "Client disconnected.")
     }
 
-    private fun disconnectInternal() {
+    @Synchronized
+    private fun disconnectLocked(advanceGeneration: Boolean = true): List<PendingRequestEntry> {
+        if (advanceGeneration) {
+            socketGeneration.incrementAndGet()
+        }
         heartbeatJob?.cancel()
         heartbeatJob = null
         reconnectJob?.cancel()
         reconnectJob = null
 
-        try {
-            webSocket?.close(1000, "User disconnect")
-        } catch (_: Exception) {
-            webSocket?.cancel()
-        }
+        val prevWs = webSocket
         webSocket = null
-        failPendingRequests("Client disconnected.")
+        if (prevWs != null) {
+            try {
+                prevWs.close(1000, "User disconnect")
+            } catch (_: Exception) {
+                prevWs.cancel()
+            }
+        }
+        val drained = drainPendingRequestsLocked()
         pendingHeartbeatId = null
+        missedHeartbeatAcks.set(0)
+        return drained
+    }
+
+    private fun disconnectInternal() {
+        val drained = synchronized(this) { disconnectLocked(advanceGeneration = true) }
+        deliverPendingError(drained, "Client disconnected.")
     }
 
     /**
@@ -495,6 +630,21 @@ class SnowWebSocketClient(
         } catch (_: Exception) {}
     }
 
+    internal fun createListenerForTest(generation: Long, trustManager: SnowTrustManager? = null): WebSocketListener {
+        return SnowListener(generation, trustManager)
+    }
+
+    internal fun getTrustManagerForTest(): SnowTrustManager? = currentTrustManager
+
+    internal fun attachSocketForTest(socket: WebSocket, generation: Long = socketGeneration.incrementAndGet()) {
+        synchronized(this) {
+            socketGeneration.set(generation)
+            userInitiatedDisconnect.set(false)
+            webSocket = socket
+            _connectionState.value = ConnectionState.CONNECTED
+        }
+    }
+
     /**
      * Send a request action to the server.
      */
@@ -503,8 +653,57 @@ class SnowWebSocketClient(
         data: Map<String, Any?>? = null,
         onResponse: ((SnowMessage) -> Unit)? = null
     ) {
-        val currentWs = webSocket
-        if (_connectionState.value != ConnectionState.CONNECTED || currentWs == null) {
+        sendRequestInternal(
+            expectedGeneration = null,
+            expectedSocket = null,
+            action = action,
+            data = data,
+            onResponse = onResponse
+        )
+    }
+
+    private fun sendRequestForGeneration(
+        expectedGeneration: Long,
+        expectedSocket: WebSocket,
+        action: String,
+        data: Map<String, Any?>? = null,
+        onResponse: ((SnowMessage) -> Unit)? = null
+    ) {
+        sendRequestInternal(
+            expectedGeneration = expectedGeneration,
+            expectedSocket = expectedSocket,
+            action = action,
+            data = data,
+            onResponse = onResponse
+        )
+    }
+
+    private fun sendRequestInternal(
+        expectedGeneration: Long?,
+        expectedSocket: WebSocket?,
+        action: String,
+        data: Map<String, Any?>?,
+        onResponse: ((SnowMessage) -> Unit)?
+    ) {
+        val currentWs: WebSocket?
+        val activeGen: Long
+        synchronized(this) {
+            val ws = webSocket
+            val gen = socketGeneration.get()
+            if (_connectionState.value != ConnectionState.CONNECTED ||
+                ws == null ||
+                (expectedGeneration != null && expectedGeneration != gen) ||
+                (expectedSocket != null && ws !== expectedSocket)
+            ) {
+                currentWs = null
+                activeGen = -1L
+            } else {
+                currentWs = ws
+                activeGen = gen
+            }
+        }
+
+        if (currentWs == null) {
             log("Cannot send request: Not connected.")
             onResponse?.invoke(
                 SnowMessage.createError(
@@ -516,6 +715,9 @@ class SnowWebSocketClient(
         }
 
         val requestMessage = SnowMessage.createRequest(action = action, data = data)
+        var safeCallback: ((SnowMessage) -> Unit)? = null
+        var timeoutFuture: ScheduledFuture<*>? = null
+
         if (onResponse != null) {
             if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
                 log("Cannot send request: Pending request capacity ($MAX_PENDING_REQUESTS) exceeded.")
@@ -531,42 +733,60 @@ class SnowWebSocketClient(
             val invoked = AtomicBoolean(false)
             val timeoutFutureRef = AtomicReference<ScheduledFuture<*>?>()
 
-            val safeCallback: (SnowMessage) -> Unit = { response ->
+            val cb: (SnowMessage) -> Unit = { response ->
                 if (invoked.compareAndSet(false, true)) {
                     timeoutFutureRef.get()?.cancel(false)
                     pendingRequests.remove(requestMessage.id)
                     onResponse.invoke(response)
                 }
             }
+            safeCallback = cb
+            pendingRequests[requestMessage.id] = PendingRequestEntry(activeGen, cb)
 
-            val timeoutFuture = timeoutScheduler.schedule({
-                if (invoked.compareAndSet(false, true)) {
-                    pendingRequests.remove(requestMessage.id)
-                    onResponse.invoke(
-                        SnowMessage.createError(
-                            code = ErrorCode.INTERNAL_ERROR,
-                            message = "Request timed out after $DEFAULT_REQUEST_TIMEOUT_SECONDS seconds [action='$action']",
-                            correlationId = requestMessage.id
-                        )
+            val activeTimeoutMs = requestTimeoutMs
+            timeoutFuture = timeoutScheduler.schedule({
+                cb.invoke(
+                    SnowMessage.createError(
+                        code = ErrorCode.INTERNAL_ERROR,
+                        message = "Request timed out after ${activeTimeoutMs}ms [action='$action']",
+                        correlationId = requestMessage.id
                     )
-                }
-            }, DEFAULT_REQUEST_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                )
+            }, activeTimeoutMs, TimeUnit.MILLISECONDS)
 
             timeoutFutureRef.set(timeoutFuture)
-            pendingRequests[requestMessage.id] = safeCallback
+            if (invoked.get()) {
+                timeoutFuture.cancel(false)
+            }
+        }
+
+        if (!isCurrentGeneration(activeGen, currentWs)) {
+            safeCallback?.invoke(
+                SnowMessage.createError(
+                    code = ErrorCode.INTERNAL_ERROR,
+                    message = "Cannot send request: connection generation changed.",
+                    correlationId = requestMessage.id
+                )
+            )
+            return
         }
 
         val json = JsonSerialization.toJson(requestMessage)
-        val sent = currentWs.send(json)
+        val sent = try {
+            currentWs.send(json)
+        } catch (_: Exception) {
+            false
+        }
         if (sent) {
             log("Sent request action='$action' id=${requestMessage.id}")
         } else {
             log("Failed to send request id=${requestMessage.id}")
-            pendingRequests.remove(requestMessage.id)
-            onResponse?.invoke(
+            timeoutFuture?.cancel(false)
+            safeCallback?.invoke(
                 SnowMessage.createError(
                     code = ErrorCode.INTERNAL_ERROR,
-                    message = "Failed to send WebSocket frame to desktop."
+                    message = "Failed to send WebSocket frame to desktop.",
+                    correlationId = requestMessage.id
                 )
             )
         }
@@ -576,9 +796,13 @@ class SnowWebSocketClient(
      * Send a raw SnowMessage directly.
      */
     fun sendMessage(message: SnowMessage): Boolean {
-        val currentWs = webSocket ?: return false
+        val currentWs = synchronized(this) { webSocket } ?: return false
         val json = JsonSerialization.toJson(message)
-        return currentWs.send(json)
+        return try {
+            currentWs.send(json)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /**
@@ -605,7 +829,10 @@ class SnowWebSocketClient(
     }
 
     @Synchronized
-    private fun scheduleReconnection() {
+    private fun scheduleReconnection(expectedGeneration: Long = socketGeneration.get()) {
+        if (expectedGeneration != socketGeneration.get()) {
+            return
+        }
         if (userInitiatedDisconnect.get() || !autoReconnectEnabled) {
             if (!autoReconnectEnabled) {
                 log("Auto-reconnect disabled; staying disconnected.")
@@ -614,7 +841,7 @@ class SnowWebSocketClient(
             return
         }
 
-        // Prevent duplicate concurrent reconnect loops
+        // Prevent duplicate concurrent reconnect loops within the same generation
         if (reconnectJob?.isActive == true) {
             return
         }
@@ -641,182 +868,333 @@ class SnowWebSocketClient(
 
         _connectionState.value = ConnectionState.RECONNECTING
         val delayMs = backoffPolicy.nextDelayMs()
-        log("Reconnecting in ${delayMs}ms (attempt #${backoffPolicy.currentAttempt}/$maxAttempts) ...")
+        log("Reconnecting in ${delayMs}ms (attempt #${backoffPolicy.currentAttempt}/$maxAttempts, gen=$expectedGeneration) ...")
 
         reconnectJob?.cancel()
-        reconnectJob = scope.launch {
+        lateinit var launchedJob: Job
+        launchedJob = scope.launch {
             delay(delayMs)
-            if (!userInitiatedDisconnect.get() && autoReconnectEnabled && isActive) {
+            synchronized(this@SnowWebSocketClient) {
+                if (!isActive ||
+                    userInitiatedDisconnect.get() ||
+                    !autoReconnectEnabled ||
+                    reconnectJob !== launchedJob ||
+                    expectedGeneration != socketGeneration.get()
+                ) {
+                    return@launch
+                }
+                reconnectJob = null
                 initiateConnection()
             }
         }
+        reconnectJob = launchedJob
     }
 
-    internal fun handleHeartbeatFailure(reason: String = "Missed consecutive heartbeat acknowledgements") {
-        val prevWs = webSocket
-        webSocket = null
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-        pendingHeartbeatId = null
-        missedHeartbeatAcks.set(0)
+    internal fun handleHeartbeatFailure(
+        reason: String = "Missed consecutive heartbeat acknowledgements",
+        expectedSocket: WebSocket? = null,
+        expectedGeneration: Long? = null
+    ) {
+        val pending: List<PendingRequestEntry>
+        val prevWs: WebSocket?
+        val reconnectGen: Long
+        val shouldScheduleReconnect: Boolean
+        synchronized(this) {
+            val gen = socketGeneration.get()
+            if (expectedGeneration != null && expectedGeneration != gen) {
+                log("Ignoring stale heartbeat failure from gen=$expectedGeneration (active=$gen).")
+                return
+            }
+            if (expectedSocket != null && this.webSocket !== expectedSocket) {
+                log("Ignoring heartbeat failure for non-active socket.")
+                return
+            }
+
+            reconnectGen = socketGeneration.incrementAndGet()
+            prevWs = webSocket
+            webSocket = null
+            heartbeatJob?.cancel()
+            heartbeatJob = null
+            pendingHeartbeatId = null
+            missedHeartbeatAcks.set(0)
+            pending = drainPendingRequestsLocked()
+            _authState.value = AuthState.Disconnected
+            _connectionState.value = ConnectionState.DISCONNECTED
+            log("Heartbeat timeout! $reason. Stale session cleared.")
+            shouldScheduleReconnect = autoReconnectEnabled && !userInitiatedDisconnect.get()
+            if (shouldScheduleReconnect) {
+                scheduleReconnection(reconnectGen)
+            }
+        }
         try {
             prevWs?.cancel()
         } catch (_: Exception) {}
-        failPendingRequests("Heartbeat timeout: $reason")
-        _authState.value = AuthState.Disconnected
-        _connectionState.value = ConnectionState.DISCONNECTED
-        log("Heartbeat timeout! $reason. Stale session cleared.")
-        if (autoReconnectEnabled && !userInitiatedDisconnect.get()) {
-            scheduleReconnection()
-        }
+        deliverPendingError(pending, "Heartbeat timeout: $reason")
     }
 
-    internal fun startHeartbeatLoop(socketRef: WebSocket? = webSocket) {
-        heartbeatJob?.cancel()
-        lastAckTimestamp = System.currentTimeMillis()
-        pendingHeartbeatId = null
-        missedHeartbeatAcks.set(0)
+    internal fun startHeartbeatLoop(
+        socketRef: WebSocket? = webSocket,
+        generation: Long = socketGeneration.get()
+    ) {
+        val capturedSocket = socketRef ?: return
+        synchronized(this) {
+            if (generation != socketGeneration.get() || this.webSocket !== capturedSocket) {
+                return
+            }
+            heartbeatJob?.cancel()
+            lastAckTimestamp = System.currentTimeMillis()
+            pendingHeartbeatId = null
+            missedHeartbeatAcks.set(0)
 
-        heartbeatJob = scope.launch {
-            while (isActive && _connectionState.value == ConnectionState.CONNECTED) {
-                delay(heartbeatIntervalMs)
-                if (!isActive || _connectionState.value != ConnectionState.CONNECTED) break
+            lateinit var launchedHeartbeat: Job
+            launchedHeartbeat = scope.launch {
+                try {
+                    while (isActive && isCurrentGeneration(generation, capturedSocket) &&
+                        _connectionState.value == ConnectionState.CONNECTED
+                    ) {
+                        delay(heartbeatIntervalMs)
+                        if (!isActive || !isCurrentGeneration(generation, capturedSocket) ||
+                            _connectionState.value != ConnectionState.CONNECTED
+                        ) {
+                            break
+                        }
 
-                if (pendingHeartbeatId != null) {
-                    val missed = missedHeartbeatAcks.incrementAndGet()
-                    val now = System.currentTimeMillis()
-                    if (missed >= 2 || (now - lastAckTimestamp) > heartbeatTimeoutMs) {
-                        handleHeartbeatFailure("Missed $missed consecutive heartbeat_ack frames.")
-                        break
+                        var timedOutMissed: Int? = null
+                        var jsonPayload: String? = null
+                        var sentHeartbeatId: String? = null
+
+                        synchronized(this@SnowWebSocketClient) {
+                            if (generation != socketGeneration.get() ||
+                                this@SnowWebSocketClient.webSocket !== capturedSocket ||
+                                _connectionState.value != ConnectionState.CONNECTED ||
+                                heartbeatJob !== launchedHeartbeat
+                            ) {
+                                return@launch
+                            }
+                            if (pendingHeartbeatId != null) {
+                                val missed = missedHeartbeatAcks.incrementAndGet()
+                                val now = System.currentTimeMillis()
+                                if (missed >= 2 || (now - lastAckTimestamp) > heartbeatTimeoutMs) {
+                                    timedOutMissed = missed
+                                } else {
+                                    log("Heartbeat ack missed ($missed/2); sending follow-up heartbeat.")
+                                }
+                            }
+                            if (timedOutMissed == null) {
+                                val heartbeat = SnowMessage.createHeartbeat()
+                                sentHeartbeatId = heartbeat.id
+                                jsonPayload = JsonSerialization.toJson(heartbeat)
+                                pendingHeartbeatId = heartbeat.id
+                            }
+                        }
+
+                        if (timedOutMissed != null) {
+                            handleHeartbeatFailure(
+                                reason = "Missed $timedOutMissed consecutive heartbeat_ack frames.",
+                                expectedSocket = capturedSocket,
+                                expectedGeneration = generation
+                            )
+                            break
+                        }
+
+                        if (!isCurrentGeneration(generation, capturedSocket)) {
+                            break
+                        }
+
+                        val sent = try {
+                            capturedSocket.send(jsonPayload!!)
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (sent) {
+                            log("Heartbeat sent id=$sentHeartbeatId")
+                        } else {
+                            log("Failed sending heartbeat id=$sentHeartbeatId")
+                        }
                     }
-                    log("Heartbeat ack missed ($missed/2); sending follow-up heartbeat.")
-                }
-
-                val heartbeat = SnowMessage.createHeartbeat()
-                val json = JsonSerialization.toJson(heartbeat)
-                pendingHeartbeatId = heartbeat.id
-                val sent = (socketRef ?: webSocket)?.send(json) == true
-                if (sent) {
-                    log("Heartbeat sent id=${heartbeat.id}")
-                } else {
-                    log("Failed sending heartbeat id=${heartbeat.id}")
+                } finally {
+                    synchronized(this@SnowWebSocketClient) {
+                        if (heartbeatJob === launchedHeartbeat) {
+                            heartbeatJob = null
+                        }
+                    }
                 }
             }
+            heartbeatJob = launchedHeartbeat
         }
     }
 
-    private inner class SnowListener : WebSocketListener() {
+    private inner class SnowListener(
+        private val generation: Long,
+        private val listenerTrustManager: SnowTrustManager?
+    ) : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            if (userInitiatedDisconnect.get()) {
-                webSocket.close(1000, "Disconnected")
+            val shouldStart = synchronized(this@SnowWebSocketClient) {
+                if (userInitiatedDisconnect.get()) {
+                    false
+                } else if (generation != socketGeneration.get() ||
+                    this@SnowWebSocketClient.webSocket !== webSocket
+                ) {
+                    log("Ignoring onOpen from obsolete generation=$generation (active=${socketGeneration.get()}).")
+                    false
+                } else {
+                    reconnectJob?.cancel()
+                    reconnectJob = null
+                    _connectionState.value = ConnectionState.CONNECTED
+                    val scheme = if (useTls) "wss" else "ws"
+                    log("Connected to $scheme://$targetHost:$targetPort (gen=$generation, awaiting auth before resetting backoff)")
+                    lastAckTimestamp = System.currentTimeMillis()
+                    startHeartbeatLoop(webSocket, generation)
+                    true
+                }
+            }
+
+            if (!shouldStart) {
+                try {
+                    webSocket.close(1000, "Stale or disconnected")
+                } catch (_: Exception) {
+                    webSocket.cancel()
+                }
                 return
             }
 
-            _connectionState.value = ConnectionState.CONNECTED
-            val scheme = if (useTls) "wss" else "ws"
-            log("Connected to $scheme://$targetHost:$targetPort (awaiting authentication before resetting backoff)")
-            lastAckTimestamp = System.currentTimeMillis()
-            startHeartbeatLoop()
-
-            // Automatic post-connection authentication handshake
-            performPostConnectionHandshake()
+            // Automatic post-connection authentication handshake bound strictly to (webSocket, generation)
+            performPostConnectionHandshake(webSocket, generation)
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            handleIncomingMessage(webSocket, text)
+            if (!isCurrentGeneration(generation, webSocket)) {
+                log("Ignoring onMessage from stale generation=$generation.")
+                return
+            }
+            handleIncomingMessage(webSocket, text, expectedGeneration = generation)
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            log("Server closing connection: $code - $reason")
-            webSocket.close(code, reason)
+            if (isCurrentGeneration(generation, webSocket)) {
+                log("Server closing connection (gen=$generation): $code - $reason")
+            }
+            try {
+                webSocket.close(code, reason)
+            } catch (_: Exception) {}
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (this@SnowWebSocketClient.webSocket !== webSocket) {
-                log("Ignoring onClosed from stale socket (code=$code).")
-                return
+            val drained: List<PendingRequestEntry>
+            synchronized(this@SnowWebSocketClient) {
+                if (generation != socketGeneration.get() || this@SnowWebSocketClient.webSocket !== webSocket) {
+                    log("Ignoring onClosed from stale socket (gen=$generation, code=$code).")
+                    return
+                }
+                log("Connection closed: $code - $reason")
+                val nextGen = socketGeneration.incrementAndGet()
+                heartbeatJob?.cancel()
+                heartbeatJob = null
+                pendingHeartbeatId = null
+                missedHeartbeatAcks.set(0)
+                _authState.value = AuthState.Disconnected
+                drained = drainPendingRequestsLocked()
+                this@SnowWebSocketClient.webSocket = null
+                if (!userInitiatedDisconnect.get()) {
+                    scheduleReconnection(nextGen)
+                } else {
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                }
             }
-            log("Connection closed: $code - $reason")
-            heartbeatJob?.cancel()
-            _authState.value = AuthState.Disconnected
-            failPendingRequests("Connection closed ($code: $reason)")
-            this@SnowWebSocketClient.webSocket = null
-            if (!userInitiatedDisconnect.get()) {
-                scheduleReconnection()
-            } else {
-                _connectionState.value = ConnectionState.DISCONNECTED
-            }
+            deliverPendingError(drained, "Connection closed ($code: $reason)")
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            if (this@SnowWebSocketClient.webSocket !== webSocket) {
-                log("Ignoring onFailure from stale socket: ${t.message}")
-                return
-            }
-            heartbeatJob?.cancel()
-            failPendingRequests("Connection failed: ${t.message}")
-            this@SnowWebSocketClient.webSocket = null
+            val drained: List<PendingRequestEntry>
+            var unconfirmedFpToNotify: String? = null
+            var mismatchToNotify: Pair<String, String>? = null
 
-            // 1. Check for specific TLS certificate verification exceptions in cause chain
-            var certException: Throwable? = t
-            while (certException != null) {
-                if (certException is UnconfirmedCertificateException) {
-                    val fp = certException.presentedFingerprint
-                    _authState.value = AuthState.FingerprintConfirmationRequired(fp)
-                    onUnconfirmedFingerprint?.invoke(fp)
-                    log("Server certificate not yet confirmed by user. Fingerprint: $fp")
-                    _connectionState.value = ConnectionState.DISCONNECTED
-                    currentTrustManager?.resetLastPresentedFingerprint()
+            synchronized(this@SnowWebSocketClient) {
+                if (generation != socketGeneration.get() || this@SnowWebSocketClient.webSocket !== webSocket) {
+                    log("Ignoring onFailure from stale socket (gen=$generation): ${t.message}")
                     return
                 }
-                if (certException is CertificateMismatchException) {
-                    val pinned = certException.pinnedFingerprint
-                    val presented = certException.presentedFingerprint
-                    _authState.value = AuthState.FingerprintMismatch(pinned, presented)
-                    onCertificateMismatch?.invoke(pinned, presented)
-                    log("Untrusted server certificate! Mismatch detected. Pinned: $pinned, Presented: $presented")
-                    _connectionState.value = ConnectionState.DISCONNECTED
-                    currentTrustManager?.resetLastPresentedFingerprint()
-                    return
+                socketGeneration.incrementAndGet()
+                heartbeatJob?.cancel()
+                heartbeatJob = null
+                pendingHeartbeatId = null
+                missedHeartbeatAcks.set(0)
+                drained = drainPendingRequestsLocked()
+                this@SnowWebSocketClient.webSocket = null
+
+                val trustMgr = listenerTrustManager ?: currentTrustManager
+
+                // 1. Check for specific TLS certificate verification exceptions in cause chain
+                var certException: Throwable? = t
+                var handledTls = false
+                while (certException != null) {
+                    if (certException is UnconfirmedCertificateException) {
+                        val fp = certException.presentedFingerprint
+                        _authState.value = AuthState.FingerprintConfirmationRequired(fp)
+                        log("Server certificate not yet confirmed by user. Fingerprint: $fp")
+                        _connectionState.value = ConnectionState.DISCONNECTED
+                        trustMgr?.resetLastPresentedFingerprint()
+                        unconfirmedFpToNotify = fp
+                        handledTls = true
+                        break
+                    }
+                    if (certException is CertificateMismatchException) {
+                        val pinned = certException.pinnedFingerprint
+                        val presented = certException.presentedFingerprint
+                        _authState.value = AuthState.FingerprintMismatch(pinned, presented)
+                        log("Untrusted server certificate! Mismatch detected. Pinned: $pinned, Presented: $presented")
+                        _connectionState.value = ConnectionState.DISCONNECTED
+                        trustMgr?.resetLastPresentedFingerprint()
+                        mismatchToNotify = pinned to presented
+                        handledTls = true
+                        break
+                    }
+                    certException = certException.cause
                 }
-                certException = certException.cause
-            }
 
-            // 2. Fallback check: If Conscrypt wrapped or stripped the custom exception,
-            // check currentTrustManager's lastPresentedFingerprint against pinned storage.
-            val trustMgr = currentTrustManager
-            val presentedFp = trustMgr?.lastPresentedFingerprint
-            val pinnedFp = resolveScopedPinnedFingerprint(presentedFp)
+                if (!handledTls) {
+                    // 2. Fallback check: inspect scoped TrustManager for this generation
+                    val presentedFp = trustMgr?.lastPresentedFingerprint
+                    val pinnedFp = resolveScopedPinnedFingerprint(presentedFp)
 
-            if (presentedFp != null) {
-                if (pinnedFp == null) {
-                    _authState.value = AuthState.FingerprintConfirmationRequired(presentedFp)
-                    onUnconfirmedFingerprint?.invoke(presentedFp)
-                    log("Server certificate not yet confirmed by user (via trust manager). Fingerprint: $presentedFp")
-                    _connectionState.value = ConnectionState.DISCONNECTED
-                    trustMgr.resetLastPresentedFingerprint()
-                    return
-                } else if (!TlsConfig.fingerprintsMatch(pinnedFp, presentedFp)) {
-                    _authState.value = AuthState.FingerprintMismatch(pinnedFp, presentedFp)
-                    onCertificateMismatch?.invoke(pinnedFp, presentedFp)
-                    log("Untrusted server certificate! Mismatch detected. Pinned: $pinnedFp, Presented: $presentedFp")
-                    _connectionState.value = ConnectionState.DISCONNECTED
-                    trustMgr.resetLastPresentedFingerprint()
-                    return
+                    if (presentedFp != null) {
+                        if (pinnedFp == null) {
+                            _authState.value = AuthState.FingerprintConfirmationRequired(presentedFp)
+                            log("Server certificate not yet confirmed by user (via trust manager). Fingerprint: $presentedFp")
+                            _connectionState.value = ConnectionState.DISCONNECTED
+                            trustMgr.resetLastPresentedFingerprint()
+                            unconfirmedFpToNotify = presentedFp
+                            handledTls = true
+                        } else if (!TlsConfig.fingerprintsMatch(pinnedFp, presentedFp)) {
+                            _authState.value = AuthState.FingerprintMismatch(pinnedFp, presentedFp)
+                            log("Untrusted server certificate! Mismatch detected. Pinned: $pinnedFp, Presented: $presentedFp")
+                            _connectionState.value = ConnectionState.DISCONNECTED
+                            trustMgr.resetLastPresentedFingerprint()
+                            mismatchToNotify = pinnedFp to presentedFp
+                            handledTls = true
+                        }
+                    }
+                }
+
+                if (!handledTls) {
+                    log("Connection error: ${t.message ?: t.javaClass.simpleName}")
+                    _authState.value = AuthState.Disconnected
+                    if (!userInitiatedDisconnect.get()) {
+                        scheduleReconnection(socketGeneration.get())
+                    } else {
+                        _connectionState.value = ConnectionState.DISCONNECTED
+                    }
                 }
             }
 
-            log("Connection error: ${t.message ?: t.javaClass.simpleName}")
-            _authState.value = AuthState.Disconnected
-            if (!userInitiatedDisconnect.get()) {
-                scheduleReconnection()
-            } else {
-                _connectionState.value = ConnectionState.DISCONNECTED
-            }
+            deliverPendingError(drained, "Connection failed: ${t.message}")
+            unconfirmedFpToNotify?.let { fp -> onUnconfirmedFingerprint?.invoke(fp) }
+            mismatchToNotify?.let { (pinned, presented) -> onCertificateMismatch?.invoke(pinned, presented) }
         }
     }
 
-    private fun performPostConnectionHandshake() {
+    private fun performPostConnectionHandshake(socketRef: WebSocket, generation: Long) {
+        if (!isCurrentGeneration(generation, socketRef)) return
         val devId = identity?.deviceId
         val token = resolveStoredTokenForActiveTarget()
 
@@ -824,7 +1202,9 @@ class SnowWebSocketClient(
             log("Initiating automatic authentication handshake (device_id=${devId.take(8)}...)...")
             val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
             val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
-            sendRequest(
+            sendRequestForGeneration(
+                expectedGeneration = generation,
+                expectedSocket = socketRef,
                 action = "auth_request",
                 data = mapOf(
                     "device_id" to devId,
@@ -834,29 +1214,38 @@ class SnowWebSocketClient(
                     "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
                 )
             ) { response ->
+                if (!isCurrentGeneration(generation, socketRef)) {
+                    log("Ignoring stale auth_request response for obsolete gen=$generation.")
+                    return@sendRequestForGeneration
+                }
                 if (response.type == MessageType.RESPONSE && response.payload?.get("status") == "success") {
                     val data = (response.payload["data"] as? Map<*, *>) ?: response.payload
                     val authState = parseAuthenticatedState(data)
-                    val canonicalPeerId = authState.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
-                        ?: activeTargetDeviceId()
-                    if (canonicalPeerId != null) {
-                        resolvedTargetDeviceId = canonicalPeerId
-                        // Idempotently promote any legacy single-slot credentials to canonical device slot
-                        (tokenStorage as? org.snow.security.SharedPreferencesTokenStorage)
-                            ?.migrateLegacyTokenToDeviceIfKnown(canonicalPeerId)
-                        (certPinStorage as? org.snow.security.EncryptedCertPinStorage)
-                            ?.migrateLegacyPinToDeviceIfKnown(canonicalPeerId)
-                        currentTrustManager?.lastPresentedFingerprint?.let { fp ->
-                            if (certPinStorage?.getPinnedFingerprintForDevice(canonicalPeerId) == null) {
-                                certPinStorage?.pinFingerprintForDevice(canonicalPeerId, fp)
+                    synchronized(this) {
+                        if (generation != socketGeneration.get() || this.webSocket !== socketRef) {
+                            log("Ignoring stale auth success immediately before state write (gen=$generation).")
+                            return@sendRequestForGeneration
+                        }
+                        val canonicalPeerId = authState.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+                            ?: activeTargetDeviceId()
+                        if (canonicalPeerId != null) {
+                            resolvedTargetDeviceId = canonicalPeerId
+                            (tokenStorage as? org.snow.security.SharedPreferencesTokenStorage)
+                                ?.migrateLegacyTokenToDeviceIfKnown(canonicalPeerId)
+                            (certPinStorage as? org.snow.security.EncryptedCertPinStorage)
+                                ?.migrateLegacyPinToDeviceIfKnown(canonicalPeerId)
+                            currentTrustManager?.lastPresentedFingerprint?.let { fp ->
+                                if (certPinStorage?.getPinnedFingerprintForDevice(canonicalPeerId) == null) {
+                                    certPinStorage?.pinFingerprintForDevice(canonicalPeerId, fp)
+                                }
+                            }
+                            if (tokenStorage?.getTokenForDevice(canonicalPeerId) == null && !token.isNullOrBlank()) {
+                                tokenStorage?.saveTokenForDevice(canonicalPeerId, token)
                             }
                         }
-                        if (tokenStorage?.getTokenForDevice(canonicalPeerId) == null && !token.isNullOrBlank()) {
-                            tokenStorage?.saveTokenForDevice(canonicalPeerId, token)
-                        }
+                        backoffPolicy.reset()
+                        _authState.value = authState
                     }
-                    backoffPolicy.reset()
-                    _authState.value = authState
                     log("Authenticated successfully with peer core [session=${authState.sessionId}, tier=${authState.trustTier}, profile=${authState.permissionProfile ?: "unset"}, type=${authState.peerDeviceType ?: "unknown"}]")
                 } else {
                     val errCode = response.error?.code ?: ErrorCode.UNAUTHORIZED
@@ -865,23 +1254,33 @@ class SnowWebSocketClient(
 
                     if (errCode == ErrorCode.DEVICE_NOT_FOUND) {
                         log("Server reported device not paired (revoked). Clearing token and disabling auto-reconnect.")
-                        handleRemoteRevocation("Device pairing revoked on desktop host.")
+                        handleRemoteRevocation("Device pairing revoked on desktop host.", expectedGeneration = generation, expectedSocket = socketRef)
                     } else if (errCode == ErrorCode.UNAUTHORIZED && errMsg.startsWith("MANUAL_DISCONNECT", ignoreCase = true)) {
                         log("Host manually disconnected session; keeping pairing token intact and pausing auto-reconnect.")
-                        userInitiatedDisconnect.set(true)
-                        disconnectInternal()
-                        backoffPolicy.reset()
-                        _authState.value = AuthState.Disconnected
-                        _connectionState.value = ConnectionState.DISCONNECTED
+                        val drained: List<PendingRequestEntry>
+                        synchronized(this) {
+                            if (generation != socketGeneration.get() || this.webSocket !== socketRef) return@sendRequestForGeneration
+                            userInitiatedDisconnect.set(true)
+                            drained = disconnectLocked(advanceGeneration = true)
+                            backoffPolicy.reset()
+                            _authState.value = AuthState.Disconnected
+                            _connectionState.value = ConnectionState.DISCONNECTED
+                        }
+                        deliverPendingError(drained, "Manual disconnect by host.")
                     } else if (errCode == ErrorCode.UNAUTHORIZED) {
                         log("Stored token is invalid. Clearing stale token and awaiting user pairing...")
-                        clearStoredTokenForActiveTarget()
-                        _authState.value = AuthState.ConnectedUnauthenticated
+                        synchronized(this) {
+                            if (generation != socketGeneration.get() || this.webSocket !== socketRef) return@sendRequestForGeneration
+                            clearStoredTokenForActiveTarget()
+                            _authState.value = AuthState.ConnectedUnauthenticated
+                        }
 
                         // Immunize connection from timeout and register unauthenticated pending pairing
                         val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
                         val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
-                        sendRequest(
+                        sendRequestForGeneration(
+                            expectedGeneration = generation,
+                            expectedSocket = socketRef,
                             action = "pair_request",
                             data = mapOf(
                                 "device_id" to devId,
@@ -891,21 +1290,36 @@ class SnowWebSocketClient(
                                 "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
                             )
                         ) { pairResp ->
-                            log("Desktop pairing registration updated (status=${pairResp.payload?.get("status")})")
+                            if (isCurrentGeneration(generation, socketRef)) {
+                                log("Desktop pairing registration updated (status=${pairResp.payload?.get("status")})")
+                            }
                         }
                     } else {
-                        _authState.value = AuthState.AuthFailed(errMsg)
+                        synchronized(this) {
+                            if (generation == socketGeneration.get() && this.webSocket === socketRef) {
+                                _authState.value = AuthState.AuthFailed(errMsg)
+                            }
+                        }
                     }
                 }
             }
         } else {
-            _authState.value = AuthState.ConnectedUnauthenticated
+            val shouldPair = synchronized(this) {
+                if (generation != socketGeneration.get() || this.webSocket !== socketRef) {
+                    false
+                } else {
+                    _authState.value = AuthState.ConnectedUnauthenticated
+                    true
+                }
+            }
+            if (!shouldPair) return
             log("Connected over WSS. Device is not paired; initializing pairing on desktop...")
             if (!devId.isNullOrBlank()) {
-                // Immunize connection from handshake timeout and register with desktop pairing manager
                 val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
                 val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
-                sendRequest(
+                sendRequestForGeneration(
+                    expectedGeneration = generation,
+                    expectedSocket = socketRef,
                     action = "pair_request",
                     data = mapOf(
                         "device_id" to devId,
@@ -915,28 +1329,59 @@ class SnowWebSocketClient(
                         "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
                     )
                 ) { response ->
-                    log("Desktop core pairing initialized (status=${response.payload?.get("status")})")
+                    if (isCurrentGeneration(generation, socketRef)) {
+                        log("Desktop core pairing initialized (status=${response.payload?.get("status")})")
+                    }
                 }
             }
         }
     }
 
-    internal fun handleRemoteRevocation(reason: String? = null) {
-        clearStoredTokenForActiveTarget()
-        userInitiatedDisconnect.set(true)
-        disconnectInternal()
-        backoffPolicy.reset()
-        _authState.value = AuthState.AuthFailed(reason ?: "Device access revoked by host.")
-        _connectionState.value = ConnectionState.DISCONNECTED
+    internal fun handleRemoteRevocation(
+        reason: String? = null,
+        expectedGeneration: Long? = null,
+        expectedSocket: WebSocket? = null
+    ) {
+        val drained: List<PendingRequestEntry>
+        synchronized(this) {
+            if (expectedGeneration != null && expectedGeneration != socketGeneration.get()) return
+            if (expectedSocket != null && this.webSocket != null && this.webSocket !== expectedSocket) return
+            clearStoredTokenForActiveTarget()
+            userInitiatedDisconnect.set(true)
+            drained = disconnectLocked(advanceGeneration = true)
+            backoffPolicy.reset()
+            _authState.value = AuthState.AuthFailed(reason ?: "Device access revoked by host.")
+            _connectionState.value = ConnectionState.DISCONNECTED
+        }
+        deliverPendingError(drained, "Device access revoked by host.")
         onDeviceRevoked?.invoke(reason)
     }
 
-    internal fun handleIncomingMessage(incomingSocket: WebSocket, rawText: String) {
+    internal fun handleIncomingMessage(
+        incomingSocket: WebSocket,
+        rawText: String,
+        expectedGeneration: Long? = null
+    ) {
+        // Guard against stale socket / obsolete generation deliveries
+        synchronized(this) {
+            val activeGen = socketGeneration.get()
+            if (expectedGeneration != null) {
+                if (expectedGeneration != activeGen || this.webSocket !== incomingSocket) {
+                    log("Dropping incoming message from obsolete gen=$expectedGeneration (active=$activeGen).")
+                    return
+                }
+            } else if (this.webSocket != null && this.webSocket !== incomingSocket) {
+                log("Dropping incoming message from non-active socket.")
+                return
+            }
+        }
+
+        val capturedGeneration = expectedGeneration ?: socketGeneration.get()
         val message = try {
             ProtocolValidator.validateRawMessage(rawText)
         } catch (e: ProtocolValidationError) {
             log("Received invalid message: ${e.message}")
-            if (e.correlationId != null) {
+            if (e.correlationId != null && (expectedGeneration == null || isCurrentGeneration(capturedGeneration, incomingSocket))) {
                 val err = SnowMessage.createError(
                     code = e.code,
                     message = e.message,
@@ -949,36 +1394,54 @@ class SnowWebSocketClient(
 
         when (message.type) {
             MessageType.HEARTBEAT -> {
+                if (expectedGeneration != null && !isCurrentGeneration(capturedGeneration, incomingSocket)) return
                 log("Received heartbeat from server id=${message.id}. Sending ack.")
                 val ack = SnowMessage.createHeartbeatAck(correlationId = message.id)
                 incomingSocket.send(JsonSerialization.toJson(ack))
             }
 
             MessageType.HEARTBEAT_ACK -> {
-                if (message.correlationId == pendingHeartbeatId) {
-                    lastAckTimestamp = System.currentTimeMillis()
-                    pendingHeartbeatId = null
-                    missedHeartbeatAcks.set(0)
-                    backoffPolicy.reset()
-                    log("Received heartbeat_ack for ${message.correlationId}. Connection healthy.")
-                } else {
-                    log("Received heartbeat_ack with unexpected correlation_id=${message.correlationId}")
+                synchronized(this) {
+                    if (expectedGeneration != null && (capturedGeneration != socketGeneration.get() || this.webSocket !== incomingSocket)) {
+                        return
+                    }
+                    if (message.correlationId == pendingHeartbeatId) {
+                        lastAckTimestamp = System.currentTimeMillis()
+                        pendingHeartbeatId = null
+                        missedHeartbeatAcks.set(0)
+                        backoffPolicy.reset()
+                        log("Received heartbeat_ack for ${message.correlationId}. Connection healthy.")
+                    } else {
+                        log("Received heartbeat_ack with unexpected correlation_id=${message.correlationId}")
+                    }
                 }
             }
 
             MessageType.RESPONSE -> {
                 log("Received response id=${message.id} corr=${message.correlationId}")
                 message.correlationId?.let { corrId ->
-                    val callback = pendingRequests.remove(corrId)
-                    callback?.invoke(message)
+                    val entry = pendingRequests[corrId]
+                    if (entry != null &&
+                        (expectedGeneration == null || (entry.generation == capturedGeneration && isCurrentGeneration(capturedGeneration, incomingSocket)))
+                    ) {
+                        if (pendingRequests.remove(corrId, entry)) {
+                            entry.callback.invoke(message)
+                        }
+                    }
                 }
             }
 
             MessageType.ERROR -> {
                 log("Received error from server: code=${message.error?.code} msg=${message.error?.message} corr=${message.correlationId}")
                 message.correlationId?.let { corrId ->
-                    val callback = pendingRequests.remove(corrId)
-                    callback?.invoke(message)
+                    val entry = pendingRequests[corrId]
+                    if (entry != null &&
+                        (expectedGeneration == null || (entry.generation == capturedGeneration && isCurrentGeneration(capturedGeneration, incomingSocket)))
+                    ) {
+                        if (pendingRequests.remove(corrId, entry)) {
+                            entry.callback.invoke(message)
+                        }
+                    }
                 }
             }
 
@@ -996,7 +1459,11 @@ class SnowWebSocketClient(
                     try {
                         incomingSocket.send(JsonSerialization.toJson(ackResp))
                     } catch (_: Exception) {}
-                    handleRemoteRevocation(reason)
+                    handleRemoteRevocation(
+                        reason = reason,
+                        expectedGeneration = expectedGeneration,
+                        expectedSocket = if (expectedGeneration != null) incomingSocket else null
+                    )
                 } else if (action == "session_disconnect") {
                     val reason = (data?.get("reason") as? String) ?: "Disconnected by desktop host."
                     log("Received session_disconnect from server: $reason")
@@ -1007,12 +1474,20 @@ class SnowWebSocketClient(
                     try {
                         incomingSocket.send(JsonSerialization.toJson(ackResp))
                     } catch (_: Exception) {}
-                    userInitiatedDisconnect.set(true)
-                    disconnectInternal()
-                    backoffPolicy.reset()
-                    _authState.value = AuthState.Disconnected
-                    _connectionState.value = ConnectionState.DISCONNECTED
+                    val drained = synchronized(this) {
+                        if (expectedGeneration != null && (capturedGeneration != socketGeneration.get() || this.webSocket !== incomingSocket)) {
+                            return
+                        }
+                        userInitiatedDisconnect.set(true)
+                        val pending = disconnectLocked(advanceGeneration = true)
+                        backoffPolicy.reset()
+                        _authState.value = AuthState.Disconnected
+                        _connectionState.value = ConnectionState.DISCONNECTED
+                        pending
+                    }
+                    deliverPendingError(drained, "Disconnected by desktop host.")
                 } else if (action == "ping") {
+                    if (expectedGeneration != null && !isCurrentGeneration(capturedGeneration, incomingSocket)) return
                     val respPayload = mapOf<String, Any?>(
                         "status" to "success",
                         "action" to "pong"
@@ -1030,6 +1505,9 @@ class SnowWebSocketClient(
                                 ?: Pair(null, SnowError(ErrorCode.UNSUPPORTED_ACTION, "No request dispatcher registered."))
                         } catch (e: Exception) {
                             Pair(null, SnowError(ErrorCode.INTERNAL_ERROR, "Error handling action '$action': ${e.message}"))
+                        }
+                        if (!isActive || (expectedGeneration != null && !isCurrentGeneration(capturedGeneration, incomingSocket))) {
+                            return@launch
                         }
                         if (error != null) {
                             val errMessage = SnowMessage.createError(
@@ -1049,6 +1527,7 @@ class SnowWebSocketClient(
                         }
                     }
                 } else {
+                    if (expectedGeneration != null && !isCurrentGeneration(capturedGeneration, incomingSocket)) return
                     val err = SnowMessage.createError(
                         code = ErrorCode.UNSUPPORTED_ACTION,
                         message = "Unsupported action '$action' on Android client.",

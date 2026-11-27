@@ -183,6 +183,8 @@ class SnowIpcServer:
         # Layer 3 SessionRouter and NodeRegistry delegation
         self.session_router = getattr(core_server, "session_router", None)
         self.node_registry = getattr(core_server, "node_registry", None)
+        self._async_transfer_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._async_transfer_cleanup_paths: dict[str, Path] = {}
 
     def _sync_capability_engine(self) -> None:
         """Synchronize capability engine references with core_server attributes."""
@@ -1582,13 +1584,17 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "android_file_list":
-            requested_scope = payload.get("scope", "saf")
+            requested_scope = payload.get("scope", "auto")
             # Enforce caller-specific storage scopes: AI_MCP is strictly locked to saf
             if ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
                 effective_scope = "saf"
                 show_hidden = False
             else:
-                effective_scope = "full" if requested_scope == "full" else "saf"
+                effective_scope = (
+                    requested_scope
+                    if requested_scope in ("auto", "saf", "full")
+                    else "auto"
+                )
                 show_hidden = bool(payload.get("show_hidden", False))
 
             dev_resp = await self._handle_device_request({
@@ -1611,6 +1617,35 @@ class SnowIpcServer:
 
         if op == "android_file_send":
             res = await self._handle_android_file_send(payload)
+            res_data = res.get("data")
+            if res_data is None and (res.get("transfer_id") or res.get("status") == "ACCEPTED"):
+                res_data = {
+                    k: v
+                    for k, v in res.items()
+                    if k not in ("success", "status", "error")
+                }
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res_data,
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "transfer_status":
+            res = await self._handle_transfer_status(payload, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.get("success", False),
+                "status": res.get("status", "ERROR"),
+                "data": res.get("data"),
+                "error": res.get("error"),
+            }, now_authed
+
+        if op == "transfer_cancel":
+            res = await self._handle_transfer_cancel(payload, ctx=ctx)
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -2650,11 +2685,125 @@ class SnowIpcServer:
                     return session.device_id
         return None
 
+    async def _handle_transfer_status(self, payload: dict, ctx: Optional[ExecutionContext] = None) -> dict:
+        """Query owner-scoped transfer progress/state honestly (returns NOT_FOUND after Core restart)."""
+        cs = self.core_server
+        transfer_id = str(payload.get("transfer_id") or "").strip()
+        device_id = str(payload.get("device_id") or "").strip()
+        if not transfer_id:
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "Missing 'transfer_id'."}
+        if not cs or not getattr(cs, "transfer_manager", None):
+            return {"success": False, "status": "NOT_FOUND", "error": "Transfer manager unavailable."}
+        record = (
+            cs.transfer_manager.get_transfer_for_device(transfer_id, device_id)
+            if device_id
+            else cs.transfer_manager.get_transfer(transfer_id)
+        )
+        if not record:
+            return {"success": False, "status": "NOT_FOUND", "error": f"Transfer '{transfer_id}' not found."}
+
+        pct = (
+            min(100, int((record.current_offset * 100) / record.file_size))
+            if record.file_size > 0
+            else (100 if record.status.value == "COMPLETED" else 0)
+        )
+        return {
+            "success": True,
+            "status": "SUCCESS",
+            "data": {
+                "transfer_id": record.transfer_id,
+                "device_id": record.device_id,
+                "direction": record.direction.value,
+                "file_name": record.file_name,
+                "file_size": record.file_size,
+                "current_offset": record.current_offset,
+                "bytes_transferred": record.current_offset,
+                "percent": pct,
+                "sha256": record.sha256,
+                "transfer_status": record.status.value,
+                "state": record.status.value,
+                "error_message": record.error_message,
+            },
+        }
+
+    async def _handle_transfer_cancel(self, payload: dict, ctx: Optional[ExecutionContext] = None) -> dict:
+        """Cancel an in-flight transfer across Core Task -> TransferManager -> Android."""
+        cs = self.core_server
+        transfer_id = str(payload.get("transfer_id") or "").strip()
+        device_id = str(payload.get("device_id") or "").strip()
+        if not transfer_id:
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "Missing 'transfer_id'."}
+        if not cs or not getattr(cs, "transfer_manager", None):
+            return {"success": False, "status": "NOT_FOUND", "error": "Transfer manager unavailable."}
+
+        record = (
+            cs.transfer_manager.get_transfer_for_device(transfer_id, device_id)
+            if device_id
+            else cs.transfer_manager.get_transfer(transfer_id)
+        )
+        if not record:
+            return {"success": False, "status": "NOT_FOUND", "error": f"Transfer '{transfer_id}' not found."}
+
+        owner_id = record.device_id
+        cancelled = cs.transfer_manager.cancel_transfer(transfer_id, owner_id)
+        task = getattr(self, "_async_transfer_tasks", {}).pop(transfer_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        if getattr(cs, "storage_manager", None):
+            try:
+                part_path = cs.storage_manager.get_part_path(transfer_id)
+                cs.storage_manager.delete_part_file(part_path)
+            except Exception:
+                pass
+
+        staged_cleanup = getattr(self, "_async_transfer_cleanup_paths", {}).pop(transfer_id, None)
+        if staged_cleanup and staged_cleanup.exists():
+            try:
+                staged_cleanup.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        # Propagate best-effort cancellation to Android target over WSS/router
+        try:
+            router = getattr(self, "session_router", None) or getattr(cs, "session_router", None)
+            if router and hasattr(router, "route_request") and not type(router).__name__.endswith("Mock"):
+                await asyncio.wait_for(
+                    router.route_request(
+                        action="transfer_cancel",
+                        target=owner_id,
+                        data={"transfer_id": transfer_id},
+                        timeout=5.0,
+                    ),
+                    timeout=6.0,
+                )
+            elif getattr(cs, "session_manager", None) and getattr(cs, "ws_server", None):
+                sess = cs.session_manager.get_session_by_device(owner_id)
+                if sess and sess.connection_id:
+                    await asyncio.wait_for(
+                        cs.ws_server.send_request(
+                            connection_id=sess.connection_id,
+                            action="transfer_cancel",
+                            payload={"transfer_id": transfer_id},
+                            timeout=5.0,
+                        ),
+                        timeout=6.0,
+                    )
+        except Exception as cancel_exc:
+            logger.debug("Best-effort remote transfer cancel notice failed for %s: %s", transfer_id, cancel_exc)
+
+        return {
+            "success": True,
+            "status": "CANCELLED",
+            "data": {"transfer_id": transfer_id, "cancelled": cancelled, "status": "CANCELLED"},
+        }
+
     async def _handle_android_file_send(self, payload: dict) -> dict:
         """Coordinate sending a file from Desktop to a connected Android phone."""
         cs = self.core_server
         device_id = payload.get("device_id")
         file_path_raw = payload.get("file_path")
+        async_transfer = bool(payload.get("async_transfer", False))
         timeout = float(payload.get("timeout") or 60.0)
 
         if not file_path_raw or not isinstance(file_path_raw, str):
@@ -2675,11 +2824,21 @@ class SnowIpcServer:
             return {"success": False, "status": err or "FILE_NOT_FOUND", "error": f"File access denied or not found: '{file_path_raw}'"}
 
         file_size = safe_path.stat().st_size
-        hasher = hashlib.sha256()
-        with open(safe_path, "rb") as f:
-            while chunk := f.read(65536):
-                hasher.update(chunk)
-        file_sha256 = hasher.hexdigest()
+        raw_limit = getattr(getattr(cs, "config", None), "max_transfer_size", None)
+        max_transfer_bytes = (
+            raw_limit
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else 16 * 1024 * 1024 * 1024
+        )
+        if file_size > max_transfer_bytes:
+            return {
+                "success": False,
+                "status": "FILE_TOO_LARGE",
+                "error": f"File size {file_size} exceeds maximum transfer limit of {max_transfer_bytes} bytes.",
+            }
+
+        from snow.transfer.storage import compute_stream_sha256, stream_copy_file
+        file_sha256 = await asyncio.to_thread(compute_stream_sha256, safe_path)
 
         from snow.transfer.manager import TransferDirection, TransferState
 
@@ -2708,10 +2867,10 @@ class SnowIpcServer:
                     "message": f"File '{safe_path.name}' with identical hash already exists on destination; transfer skipped.",
                 }
 
-        # Ensure file exists at destination inside storage_manager so download handler can serve it
+        # Ensure file exists at destination inside storage_manager without blocking event loop
         dest_path = cs.storage_manager.resolve_destination_path(safe_path.name)
         if dest_path.resolve() != safe_path.resolve():
-            shutil.copy2(safe_path, dest_path)
+            await asyncio.to_thread(stream_copy_file, safe_path, dest_path)
 
         record = cs.transfer_manager.create_transfer(
             device_id=device_id,
@@ -2719,6 +2878,7 @@ class SnowIpcServer:
             file_size=file_size,
             sha256=file_sha256,
             direction=TransferDirection.DOWNLOAD,
+            file_path=str(dest_path),
         )
 
         transfer_port = (
@@ -2734,6 +2894,8 @@ class SnowIpcServer:
             "sha256": file_sha256,
             "transfer_port": transfer_port,
         }
+        if async_transfer:
+            req_data["async"] = True
 
         # 2. Prefer SessionRouter for capability-aware multi-transport dispatch
         router = getattr(self, "session_router", None) or (
@@ -2744,6 +2906,83 @@ class SnowIpcServer:
             or getattr(router, "_is_router_mock", False) is True
             or (not type(router).__name__.endswith("Mock") and hasattr(router, "route_request"))
         )
+
+        async def _dispatch_once(dispatch_timeout: float) -> dict[str, Any]:
+            if has_real_router:
+                return await router.route_request(
+                    action="file_send_request",
+                    target=device_id,
+                    data=req_data,
+                    timeout=dispatch_timeout,
+                )
+            session = cs.session_manager.get_session_by_device(device_id)
+            if not session or not session.connection_id:
+                return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
+            conn = cs.connection_manager.get(session.connection_id)
+            if not conn or not conn.is_active:
+                return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
+            resp = await cs.ws_server.send_request(
+                connection_id=session.connection_id,
+                action="file_send_request",
+                payload=req_data,
+                timeout=dispatch_timeout,
+            )
+            is_ok = resp.type == MessageType.RESPONSE and (
+                resp.payload is None or resp.payload.get("status") != "error"
+            )
+            if is_ok:
+                p = resp.payload or {}
+                d = p.get("data") if isinstance(p.get("data"), dict) else p
+                return {"success": True, "status": str(d.get("status") or p.get("status") or "SUCCESS").upper(), "data": p}
+            err_msg = (
+                resp.error.get("message")
+                if isinstance(resp.error, dict)
+                else (resp.payload.get("error") if resp.payload else "Transfer failed on Android device.")
+            )
+            return {"success": False, "status": "TRANSFER_FAILED", "error": err_msg}
+
+        if async_transfer:
+            async def _bg_async_dispatch() -> None:
+                try:
+                    cs.transfer_manager.update_offset(record.transfer_id, 0)
+                    dispatch_res = await _dispatch_once(min(timeout, 30.0))
+                    if record.status == TransferState.CANCELLED:
+                        return
+                    if not dispatch_res.get("success"):
+                        cs.transfer_manager.fail_transfer(
+                            record.transfer_id,
+                            dispatch_res.get("error") or "Transfer rejected by target device.",
+                        )
+                        return
+                    inner = dispatch_res.get("data") if isinstance(dispatch_res.get("data"), dict) else dispatch_res
+                    remote_status = str(
+                        (inner or {}).get("status") or dispatch_res.get("status") or ""
+                    ).strip().upper()
+                    if remote_status in ("SUCCESS", "COMPLETED"):
+                        cs.transfer_manager.complete_transfer(record.transfer_id)
+                except asyncio.CancelledError:
+                    cs.transfer_manager.cancel_transfer(record.transfer_id, device_id)
+                except Exception as exc:
+                    if record.status != TransferState.CANCELLED:
+                        cs.transfer_manager.fail_transfer(record.transfer_id, str(exc))
+                finally:
+                    self._async_transfer_tasks.pop(record.transfer_id, None)
+
+            if not hasattr(self, "_async_transfer_tasks"):
+                self._async_transfer_tasks = {}
+            self._async_transfer_tasks[record.transfer_id] = asyncio.create_task(_bg_async_dispatch())
+            return {
+                "success": True,
+                "status": "ACCEPTED",
+                "accepted": True,
+                "transfer_id": record.transfer_id,
+                "device_id": device_id,
+                "file_name": safe_path.name,
+                "file_size": file_size,
+                "sha256": file_sha256,
+                "transfer_port": transfer_port,
+            }
+
         if has_real_router:
             route_res = await router.route_request(
                 action="file_send_request",

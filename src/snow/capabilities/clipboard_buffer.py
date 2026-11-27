@@ -40,6 +40,7 @@ MAX_BUNDLE_BYTES: int = 15 * 1024 * 1024  # 15 MiB
 MAX_BUNDLE_FILES: int = 5
 MAX_BUFFER_MEDIA_BYTES: int = 100 * 1024 * 1024  # 100 MiB aggregate persisted media
 DEFAULT_DEBOUNCE_SECONDS: float = 0.5
+IMAGE_BURST_WINDOW_SECONDS: float = 1.0
 MAX_PREVIEW_CHARS: int = 120
 
 VALID_CONTENT_TYPES = frozenset({"text", "image", "file", "file_bundle"})
@@ -298,6 +299,8 @@ class ClipboardRingBuffer:
         self.debounce_seconds: float = debounce_seconds
         self.db_manager = db_manager
         self._lock = threading.RLock()
+        self._hydration_lock = threading.Lock()
+        self._hydration_attempted: Set[str] = set()
         self._items: List[ClipboardItem] = []
         self._seq_counter: int = 0
         # Echo-loop tracking: sha256 -> set of device_ids, and event_id -> set of device_ids
@@ -333,23 +336,32 @@ class ClipboardRingBuffer:
             return
         try:
             rel_p = item.image_path.name if item.image_path else None
-            self.db_manager.save_clipboard_item(
-                item_id=item.item_id,
-                content_type=item.content_type,
-                preview=item.preview,
-                source_device_id=item.source_device_id,
-                source_device_name=item.source_device_name,
-                timestamp=item.timestamp,
-                sha256=item.sha256,
-                size_bytes=item.size_bytes,
-                pinned=item.pinned,
-                text_content=item.text_content if item.content_type == "text" else None,
-                image_rel_path=rel_p,
-                mime_type=item.mime_type,
-                event_id=item.event_id,
-                seq=item.seq,
-                file_manifest=item.file_manifest if item.content_type in ("file", "file_bundle") else [],
-            )
+            kwargs: Dict[str, Any] = {
+                "item_id": item.item_id,
+                "content_type": item.content_type,
+                "preview": item.preview,
+                "source_device_id": item.source_device_id,
+                "source_device_name": item.source_device_name,
+                "timestamp": item.timestamp,
+                "sha256": item.sha256,
+                "size_bytes": item.size_bytes,
+                "pinned": item.pinned,
+                "text_content": item.text_content if item.content_type == "text" else None,
+                "image_rel_path": rel_p,
+                "mime_type": item.mime_type,
+                "event_id": item.event_id,
+                "seq": item.seq,
+                "file_manifest": item.file_manifest if item.content_type in ("file", "file_bundle") else [],
+            }
+            try:
+                self.db_manager.save_clipboard_item(
+                    **kwargs,
+                    canonical_sha256=item.canonical_sha256,
+                    width=item.width,
+                    height=item.height,
+                )
+            except TypeError:
+                self.db_manager.save_clipboard_item(**kwargs)
         except Exception as e:
             logger.warning("Error persisting clipboard item %s to DB: %s", item.item_id, e)
 
@@ -500,6 +512,9 @@ class ClipboardRingBuffer:
                             pinned=pinned,
                             image_path=disk_file,
                             mime_type=row.get("mime_type") or "image/png",
+                            canonical_sha256=row.get("canonical_sha256"),
+                            width=row.get("width"),
+                            height=row.get("height"),
                             event_id=event_id,
                             seq=seq,
                         )
@@ -622,8 +637,101 @@ class ClipboardRingBuffer:
                 return items[:limit]
             return items
 
+    def _hydrate_image_item_canonical(self, item_id: str) -> Optional[str]:
+        """Lazily hydrate canonical_sha256/width/height for a legacy image row outside DB and buffer locks."""
+        target_path: Optional[Path] = None
+        expected_sha: str = ""
+        with self._lock:
+            target_item = next((it for it in self._items if it.item_id == item_id), None)
+            if target_item is None or target_item.content_type != "image":
+                return None
+            if target_item.canonical_sha256:
+                return target_item.canonical_sha256
+            if item_id in self._hydration_attempted:
+                return None
+            if target_item.image_path and is_contained_non_symlink(target_item.image_path, self.storage_dir):
+                resolved = target_item.image_path.resolve()
+                try:
+                    if 0 < resolved.stat().st_size <= MAX_IMAGE_BYTES:
+                        target_path = resolved
+                        expected_sha = target_item.sha256
+                except OSError:
+                    target_path = None
+
+        canon_digest: Optional[str] = None
+        img_w: Optional[int] = None
+        img_h: Optional[int] = None
+        if target_path is not None:
+            with self._hydration_lock:
+                # Re-check whether another thread hydrated while waiting on _hydration_lock
+                with self._lock:
+                    again = next((it for it in self._items if it.item_id == item_id), None)
+                    if again is None:
+                        return None
+                    if again.canonical_sha256:
+                        return again.canonical_sha256
+                    if item_id in self._hydration_attempted:
+                        return None
+                try:
+                    raw_bytes = target_path.read_bytes()
+                    from snow.capabilities.windows.clipboard import compute_canonical_image_digest
+
+                    canon_digest, img_w, img_h = compute_canonical_image_digest(raw_bytes)
+                    del raw_bytes
+                except Exception as exc:
+                    logger.debug("Lazy canonical hydration failed for item %s: %s", item_id, exc)
+                    canon_digest, img_w, img_h = None, None, None
+
+        should_persist = False
+        with self._lock:
+            self._hydration_attempted.add(item_id)
+            updated_item = next((it for it in self._items if it.item_id == item_id), None)
+            if updated_item is not None and updated_item.sha256 == expected_sha and canon_digest:
+                updated_item.canonical_sha256 = canon_digest
+                updated_item.width = img_w
+                updated_item.height = img_h
+                should_persist = True
+
+        if should_persist and self.db_manager and hasattr(self.db_manager, "update_clipboard_canonical_metadata"):
+            try:
+                self.db_manager.update_clipboard_canonical_metadata(item_id, canon_digest, img_w, img_h)
+            except Exception as db_exc:
+                logger.debug("Failed persisting hydrated canonical metadata for %s: %s", item_id, db_exc)
+
+        return canon_digest
+
+    def hydrate_latest_image_canonical(self) -> Optional[Dict[str, Any]]:
+        """Lazily hydrate the newest buffer entry if it is a legacy image missing canonical metadata."""
+        target_id: Optional[str] = None
+        with self._lock:
+            if not self._items:
+                return None
+            top = self._items[0]
+            if top.content_type != "image":
+                return top.to_metadata()
+            if top.canonical_sha256 or top.item_id in self._hydration_attempted:
+                return top.to_metadata()
+            target_id = top.item_id
+        if target_id:
+            self._hydrate_image_item_canonical(target_id)
+        return self.get_item(target_id) if target_id else None
+
     def get_item(self, item_id: str, include_content: bool = False) -> Optional[Dict[str, Any]]:
-        """Retrieve a specific item by ID."""
+        """Retrieve a specific item by ID, lazily hydrating canonical image metadata if absent."""
+        needs_hydration = False
+        with self._lock:
+            for item in self._items:
+                if item.item_id == item_id:
+                    if (
+                        item.content_type == "image"
+                        and not item.canonical_sha256
+                        and item_id not in self._hydration_attempted
+                    ):
+                        needs_hydration = True
+                    else:
+                        return item.to_detail() if include_content else item.to_metadata()
+        if needs_hydration:
+            self._hydrate_image_item_canonical(item_id)
         with self._lock:
             for item in self._items:
                 if item.item_id == item_id:
@@ -709,6 +817,14 @@ class ClipboardRingBuffer:
                 return None
             return latest.to_metadata()
 
+    def _effective_image_burst_window(self) -> float:
+        """Use ~1.0s burst suppression for OS image bursts while honoring tighter test overrides."""
+        if self.debounce_seconds <= 0.0:
+            return 0.0
+        if self.debounce_seconds < DEFAULT_DEBOUNCE_SECONDS:
+            return self.debounce_seconds
+        return max(self.debounce_seconds, IMAGE_BURST_WINDOW_SECONDS)
+
     def _find_recent_duplicate_locked(
         self,
         content_type: str,
@@ -716,25 +832,18 @@ class ClipboardRingBuffer:
         now: float,
         canonical_digest: Optional[str] = None,
     ) -> Optional[int]:
-        """Find matching item within the debounce window (returns index or None)."""
+        """Find matching item within the debounce/burst window (returns index or None)."""
+        window = self._effective_image_burst_window() if content_type == "image" else self.debounce_seconds
+        if window <= 0.0:
+            return None
         for idx, item in enumerate(self._items):
             if item.content_type != content_type:
                 continue
             matched = item.sha256 == digest
-            if not matched and content_type == "image" and canonical_digest:
-                item_canonical = item.canonical_sha256
-                if not item_canonical and item.image_path and is_contained_non_symlink(item.image_path, self.storage_dir):
-                    try:
-                        from snow.capabilities.windows.clipboard import compute_canonical_image_digest
-
-                        item_canonical, _, _ = compute_canonical_image_digest(item.image_path.read_bytes())
-                        item.canonical_sha256 = item_canonical
-                    except Exception:
-                        item_canonical = None
-                if item_canonical and item_canonical == canonical_digest:
-                    matched = True
+            if not matched and content_type == "image" and canonical_digest and item.canonical_sha256:
+                matched = item.canonical_sha256 == canonical_digest
             if matched:
-                if (now - item.timestamp) <= self.debounce_seconds:
+                if (now - item.timestamp) <= window:
                     return idx
                 return None
         return None
@@ -896,15 +1005,35 @@ class ClipboardRingBuffer:
         from snow.capabilities.windows.clipboard import compute_canonical_image_digest
 
         canonical_digest, img_w, img_h = compute_canonical_image_digest(raw)
+        bypass_debounce = bool(kwargs.get("bypass_debounce", False) or kwargs.get("explicit_user_action", False))
         to_unlink: List[Path] = []
+
+        # Lazily hydrate only unhydrated recent image rows outside locks before duplicate matching.
+        if canonical_digest and not bypass_debounce:
+            candidate_ids: List[str] = []
+            now_probe = time.time()
+            window_probe = self._effective_image_burst_window()
+            if window_probe > 0.0:
+                with self._lock:
+                    for it in self._items:
+                        if it.content_type != "image":
+                            continue
+                        if (now_probe - it.timestamp) <= window_probe and not it.canonical_sha256 and it.item_id not in self._hydration_attempted:
+                            candidate_ids.append(it.item_id)
+            for cid in candidate_ids:
+                self._hydrate_image_item_canonical(cid)
 
         with self._lock:
             now = time.time()
-            existing_idx = self._find_recent_duplicate_locked(
-                "image",
-                digest,
-                now,
-                canonical_digest=canonical_digest,
+            existing_idx = (
+                None
+                if bypass_debounce
+                else self._find_recent_duplicate_locked(
+                    "image",
+                    digest,
+                    now,
+                    canonical_digest=canonical_digest,
+                )
             )
             if existing_idx is not None:
                 existing = self._items.pop(existing_idx)

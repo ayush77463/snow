@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
@@ -20,12 +21,14 @@ import org.snow.security.SafeLog
 import org.snow.security.SnowTrustManager
 import org.snow.security.TlsConfig
 import org.snow.security.TokenStorage
+import java.io.EOFException
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -48,7 +51,9 @@ open class FileTransferClient(
     private val tokenStorage: TokenStorage? = null,
     private val useTls: Boolean = true,
     customClient: OkHttpClient? = null,
-    private val targetDeviceIdProvider: (() -> String?)? = null
+    private val targetDeviceIdProvider: (() -> String?)? = null,
+    private val maxRetryAttempts: Int = 3,
+    private val retryBaseDelayMs: Long = 200L
 ) {
     companion object {
         const val TAG = "FileTransferClient"
@@ -74,6 +79,46 @@ open class FileTransferClient(
          */
         fun computeSha256(file: File): String {
             return FileInputStream(file).use { computeSha256(it) }
+        }
+
+        /**
+         * Skip an exact Long byte offset without Int truncation, handling zero-progress skip()
+         * calls and throwing EOFException on premature stream end.
+         */
+        @Throws(IOException::class)
+        internal fun skipExactBytes(input: InputStream, bytesToSkip: Long) {
+            if (bytesToSkip <= 0L) return
+            if (input is FileInputStream) {
+                try {
+                    val ch = input.channel
+                    if (ch.size() < bytesToSkip) {
+                        throw EOFException("Premature EOF while seeking offset $bytesToSkip (file size=${ch.size()})")
+                    }
+                    ch.position(bytesToSkip)
+                    return
+                } catch (e: EOFException) {
+                    throw e
+                } catch (_: UnsupportedOperationException) {
+                    // Fall through to generic InputStream skip loop
+                } catch (_: Exception) {
+                    // Fall through cleanly if custom FileInputStream subclass lacks usable channel
+                }
+            }
+            var remaining = bytesToSkip
+            val discardBuf = ByteArray(8192)
+            while (remaining > 0L) {
+                val skipped = input.skip(remaining)
+                if (skipped > 0L) {
+                    remaining -= skipped
+                    continue
+                }
+                val toRead = minOf(remaining, discardBuf.size.toLong()).toInt()
+                val read = input.read(discardBuf, 0, toRead)
+                if (read < 0) {
+                    throw EOFException("Premature EOF skipping offset ($remaining bytes remaining out of $bytesToSkip)")
+                }
+                remaining -= read.toLong()
+            }
         }
     }
 
@@ -121,7 +166,9 @@ open class FileTransferClient(
 
     private val httpClient: OkHttpClient = customClient ?: buildHttpClient()
     private val activeCall = AtomicReference<Call?>(null)
+    private val activeCallsById = ConcurrentHashMap<String, Call>()
     private val transferCancelled = AtomicBoolean(false)
+    private val cancelledIds = ConcurrentHashMap.newKeySet<String>()
 
     /**
      * Cancel any active in-flight HTTP file upload or download immediately.
@@ -129,6 +176,55 @@ open class FileTransferClient(
     fun cancelActiveTransfer() {
         transferCancelled.set(true)
         activeCall.getAndSet(null)?.cancel()
+        activeCallsById.values.forEach { it.cancel() }
+        activeCallsById.clear()
+    }
+
+    /**
+     * Cancel a specific transfer by ID without disturbing unrelated transfers.
+     */
+    fun cancelTransfer(transferId: String?) {
+        val cleanId = transferId?.trim().orEmpty()
+        if (cleanId.isEmpty()) {
+            cancelActiveTransfer()
+            return
+        }
+        cancelledIds.add(cleanId)
+        activeCallsById.remove(cleanId)?.cancel()
+    }
+
+    private fun isCancelledFor(transferId: String?): Boolean {
+        if (transferCancelled.get() || Thread.currentThread().isInterrupted) return true
+        val cleanId = transferId?.trim().orEmpty()
+        return cleanId.isNotEmpty() && cancelledIds.contains(cleanId)
+    }
+
+    private fun isRetryableHttpCode(code: Int): Boolean {
+        return code == 408 || code == 429 || code in 500..599
+    }
+
+    private suspend fun queryUploadResumeOffset(
+        serverHost: String,
+        transferPort: Int,
+        transferId: String
+    ): Long? {
+        val url = "${getBaseUrl(serverHost, transferPort)}/api/v1/transfers/upload/$transferId/status"
+        val token = getAuthToken() ?: ""
+        val req = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $token")
+            .addHeader("X-Snow-Device-Id", deviceId)
+            .get()
+            .build()
+        return try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                val json = JSONObject(resp.body?.string() ?: "{}")
+                json.optLong("current_offset", 0L).coerceAtLeast(0L)
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun buildHttpClient(): OkHttpClient {
@@ -285,93 +381,129 @@ open class FileTransferClient(
         // 2. Initialize transfer session
         val init = initTransfer(serverHost, transferPort, fileName, fileSize, sha256, "UPLOAD")
             ?: return@withContext TransferResult.Error(null, "Failed to initialize upload session.")
-        val (transferId, resumeOffset) = init
+        val transferId = init.first
+        var resumeOffset = init.second
 
-        // 3. Prepare streaming request body
+        transferCancelled.set(false)
+        cancelledIds.remove(transferId)
+
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val uploadUrl = "$baseUrl/api/v1/transfers/upload/$transferId"
+        var lastError: TransferResult.Error? = null
 
-        val requestBody = object : RequestBody() {
-            override fun contentType() = OCTET_STREAM
-            override fun contentLength() = fileSize - resumeOffset
+        for (attempt in 0..maxRetryAttempts) {
+            if (isCancelledFor(transferId)) {
+                return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+            }
+            if (attempt > 0) {
+                val backoffMs = minOf(retryBaseDelayMs * (1L shl (attempt - 1)), 4000L)
+                delay(backoffMs)
+                if (isCancelledFor(transferId)) {
+                    return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                }
+                queryUploadResumeOffset(serverHost, transferPort, transferId)?.let { serverOffset ->
+                    resumeOffset = serverOffset.coerceIn(0L, fileSize)
+                }
+            }
 
-            override fun writeTo(sink: BufferedSink) {
-                FileInputStream(file).use { input ->
-                    if (resumeOffset > 0) {
-                        input.skip(resumeOffset)
-                    }
-                    val buffer = ByteArray(CHUNK_SIZE)
-                    var bytesRead: Int
-                    var totalWritten = resumeOffset
+            val attemptOffset = resumeOffset.coerceIn(0L, fileSize)
+            val requestBody = object : RequestBody() {
+                override fun contentType() = OCTET_STREAM
+                override fun contentLength() = fileSize - attemptOffset
 
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        if (transferCancelled.get() || Thread.currentThread().isInterrupted) {
-                            throw IOException("Transfer cancelled")
+                override fun writeTo(sink: BufferedSink) {
+                    FileInputStream(file).use { input ->
+                        if (attemptOffset > 0L) {
+                            skipExactBytes(input, attemptOffset)
                         }
-                        sink.write(buffer, 0, bytesRead)
-                        totalWritten += bytesRead
-                        val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
-                        onProgress?.invoke(
-                            TransferProgress(
-                                transferId = transferId,
-                                bytesTransferred = totalWritten,
-                                totalBytes = fileSize,
-                                percent = percent
+                        val buffer = ByteArray(CHUNK_SIZE)
+                        var bytesRead: Int
+                        var totalWritten = attemptOffset
+
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            if (isCancelledFor(transferId)) {
+                                throw IOException("Transfer cancelled")
+                            }
+                            sink.write(buffer, 0, bytesRead)
+                            totalWritten += bytesRead
+                            val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
+                            onProgress?.invoke(
+                                TransferProgress(
+                                    transferId = transferId,
+                                    bytesTransferred = totalWritten,
+                                    totalBytes = fileSize,
+                                    percent = percent
+                                )
                             )
-                        )
+                        }
                     }
                 }
             }
-        }
 
-        val token = getAuthToken() ?: ""
-        val reqBuilder = Request.Builder()
-            .url(uploadUrl)
-            .addHeader("Authorization", "Bearer $token")
-            .addHeader("X-Snow-Device-Id", deviceId)
-            .addHeader("X-Snow-Filename", fileName)
-            .addHeader("X-Snow-Filesize", fileSize.toString())
-            .addHeader("X-Snow-SHA256", sha256)
+            val token = getAuthToken() ?: ""
+            val reqBuilder = Request.Builder()
+                .url(uploadUrl)
+                .addHeader("Authorization", "Bearer $token")
+                .addHeader("X-Snow-Device-Id", deviceId)
+                .addHeader("X-Snow-Filename", fileName)
+                .addHeader("X-Snow-Filesize", fileSize.toString())
+                .addHeader("X-Snow-SHA256", sha256)
 
-        if (resumeOffset > 0) {
-            reqBuilder.addHeader("Content-Range", "bytes $resumeOffset-${fileSize - 1}/$fileSize")
-        }
+            if (attemptOffset > 0L && fileSize > attemptOffset) {
+                reqBuilder.addHeader("Content-Range", "bytes $attemptOffset-${fileSize - 1}/$fileSize")
+            }
 
-        val request = reqBuilder.post(requestBody).build()
-        transferCancelled.set(false)
-        val call = httpClient.newCall(request)
-        activeCall.set(call)
+            val request = reqBuilder.post(requestBody).build()
+            val call = httpClient.newCall(request)
+            activeCall.set(call)
+            activeCallsById[transferId] = call
 
-        try {
-            call.execute().use { response ->
-                if (response.isSuccessful) {
-                    val bodyStr = response.body?.string() ?: "{}"
-                    val json = JSONObject(bodyStr)
-                    val verifiedHash = json.optString("sha256", sha256)
-                    SafeLog.i(TAG, "Upload completed successfully. Verified SHA-256: $verifiedHash")
-                    TransferResult.Success(transferId, verifiedHash, file)
-                } else if (response.code == 422) {
-                    SafeLog.e(TAG, "SHA-256 integrity verification rejected by desktop core (422).")
-                    TransferResult.Error(transferId, "Integrity verification failed (HTTP 422).", 422)
-                } else {
-                    SafeLog.w(TAG, "Upload failed with HTTP ${response.code}")
-                    TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+            try {
+                val resOrNull = call.execute().use { response ->
+                    if (response.isSuccessful) {
+                        val bodyStr = response.body?.string() ?: "{}"
+                        val json = JSONObject(bodyStr)
+                        val verifiedHash = json.optString("sha256", sha256)
+                        SafeLog.i(TAG, "Upload completed successfully. Verified SHA-256: $verifiedHash")
+                        TransferResult.Success(transferId, verifiedHash, file)
+                    } else if (response.code == 416 && attempt < maxRetryAttempts) {
+                        lastError = TransferResult.Error(transferId, "Range mismatch (HTTP 416).", 416)
+                        null
+                    } else if (isRetryableHttpCode(response.code) && attempt < maxRetryAttempts) {
+                        SafeLog.w(TAG, "Upload transient HTTP ${response.code}; retrying...")
+                        lastError = TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+                        null
+                    } else if (response.code == 422) {
+                        SafeLog.e(TAG, "SHA-256 integrity verification rejected by desktop core (422).")
+                        TransferResult.Error(transferId, "Integrity verification failed (HTTP 422).", 422)
+                    } else {
+                        SafeLog.w(TAG, "Upload failed with HTTP ${response.code}")
+                        TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+                    }
                 }
+                if (resOrNull != null) {
+                    return@withContext resOrNull
+                }
+            } catch (e: CancellationException) {
+                call.cancel()
+                throw e
+            } catch (e: Exception) {
+                if (isCancelledFor(transferId) || call.isCanceled()) {
+                    SafeLog.i(TAG, "Upload cancelled by user: $fileName")
+                    return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                }
+                lastError = TransferResult.Error(transferId, e.message ?: "Upload network exception")
+                if (attempt >= maxRetryAttempts) {
+                    SafeLog.e(TAG, "Upload failed after retries: ${e.message}", e)
+                    return@withContext lastError!!
+                }
+                SafeLog.w(TAG, "Upload attempt ${attempt + 1} failed (${e.message}); resuming via Range...")
+            } finally {
+                activeCall.compareAndSet(call, null)
+                activeCallsById.remove(transferId, call)
             }
-        } catch (e: CancellationException) {
-            call.cancel()
-            throw e
-        } catch (e: Exception) {
-            if (transferCancelled.get() || call.isCanceled()) {
-                SafeLog.i(TAG, "Upload cancelled by user: $fileName")
-                TransferResult.Error(transferId, "Transfer cancelled")
-            } else {
-                SafeLog.e(TAG, "Upload exception: ${e.message}", e)
-                TransferResult.Error(transferId, e.message ?: "Upload network exception")
-            }
-        } finally {
-            activeCall.compareAndSet(call, null)
         }
+        lastError ?: TransferResult.Error(transferId, "Upload failed after retries.")
     }
 
     /**
@@ -398,94 +530,132 @@ open class FileTransferClient(
         // Init transfer
         val init = initTransfer(serverHost, transferPort, fileName, fileSize, sha256, "UPLOAD")
             ?: return@withContext TransferResult.Error(null, "Failed to initialize upload session.")
-        val (transferId, resumeOffset) = init
+        val transferId = init.first
+        var resumeOffset = init.second
+
+        transferCancelled.set(false)
+        cancelledIds.remove(transferId)
 
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val uploadUrl = "$baseUrl/api/v1/transfers/upload/$transferId"
+        var lastError: TransferResult.Error? = null
 
-        val requestBody = object : RequestBody() {
-            override fun contentType() = OCTET_STREAM
-            override fun contentLength() = fileSize - resumeOffset
+        for (attempt in 0..maxRetryAttempts) {
+            if (isCancelledFor(transferId)) {
+                return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+            }
+            if (attempt > 0) {
+                val backoffMs = minOf(retryBaseDelayMs * (1L shl (attempt - 1)), 4000L)
+                delay(backoffMs)
+                if (isCancelledFor(transferId)) {
+                    return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                }
+                queryUploadResumeOffset(serverHost, transferPort, transferId)?.let { serverOffset ->
+                    resumeOffset = serverOffset.coerceIn(0L, fileSize)
+                }
+            }
 
-            override fun writeTo(sink: BufferedSink) {
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    if (resumeOffset > 0) {
-                        input.skip(resumeOffset)
-                    }
-                    val buffer = ByteArray(CHUNK_SIZE)
-                    var bytesRead: Int
-                    var totalWritten = resumeOffset
+            val attemptOffset = resumeOffset.coerceIn(0L, fileSize)
+            val requestBody = object : RequestBody() {
+                override fun contentType() = OCTET_STREAM
+                override fun contentLength() = fileSize - attemptOffset
 
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        if (transferCancelled.get() || Thread.currentThread().isInterrupted) {
-                            throw IOException("Transfer cancelled")
+                override fun writeTo(sink: BufferedSink) {
+                    val rawStream = context.contentResolver.openInputStream(uri)
+                        ?: throw IOException("Unable to open SAF URI stream for $fileName")
+                    rawStream.use { input ->
+                        if (attemptOffset > 0L) {
+                            skipExactBytes(input, attemptOffset)
                         }
-                        sink.write(buffer, 0, bytesRead)
-                        totalWritten += bytesRead
-                        val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
-                        onProgress?.invoke(
-                            TransferProgress(
-                                transferId = transferId,
-                                bytesTransferred = totalWritten,
-                                totalBytes = fileSize,
-                                percent = percent
+                        val buffer = ByteArray(CHUNK_SIZE)
+                        var bytesRead: Int
+                        var totalWritten = attemptOffset
+
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            if (isCancelledFor(transferId)) {
+                                throw IOException("Transfer cancelled")
+                            }
+                            sink.write(buffer, 0, bytesRead)
+                            totalWritten += bytesRead
+                            val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
+                            onProgress?.invoke(
+                                TransferProgress(
+                                    transferId = transferId,
+                                    bytesTransferred = totalWritten,
+                                    totalBytes = fileSize,
+                                    percent = percent
+                                )
                             )
-                        )
+                        }
                     }
                 }
             }
-        }
 
-        val token = getAuthToken() ?: ""
-        val reqBuilder = Request.Builder()
-            .url(uploadUrl)
-            .addHeader("Authorization", "Bearer $token")
-            .addHeader("X-Snow-Device-Id", deviceId)
-            .addHeader("X-Snow-Filename", fileName)
-            .addHeader("X-Snow-Filesize", fileSize.toString())
-            .addHeader("X-Snow-SHA256", sha256)
+            val token = getAuthToken() ?: ""
+            val reqBuilder = Request.Builder()
+                .url(uploadUrl)
+                .addHeader("Authorization", "Bearer $token")
+                .addHeader("X-Snow-Device-Id", deviceId)
+                .addHeader("X-Snow-Filename", fileName)
+                .addHeader("X-Snow-Filesize", fileSize.toString())
+                .addHeader("X-Snow-SHA256", sha256)
 
-        if (resumeOffset > 0) {
-            reqBuilder.addHeader("Content-Range", "bytes $resumeOffset-${fileSize - 1}/$fileSize")
-        }
+            if (attemptOffset > 0L && fileSize > attemptOffset) {
+                reqBuilder.addHeader("Content-Range", "bytes $attemptOffset-${fileSize - 1}/$fileSize")
+            }
 
-        val request = reqBuilder.post(requestBody).build()
-        transferCancelled.set(false)
-        val call = httpClient.newCall(request)
-        activeCall.set(call)
+            val request = reqBuilder.post(requestBody).build()
+            val call = httpClient.newCall(request)
+            activeCall.set(call)
+            activeCallsById[transferId] = call
 
-        try {
-            call.execute().use { response ->
-                if (response.isSuccessful) {
-                    val bodyStr = response.body?.string() ?: "{}"
-                    val json = JSONObject(bodyStr)
-                    val verifiedHash = json.optString("sha256", sha256)
-                    TransferResult.Success(transferId, verifiedHash, File(fileName))
-                } else if (response.code == 422) {
-                    TransferResult.Error(transferId, "Integrity verification failed (HTTP 422).", 422)
-                } else {
-                    TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+            try {
+                val resOrNull = call.execute().use { response ->
+                    if (response.isSuccessful) {
+                        val bodyStr = response.body?.string() ?: "{}"
+                        val json = JSONObject(bodyStr)
+                        val verifiedHash = json.optString("sha256", sha256)
+                        TransferResult.Success(transferId, verifiedHash, File(fileName))
+                    } else if (response.code == 416 && attempt < maxRetryAttempts) {
+                        lastError = TransferResult.Error(transferId, "Range mismatch (HTTP 416).", 416)
+                        null
+                    } else if (isRetryableHttpCode(response.code) && attempt < maxRetryAttempts) {
+                        lastError = TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+                        null
+                    } else if (response.code == 422) {
+                        TransferResult.Error(transferId, "Integrity verification failed (HTTP 422).", 422)
+                    } else {
+                        TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+                    }
                 }
+                if (resOrNull != null) {
+                    return@withContext resOrNull
+                }
+            } catch (e: CancellationException) {
+                call.cancel()
+                throw e
+            } catch (e: Exception) {
+                if (isCancelledFor(transferId) || call.isCanceled()) {
+                    SafeLog.i(TAG, "Upload URI cancelled by user: $fileName")
+                    return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                }
+                lastError = TransferResult.Error(transferId, e.message ?: "Upload network exception")
+                if (attempt >= maxRetryAttempts) {
+                    SafeLog.e(TAG, "Upload URI failed after retries: ${e.message}", e)
+                    return@withContext lastError!!
+                }
+                SafeLog.w(TAG, "Upload URI attempt ${attempt + 1} failed (${e.message}); retrying...")
+            } finally {
+                activeCall.compareAndSet(call, null)
+                activeCallsById.remove(transferId, call)
             }
-        } catch (e: CancellationException) {
-            call.cancel()
-            throw e
-        } catch (e: Exception) {
-            if (transferCancelled.get() || call.isCanceled()) {
-                SafeLog.i(TAG, "Upload URI cancelled by user: $fileName")
-                TransferResult.Error(transferId, "Transfer cancelled")
-            } else {
-                SafeLog.e(TAG, "Upload URI exception: ${e.message}", e)
-                TransferResult.Error(transferId, e.message ?: "Upload network exception")
-            }
-        } finally {
-            activeCall.compareAndSet(call, null)
         }
+        lastError ?: TransferResult.Error(transferId, "Upload failed after retries.")
     }
 
     /**
-     * Download a file from desktop server with support for HTTP Range resume and
-     * SHA-256 verification before atomic commit to final destination.
+     * Download a file from desktop server with support for HTTP Range resume, bounded retries
+     * on transient disconnects, HTTP 416 recovery, and SHA-256 verification before atomic commit.
      */
     suspend fun downloadFile(
         serverHost: String,
@@ -499,110 +669,182 @@ open class FileTransferClient(
         val partFile = File(destinationFile.parentFile, "${destinationFile.name}.part")
         destinationFile.parentFile?.mkdirs()
 
-        val resumeOffset = if (resume && partFile.exists()) partFile.length() else 0L
+        transferCancelled.set(false)
+        cancelledIds.remove(transferId)
 
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val downloadUrl = "$baseUrl/api/v1/transfers/download/$transferId"
+        var lastError: TransferResult.Error? = null
+        var handled416Once = false
 
-        val token = getAuthToken() ?: ""
-        val reqBuilder = Request.Builder()
-            .url(downloadUrl)
-            .addHeader("Authorization", "Bearer $token")
-            .addHeader("X-Snow-Device-Id", deviceId)
-
-        if (resumeOffset > 0) {
-            reqBuilder.addHeader("Range", "bytes=$resumeOffset-")
-        }
-
-        val request = reqBuilder.get().build()
-        transferCancelled.set(false)
-        val call = httpClient.newCall(request)
-        activeCall.set(call)
-
-        try {
-            call.execute().use { response ->
-                if (response.code != 200 && response.code != 206) {
-                    return@withContext TransferResult.Error(
-                        transferId,
-                        "Download failed with HTTP ${response.code}",
-                        response.code
-                    )
+        for (attempt in 0..maxRetryAttempts) {
+            if (isCancelledFor(transferId)) {
+                partFile.delete()
+                return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+            }
+            if (attempt > 0) {
+                val backoffMs = minOf(retryBaseDelayMs * (1L shl (attempt - 1)), 4000L)
+                delay(backoffMs)
+                if (isCancelledFor(transferId)) {
+                    partFile.delete()
+                    return@withContext TransferResult.Error(transferId, "Transfer cancelled")
                 }
+            }
 
-                val append = response.code == 206
-                val body = response.body ?: return@withContext TransferResult.Error(
-                    transferId,
-                    "Empty response body"
-                )
+            val resumeOffset = if (resume && partFile.exists()) partFile.length() else 0L
+            val token = getAuthToken() ?: ""
+            val reqBuilder = Request.Builder()
+                .url(downloadUrl)
+                .addHeader("Authorization", "Bearer $token")
+                .addHeader("X-Snow-Device-Id", deviceId)
 
-                val contentLength = body.contentLength()
-                val totalExpected = if (append) resumeOffset + contentLength else contentLength
+            if (resumeOffset > 0L) {
+                reqBuilder.addHeader("Range", "bytes=$resumeOffset-")
+            }
 
-                body.byteStream().use { input ->
-                    FileOutputStream(partFile, append).use { output ->
-                        val buffer = ByteArray(CHUNK_SIZE)
-                        var bytesRead: Int
-                        var downloaded = if (append) resumeOffset else 0L
+            val request = reqBuilder.get().build()
+            val call = httpClient.newCall(request)
+            activeCall.set(call)
+            activeCallsById[transferId] = call
 
-                        while (input.read(buffer).also { bytesRead = it } != -1) {
-                            if (transferCancelled.get() || Thread.currentThread().isInterrupted) {
-                                throw IOException("Transfer cancelled")
-                            }
-                            output.write(buffer, 0, bytesRead)
-                            downloaded += bytesRead
-                            val percent = if (totalExpected > 0) ((downloaded * 100) / totalExpected).toInt() else 100
-                            onProgress?.invoke(
-                                TransferProgress(
-                                    transferId = transferId,
-                                    bytesTransferred = downloaded,
-                                    totalBytes = totalExpected,
-                                    percent = percent
-                                )
+            try {
+                var needsRetry = false
+                var readyToCommit = false
+                var immediateError: TransferResult.Error? = null
+
+                call.execute().use { response ->
+                    if (response.code == 416) {
+                        val totalFromHeader = response.header("Content-Range")
+                            ?.let { Regex("""bytes\s+\*/(\d+)""").find(it)?.groupValues?.getOrNull(1)?.toLongOrNull() }
+                        if (totalFromHeader != null && resumeOffset == totalFromHeader && partFile.exists()) {
+                            readyToCommit = true
+                            return@use
+                        }
+                        if (!handled416Once) {
+                            handled416Once = true
+                            partFile.delete()
+                            needsRetry = attempt < maxRetryAttempts
+                            lastError = TransferResult.Error(transferId, "Range offset rejected (HTTP 416)", 416)
+                            return@use
+                        }
+                        immediateError = TransferResult.Error(transferId, "Download failed with HTTP 416", 416)
+                        return@use
+                    }
+
+                    if (response.code != 200 && response.code != 206) {
+                        if (isRetryableHttpCode(response.code) && attempt < maxRetryAttempts) {
+                            lastError = TransferResult.Error(transferId, "Download failed with HTTP ${response.code}", response.code)
+                            needsRetry = true
+                        } else {
+                            immediateError = TransferResult.Error(
+                                transferId,
+                                "Download failed with HTTP ${response.code}",
+                                response.code
                             )
                         }
+                        return@use
                     }
+
+                    val append = response.code == 206 && resumeOffset > 0L
+                    val body = response.body
+                    if (body == null) {
+                        if (attempt < maxRetryAttempts) {
+                            lastError = TransferResult.Error(transferId, "Empty response body")
+                            needsRetry = true
+                        } else {
+                            immediateError = TransferResult.Error(transferId, "Empty response body")
+                        }
+                        return@use
+                    }
+
+                    val contentLength = body.contentLength()
+                    val totalExpected = if (contentLength >= 0L) {
+                        if (append) resumeOffset + contentLength else contentLength
+                    } else {
+                        -1L
+                    }
+
+                    var downloaded = if (append) resumeOffset else 0L
+                    body.byteStream().use { input ->
+                        FileOutputStream(partFile, append).use { output ->
+                            val buffer = ByteArray(CHUNK_SIZE)
+                            var bytesRead: Int
+                            while (input.read(buffer).also { bytesRead = it } != -1) {
+                                if (isCancelledFor(transferId)) {
+                                    throw IOException("Transfer cancelled")
+                                }
+                                output.write(buffer, 0, bytesRead)
+                                downloaded += bytesRead
+                                val percent = if (totalExpected > 0L) ((downloaded * 100) / totalExpected).toInt().coerceIn(0, 100) else 100
+                                onProgress?.invoke(
+                                    TransferProgress(
+                                        transferId = transferId,
+                                        bytesTransferred = downloaded,
+                                        totalBytes = totalExpected,
+                                        percent = percent
+                                    )
+                                )
+                            }
+                            output.flush()
+                        }
+                    }
+
+                    if (totalExpected > 0L && downloaded < totalExpected) {
+                        throw IOException("Truncated download stream ($downloaded/$totalExpected bytes received)")
+                    }
+                    readyToCommit = true
                 }
 
-                // Verify integrity
-                val actualSha256 = computeSha256(partFile)
-                if (!actualSha256.equals(expectedSha256.trim(), ignoreCase = true)) {
-                    partFile.delete()
-                    return@withContext TransferResult.Error(
-                        transferId,
-                        "Downloaded file integrity mismatch: expected $expectedSha256, got $actualSha256",
-                        422
-                    )
+                if (immediateError != null) {
+                    return@withContext immediateError!!
                 }
+                if (needsRetry) {
+                    continue
+                }
+                if (readyToCommit) {
+                    val actualSha256 = computeSha256(partFile)
+                    if (!actualSha256.equals(expectedSha256.trim(), ignoreCase = true)) {
+                        partFile.delete()
+                        return@withContext TransferResult.Error(
+                            transferId,
+                            "Downloaded file integrity mismatch: expected $expectedSha256, got $actualSha256",
+                            422
+                        )
+                    }
 
-                // Atomic commit to target destination
-                if (destinationFile.exists()) {
-                    destinationFile.delete()
-                }
-                if (!partFile.renameTo(destinationFile)) {
-                    // Fallback to copy and delete if rename fails
-                    partFile.copyTo(destinationFile, overwrite = true)
-                    partFile.delete()
-                }
+                    if (destinationFile.exists()) {
+                        destinationFile.delete()
+                    }
+                    if (!partFile.renameTo(destinationFile)) {
+                        partFile.copyTo(destinationFile, overwrite = true)
+                        partFile.delete()
+                    }
 
-                SafeLog.i(TAG, "Download completed and verified: ${destinationFile.name}")
-                TransferResult.Success(transferId, actualSha256, destinationFile)
-            }
-        } catch (e: CancellationException) {
-            call.cancel()
-            partFile.delete()
-            throw e
-        } catch (e: Exception) {
-            if (transferCancelled.get() || call.isCanceled()) {
+                    SafeLog.i(TAG, "Download completed and verified: ${destinationFile.name}")
+                    return@withContext TransferResult.Success(transferId, actualSha256, destinationFile)
+                }
+            } catch (e: CancellationException) {
+                call.cancel()
                 partFile.delete()
-                SafeLog.i(TAG, "Download cancelled by user: ${destinationFile.name}")
-                TransferResult.Error(transferId, "Transfer cancelled")
-            } else {
-                SafeLog.e(TAG, "Download exception: ${e.message}", e)
-                TransferResult.Error(transferId, e.message ?: "Download exception")
+                throw e
+            } catch (e: Exception) {
+                if (isCancelledFor(transferId) || call.isCanceled()) {
+                    partFile.delete()
+                    SafeLog.i(TAG, "Download cancelled by user: ${destinationFile.name}")
+                    return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                }
+                lastError = TransferResult.Error(transferId, e.message ?: "Download exception")
+                if (attempt >= maxRetryAttempts) {
+                    SafeLog.e(TAG, "Download exception after retries: ${e.message}", e)
+                    return@withContext lastError!!
+                }
+                SafeLog.w(TAG, "Download attempt ${attempt + 1} interrupted (${e.message}); resuming via HTTP Range...")
+            } finally {
+                activeCall.compareAndSet(call, null)
+                activeCallsById.remove(transferId, call)
             }
-        } finally {
-            activeCall.compareAndSet(call, null)
         }
+        lastError ?: TransferResult.Error(transferId, "Download failed after retries.")
     }
 
     data class ScreenSenderInfo(

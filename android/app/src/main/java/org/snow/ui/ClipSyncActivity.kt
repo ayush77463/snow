@@ -31,7 +31,7 @@ class ClipSyncActivity : AppCompatActivity() {
             ClipboardHandler.isUserIntentGranted = true
             handler.postDelayed({
                 val repo = SnowUiRepository.getInstance(applicationContext)
-                repo.pushCurrentClipboard { success, errOrMsg ->
+                repo.pushCurrentClipboard(userInitiated = true) { success, errOrMsg ->
                     runOnUiThread {
                         if (success) {
                             Toast.makeText(applicationContext, "Clipboard pushed to PC ❄️", Toast.LENGTH_SHORT).show()

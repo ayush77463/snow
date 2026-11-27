@@ -5,12 +5,17 @@ import android.content.Context
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.snow.security.SafeLog
 import org.snow.transfer.FileTransferClient
 import org.snow.ui.files.SafFolderManager
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Android bidirectional file transfer capability handler.
@@ -27,6 +32,10 @@ class AndroidFileHandler(
     private val storageRootDirProvider: (() -> File?)? = null,
     private val allFilesAccessProvider: (() -> Boolean)? = null
 ) {
+    private val fileScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val activeDownloadJobs = ConcurrentHashMap<String, Job>()
+    private val cancelledTransferIds = ConcurrentHashMap.newKeySet<String>()
+
     companion object {
         private const val TAG = "AndroidFileHandler"
 
@@ -53,13 +62,32 @@ class AndroidFileHandler(
         return dir
     }
 
+    fun cancelTransfer(transferId: String): Boolean {
+        val cleanId = transferId.trim()
+        if (cleanId.isEmpty()) return false
+        cancelledTransferIds.add(cleanId)
+        val job = activeDownloadJobs.remove(cleanId)
+        job?.cancel()
+        transferClientProvider()?.cancelTransfer(cleanId)
+        val stagingDir = try {
+            SafFolderManager(context).getStagingDir()
+        } catch (_: Exception) {
+            getTransfersDirectory()
+        }
+        stagingDir.listFiles { f -> f.isFile && f.name.startsWith("${cleanId}_") }?.forEach { f ->
+            try { f.delete() } catch (_: Exception) {}
+        }
+        return job != null || cancelledTransferIds.contains(cleanId)
+    }
+
     /**
      * Handle desktop -> Android file transmission request.
      */
     suspend fun handleFileSendRequest(
         data: Map<String, Any?>?,
         serverHost: String,
-        defaultTransferPort: Int
+        defaultTransferPort: Int,
+        completionNotifier: ((Map<String, Any?>) -> Unit)? = null
     ): Map<String, Any?> = withContext(Dispatchers.IO) {
         if (data == null) {
             return@withContext mapOf("status" to "error", "error" to "Missing transfer payload.")
@@ -69,12 +97,17 @@ class AndroidFileHandler(
         val rawFileName = data["file_name"] as? String
         val expectedSha256 = data["sha256"] as? String
         val transferPort = (data["transfer_port"] as? Number)?.toInt() ?: defaultTransferPort
+        val isAsync = data["async"] == true
 
         if (transferId.isNullOrBlank() || rawFileName.isNullOrBlank() || expectedSha256.isNullOrBlank()) {
             return@withContext mapOf(
                 "status" to "error",
                 "error" to "Missing required fields: transfer_id, file_name, or sha256."
             )
+        }
+
+        if (cancelledTransferIds.contains(transferId)) {
+            return@withContext mapOf("status" to "error", "transfer_id" to transferId, "error" to "Transfer already cancelled.")
         }
 
         // Sanitize filename to prevent directory traversal
@@ -88,110 +121,158 @@ class AndroidFileHandler(
             return@withContext mapOf("status" to "error", "error" to "FileTransferClient not initialized.")
         }
 
-        val safManager = try {
-            SafFolderManager(context)
-        } catch (_: Exception) {
-            null
-        }
-        val safUri = try {
-            safManager?.getDestinationUri()
-        } catch (_: Exception) {
-            null
-        }
-        val stagingDir = try {
-            safManager?.getStagingDir() ?: File(context.cacheDir, "snow_staging").apply { mkdirs() }
-        } catch (_: Exception) {
-            getTransfersDirectory()
-        }
-        val stagedFile = File(stagingDir, "${transferId}_$safeFileName")
-
-        SafeLog.i(TAG, "Downloading incoming file '$safeFileName' [transfer_id=$transferId]...")
-        val result = client.downloadFile(
-            serverHost = serverHost,
-            transferPort = transferPort,
-            transferId = transferId,
-            destinationFile = stagedFile,
-            expectedSha256 = expectedSha256,
-            resume = true
-        )
-
-        when (result) {
-            is FileTransferClient.TransferResult.Success -> {
-                val expectedBytes = stagedFile.length()
-                val commitOutcome = commitDownloadedFile(
-                    stagedFile = stagedFile,
-                    safeFileName = safeFileName,
-                    expectedBytes = expectedBytes,
-                    safManager = safManager,
-                    hasConfiguredSaf = (safUri != null),
-                )
-                if (commitOutcome.isFailure) {
-                    try { stagedFile.delete() } catch (_: Exception) {}
-                    val errMsg = commitOutcome.exceptionOrNull()?.message ?: "Failed saving downloaded file."
-                    SafeLog.e(TAG, "Commit failed for '$safeFileName': $errMsg")
-                    return@withContext mapOf(
-                        "status" to "error",
-                        "transfer_id" to transferId,
-                        "error" to errMsg
-                    )
-                }
-                val (savedPath, storageMode) = commitOutcome.getOrThrow()
-                SafeLog.i(TAG, "Download successful [$storageMode]: $savedPath ($expectedBytes bytes)")
-                mapOf(
-                    "status" to "success",
-                    "transfer_id" to transferId,
-                    "file_name" to safeFileName,
-                    "bytes_downloaded" to expectedBytes,
-                    "sha256" to result.sha256,
-                    "saved_path" to savedPath,
-                    "storage_mode" to storageMode,
-                )
+        suspend fun executeDownloadAndCommit(): Map<String, Any?> {
+            val safManager = try {
+                SafFolderManager(context)
+            } catch (_: Exception) {
+                null
             }
-            is FileTransferClient.TransferResult.Duplicate -> {
-                val bytes = if (stagedFile.exists()) stagedFile.length() else 0L
-                val commitOutcome = if (stagedFile.exists()) {
-                    commitDownloadedFile(
+            val safUri = try {
+                safManager?.getDestinationUri()
+            } catch (_: Exception) {
+                null
+            }
+            val stagingDir = try {
+                safManager?.getStagingDir() ?: File(context.cacheDir, "snow_staging").apply { mkdirs() }
+            } catch (_: Exception) {
+                getTransfersDirectory()
+            }
+            val stagedFile = File(stagingDir, "${transferId}_$safeFileName")
+
+            SafeLog.i(TAG, "Downloading incoming file '$safeFileName' [transfer_id=$transferId]...")
+            val result = client.downloadFile(
+                serverHost = serverHost,
+                transferPort = transferPort,
+                transferId = transferId,
+                destinationFile = stagedFile,
+                expectedSha256 = expectedSha256,
+                resume = true
+            )
+
+            return when (result) {
+                is FileTransferClient.TransferResult.Success -> {
+                    val expectedBytes = stagedFile.length()
+                    val commitOutcome = commitDownloadedFile(
                         stagedFile = stagedFile,
                         safeFileName = safeFileName,
-                        expectedBytes = bytes,
+                        expectedBytes = expectedBytes,
                         safManager = safManager,
                         hasConfiguredSaf = (safUri != null),
                     )
-                } else {
-                    val defaultDisplay = safManager?.getDestinationDisplayName() ?: "Downloads/SNOW"
-                    Result.success(defaultDisplay to if (safUri != null) "saf_tree" else "public_downloads")
+                    if (commitOutcome.isFailure) {
+                        try { stagedFile.delete() } catch (_: Exception) {}
+                        val errMsg = commitOutcome.exceptionOrNull()?.message ?: "Failed saving downloaded file."
+                        SafeLog.e(TAG, "Commit failed for '$safeFileName': $errMsg")
+                        mapOf(
+                            "status" to "error",
+                            "transfer_id" to transferId,
+                            "error" to errMsg
+                        )
+                    } else {
+                        val (savedPath, storageMode) = commitOutcome.getOrThrow()
+                        SafeLog.i(TAG, "Download successful [$storageMode]: $savedPath ($expectedBytes bytes)")
+                        mapOf(
+                            "status" to "success",
+                            "transfer_id" to transferId,
+                            "file_name" to safeFileName,
+                            "bytes_downloaded" to expectedBytes,
+                            "sha256" to result.sha256,
+                            "saved_path" to savedPath,
+                            "storage_mode" to storageMode,
+                        )
+                    }
                 }
-                if (commitOutcome.isFailure) {
+                is FileTransferClient.TransferResult.Duplicate -> {
+                    val bytes = if (stagedFile.exists()) stagedFile.length() else 0L
+                    val commitOutcome = if (stagedFile.exists()) {
+                        commitDownloadedFile(
+                            stagedFile = stagedFile,
+                            safeFileName = safeFileName,
+                            expectedBytes = bytes,
+                            safManager = safManager,
+                            hasConfiguredSaf = (safUri != null),
+                        )
+                    } else {
+                        val defaultDisplay = safManager?.getDestinationDisplayName() ?: "Downloads/SNOW"
+                        Result.success(defaultDisplay to if (safUri != null) "saf_tree" else "public_downloads")
+                    }
+                    if (commitOutcome.isFailure) {
+                        try { stagedFile.delete() } catch (_: Exception) {}
+                        val errMsg = commitOutcome.exceptionOrNull()?.message ?: "Failed saving duplicate file."
+                        mapOf(
+                            "status" to "error",
+                            "transfer_id" to transferId,
+                            "error" to errMsg
+                        )
+                    } else {
+                        val (savedPath, storageMode) = commitOutcome.getOrThrow()
+                        mapOf(
+                            "status" to "success",
+                            "transfer_id" to transferId,
+                            "file_name" to safeFileName,
+                            "bytes_downloaded" to bytes,
+                            "sha256" to result.sha256,
+                            "saved_path" to savedPath,
+                            "storage_mode" to storageMode,
+                            "message" to "File already exists with matching SHA-256."
+                        )
+                    }
+                }
+                is FileTransferClient.TransferResult.Error -> {
                     try { stagedFile.delete() } catch (_: Exception) {}
-                    val errMsg = commitOutcome.exceptionOrNull()?.message ?: "Failed saving duplicate file."
-                    return@withContext mapOf(
+                    SafeLog.e(TAG, "Download failed: ${result.message}")
+                    mapOf(
                         "status" to "error",
                         "transfer_id" to transferId,
-                        "error" to errMsg
+                        "error" to result.message
                     )
                 }
-                val (savedPath, storageMode) = commitOutcome.getOrThrow()
-                mapOf(
-                    "status" to "success",
-                    "transfer_id" to transferId,
-                    "file_name" to safeFileName,
-                    "bytes_downloaded" to bytes,
-                    "sha256" to result.sha256,
-                    "saved_path" to savedPath,
-                    "storage_mode" to storageMode,
-                    "message" to "File already exists with matching SHA-256."
-                )
-            }
-            is FileTransferClient.TransferResult.Error -> {
-                try { stagedFile.delete() } catch (_: Exception) {}
-                SafeLog.e(TAG, "Download failed: ${result.message}")
-                mapOf(
-                    "status" to "error",
-                    "transfer_id" to transferId,
-                    "error" to result.message
-                )
             }
         }
+
+        if (isAsync) {
+            val job = fileScope.launch {
+                try {
+                    val finalRes = executeDownloadAndCommit()
+                    val statusOut = if (cancelledTransferIds.contains(transferId)) {
+                        "CANCELLED"
+                    } else if (finalRes["status"] == "success") {
+                        "COMPLETED"
+                    } else {
+                        "FAILED"
+                    }
+                    completionNotifier?.invoke(
+                        mapOf(
+                            "transfer_id" to transferId,
+                            "status" to statusOut,
+                            "sha256" to (finalRes["sha256"] ?: expectedSha256),
+                            "saved_path" to finalRes["saved_path"],
+                            "error" to finalRes["error"]
+                        )
+                    )
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    completionNotifier?.invoke(
+                        mapOf("transfer_id" to transferId, "status" to "CANCELLED")
+                    )
+                    throw ce
+                } catch (e: Exception) {
+                    completionNotifier?.invoke(
+                        mapOf("transfer_id" to transferId, "status" to "FAILED", "error" to e.message)
+                    )
+                } finally {
+                    activeDownloadJobs.remove(transferId)
+                }
+            }
+            activeDownloadJobs[transferId] = job
+            return@withContext mapOf(
+                "status" to "accepted",
+                "accepted" to true,
+                "transfer_id" to transferId,
+                "file_name" to safeFileName
+            )
+        }
+
+        return@withContext executeDownloadAndCommit()
     }
 
     private fun commitDownloadedFile(
@@ -438,7 +519,7 @@ class AndroidFileHandler(
             )
         }
 
-        if (isFullStorageEligible && (requestedScope == "full" || requestedScope == null)) {
+        if (isFullStorageEligible && (requestedScope == "full" || requestedScope == "auto" || requestedScope == null)) {
             return listFullSharedStorage(subpath, showHidden)
         }
 

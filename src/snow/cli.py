@@ -1157,13 +1157,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_web(port: int = 8769, no_browser: bool = False) -> int:
-    """Launch the local SNOW Web Dashboard server (snow web)."""
+    """Launch or safely reuse the local SNOW Web Dashboard server (snow web)."""
+    from snow.web.server import (
+        is_port_bound,
+        reuse_or_reject_existing_dashboard,
+        run_dashboard,
+    )
+
+    if is_port_bound(host="127.0.0.1", port=port):
+        return reuse_or_reject_existing_dashboard(
+            host="127.0.0.1",
+            port=port,
+            no_browser=no_browser,
+        )
+
     try:
         from snow.daemon import CoreDaemonManager
-        asyncio.run(CoreDaemonManager().ensure_core_running())
+        core_res = asyncio.run(CoreDaemonManager().ensure_core_running())
+        if not core_res.get("success") and core_res.get("status") == "PORT_CONFLICT":
+            logging.getLogger("snow.cli").warning(
+                "Core startup aborted due to port conflict: %s",
+                core_res.get("error"),
+            )
     except Exception as exc:
         logging.getLogger("snow.cli").warning("Could not auto-start Core daemon: %s", exc)
-    from snow.web.server import run_dashboard
     return run_dashboard(port=port, no_browser=no_browser)
 
 

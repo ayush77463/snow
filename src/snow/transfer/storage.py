@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import logging
@@ -12,7 +13,7 @@ import shutil
 import stat
 import sys
 import time
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,54 @@ def compute_stream_sha256(file_path: Path, chunk_size: int = CHUNK_SIZE) -> str:
     return hasher.hexdigest().lower()
 
 
+def check_free_space(target_dir: Path, required_bytes: int) -> tuple[bool, int]:
+    """Check whether target_dir filesystem has at least required_bytes free."""
+    if required_bytes <= 0:
+        return True, 0
+    probe = target_dir
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    usage = shutil.disk_usage(probe)
+    return usage.free >= required_bytes, usage.free
+
+
+def stream_copy_file(
+    src_path: Path,
+    dest_path: Path,
+    chunk_size: int = CHUNK_SIZE,
+    expected_sha256: Optional[str] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> str:
+    """Stream-copy src_path to dest_path in bounded chunks using an atomic temp .part commit."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_part = dest_path.parent / f".{dest_path.name}.{uuid.uuid4().hex[:8]}.part"
+    hasher = hashlib.sha256()
+    try:
+        with open(src_path, "rb") as src, open(tmp_part, "wb") as dst:
+            while True:
+                if cancel_check is not None and cancel_check():
+                    raise RuntimeError("File stream copy cancelled.")
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                hasher.update(chunk)
+            dst.flush()
+        actual_hash = hasher.hexdigest().lower()
+        if expected_sha256 and actual_hash != expected_sha256.strip().lower():
+            raise ValueError(
+                f"SHA-256 mismatch during stream copy: expected '{expected_sha256}', got '{actual_hash}'."
+            )
+        os.replace(tmp_part, dest_path)
+        return actual_hash
+    except Exception:
+        try:
+            tmp_part.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 class TransferStorageManager:
     """Manages storage root, safe path isolation, temporary .part files, and atomic commits."""
 
@@ -157,6 +206,10 @@ class TransferStorageManager:
         self._ensure_directories()
         logger.info("TransferStorageManager destination root updated to '%s'.", self.root_dir)
         return self.root_dir
+
+    def check_free_space(self, required_bytes: int) -> tuple[bool, int]:
+        """Return (has_enough_space, free_bytes) for transfer root storage."""
+        return check_free_space(self.parts_dir if self.parts_dir.exists() else self.root_dir, required_bytes)
 
     def resolve_destination_path(self, filename: str) -> Path:
         """Resolve a safe destination path within the transfer root.
@@ -264,6 +317,17 @@ class TransferStorageManager:
             logger.info("Successfully committed completed file '%s' (SHA-256: %s)",
                         resolved_dest.name, actual_hash)
             return actual_hash
+        except OSError as oex:
+            if oex.errno == errno.EXDEV:
+                stream_copy_file(part_path, resolved_dest, expected_sha256=clean_expected)
+                self.delete_part_file(part_path)
+                logger.info("Successfully committed cross-device file '%s' (SHA-256: %s)",
+                            resolved_dest.name, actual_hash)
+                return actual_hash
+            logger.error("Failed to atomically commit '%s' to '%s': %s",
+                         part_path, resolved_dest, oex)
+            self.delete_part_file(part_path)
+            raise
         except Exception as exc:
             logger.error("Failed to atomically commit '%s' to '%s': %s",
                          part_path, resolved_dest, exc)

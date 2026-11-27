@@ -62,8 +62,8 @@ class SnowHttpTransferServer:
         self._bound_port: Optional[int] = None
         self._is_running = False
 
-        # Bound client upload size (default 2 GiB or configured max_transfer_size)
-        max_upload_size = getattr(config, "max_transfer_size", 2 * 1024 * 1024 * 1024)
+        # Bound client upload size (default 16 GiB or configured max_transfer_size)
+        max_upload_size = getattr(config, "max_transfer_size", 16 * 1024 * 1024 * 1024)
         self.app = web.Application(
             client_max_size=max_upload_size,
             middlewares=[self._auth_middleware],
@@ -85,6 +85,7 @@ class SnowHttpTransferServer:
         self.app.router.add_post("/api/v1/transfers/check-duplicate", self.handle_check_duplicate)
         self.app.router.add_post("/api/v1/transfers/init", self.handle_init_transfer)
         self.app.router.add_get("/api/v1/transfers", self.handle_list_transfers)
+        self.app.router.add_get("/api/v1/transfers/{transfer_id}/status", self.handle_transfer_status)
         self.app.router.add_get("/api/v1/transfers/upload/{transfer_id}/status", self.handle_upload_status)
         self.app.router.add_post("/api/v1/transfers/upload/{transfer_id}", self.handle_upload)
         self.app.router.add_get("/api/v1/transfers/download/{transfer_id}", self.handle_download)
@@ -215,13 +216,41 @@ class SnowHttpTransferServer:
         except ValueError:
             return web.json_response({"error": f"Invalid direction: {dir_str}"}, status=400)
 
+        try:
+            parsed_size = int(file_size)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "file_size must be a non-negative integer."}, status=400)
+
+        raw_limit = getattr(self.config, "max_transfer_size", None)
+        max_upload_size = (
+            raw_limit
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else 16 * 1024 * 1024 * 1024
+        )
+        if parsed_size > max_upload_size:
+            return web.json_response(
+                {"error": f"Transfer size {parsed_size} exceeds maximum limit of {max_upload_size} bytes."},
+                status=413,
+            )
+
         device_id = request["device_id"]
+
+        if direction == TransferDirection.UPLOAD and hasattr(self.storage_manager, "check_free_space"):
+            try:
+                has_space, free_bytes = self.storage_manager.check_free_space(parsed_size)
+                if not has_space:
+                    return web.json_response(
+                        {"error": f"Insufficient disk space: need {parsed_size} bytes, only {free_bytes} bytes free."},
+                        status=507,
+                    )
+            except Exception:
+                pass
 
         try:
             record = self.transfer_manager.create_transfer(
                 device_id=device_id,
                 file_name=file_name,
-                file_size=int(file_size),
+                file_size=parsed_size,
                 sha256=sha256,
                 direction=direction,
             )
@@ -272,6 +301,34 @@ class SnowHttpTransferServer:
             "status": record.status.value,
         })
 
+    async def handle_transfer_status(self, request: web.Request) -> web.Response:
+        """Query owner-scoped transfer progress/status for upload or download."""
+        transfer_id = request.match_info["transfer_id"]
+        device_id = request["device_id"]
+
+        record = self.transfer_manager.get_transfer_for_device(transfer_id, device_id)
+        if not record:
+            return web.json_response({"error": "Transfer not found or not owned by device."}, status=404)
+
+        current_offset = record.current_offset
+        if record.direction == TransferDirection.UPLOAD and record.status != TransferState.COMPLETED:
+            try:
+                part_path = self.storage_manager.get_part_path(transfer_id)
+                if part_path.exists():
+                    current_offset = max(current_offset, part_path.stat().st_size)
+            except Exception:
+                pass
+
+        return web.json_response({
+            "transfer_id": transfer_id,
+            "direction": record.direction.value,
+            "file_name": record.file_name,
+            "current_offset": current_offset,
+            "file_size": record.file_size,
+            "status": record.status.value,
+            "error_message": record.error_message,
+        })
+
     async def handle_upload(self, request: web.Request) -> web.Response:
         """Stream an incoming file or chunk into the destination .part file."""
         transfer_id = request.match_info["transfer_id"]
@@ -302,6 +359,22 @@ class SnowHttpTransferServer:
                 "transfer_id": transfer_id,
                 "sha256": record.sha256,
             })
+
+        raw_limit = getattr(self.config, "max_transfer_size", None)
+        max_upload_size = (
+            raw_limit
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
+            else 16 * 1024 * 1024 * 1024
+        )
+        if record.file_size > max_upload_size:
+            self.transfer_manager.mark_failed(
+                transfer_id,
+                f"Transfer size {record.file_size} exceeds maximum limit of {max_upload_size} bytes.",
+            )
+            return web.json_response(
+                {"error": f"Payload Too Large: exceeds {max_upload_size} byte limit."},
+                status=413,
+            )
 
         try:
             dest_path = self.storage_manager.resolve_destination_path(record.file_name)
@@ -389,6 +462,19 @@ class SnowHttpTransferServer:
                     status=413,
                 )
 
+        # Check remaining disk space before streaming body
+        needed_bytes = max(0, record.file_size - expected_start)
+        if needed_bytes > 0 and hasattr(self.storage_manager, "check_free_space"):
+            try:
+                has_space, free_bytes = self.storage_manager.check_free_space(needed_bytes)
+                if not has_space:
+                    return web.json_response(
+                        {"error": f"Insufficient disk space: need {needed_bytes} bytes, only {free_bytes} bytes free."},
+                        status=507,
+                    )
+            except Exception:
+                pass
+
         # Stream request body into .part file in bounded 64 KiB chunks
         bytes_written = expected_start
         try:
@@ -397,8 +483,8 @@ class SnowHttpTransferServer:
                     chunk = await request.content.read(CHUNK_SIZE)
                     if not chunk:
                         break
-                    # Enforce hard upload limit against declared file_size
-                    if bytes_written + len(chunk) > record.file_size:
+                    # Enforce hard upload limit against declared file_size and configured limit
+                    if bytes_written + len(chunk) > min(record.file_size, max_upload_size):
                         f.close()
                         self.storage_manager.delete_part_file(part_path)
                         self.transfer_manager.mark_failed(
@@ -412,16 +498,18 @@ class SnowHttpTransferServer:
                     f.write(chunk)
                     bytes_written += len(chunk)
                     self.transfer_manager.update_offset(transfer_id, bytes_written)
+                f.flush()
         except Exception as exc:
             logger.error("Error streaming upload for transfer [%s]: %s", transfer_id, exc)
             self.storage_manager.delete_part_file(part_path)
             self.transfer_manager.mark_failed(transfer_id, f"I/O error during upload: {exc}")
             return web.json_response({"error": "I/O error during upload.", "details": str(exc)}, status=500)
 
-        # If full file size reached, perform integrity verification and atomic commit
+        # If full file size reached, perform off-loop integrity verification and atomic commit
         if bytes_written >= record.file_size:
             try:
-                verified_hash = self.storage_manager.atomic_commit(
+                verified_hash = await asyncio.to_thread(
+                    self.storage_manager.atomic_commit,
                     part_path=part_path,
                     dest_path=dest_path,
                     expected_sha256=record.sha256,
@@ -500,7 +588,12 @@ class SnowHttpTransferServer:
         end = total_size - 1
         is_range = False
 
-        if range_header:
+        if total_size == 0:
+            if range_header:
+                return web.Response(status=416, headers={"Content-Range": "bytes */0"})
+            start = 0
+            end = -1
+        elif range_header:
             match = re.match(r"^bytes[=\s]+(\d+)-(\d*)$", range_header.strip())
             if match:
                 start = int(match.group(1))
@@ -541,6 +634,8 @@ class SnowHttpTransferServer:
                         break
                     await response.write(chunk)
                     remaining -= len(chunk)
+                    downloaded_so_far = (end - start + 1) - remaining + start
+                    self.transfer_manager.update_offset(transfer_id, downloaded_so_far)
             await response.write_eof()
         except Exception as exc:
             logger.error("Error streaming download for transfer [%s]: %s", transfer_id, exc)
