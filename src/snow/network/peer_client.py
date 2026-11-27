@@ -38,6 +38,13 @@ class PeerConnectionResult:
     cert_fingerprint: Optional[str] = None
     manifest: Optional[dict[str, Any]] = None
     error: Optional[str] = None
+    network_id: Optional[str] = None
+    network_action: Optional[str] = None
+    network_conflict: bool = False
+    relationship: str = "member"
+    merge_tx_id: Optional[str] = None
+    host_network_id: Optional[str] = None
+    client_network_id: Optional[str] = None
 
 
 class SnowPeerClient:
@@ -54,7 +61,11 @@ class SnowPeerClient:
         self.host = host
         self.port = port
         self.identity = identity or load_or_create_device_identity()
-        self.expected_fingerprint = expected_fingerprint.lower() if expected_fingerprint else None
+        self.expected_fingerprint = (
+            expected_fingerprint.replace(":", "").replace(" ", "").strip().lower()
+            if expected_fingerprint
+            else None
+        )
         self.use_tls = use_tls
 
         self._ws: Optional[ClientConnection] = None
@@ -108,6 +119,13 @@ class SnowPeerClient:
         pin: str = "",
         auth_token: str = "",
         timeout: float = 10.0,
+        handshake_token: str = "",
+        network_id: Optional[str] = None,
+        client_network_id: Optional[str] = None,
+        network_decision: Optional[str] = None,
+        merge_tx_id: Optional[str] = None,
+        client_merge_approved: bool = False,
+        surviving_network_id: Optional[str] = None,
     ) -> PeerConnectionResult:
         """Establish WebSocket connection, verify TLS certificate, and authenticate/pair."""
         scheme = "wss" if self.use_tls else "ws"
@@ -157,15 +175,34 @@ class SnowPeerClient:
 
         # Perform authentication or pairing handshake
         try:
-            if pin:
+            if pin or handshake_token:
+                pair_payload: dict[str, Any] = {
+                    "device_id": self.identity.device_id,
+                    "device_name": self.identity.device_name,
+                    "platform": "windows",
+                    "device_type": "windows",
+                    "manifest": build_windows_manifest().to_dict(),
+                }
+                if handshake_token:
+                    pair_payload["handshake_token"] = handshake_token.strip()
+                    if network_id:
+                        pair_payload["network_id"] = str(network_id).strip().upper()
+                else:
+                    pair_payload["pin"] = pin.strip()
+                if client_network_id:
+                    pair_payload["client_network_id"] = str(client_network_id).strip().upper()
+                if network_decision:
+                    pair_payload["network_decision"] = str(network_decision).strip().lower()
+                if merge_tx_id:
+                    pair_payload["merge_tx_id"] = str(merge_tx_id).strip()
+                if client_merge_approved:
+                    pair_payload["client_merge_approved"] = True
+                if surviving_network_id:
+                    pair_payload["surviving_network_id"] = str(surviving_network_id).strip().upper()
+
                 pair_req = SnowMessage.create_request(
                     action="pair_request",
-                    data={
-                        "pin": pin.strip(),
-                        "device_id": self.identity.device_id,
-                        "device_name": self.identity.device_name,
-                        "manifest": build_windows_manifest().to_dict(),
-                    },
+                    data=pair_payload,
                 )
                 response = await self.send_message(pair_req, timeout=timeout)
                 if response.type == MessageType.ERROR:
@@ -198,6 +235,13 @@ class SnowPeerClient:
                     auth_token=self._auth_token,
                     cert_fingerprint=self._connected_fingerprint,
                     manifest=raw_manifest if isinstance(raw_manifest, dict) else None,
+                    network_id=data.get("network_id"),
+                    network_action=data.get("network_action"),
+                    network_conflict=bool(data.get("network_conflict", False)),
+                    relationship=str(data.get("relationship") or "member"),
+                    merge_tx_id=data.get("merge_tx_id"),
+                    host_network_id=data.get("host_network_id"),
+                    client_network_id=data.get("client_network_id"),
                 )
 
             elif auth_token:
@@ -359,3 +403,61 @@ class SnowPeerClient:
             self._ws = None
 
         logger.debug("Closed connection to peer %s:%d", self.host, self.port)
+
+    @classmethod
+    async def connect_from_qr(
+        cls,
+        qr_payload: dict[str, Any] | str,
+        local_identity: Optional[DeviceIdentity] = None,
+        client_network_id: Optional[str] = None,
+        timeout: float = 10.0,
+        allow_usb_loopback: bool = False,
+        use_tls: bool = True,
+    ) -> tuple[Optional["SnowPeerClient"], PeerConnectionResult]:
+        """Validate QR v1/v2 payload and connect sequentially across ranked candidate IPs."""
+        from snow.security.pairing import validate_qr_pairing_payload
+
+        try:
+            validated = validate_qr_pairing_payload(
+                qr_payload, allow_usb_loopback=allow_usb_loopback
+            )
+        except Exception as exc:
+            return None, PeerConnectionResult(
+                success=False, status="INVALID_QR", error=str(exc)
+            )
+
+        candidate_ips: list[str] = list(validated.get("ips") or [])
+        port = int(validated["port"])
+        fp = str(validated["fp"])
+        htok = str(validated.get("handshake_token") or "")
+        pin = str(validated.get("pin") or "")
+        net_id = validated.get("network_id")
+
+        last_result: Optional[PeerConnectionResult] = None
+        for cand_ip in candidate_ips:
+            client = cls(
+                host=cand_ip,
+                port=port,
+                identity=local_identity,
+                expected_fingerprint=fp,
+                use_tls=use_tls,
+            )
+            res = await client.connect(
+                pin="" if htok else pin,
+                handshake_token=htok,
+                network_id=net_id,
+                client_network_id=client_network_id,
+                timeout=timeout,
+            )
+            if res.success:
+                return client, res
+            last_result = res
+            await client.close()
+            if res.status in ("FINGERPRINT_MISMATCH", "PAIRING_REJECTED"):
+                return None, res
+
+        return None, last_result or PeerConnectionResult(
+            success=False,
+            status="NO_REACHABLE_CANDIDATES",
+            error="No reachable candidate IPs succeeded in QR onboarding.",
+        )

@@ -196,10 +196,14 @@ class TestMasterQrWebEndpoints(unittest.TestCase):
             self.assertEqual(parsed_qr2a["pin"], "654321")
             self.assertNotIn("relay_ticket", parsed_qr2a)
             self.assertIn("hub_url", parsed_qr2a)
-            self.assertIn("network_id", parsed_qr2a)
+            self.assertIsNone(parsed_qr2a.get("network_id"))
 
-        # Case 2b: Relay tunnel is ACTIVE WITH explicit SNOW_RELAY_SECRET -> mints genuine legacy ticket
-        with patch.dict("os.environ", {"SNOW_RELAY_SECRET": "explicit-stage4a-relay-secret"}, clear=False), \
+        # Case 2b: Relay tunnel is ACTIVE WITH explicit SNOW_RELAY_SECRET + canonical group -> mints genuine legacy ticket
+        with patch.dict(
+            "os.environ",
+            {"SNOW_RELAY_SECRET": "explicit-stage4a-relay-secret", "SNOW_RELAY_GROUP_ID": "SNW-NET-11223344"},
+            clear=False,
+        ), \
              patch.object(server.tunnel_manager, "get_status", return_value=fake_relay_status):
             req2 = make_mocked_request("GET", "/api/pair/qr")
             resp2 = asyncio.run(server.handle_api_pair_qr(req2))
@@ -211,12 +215,27 @@ class TestMasterQrWebEndpoints(unittest.TestCase):
             self.assertEqual(parsed_qr2["pin"], "654321")
             self.assertEqual(parsed_qr2["relay_url"], "wss://snow-relay-stage4a.trycloudflare.com/v1/tunnel")
             self.assertIn("relay_ticket", parsed_qr2)
-            self.assertEqual(parsed_qr2["group_id"], "default_group")
+            self.assertEqual(parsed_qr2["group_id"], "SNW-NET-11223344")
 
     def test_relay_tunnel_web_api_routes(self) -> None:
         server = SnowWebServer(host="127.0.0.1", port=8769, auto_open_browser=False)
+        server.bridge = MagicMock()
+        server.bridge.get_relay_config = AsyncMock(
+            return_value={
+                "success": True,
+                "status": "SUCCESS",
+                "data": {"enabled": False, "connected": False, "relay_url": "", "group_id": "", "active_tunnels": []},
+            }
+        )
+        server.bridge.set_relay_config = AsyncMock(
+            return_value={
+                "success": True,
+                "status": "SUCCESS",
+                "data": {"enabled": True, "connected": True, "relay_url": "wss://snow-relay.onrender.com/v1/tunnel", "group_id": "SNW-NET-TEST0001"},
+            }
+        )
 
-        # 1. Status endpoint
+        # 1. Status endpoint (Cloudflare optional tunnel active)
         with patch.object(
             server.tunnel_manager,
             "get_status",
@@ -229,20 +248,32 @@ class TestMasterQrWebEndpoints(unittest.TestCase):
             self.assertTrue(data_stat["active"])
             self.assertEqual(data_stat["relay_endpoint"], "wss://xyz.trycloudflare.com/v1/tunnel")
 
-        # 2. Start endpoint
+        # 2. Start endpoint (explicit optional cloudflared tunnel)
         with patch.object(
             server.tunnel_manager,
             "start_relay_tunnel",
             new_callable=AsyncMock,
             return_value={"success": True, "active": True, "public_url": "https://abc.trycloudflare.com", "relay_endpoint": "wss://abc.trycloudflare.com/v1/tunnel"}
-        ):
+        ) as mock_start_tunnel:
             req_start = make_mocked_request("POST", "/api/relay/tunnel/start")
+            req_start.json = AsyncMock(return_value={"provider": "cloudflared"})
             resp_start = asyncio.run(server.handle_api_relay_tunnel_start(req_start))
             self.assertEqual(resp_start.status, 200)
             data_start = json.loads(resp_start.text)
             self.assertTrue(data_start["active"])
+            mock_start_tunnel.assert_awaited_once_with(provider="cloudflared", port=8770, custom_url=None)
 
-        # 3. Stop endpoint
+        # 3. Default Render Hub behavior remains unchanged when provider is omitted
+        req_render = make_mocked_request("POST", "/api/relay/tunnel/start")
+        req_render.json = AsyncMock(return_value={})
+        resp_render = asyncio.run(server.handle_api_relay_tunnel_start(req_render))
+        self.assertEqual(resp_render.status, 200)
+        data_render = json.loads(resp_render.text)
+        self.assertEqual(data_render["provider"], "render")
+        self.assertTrue(data_render["active"])
+        server.bridge.set_relay_config.assert_awaited_once()
+
+        # 4. Stop endpoint
         with patch.object(
             server.tunnel_manager,
             "stop_tunnel",

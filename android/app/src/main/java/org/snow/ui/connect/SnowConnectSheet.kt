@@ -53,6 +53,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.snow.ui.components.SnowOutlinedButton
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import org.snow.network.PeerHostState
@@ -82,7 +83,9 @@ fun SnowConnectSheet(
     pairingQrError: String? = null,
     isPreparingPairingQr: Boolean = false,
     onPreparePairingQr: () -> Unit = {},
-    onRegeneratePairingPin: () -> Unit = {}
+    onRegeneratePairingPin: () -> Unit = {},
+    onCancelPairingPin: () -> Unit = {},
+    myNetworkId: String? = null
 ) {
     if (!visible) return
 
@@ -189,7 +192,7 @@ fun SnowConnectSheet(
                     if (showManualInput) {
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Enter a SNOW ID (SNW-...) or 9-digit network invite code.",
+                            text = "Enter a peer SNOW ID (SNW-...), or SNOW ID + 6-digit PIN.",
                             style = SnowTypography.bodySmall,
                             color = colors.textSecondary
                         )
@@ -201,7 +204,7 @@ fun SnowConnectSheet(
                             modifier = Modifier.fillMaxWidth(),
                             placeholder = {
                                 Text(
-                                    text = "SNW-XXXX-XXXX or 123-456-789",
+                                    text = "SNW-XXXX-XXXX or SNW-XXXX-XXXX 123456",
                                     style = SnowTypography.bodyMedium,
                                     color = colors.textMuted
                                 )
@@ -377,22 +380,36 @@ fun SnowConnectSheet(
                                         style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
                                         color = colors.accentCyan
                                     )
-                                    val ttlText = if (peerHostState.pinExpiresInSeconds > 0L) {
-                                        "Expires in ${peerHostState.pinExpiresInSeconds}s • ${peerHostState.ipAddress}"
-                                    } else {
-                                        "Host ${peerHostState.ipAddress}"
-                                    }
-                                    Text(
-                                        text = ttlText,
-                                        style = SnowTypography.labelSmall,
-                                        color = colors.textMuted
-                                    )
+                                val ttlText = if (peerHostState.pinExpiresInSeconds > 0L) {
+                                    "Expires in ${peerHostState.pinExpiresInSeconds}s • ${peerHostState.ipAddress}"
+                                } else {
+                                    "Host ${peerHostState.ipAddress}"
                                 }
-                                SnowTonalButton(
-                                    text = "New PIN",
-                                    icon = Icons.Default.Refresh,
-                                    onClick = onRegeneratePairingPin
+                                Text(
+                                    text = ttlText,
+                                    style = SnowTypography.labelSmall,
+                                    color = colors.textMuted
                                 )
+                                Text(
+                                    text = myNetworkId?.takeIf { it.isNotBlank() }?.let { "Network: $it" }
+                                        ?: "Standalone (not in a shared network yet)",
+                                    style = SnowTypography.labelSmall,
+                                    color = colors.textMuted
+                                )
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    SnowTonalButton(
+                                        text = "New PIN",
+                                        icon = Icons.Default.Refresh,
+                                        onClick = onRegeneratePairingPin
+                                    )
+                                    if (!peerHostState.pairingPin.isNullOrBlank()) {
+                                        SnowOutlinedButton(
+                                            text = "Cancel",
+                                            onClick = onCancelPairingPin
+                                        )
+                                    }
+                                }
                             }
                         } else {
                             Column(

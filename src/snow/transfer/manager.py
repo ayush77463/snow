@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 import logging
+import threading
 from typing import Dict, List, Optional, Set
 import uuid
 
@@ -68,8 +69,15 @@ class TransferRecord:
 class TransferManager:
     """Thread-safe and asyncio-compatible registry for managing file transfer sessions."""
 
+    TERMINAL_STATES = (
+        TransferState.COMPLETED,
+        TransferState.FAILED,
+        TransferState.CANCELLED,
+    )
+
     def __init__(self) -> None:
         self._transfers: Dict[str, TransferRecord] = {}
+        self._lock = threading.RLock()
 
     def create_transfer(
         self,
@@ -101,7 +109,8 @@ class TransferManager:
             status=TransferState.QUEUED,
             file_path=file_path,
         )
-        self._transfers[tid] = record
+        with self._lock:
+            self._transfers[tid] = record
         logger.info(
             "Created transfer record [%s] (%s, %s, %d bytes) for device [%s]",
             tid, direction.value, file_name, file_size, device_id
@@ -110,47 +119,52 @@ class TransferManager:
 
     def get_transfer(self, transfer_id: str) -> Optional[TransferRecord]:
         """Retrieve a transfer record by transfer_id."""
-        return self._transfers.get(transfer_id)
+        with self._lock:
+            return self._transfers.get(transfer_id)
 
     def get_transfer_for_device(self, transfer_id: str, device_id: str) -> Optional[TransferRecord]:
         """Retrieve a transfer record only if owned by the requesting device.
 
         Enforces strict cross-device isolation: Device A cannot access Device B's transfer.
         """
-        record = self._transfers.get(transfer_id)
-        if record and record.device_id == device_id:
-            return record
-        return None
+        with self._lock:
+            record = self._transfers.get(transfer_id)
+            if record and record.device_id == device_id:
+                return record
+            return None
 
     def update_offset(self, transfer_id: str, offset: int) -> bool:
         """Update current stream offset of an active transfer."""
-        record = self._transfers.get(transfer_id)
-        if not record:
-            return False
-        record.current_offset = offset
-        record.status = TransferState.IN_PROGRESS
-        record.updated_at = datetime.now(timezone.utc).isoformat()
-        return True
+        with self._lock:
+            record = self._transfers.get(transfer_id)
+            if not record or record.status in self.TERMINAL_STATES:
+                return False
+            record.current_offset = offset
+            record.status = TransferState.IN_PROGRESS
+            record.updated_at = datetime.now(timezone.utc).isoformat()
+            return True
 
     def mark_completed(self, transfer_id: str) -> bool:
-        """Mark transfer as successfully completed and verified."""
-        record = self._transfers.get(transfer_id)
-        if not record:
-            return False
-        record.current_offset = record.file_size
-        record.status = TransferState.COMPLETED
-        record.updated_at = datetime.now(timezone.utc).isoformat()
+        """Mark transfer as successfully completed and verified (once-only terminal transition)."""
+        with self._lock:
+            record = self._transfers.get(transfer_id)
+            if not record or record.status in self.TERMINAL_STATES:
+                return False
+            record.current_offset = record.file_size
+            record.status = TransferState.COMPLETED
+            record.updated_at = datetime.now(timezone.utc).isoformat()
         logger.info("Transfer [%s] marked as COMPLETED", transfer_id)
         return True
 
     def mark_failed(self, transfer_id: str, error_message: str) -> bool:
-        """Mark transfer as failed with an explanatory error."""
-        record = self._transfers.get(transfer_id)
-        if not record:
-            return False
-        record.status = TransferState.FAILED
-        record.error_message = error_message
-        record.updated_at = datetime.now(timezone.utc).isoformat()
+        """Mark transfer as failed with an explanatory error (once-only terminal transition)."""
+        with self._lock:
+            record = self._transfers.get(transfer_id)
+            if not record or record.status in self.TERMINAL_STATES:
+                return False
+            record.status = TransferState.FAILED
+            record.error_message = error_message
+            record.updated_at = datetime.now(timezone.utc).isoformat()
         logger.warning("Transfer [%s] marked as FAILED: %s", transfer_id, error_message)
         return True
 
@@ -159,27 +173,30 @@ class TransferManager:
 
     def cancel_transfer(self, transfer_id: str, device_id: str) -> bool:
         """Cancel an in-flight transfer, enforcing device ownership."""
-        record = self.get_transfer_for_device(transfer_id, device_id)
-        if not record:
-            return False
-        if record.status in (TransferState.COMPLETED, TransferState.CANCELLED):
-            return False
-        record.status = TransferState.CANCELLED
-        record.updated_at = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            record = self._transfers.get(transfer_id)
+            if not record or record.device_id != device_id:
+                return False
+            if record.status in self.TERMINAL_STATES:
+                return False
+            record.status = TransferState.CANCELLED
+            record.updated_at = datetime.now(timezone.utc).isoformat()
         logger.info("Transfer [%s] CANCELLED by device [%s]", transfer_id, device_id)
         return True
 
     def list_transfers_for_device(self, device_id: str) -> List[TransferRecord]:
         """Return all transfer records associated with a specific device."""
-        return [
-            rec for rec in self._transfers.values()
-            if rec.device_id == device_id
-        ]
+        with self._lock:
+            return [
+                rec for rec in self._transfers.values()
+                if rec.device_id == device_id
+            ]
 
     def get_active_transfer_ids(self) -> Set[str]:
         """Return set of transfer IDs that are currently active or resume-eligible."""
-        return {
-            rec.transfer_id
-            for rec in self._transfers.values()
-            if rec.status in (TransferState.QUEUED, TransferState.IN_PROGRESS, TransferState.PAUSED)
-        }
+        with self._lock:
+            return {
+                rec.transfer_id
+                for rec in self._transfers.values()
+                if rec.status in (TransferState.QUEUED, TransferState.IN_PROGRESS, TransferState.PAUSED)
+            }

@@ -7,12 +7,18 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
 import time
 from typing import Any, Optional, Tuple
 
 
 SNOW_ID_REGEX = re.compile(r"^SNW-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 NETWORK_ID_REGEX = re.compile(r"^SNW-NET-[A-F0-9]{8}$")
+
+
+def generate_canonical_network_id() -> str:
+    """Generate a new canonical network identifier in ^SNW-NET-[A-F0-9]{8}$ format."""
+    return f"SNW-NET-{secrets.token_hex(4).upper()}"
 
 
 def _get_ed25519_types():

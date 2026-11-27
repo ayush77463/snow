@@ -69,8 +69,8 @@ class TestGroupANetworkIdentityAndPersistence(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_01_schema_v5_migration_and_tables(self) -> None:
-        """Verify database initializes or migrates to SCHEMA_VERSION 5 with all Phase 27 tables."""
-        self.assertIn(SCHEMA_VERSION, (5, 6, 7))
+        """Verify database initializes or migrates to SCHEMA_VERSION >= 5 (now v8) with all mesh tables."""
+        self.assertIn(SCHEMA_VERSION, (5, 6, 7, 8))
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
@@ -90,9 +90,15 @@ class TestGroupANetworkIdentityAndPersistence(unittest.TestCase):
             self.assertIn("endpoints_json", cols, "paired_devices must have 'endpoints_json' column.")
 
     def test_02_network_identity_dataclass(self) -> None:
-        """Verify NetworkIdentity dataclass round-trip serialization and defaults."""
-        ident = NetworkIdentity(network_name="Home Mesh", owner_id="owner-fp-123")
-        self.assertTrue(len(ident.network_id) > 10)
+        """Verify NetworkIdentity dataclass round-trip serialization and standalone None default."""
+        standalone = NetworkIdentity(network_name="Standalone Host", owner_id="owner-fp-123")
+        self.assertIsNone(standalone.network_id)
+        ident = NetworkIdentity(
+            network_id="SNW-NET-CAFE1234",
+            network_name="Home Mesh",
+            owner_id="owner-fp-123",
+        )
+        self.assertEqual(ident.network_id, "SNW-NET-CAFE1234")
         self.assertEqual(ident.network_name, "Home Mesh")
         self.assertEqual(ident.owner_id, "owner-fp-123")
 
@@ -103,22 +109,24 @@ class TestGroupANetworkIdentityAndPersistence(unittest.TestCase):
         self.assertEqual(restored.owner_id, "owner-fp-123")
 
     def test_03_snow_network_manager_identity_persistence(self) -> None:
-        """Verify SnowNetworkManager loads or creates persistent network identity."""
+        """Verify SnowNetworkManager stays standalone (None) until formed, then persists canonical SNW-NET-XXXXXXXX."""
         mgr = SnowNetworkManager(db_manager=self.db)
-        ident1 = mgr.get_network_identity()
-        self.assertEqual(ident1.network_name, DEFAULT_NETWORK_NAME)
-        self.assertTrue(bool(ident1.network_id))
+        ident_standalone = mgr.get_network_identity()
+        self.assertEqual(ident_standalone.network_name, DEFAULT_NETWORK_NAME)
+        self.assertIsNone(ident_standalone.network_id)
 
-        # Update name
+        # Form canonical network & update name
+        formed = mgr.form_network(network_name="Ayush's Lab Mesh", owner_device_id="owner-pc-1", network_id="SNW-NET-A1B2C3D4")
+        self.assertEqual(formed.network_id, "SNW-NET-A1B2C3D4")
         updated = mgr.update_network_name("Ayush's Lab Mesh")
         self.assertEqual(updated.network_name, "Ayush's Lab Mesh")
 
         # Create new manager against same DB: identity must persist
         mgr2 = SnowNetworkManager(db_manager=self.db)
         ident2 = mgr2.get_network_identity()
-        self.assertEqual(ident2.network_id, ident1.network_id)
+        self.assertEqual(ident2.network_id, "SNW-NET-A1B2C3D4")
         self.assertEqual(ident2.network_name, "Ayush's Lab Mesh")
-        self.assertEqual(ident2.owner_id, ident1.owner_id)
+        self.assertEqual(ident2.owner_id, "owner-pc-1")
 
     def test_04_endpoint_ring_buffer_history(self) -> None:
         """Verify endpoint history records endpoints up to MAX_ENDPOINT_HISTORY (5)."""

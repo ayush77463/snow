@@ -118,6 +118,17 @@ class TestPhase20QrPairingPayload(unittest.TestCase):
                 )
 
     def test_create_qr_pairing_rejects_unsupported_version(self) -> None:
+        v2_payload = create_qr_pairing_payload(
+            node_id=self.node_id,
+            candidate_ips=self.valid_ips,
+            port=self.port,
+            cert_fingerprint=self.valid_fp,
+            pin=self.valid_pin,
+            version=2,
+            network_id=None,
+        )
+        self.assertEqual(v2_payload["v"], 2)
+        self.assertIsNone(v2_payload["network_id"])
         with self.assertRaises(ValueError):
             create_qr_pairing_payload(
                 node_id=self.node_id,
@@ -125,7 +136,7 @@ class TestPhase20QrPairingPayload(unittest.TestCase):
                 port=self.port,
                 cert_fingerprint=self.valid_fp,
                 pin=self.valid_pin,
-                version=2,
+                version=99,
             )
 
     def test_validate_qr_pairing_payload_json_string(self) -> None:

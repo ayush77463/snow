@@ -23,6 +23,7 @@ import uuid
 
 from snow.security.context import ExecutionContext, ExecutionPrincipal
 from snow.network.federation import is_capability_forbidden_for_federation
+from snow.relay.auth import generate_canonical_network_id, is_valid_network_id
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,9 @@ def current_utc_timestamp() -> str:
 
 @dataclass
 class NetworkIdentity:
-    """Persistent cryptographic identity of the local SNOW Network."""
+    """Persistent identity of the local SNOW Network (network_id is None when standalone)."""
 
-    network_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    network_id: Optional[str] = None
     network_name: str = DEFAULT_NETWORK_NAME
     owner_id: str = ""
     created_timestamp: str = field(default_factory=current_utc_timestamp)
@@ -64,8 +65,14 @@ class NetworkIdentity:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> NetworkIdentity:
+        raw_net_id = data.get("network_id")
+        clean_net_id = (
+            str(raw_net_id).strip().upper()
+            if isinstance(raw_net_id, str) and is_valid_network_id(raw_net_id)
+            else None
+        )
         return cls(
-            network_id=data.get("network_id") or str(uuid.uuid4()),
+            network_id=clean_net_id,
             network_name=data.get("network_name") or DEFAULT_NETWORK_NAME,
             owner_id=data.get("owner_id") or "",
             created_timestamp=data.get("created_timestamp") or current_utc_timestamp(),
@@ -134,43 +141,84 @@ class SnowNetworkManager:
         self._identity: Optional[NetworkIdentity] = None
         self._init_network_identity()
 
-    def _init_network_identity(self) -> None:
-        """Load or create persistent network identity in SQLite."""
-        row = self.db_manager.get_network_identity()
-        if row:
-            self._identity = NetworkIdentity.from_dict(row)
-        else:
-            # Derive stable owner fingerprint from local identity
-            owner_id = ""
-            if self.local_identity:
-                cert_fp = getattr(self.local_identity, "cert_fingerprint", None)
-                dev_id = getattr(self.local_identity, "device_id", None)
-                owner_id = cert_fp or (hashlib.sha256(dev_id.encode("utf-8")).hexdigest() if dev_id else "")
+    def _resolve_owner_id(self) -> str:
+        owner_id = ""
+        if self.local_identity:
+            cert_fp = getattr(self.local_identity, "cert_fingerprint", None)
+            dev_id = getattr(self.local_identity, "device_id", None)
+            owner_id = cert_fp or dev_id or ""
+        if not owner_id and self.db_manager and hasattr(self.db_manager, "get_setting"):
+            owner_id = self.db_manager.get_setting("local_owner_id") or ""
             if not owner_id:
                 owner_id = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+                self.db_manager.set_setting("local_owner_id", owner_id)
+        if not owner_id:
+            owner_id = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        return owner_id
 
-            ident = NetworkIdentity(
-                network_id=str(uuid.uuid4()),
-                network_name=DEFAULT_NETWORK_NAME,
-                owner_id=owner_id,
-                created_timestamp=current_utc_timestamp(),
+    def _init_network_identity(self) -> None:
+        """Load active canonical network identity from SQLite without fabricating fake standalone IDs."""
+        active = self.db_manager.get_active_network() if hasattr(self.db_manager, "get_active_network") else None
+        if active and is_valid_network_id(active.get("network_id")):
+            self._identity = NetworkIdentity(
+                network_id=str(active["network_id"]).strip().upper(),
+                network_name=active.get("network_name") or DEFAULT_NETWORK_NAME,
+                owner_id=active.get("owner_device_id") or self._resolve_owner_id(),
+                created_timestamp=active.get("created_timestamp") or current_utc_timestamp(),
             )
-            self.db_manager.save_network_identity(
-                network_id=ident.network_id,
-                network_name=ident.network_name,
-                owner_id=ident.owner_id,
-                created_timestamp=ident.created_timestamp,
-            )
-            self._identity = ident
+            return
+
+        row = self.db_manager.get_network_identity()
+        if row and is_valid_network_id(row.get("network_id")):
+            self._identity = NetworkIdentity.from_dict(row)
+            return
+
+        saved_name = DEFAULT_NETWORK_NAME
+        if hasattr(self.db_manager, "get_setting"):
+            saved_name = self.db_manager.get_setting("network_name") or DEFAULT_NETWORK_NAME
+        self._identity = NetworkIdentity(
+            network_id=None,
+            network_name=saved_name,
+            owner_id=self._resolve_owner_id(),
+            created_timestamp=current_utc_timestamp(),
+        )
 
     def get_network_identity(self) -> NetworkIdentity:
-        """Return the current local SNOW Network identity."""
-        if not self._identity:
-            self._init_network_identity()
-        return self._identity or NetworkIdentity()
+        """Return the current local SNOW Network identity (network_id is None when standalone)."""
+        self._init_network_identity()
+        assert self._identity is not None
+        return self._identity
+
+    def get_active_network_id(self) -> Optional[str]:
+        """Return canonical SNW-NET-XXXXXXXX if this node is in an active network, else None."""
+        ident = self.get_network_identity()
+        return ident.network_id if ident and is_valid_network_id(ident.network_id) else None
+
+    def form_network(
+        self,
+        network_name: Optional[str] = None,
+        owner_device_id: Optional[str] = None,
+        network_id: Optional[str] = None,
+    ) -> NetworkIdentity:
+        """Form or adopt a canonical SNW-NET-XXXXXXXX network cleanly in SQLite."""
+        cur = self.get_network_identity()
+        target_name = (network_name or "").strip() or cur.network_name or DEFAULT_NETWORK_NAME
+        owner = (owner_device_id or "").strip() or cur.owner_id or self._resolve_owner_id()
+        rec = self.db_manager.ensure_active_network(
+            network_name=target_name,
+            owner_device_id=owner,
+            network_id=network_id,
+        )
+        self._identity = NetworkIdentity(
+            network_id=rec["network_id"],
+            network_name=rec["network_name"],
+            owner_id=rec["owner_device_id"],
+            created_timestamp=rec["created_timestamp"],
+        )
+        return self._identity
 
     def update_network_name(self, network_name: str) -> NetworkIdentity:
-        """Update network name in SQLite and in-memory state."""
+        """Update network name in SQLite and in-memory state (works standalone or formed)."""
         clean_name = (network_name or "").strip()
         if not clean_name:
             raise ValueError("Network name cannot be empty.")
@@ -290,6 +338,8 @@ class SnowNetworkManager:
                             platform = p_plat
                             trust_tier = p.trust_tier or "peer"
                             role = getattr(p, "role", "member")
+                            relationship = getattr(p, "relationship", "member") or "member"
+                            network_id = getattr(p, "network_id", None)
                             is_connected = False
                             reachability_state = "offline"
                             transport = "none"
@@ -424,6 +474,7 @@ class SnowNetworkManager:
                     "platform": n.platform,
                     "trust_tier": getattr(n, "trust_tier", "peer"),
                     "role": getattr(n, "role", "member") if hasattr(n, "role") else "member",
+                    "relationship": getattr(n, "relationship", "member"),
                     "is_connected": n.is_connected,
                     "reachability_state": str(n.reachability_state),
                     "transport": safe_tr,
@@ -432,8 +483,10 @@ class SnowNetworkManager:
                     "last_seen": getattr(n, "last_seen_timestamp", 0.0),
                     "federated": is_fed,
                 }
+                node_net_id = getattr(n, "network_id", None)
+                if node_net_id:
+                    view_entry["network_id"] = node_net_id
                 if is_fed:
-                    view_entry["network_id"] = getattr(n, "network_id", "")
                     view_entry["network_name"] = getattr(n, "network_name", "")
                     view_entry["expires_timestamp"] = getattr(n, "expires_timestamp", None)
                 device_views.append(view_entry)
@@ -450,6 +503,7 @@ class SnowNetworkManager:
                 "success": True,
                 "status": "SUCCESS",
                 "network_id": ident.network_id,
+                "network_formed": bool(ident.network_id),
                 "network_name": ident.network_name,
                 "owner_id": ident.owner_id,
                 "created_timestamp": ident.created_timestamp,

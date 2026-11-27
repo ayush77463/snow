@@ -18,11 +18,49 @@ import org.snow.security.SafeLog
 import org.snow.security.TokenStorage
 import java.net.InetSocketAddress
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLContext
+
+enum class PinVerificationStatus {
+    SUCCESS,
+    INVALID_PIN,
+    EXPIRED,
+    LOCKED
+}
+
+data class PinVerificationResult(
+    val status: PinVerificationStatus,
+    val remainingAttempts: Int = 0,
+    val lockoutSeconds: Long = 0L,
+    val message: String = ""
+)
+
+data class NetworkNegotiationOutcome(
+    val peerDeviceId: String,
+    val peerDeviceName: String,
+    val relationship: String,
+    val networkAction: String,
+    val networkConflict: Boolean,
+    val effectiveHostNetworkId: String?,
+    val peerNetworkId: String?,
+    val mergeTxId: String? = null,
+    val survivingNetworkId: String? = null
+)
+
+data class NetworkMergeCommandResult(
+    val success: Boolean,
+    val committed: Boolean = false,
+    val networkAction: String? = null,
+    val networkId: String? = null,
+    val relationship: String? = null,
+    val errorCode: String? = null,
+    val errorMessage: String? = null
+)
 
 /**
  * Lightweight RFC 6455 WebSocket peer host server for Android-to-Android and Python-to-Android peer mesh.
@@ -48,7 +86,12 @@ class AndroidPeerHostServer(
     private val sslContext: SSLContext? = null,
     private val handshakeTokenVerifier: ((String, String?) -> Boolean)? = null,
     private val hostSnowId: String? = null,
-    private val hostNetworkId: String? = null
+    private val hostNetworkId: String? = null,
+    private val defaultMediaPort: Int = AndroidPeerHostManager.DEFAULT_MEDIA_PORT,
+    private val hostNetworkIdProvider: (() -> String?)? = null,
+    private val pinDetailedVerifier: ((String) -> PinVerificationResult)? = null,
+    private val onNetworkNegotiated: ((NetworkNegotiationOutcome) -> Unit)? = null,
+    private val mergeDecisionHandler: ((txId: String, decision: String, actingDeviceId: String) -> NetworkMergeCommandResult)? = null
 ) {
     companion object {
         private const val TAG = "AndroidPeerHostServer"
@@ -64,6 +107,35 @@ class AndroidPeerHostServer(
     private val isRunning = AtomicBoolean(false)
     private var wsServer: WebSocketServer? = null
     private val serverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile
+    private var dynamicHostNetworkId: String? = hostNetworkId?.trim()?.uppercase()?.takeIf {
+        AndroidPeerHostManager.isValidCanonicalNetworkId(it)
+    }
+    private data class InMemoryMergeProposal(
+        val txId: String,
+        val sourceNetworkId: String,
+        val targetNetworkId: String,
+        val survivingNetworkId: String,
+        val sourceOwnerDeviceId: String,
+        val targetOwnerDeviceId: String,
+        var sourceApproved: Boolean = false,
+        var targetApproved: Boolean = false,
+        var status: String = "PENDING"
+    )
+    private val fallbackMergeProposals = ConcurrentHashMap<String, InMemoryMergeProposal>()
+    private val mergeRandom = SecureRandom()
+
+    private fun currentHostNetworkId(): String? {
+        val provided = hostNetworkIdProvider?.invoke()?.trim()?.uppercase()
+        if (AndroidPeerHostManager.isValidCanonicalNetworkId(provided)) return provided
+        return dynamicHostNetworkId?.takeIf { AndroidPeerHostManager.isValidCanonicalNetworkId(it) }
+    }
+
+    private fun nextMergeTxId(): String {
+        val bytes = ByteArray(6)
+        mergeRandom.nextBytes(bytes)
+        return "mrg-" + bytes.joinToString("") { "%02x".format(it) }
+    }
 
     var boundPort: Int = requestedPort
         private set
@@ -201,6 +273,7 @@ class AndroidPeerHostServer(
             val presentedNetworkId = (data["network_id"] as? String)?.trim()?.uppercase()
             val pin = (data["pin"] as? String) ?: (data["pairing_pin"] as? String)
             val peerId = (data["device_id"] as? String)?.trim()
+            val peerName = (data["device_name"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: peerId ?: "Android Peer"
 
             if (peerId.isNullOrBlank()) {
                 val err = SnowMessage.createError(
@@ -213,9 +286,17 @@ class AndroidPeerHostServer(
                 return
             }
 
+            var detailedPinResult: PinVerificationResult? = null
             // Mutual exclusion matching Desktop Core: when handshake_token is supplied, verify ONLY it.
             val isAuthorized = if (rawHandshakeToken != null) {
                 handshakeTokenVerifier?.invoke(rawHandshakeToken, presentedNetworkId) == true
+            } else if (pinDetailedVerifier != null) {
+                if (pin != null) {
+                    detailedPinResult = pinDetailedVerifier.invoke(pin)
+                    detailedPinResult.status == PinVerificationStatus.SUCCESS
+                } else {
+                    false
+                }
             } else {
                 pin != null && pinVerifier != null && pinVerifier.invoke(pin)
             }
@@ -228,6 +309,110 @@ class AndroidPeerHostServer(
                 session.peerDeviceId = peerId
                 session.sessionId = newSessionId
 
+                val hostNetId = currentHostNetworkId()
+                val rawClientNet = (data["client_network_id"] as? String)?.trim()?.uppercase()
+                val clientNetId = rawClientNet?.takeIf { AndroidPeerHostManager.isValidCanonicalNetworkId(it) }
+                val decision = (data["network_decision"] as? String)?.trim()?.lowercase()
+                val reqTxId = (data["merge_tx_id"] as? String)?.trim()?.takeIf { it.isNotBlank() }
+                val clientMergeApproved = (data["client_merge_approved"] as? Boolean) == true
+                val hostOwnerApproved = (data["host_owner_approved"] as? Boolean) == true
+                val assignedTier = ((data["trust_tier"] as? String) ?: "owner").trim().lowercase()
+
+                var relationship = "member"
+                var netAction = "FORMED"
+                var networkConflict = false
+                var outMergeTxId: String? = null
+                var respNetworkId: String?
+                var effectiveHostNetworkId = hostNetId
+                var pairedNetId: String?
+
+                if (hostNetId == null && clientNetId == null) {
+                    val formedId = AndroidPeerHostManager.generateCanonicalNetworkId()
+                    effectiveHostNetworkId = formedId
+                    dynamicHostNetworkId = formedId
+                    respNetworkId = formedId
+                    pairedNetId = formedId
+                    netAction = "FORMED"
+                } else if (hostNetId != null && clientNetId == null) {
+                    respNetworkId = hostNetId
+                    pairedNetId = hostNetId
+                    netAction = "JOINED"
+                } else if (hostNetId == null && clientNetId != null) {
+                    effectiveHostNetworkId = clientNetId
+                    dynamicHostNetworkId = clientNetId
+                    respNetworkId = clientNetId
+                    pairedNetId = clientNetId
+                    netAction = "ADOPTED"
+                } else if (hostNetId == clientNetId) {
+                    respNetworkId = hostNetId
+                    pairedNetId = hostNetId
+                    netAction = "SAME_NETWORK"
+                } else {
+                    val safeHostNet = hostNetId!!
+                    val safeClientNet = clientNetId!!
+                    val survivingCandidate = (data["surviving_network_id"] as? String)?.trim()?.uppercase()
+                    val surviving = if (survivingCandidate == safeHostNet || survivingCandidate == safeClientNet) {
+                        survivingCandidate!!
+                    } else {
+                        safeHostNet
+                    }
+                    if (decision == "keep_separate") {
+                        relationship = "external_network"
+                        netAction = "KEEP_SEPARATE"
+                        networkConflict = false
+                        respNetworkId = safeHostNet
+                        pairedNetId = safeClientNet
+                    } else {
+                        val txId = reqTxId ?: nextMergeTxId()
+                        outMergeTxId = txId
+                        relationship = "external_network"
+                        networkConflict = true
+                        netAction = "DECISION_REQUIRED"
+                        respNetworkId = safeHostNet
+                        pairedNetId = safeClientNet
+
+                        val existing = fallbackMergeProposals[txId] ?: InMemoryMergeProposal(
+                            txId = txId,
+                            sourceNetworkId = safeHostNet,
+                            targetNetworkId = safeClientNet,
+                            survivingNetworkId = surviving,
+                            sourceOwnerDeviceId = localDeviceId,
+                            targetOwnerDeviceId = peerId
+                        ).also { fallbackMergeProposals[txId] = it }
+
+                        if (decision == "merge" && assignedTier == "owner" && clientMergeApproved) {
+                            existing.targetApproved = true
+                            if (hostOwnerApproved) {
+                                existing.sourceApproved = true
+                                existing.status = "COMMITTED"
+                                relationship = "member"
+                                networkConflict = false
+                                effectiveHostNetworkId = existing.survivingNetworkId
+                                dynamicHostNetworkId = existing.survivingNetworkId
+                                respNetworkId = existing.survivingNetworkId
+                                pairedNetId = existing.survivingNetworkId
+                                netAction = "MERGED"
+                            } else {
+                                netAction = "MERGE_APPROVAL_REQUIRED"
+                            }
+                        }
+                    }
+                }
+
+                onNetworkNegotiated?.invoke(
+                    NetworkNegotiationOutcome(
+                        peerDeviceId = peerId,
+                        peerDeviceName = peerName,
+                        relationship = relationship,
+                        networkAction = netAction,
+                        networkConflict = networkConflict,
+                        effectiveHostNetworkId = effectiveHostNetworkId,
+                        peerNetworkId = pairedNetId,
+                        mergeTxId = outMergeTxId,
+                        survivingNetworkId = respNetworkId
+                    )
+                )
+
                 val respPayload = mutableMapOf<String, Any?>(
                     "status" to "success",
                     "action" to "pair_response",
@@ -237,24 +422,41 @@ class AndroidPeerHostServer(
                     "device_type" to "android",
                     "device_name" to (android.os.Build.MODEL ?: "Android Peer"),
                     "auth_token" to newToken,
+                    "trust_tier" to assignedTier,
                     "permission_profile" to dispatcher.activePermissionProfile,
+                    "relationship" to relationship,
+                    "network_action" to netAction,
+                    "network_conflict" to networkConflict,
                     "manifest" to manifestProvider()
                 )
                 if (!hostSnowId.isNullOrBlank()) respPayload["snow_id"] = hostSnowId
-                if (!hostNetworkId.isNullOrBlank()) respPayload["network_id"] = hostNetworkId
+                if (!respNetworkId.isNullOrBlank()) respPayload["network_id"] = respNetworkId
+                if (!hostNetId.isNullOrBlank()) respPayload["host_network_id"] = hostNetId
+                if (!clientNetId.isNullOrBlank()) respPayload["client_network_id"] = clientNetId
+                if (!outMergeTxId.isNullOrBlank()) respPayload["merge_tx_id"] = outMergeTxId
 
                 val resp = SnowMessage.createResponse(
                     correlationId = message.id,
                     payload = respPayload
                 )
                 conn.send(JsonSerialization.toJson(resp))
-                SafeLog.i(TAG, "Peer paired (${if (rawHandshakeToken != null) "QR handshake" else "PIN"}): device_id=$peerId session=$newSessionId")
+                SafeLog.i(TAG, "Peer paired (${if (rawHandshakeToken != null) "QR handshake" else "PIN"}): device_id=$peerId session=$newSessionId netAction=$netAction")
             } else {
-                val errCode = if (rawHandshakeToken != null) ErrorCode.UNAUTHORIZED else ErrorCode.UNAUTHORIZED
-                val errMsg = if (rawHandshakeToken != null) {
-                    "Invalid, expired, or already used QR handshake token."
-                } else {
-                    "Invalid or expired pairing PIN."
+                val (errCode, errMsg) = when {
+                    rawHandshakeToken != null -> ErrorCode.UNAUTHORIZED to "Invalid, expired, or already used QR handshake token."
+                    detailedPinResult != null -> when (detailedPinResult.status) {
+                        PinVerificationStatus.EXPIRED -> ErrorCode.PIN_EXPIRED to detailedPinResult.message.ifBlank {
+                            "Pairing PIN expired. Generate a fresh QR code or PIN on host."
+                        }
+                        PinVerificationStatus.LOCKED -> ErrorCode.PAIRING_LOCKED to detailedPinResult.message.ifBlank {
+                            "Pairing temporarily locked due to repeated invalid PIN attempts."
+                        }
+                        PinVerificationStatus.INVALID_PIN -> ErrorCode.INVALID_PIN to detailedPinResult.message.ifBlank {
+                            "Invalid pairing PIN (${detailedPinResult.remainingAttempts} attempts remaining)."
+                        }
+                        PinVerificationStatus.SUCCESS -> ErrorCode.UNAUTHORIZED to "Pairing rejected."
+                    }
+                    else -> ErrorCode.UNAUTHORIZED to "Invalid or expired pairing PIN."
                 }
                 val err = SnowMessage.createError(
                     code = errCode,
@@ -263,7 +465,7 @@ class AndroidPeerHostServer(
                 )
                 conn.send(JsonSerialization.toJson(err))
                 conn.close(1008, "Pairing unauthorized")
-                SafeLog.w(TAG, "Peer pairing rejected for device_id=$peerId")
+                SafeLog.w(TAG, "Peer pairing rejected for device_id=$peerId code=$errCode")
             }
         } else if (action == "auth_request") {
             val presentedToken = data["auth_token"] as? String
@@ -314,7 +516,8 @@ class AndroidPeerHostServer(
                     "manifest" to manifestProvider()
                 )
                 if (!hostSnowId.isNullOrBlank()) respPayload["snow_id"] = hostSnowId
-                if (!hostNetworkId.isNullOrBlank()) respPayload["network_id"] = hostNetworkId
+                val liveNetId = currentHostNetworkId()
+                if (!liveNetId.isNullOrBlank()) respPayload["network_id"] = liveNetId
 
                 val resp = SnowMessage.createResponse(
                     correlationId = message.id,
@@ -332,6 +535,106 @@ class AndroidPeerHostServer(
                 conn.close(1008, "Unauthorized")
                 SafeLog.w(TAG, "Peer authentication rejected for device_id=$peerId")
             }
+        } else if (action == "network_merge_decision") {
+            if (!session.isAuthenticated) {
+                val err = SnowMessage.createError(
+                    code = ErrorCode.UNAUTHORIZED,
+                    message = "Session not authenticated. Please authenticate first.",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                return
+            }
+            val txId = (data["tx_id"] as? String)?.trim().orEmpty()
+            val decision = (data["decision"] as? String)?.trim()?.lowercase().orEmpty()
+            val actingDevId = session.peerDeviceId ?: (data["device_id"] as? String)?.trim().orEmpty()
+            if (txId.isBlank() || decision !in listOf("merge", "keep_separate", "reject")) {
+                val err = SnowMessage.createError(
+                    code = ErrorCode.INVALID_PAYLOAD,
+                    message = "Requires 'tx_id' and decision in ('merge', 'keep_separate', 'reject').",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                return
+            }
+            val cmdRes = if (mergeDecisionHandler != null) {
+                mergeDecisionHandler.invoke(txId, decision, actingDevId)
+            } else {
+                val prop = fallbackMergeProposals[txId]
+                if (prop == null) {
+                    NetworkMergeCommandResult(
+                        success = false,
+                        errorCode = ErrorCode.INVALID_PAYLOAD,
+                        errorMessage = "Merge transaction '$txId' not found."
+                    )
+                } else if (decision == "keep_separate" || decision == "reject") {
+                    prop.status = "REJECTED"
+                    NetworkMergeCommandResult(
+                        success = true,
+                        committed = false,
+                        networkAction = "KEEP_SEPARATE",
+                        networkId = prop.sourceNetworkId,
+                        relationship = "external_network"
+                    )
+                } else {
+                    if (actingDevId != prop.sourceOwnerDeviceId && actingDevId != prop.targetOwnerDeviceId) {
+                        NetworkMergeCommandResult(
+                            success = false,
+                            errorCode = ErrorCode.UNAUTHORIZED,
+                            errorMessage = "Only network owners can approve merge transactions."
+                        )
+                    } else {
+                        if (actingDevId == prop.sourceOwnerDeviceId) prop.sourceApproved = true
+                        if (actingDevId == prop.targetOwnerDeviceId) prop.targetApproved = true
+                        if (prop.sourceApproved && prop.targetApproved) {
+                            prop.status = "COMMITTED"
+                            dynamicHostNetworkId = prop.survivingNetworkId
+                            NetworkMergeCommandResult(
+                                success = true,
+                                committed = true,
+                                networkAction = "MERGED",
+                                networkId = prop.survivingNetworkId,
+                                relationship = "member"
+                            )
+                        } else {
+                            NetworkMergeCommandResult(
+                                success = true,
+                                committed = false,
+                                networkAction = "MERGE_APPROVAL_REQUIRED",
+                                networkId = prop.sourceNetworkId,
+                                relationship = "external_network"
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (!cmdRes.success) {
+                val err = SnowMessage.createError(
+                    code = cmdRes.errorCode ?: ErrorCode.INVALID_PAYLOAD,
+                    message = cmdRes.errorMessage ?: "Network merge decision failed.",
+                    correlationId = message.id
+                )
+                conn.send(JsonSerialization.toJson(err))
+                return
+            }
+
+            val dataMap = mutableMapOf<String, Any?>(
+                "tx_id" to txId,
+                "committed" to cmdRes.committed
+            )
+            cmdRes.networkAction?.let { dataMap["network_action"] = it }
+            cmdRes.networkId?.let { dataMap["network_id"] = it }
+            cmdRes.relationship?.let { dataMap["relationship"] = it }
+            val resp = SnowMessage.createResponse(
+                correlationId = message.id,
+                payload = mapOf(
+                    "status" to "success",
+                    "action" to "network_merge_decision",
+                    "data" to dataMap
+                )
+            )
+            conn.send(JsonSerialization.toJson(resp))
         } else if (action == "ping") {
             val resp = SnowMessage.createResponse(
                 correlationId = message.id,
@@ -371,7 +674,7 @@ class AndroidPeerHostServer(
                         action = action,
                         data = data,
                         serverHost = peerHost,
-                        defaultTransferPort = 8766
+                        defaultTransferPort = defaultMediaPort
                     )
                 } catch (e: Exception) {
                     Pair(null, SnowError(ErrorCode.INTERNAL_ERROR, "Execution failed: ${e.message}"))

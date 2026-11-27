@@ -557,6 +557,99 @@ class SnowIpcServer:
                 "data": topo,
             }, now_authed
 
+        if op == "resolve_network_merge":
+            if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": "Operation requires OWNER_MANUAL authority.",
+                }, now_authed
+
+            db_mgr = getattr(self.core_server, "db_manager", None) or getattr(self, "db_manager", None)
+            if not db_mgr and self.capability_engine:
+                db_mgr = self.capability_engine.db_manager
+            if not db_mgr:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INTERNAL_ERROR",
+                    "error": "Database manager unavailable.",
+                }, now_authed
+
+            decision = str(payload.get("decision") or "").strip().lower()
+            tx_id = str(payload.get("tx_id") or "").strip()
+            if decision == "list":
+                with db_mgr._get_connection() as conn:
+                    rows = conn.execute(
+                        "SELECT * FROM network_merge_proposals WHERE status = 'PENDING' ORDER BY created_timestamp DESC;"
+                    ).fetchall()
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"proposals": [dict(r) for r in rows]},
+                }, now_authed
+
+            if not tx_id or decision not in ("merge", "keep_separate", "reject"):
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": "Requires 'tx_id' and decision in ('merge', 'keep_separate', 'reject', 'list').",
+                }, now_authed
+
+            try:
+                if decision in ("keep_separate", "reject"):
+                    rejected = db_mgr.reject_network_merge(tx_id, reason=f"Owner chose {decision}")
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": True,
+                        "status": "SUCCESS",
+                        "data": {"tx_id": tx_id, "rejected": rejected, "committed": False},
+                    }, now_authed
+
+                from snow.security.identity import load_or_create_device_identity
+                local_dev_id = getattr(getattr(self.core_server, "device_identity", None), "device_id", None)
+                if not local_dev_id:
+                    local_dev_id = load_or_create_device_identity().device_id
+                updated = db_mgr.approve_network_merge(tx_id, local_dev_id)
+                committed = False
+                if int(updated["source_owner_approved"]) == 1 and int(updated["target_owner_approved"]) == 1:
+                    updated = db_mgr.commit_network_merge(tx_id)
+                    committed = True
+                    fed_mgr = getattr(self.core_server, "federation_manager", None)
+                    if fed_mgr is not None and updated.get("surviving_network_id"):
+                        fed_mgr.local_network_id = updated["surviving_network_id"]
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"tx_id": tx_id, "committed": committed, "proposal": updated},
+                }, now_authed
+            except PermissionError as pex:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "POLICY_DENIED",
+                    "error": str(pex),
+                }, now_authed
+            except Exception as exc:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "INVALID_ARGUMENT",
+                    "error": str(exc),
+                }, now_authed
+
         if op == "mesh_connect_peer":
             if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
                 return {
@@ -2087,6 +2180,14 @@ class SnowIpcServer:
                 )
             fp = cert_info.fingerprint_sha256 if cert_info else ""
             snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=host_device_id)
+            from snow.core.config import resolve_default_hub_url
+            from snow.network.network_model import SnowNetworkManager
+            net_mgr = SnowNetworkManager(db_manager=getattr(cs, "db_manager", None))
+            active_net_id = net_mgr.get_active_network_id()
+            transfer_srv = getattr(cs, "http_transfer_server", None)
+            transfer_port = getattr(transfer_srv, "bound_port", None) or getattr(cfg, "transfer_port", None) or 8766
+            hub_url = resolve_default_hub_url(db_manager=getattr(cs, "db_manager", None)) or None
+            rdv_id = cs.get_active_rendezvous_id() if hasattr(cs, "get_active_rendezvous_id") else None
 
             pin_state = pm.get_active_pin_state(include_pin=True)
             qr_payload = None
@@ -2098,8 +2199,14 @@ class SnowIpcServer:
                         port=port,
                         cert_fingerprint=fp,
                         pin=pin_state["pin"],
+                        version=2,
                         trust_tier=pin_state.get("trust_tier", "owner"),
                         snow_id=snow_id,
+                        network_id=active_net_id,
+                        hub_url=hub_url,
+                        device_type="windows",
+                        transfer_port=transfer_port,
+                        rdv_id=rdv_id,
                     )
                 except Exception as exc:
                     logger.debug("Non-fatal QR payload build skip in get_pairing_state: %s", exc)
@@ -2147,6 +2254,13 @@ class SnowIpcServer:
                 }, now_authed
 
             cancel_res = pm.cancel_pin()
+            if hasattr(cs, "cancel_rendezvous_for_pairing"):
+                try:
+                    cancel_coro = cs.cancel_rendezvous_for_pairing()
+                    if asyncio.iscoroutine(cancel_coro):
+                        asyncio.create_task(cancel_coro)
+                except Exception:
+                    pass
             return {
                 "version": IPC_PROTOCOL_VERSION,
                 "request_id": request_id,
@@ -2204,22 +2318,38 @@ class SnowIpcServer:
 
             fp = cert_info.fingerprint_sha256 if cert_info else ""
             from snow.core.config import resolve_default_hub_url
-            from snow.security.identity import generate_snow_id, load_or_create_network_key_identity
+            from snow.network.network_model import SnowNetworkManager
+            from snow.security.identity import generate_snow_id
             from snow.security.pairing import create_qr_pairing_payload
 
-            try:
-                key_ident = load_or_create_network_key_identity()
-                network_key_id = key_ident.network_id
-            except Exception:
-                network_key_id = ""
+            net_mgr = SnowNetworkManager(db_manager=getattr(cs, "db_manager", None))
+            active_net_id = net_mgr.get_active_network_id()
+            transfer_srv = getattr(cs, "http_transfer_server", None)
+            transfer_port = getattr(transfer_srv, "bound_port", None) or getattr(cfg, "transfer_port", None) or 8766
             hub_url = resolve_default_hub_url(db_manager=getattr(cs, "db_manager", None)) or None
             snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=host_device_id)
             handshake_token = pm.issue_handshake_token(
                 host_device_id=host_device_id,
-                network_id=network_key_id,
+                network_id=active_net_id or "",
                 trust_tier=trust_tier,
-                ttl_seconds=pm.pin_lifetime or 120.0,
+                ttl_seconds=pm.pin_lifetime or 60.0,
             )
+
+            rdv_id: Optional[str] = None
+            if hasattr(cs, "open_rendezvous_for_pairing"):
+                try:
+                    rdv_res = cs.open_rendezvous_for_pairing(
+                        pin=pin,
+                        handshake_token=handshake_token,
+                        trust_tier=trust_tier,
+                        ttl_seconds=pm.pin_lifetime or 60.0,
+                    )
+                    if asyncio.iscoroutine(rdv_res):
+                        rdv_id = await rdv_res
+                    elif isinstance(rdv_res, str) and rdv_res.strip():
+                        rdv_id = rdv_res.strip()
+                except Exception as exc:
+                    logger.debug("Non-fatal rendezvous open skip in generate_pairing_qr: %s", exc)
 
             try:
                 qr_payload = create_qr_pairing_payload(
@@ -2228,11 +2358,15 @@ class SnowIpcServer:
                     port=port,
                     cert_fingerprint=fp,
                     pin=pin,
+                    version=2,
                     trust_tier=trust_tier,
                     snow_id=snow_id,
                     handshake_token=handshake_token,
-                    network_id=network_key_id or None,
+                    network_id=active_net_id,
                     hub_url=hub_url,
+                    device_type="windows",
+                    transfer_port=transfer_port,
+                    rdv_id=rdv_id,
                 )
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -2837,10 +2971,51 @@ class SnowIpcServer:
                 "error": f"File size {file_size} exceeds maximum transfer limit of {max_transfer_bytes} bytes.",
             }
 
-        from snow.transfer.storage import compute_stream_sha256, stream_copy_file
-        file_sha256 = await asyncio.to_thread(compute_stream_sha256, safe_path)
+        from snow.transfer.storage import compute_stream_sha256, finalize_staged_file, sanitize_filename
+        import tempfile
+
+        precomputed_sha256 = str(payload.get("precomputed_sha256") or "").strip().lower()
+        raw_precomputed_size = payload.get("precomputed_size")
+        staged_handoff = bool(payload.get("staged_handoff", False)) and async_transfer
+        raw_target_name = str(payload.get("file_name") or "").strip()
+        try:
+            transfer_filename = sanitize_filename(raw_target_name) if raw_target_name else safe_path.name
+        except ValueError:
+            transfer_filename = safe_path.name
+
+        web_stage_root = (Path(tempfile.gettempdir()) / "snow_web_uploads").resolve()
+        in_web_stage = False
+        try:
+            in_web_stage = safe_path.resolve().is_relative_to(web_stage_root)
+        except Exception:
+            in_web_stage = False
+
+        valid_precomputed = (
+            len(precomputed_sha256) == 64
+            and all(c in "0123456789abcdef" for c in precomputed_sha256)
+            and isinstance(raw_precomputed_size, int)
+            and not isinstance(raw_precomputed_size, bool)
+            and raw_precomputed_size == file_size
+        )
+        if valid_precomputed and (in_web_stage or staged_handoff):
+            file_sha256 = precomputed_sha256
+        else:
+            file_sha256 = await asyncio.to_thread(compute_stream_sha256, safe_path)
 
         from snow.transfer.manager import TransferDirection, TransferState
+
+        # Bounded active async queue (prevent unbounded pending upload backlog)
+        if async_transfer:
+            active_tasks = getattr(self, "_async_transfer_tasks", {})
+            max_active = getattr(getattr(cs, "config", None), "max_concurrent_transfers", None)
+            cap = max_active if isinstance(max_active, int) and not isinstance(max_active, bool) and max_active > 0 else 16
+            running_count = sum(1 for t in active_tasks.values() if t and not t.done())
+            if running_count >= cap:
+                return {
+                    "success": False,
+                    "status": "TOO_MANY_TRANSFERS",
+                    "error": f"Too many active transfers in progress ({running_count}/{cap}). Retry once an active transfer finishes.",
+                }
 
         # 1. Pre-check SHA-256 duplicate for already completed transfer
         existing_transfers = cs.transfer_manager.list_transfers_for_device(device_id)
@@ -2852,7 +3027,7 @@ class SnowIpcServer:
             ):
                 logger.info(
                     "File '%s' (sha256: %s) already transferred to [%s]; skipping duplicate.",
-                    safe_path.name,
+                    transfer_filename,
                     file_sha256[:12],
                     device_id,
                 )
@@ -2860,25 +3035,31 @@ class SnowIpcServer:
                     "success": True,
                     "status": "ALREADY_EXISTS",
                     "transfer_id": t.transfer_id,
-                    "file_name": safe_path.name,
+                    "file_name": transfer_filename,
                     "sha256": file_sha256,
                     "bytes_transferred": 0,
                     "skipped_duplicate": True,
-                    "message": f"File '{safe_path.name}' with identical hash already exists on destination; transfer skipped.",
+                    "message": f"File '{transfer_filename}' with identical hash already exists on destination; transfer skipped.",
                 }
 
-        # Ensure file exists at destination inside storage_manager without blocking event loop
-        dest_path = cs.storage_manager.resolve_destination_path(safe_path.name)
-        if dest_path.resolve() != safe_path.resolve():
-            await asyncio.to_thread(stream_copy_file, safe_path, dest_path)
+        dest_path = cs.storage_manager.resolve_destination_path(transfer_filename)
+        needs_finalize = dest_path.resolve() != safe_path.resolve()
+        if needs_finalize and not async_transfer:
+            await asyncio.to_thread(
+                finalize_staged_file,
+                safe_path,
+                dest_path,
+                precomputed_sha256=file_sha256,
+                remove_source=staged_handoff,
+            )
 
         record = cs.transfer_manager.create_transfer(
             device_id=device_id,
-            file_name=safe_path.name,
+            file_name=transfer_filename,
             file_size=file_size,
             sha256=file_sha256,
             direction=TransferDirection.DOWNLOAD,
-            file_path=str(dest_path),
+            file_path=str(safe_path if (async_transfer and needs_finalize) else dest_path),
         )
 
         transfer_port = (
@@ -2889,7 +3070,7 @@ class SnowIpcServer:
 
         req_data = {
             "transfer_id": record.transfer_id,
-            "file_name": safe_path.name,
+            "file_name": transfer_filename,
             "file_size": file_size,
             "sha256": file_sha256,
             "transfer_port": transfer_port,
@@ -2942,14 +3123,33 @@ class SnowIpcServer:
             return {"success": False, "status": "TRANSFER_FAILED", "error": err_msg}
 
         if async_transfer:
+            if staged_handoff and needs_finalize:
+                if not hasattr(self, "_async_transfer_cleanup_paths"):
+                    self._async_transfer_cleanup_paths = {}
+                self._async_transfer_cleanup_paths[record.transfer_id] = safe_path
+
             async def _bg_async_dispatch() -> None:
                 try:
                     cs.transfer_manager.update_offset(record.transfer_id, 0)
+                    if needs_finalize:
+                        await asyncio.to_thread(
+                            finalize_staged_file,
+                            safe_path,
+                            dest_path,
+                            precomputed_sha256=file_sha256,
+                            remove_source=staged_handoff,
+                            cancel_check=lambda: record.status == TransferState.CANCELLED,
+                        )
+                        record.file_path = str(dest_path)
+                        if hasattr(self, "_async_transfer_cleanup_paths"):
+                            self._async_transfer_cleanup_paths.pop(record.transfer_id, None)
+                    if record.status == TransferState.CANCELLED:
+                        return
                     dispatch_res = await _dispatch_once(min(timeout, 30.0))
                     if record.status == TransferState.CANCELLED:
                         return
                     if not dispatch_res.get("success"):
-                        cs.transfer_manager.fail_transfer(
+                        cs.transfer_manager.mark_failed(
                             record.transfer_id,
                             dispatch_res.get("error") or "Transfer rejected by target device.",
                         )
@@ -2959,12 +3159,12 @@ class SnowIpcServer:
                         (inner or {}).get("status") or dispatch_res.get("status") or ""
                     ).strip().upper()
                     if remote_status in ("SUCCESS", "COMPLETED"):
-                        cs.transfer_manager.complete_transfer(record.transfer_id)
+                        cs.transfer_manager.mark_completed(record.transfer_id)
                 except asyncio.CancelledError:
                     cs.transfer_manager.cancel_transfer(record.transfer_id, device_id)
                 except Exception as exc:
                     if record.status != TransferState.CANCELLED:
-                        cs.transfer_manager.fail_transfer(record.transfer_id, str(exc))
+                        cs.transfer_manager.mark_failed(record.transfer_id, str(exc))
                 finally:
                     self._async_transfer_tasks.pop(record.transfer_id, None)
 
@@ -2977,7 +3177,7 @@ class SnowIpcServer:
                 "accepted": True,
                 "transfer_id": record.transfer_id,
                 "device_id": device_id,
-                "file_name": safe_path.name,
+                "file_name": transfer_filename,
                 "file_size": file_size,
                 "sha256": file_sha256,
                 "transfer_port": transfer_port,

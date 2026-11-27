@@ -66,9 +66,9 @@ class TlsMemoryBioTunnel:
 
         try:
             self.ssl_obj.do_handshake()
-            self.handshake_done = True
-            # Handshake finished: extract and verify peer certificate
+            # Handshake finished: extract and verify peer certificate BEFORE marking handshake_done
             self._verify_peer()
+            self.handshake_done = True
             out_bytes = self.outgoing_bio.read() or b""
             return True, out_bytes
         except ssl.SSLWantReadError:
@@ -120,6 +120,8 @@ class TlsMemoryBioTunnel:
             if self.expected_peer_fingerprint:
                 if presented_fp != self.expected_peer_fingerprint:
                     raise FingerprintMismatchError(expected=self.expected_peer_fingerprint, presented=presented_fp)
+        elif not self.is_server and self.expected_peer_fingerprint:
+            raise FingerprintMismatchError(expected=self.expected_peer_fingerprint, presented="<none>")
 
 
 def create_e2e_tunnel_ssl_context(

@@ -114,6 +114,9 @@ fun DevicesScreen(
     isGeneratingFederationCode: Boolean = false,
     isJoiningFederation: Boolean = false,
     isFederationActionInFlight: Boolean = false,
+    myNetworkId: String? = null,
+    pendingNetworkDecision: org.snow.ui.PendingNetworkDecision? = null,
+    onResolveNetworkDecision: (merge: Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
@@ -148,6 +151,45 @@ fun DevicesScreen(
     ) {
         item {
             Spacer(modifier = Modifier.height(8.dp))
+        }
+
+        // Network Identity & Pending Merge Conflict Banner
+        item {
+            SnowCard(
+                modifier = Modifier.fillMaxWidth(),
+                cornerRadius = 16.dp
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = myNetworkId?.takeIf { it.isNotBlank() }?.let { "Shared Network: $it" }
+                            ?: "Standalone (not in a shared network yet)",
+                        style = SnowTypography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                        color = if (!myNetworkId.isNullOrBlank()) colors.accentCyan else colors.textSecondary
+                    )
+                    if (pendingNetworkDecision != null) {
+                        Text(
+                            text = "Network conflict with ${pendingNetworkDecision.peerDeviceName}: ${pendingNetworkDecision.localNetworkId} vs ${pendingNetworkDecision.remoteNetworkId}",
+                            style = SnowTypography.bodySmall,
+                            color = colors.textPrimary
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            SnowTonalButton(
+                                text = "Merge Networks",
+                                onClick = { onResolveNetworkDecision(true) },
+                                modifier = Modifier.weight(1f)
+                            )
+                            SnowOutlinedButton(
+                                text = "Keep Separate",
+                                onClick = { onResolveNetworkDecision(false) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         // Filter Chips Row
@@ -485,8 +527,9 @@ private fun DeviceListItem(
                             overflow = TextOverflow.Ellipsis
                         )
                         val trustLabel = if (SnowUiRepository.normalizeTrustTier(device.trustTier) == "owner") "Owner" else "Peer"
+                        val relTag = if (device.relationship.equals("external_network", ignoreCase = true)) " • External" else ""
                         Text(
-                            text = "${if (isPhone) "Phone" else "PC"} • $transportLabel • $trustLabel",
+                            text = "${if (isPhone) "Phone" else "PC"} • $transportLabel • $trustLabel$relTag",
                             style = SnowTypography.bodySmall,
                             color = colors.textSecondary
                         )

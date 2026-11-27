@@ -124,7 +124,10 @@
     let localHostIdentity = "This PC";
     let localHostDeviceId = "";
     let localHostTelemetry = {};
-    let canonicalSnowId = "SNW-LOCAL";
+    let canonicalSnowId = "--";
+    let activeMeshNetworkId = null;
+    let activeMeshNetworkFormed = false;
+    let pendingNetworkMergeProposals = [];
     let activeUploadXhr = null;
     let activeUploadTransferId = null;
     let activeDownloadController = null;
@@ -2269,12 +2272,12 @@
 
     async function handleUnifiedConnectInput(rawVal) {
         if (!rawVal) {
-            showNotificationToast("Enter a SNOW ID (SNW-...) or 9-digit network invite code.", "warning");
+            showNotificationToast("Enter a peer SNOW ID (SNW-...) or IP address.", "warning");
             return;
         }
         const digitsOnly = rawVal.replace(/\D/g, "");
         if (digitsOnly.length === 9 && /^[\d-\s]+$/.test(rawVal)) {
-            showNotificationToast("Accepting 9-digit federation invite...", "info");
+            showNotificationToast("Accepting cross-network federation code...", "info");
             const res = await apiRequest("/api/federation/accept", "POST", { code: rawVal });
             if (res && res.success) {
                 showNotificationToast("Federation established!", "success");
@@ -2385,6 +2388,7 @@
             const transport = isConn ? resolveTransportLabel(dev) : "Offline";
             const connMode = dev.connection_mode || "auto";
             const permProf = dev.permission_profile || "full_control";
+            const isExternalNet = String(dev.relationship || "member").toLowerCase() === "external_network";
             const batVal = dev.telemetry?.battery_level ?? dev.battery?.level ?? dev.battery_level;
             const iconSvg = isAndroidDevice(dev)
                 ? `<svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="20" rx="2" ry="2" width="14" x="5" y="2"></rect><line x1="12" x2="12.01" y1="18" y2="18"></line></svg>`
@@ -2398,10 +2402,13 @@
                         <div class="island-icon-box">${iconSvg}</div>
                         <div class="flex flex-col min-w-0">
                             <span class="text-sm font-bold text-primary truncate">${escapeHtml(dev.device_name || "Device")}</span>
-                            <span class="text-xs text-muted">${isConn ? `Connected • ${transport}` : "Disconnected"}${batVal != null ? ` • ${batVal}%` : ""} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}</span>
+                            <span class="text-xs text-muted">${isConn ? `Connected • ${transport}` : "Disconnected"}${batVal != null ? ` • ${batVal}%` : ""} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}${isExternalNet ? " • External Network" : ""}</span>
                         </div>
                     </div>
-                    <span class="chip ${isConn ? "chip-cyan" : "chip-amber"}">${transport}</span>
+                    <div class="flex items-center gap-1">
+                        ${isExternalNet ? `<span class="chip chip-sm chip-amber">External</span>` : ""}
+                        <span class="chip ${isConn ? "chip-cyan" : "chip-amber"}">${transport}</span>
+                    </div>
                 </div>
 
                 <div class="flex items-center justify-between gap-2 flex-wrap">
@@ -4040,7 +4047,7 @@
         const diagNetEl = document.getElementById("diag-my-network-id");
         const diagAiEl = document.getElementById("diag-remote-ai-url");
         if (diagSnowEl) diagSnowEl.textContent = canonicalSnowId || "--";
-        if (diagNetEl && hubRes?.network_id) diagNetEl.textContent = hubRes.network_id;
+        if (diagNetEl) diagNetEl.textContent = activeMeshNetworkId || (activeMeshNetworkFormed ? "--" : "Standalone");
         const activeEndpointPreview = (statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url))
             ? (statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`)
             : "";
@@ -4532,6 +4539,74 @@
     // 13. Background Polling & Non-Overwriting State Synchronization
     // =========================================================================
 
+    function renderNetworkIdentityAndMerges() {
+        const netChipEl = document.getElementById("pairing-network-status");
+        const modalNetEl = document.getElementById("modal-network-id");
+        const diagNetEl = document.getElementById("diag-my-network-id");
+        const netDisplay = activeMeshNetworkId || "Standalone (not in a shared network yet)";
+        if (netChipEl) {
+            netChipEl.textContent = activeMeshNetworkId || "Standalone";
+            netChipEl.className = `chip chip-sm mono ${activeMeshNetworkId ? "chip-cyan" : "chip-neutral"}`;
+        }
+        if (modalNetEl) {
+            modalNetEl.textContent = activeMeshNetworkId || (canonicalSnowId && canonicalSnowId !== "--" ? canonicalSnowId : "Standalone");
+        }
+        if (diagNetEl) {
+            diagNetEl.textContent = netDisplay;
+        }
+
+        const mergeCard = document.getElementById("network-merge-card");
+        const mergeListEl = document.getElementById("network-merge-proposals-container");
+        if (!mergeCard || !mergeListEl) return;
+        const pending = Array.isArray(pendingNetworkMergeProposals) ? pendingNetworkMergeProposals : [];
+        if (pending.length === 0) {
+            mergeCard.classList.add("d-none");
+            mergeListEl.innerHTML = "";
+            return;
+        }
+        mergeCard.classList.remove("d-none");
+        mergeListEl.innerHTML = "";
+        pending.forEach(prop => {
+            const txId = String(prop.tx_id || "");
+            const srcNet = String(prop.source_network_id || "");
+            const dstNet = String(prop.target_network_id || "");
+            const card = document.createElement("div");
+            card.className = "p-2 flex flex-col gap-2";
+            card.style = "background: var(--snow-bg-elevated); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);";
+            card.innerHTML = `
+                <div class="text-xs text-primary">
+                    Separate SNOW networks detected: <strong class="mono text-cyan">${escapeHtml(srcNet)}</strong> vs <strong class="mono text-cyan">${escapeHtml(dstNet)}</strong>
+                </div>
+                <div class="text-xs text-muted">
+                    Merge requires mutual owner confirmation. Keep Separate isolates peer trust (non-transitive).
+                </div>
+                <div class="flex gap-2">
+                    <button class="btn btn-xs btn-primary btn-merge-approve">Merge Networks</button>
+                    <button class="btn btn-xs btn-tonal btn-merge-separate">Keep Separate</button>
+                </div>
+            `;
+            card.querySelector(".btn-merge-approve").onclick = async () => {
+                const res = await apiRequest("/api/network/merge/approve", "POST", { tx_id: txId });
+                if (res && res.success) {
+                    showNotificationToast(res.committed ? "Networks merged cleanly." : "Merge approved; waiting on peer owner confirmation.", "success");
+                    refreshAllData();
+                } else {
+                    showNotificationToast(res?.error || "Failed approving merge", "error");
+                }
+            };
+            card.querySelector(".btn-merge-separate").onclick = async () => {
+                const res = await apiRequest("/api/network/merge/keep-separate", "POST", { tx_id: txId });
+                if (res && res.success) {
+                    showNotificationToast("Networks kept separate (external peer relationship).", "info");
+                    refreshAllData();
+                } else {
+                    showNotificationToast(res?.error || "Failed keeping networks separate", "error");
+                }
+            };
+            mergeListEl.appendChild(card);
+        });
+    }
+
     async function pollStateUpdates() {
         if (isPageTearingDown || isPollStateInFlight) return;
         clearDashboardPollTimer();
@@ -4539,13 +4614,26 @@
         const myPollSeq = ++pollStateSeq;
         let pollRecorded = false;
         try {
-            // 1. System status & Core health
-            const [statusRes, sysStatus, fedRes] = await Promise.all([
+            // 1. System status, Core health, Network identity & Pending merges
+            const [statusRes, sysStatus, fedRes, netRes, mergeRes] = await Promise.all([
                 apiRequest("/api/status"),
                 apiRequest("/api/system/status"),
                 apiRequest("/api/federation/grants"),
+                apiRequest("/api/network/identity"),
+                apiRequest("/api/network/merge/pending"),
             ]);
             if (myPollSeq !== pollStateSeq || isPageTearingDown) return;
+
+            if (netRes && netRes.success && netRes.identity) {
+                activeMeshNetworkId = netRes.identity.network_id || null;
+                activeMeshNetworkFormed = Boolean(netRes.identity.network_formed && activeMeshNetworkId);
+            }
+            if (mergeRes && mergeRes.success && Array.isArray(mergeRes.proposals)) {
+                pendingNetworkMergeProposals = mergeRes.proposals;
+            } else {
+                pendingNetworkMergeProposals = [];
+            }
+            renderNetworkIdentityAndMerges();
 
             let pollSucceeded = false;
             if (statusRes && statusRes.success) {
@@ -4561,7 +4649,7 @@
                 const coreIdEl = document.getElementById("core-canonical-id");
                 if (coreIdEl) coreIdEl.textContent = canonicalSnowId;
                 const diagSnowEl = document.getElementById("diag-my-snow-id");
-                if (diagSnowEl && canonicalSnowId && canonicalSnowId !== "SNW-LOCAL") {
+                if (diagSnowEl && canonicalSnowId && canonicalSnowId !== "--") {
                     diagSnowEl.textContent = canonicalSnowId;
                 }
             } else {

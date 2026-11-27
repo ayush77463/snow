@@ -473,7 +473,10 @@
                         <div class="flex flex-col gap-4">
                             <div class="card">
                                 <div class="card-header-row">
-                                    <h3 class="card-title">Connect &amp; Pair</h3>
+                                    <div class="flex items-center gap-2">
+                                        <h3 class="card-title">Connect &amp; Pair</h3>
+                                        <span id="pairing-network-status" class="chip chip-sm chip-neutral mono">Standalone</span>
+                                    </div>
                                     <div class="segmented-nav">
                                         <button id="btn-pair-tab-qr" class="segmented-tab active">SNOW ID &amp; QR</button>
                                         <button id="btn-pair-tab-apk" class="segmented-tab">Install APK</button>
@@ -488,11 +491,11 @@
                                         </div>
                                         <div class="flex flex-col gap-2 flex-1 min-w-0">
                                             <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
-                                                <span class="text-xs text-muted" style="display: block;">NETWORK ID</span>
+                                                <span class="text-xs text-muted" style="display: block;">SNOW ID</span>
                                                 <span id="pairing-snow-id" class="text-sm font-bold text-cyan mono truncate">--</span>
                                             </div>
                                             <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
-                                                <span class="text-xs text-muted" style="display: block;">PAIRING PIN</span>
+                                                <span class="text-xs text-muted" style="display: block;">UNIFIED PAIRING PIN</span>
                                                 <div class="flex items-center justify-between gap-2">
                                                     <span id="pairing-pin-display" class="text-sm font-bold text-primary mono">No active PIN</span>
                                                     <span id="pairing-countdown-display" class="text-xs text-muted mono">--</span>
@@ -502,7 +505,7 @@
                                     </div>
                                     <div class="text-xs text-muted truncate">Fingerprint: <span id="pairing-device-fp" class="mono">--</span></div>
                                     <div class="flex gap-2">
-                                        <input type="text" id="pairing-input" class="form-input" placeholder="Enter SNOW ID (SNW-...) or 9-digit network code">
+                                        <input type="text" id="pairing-input" class="form-input" placeholder="Enter SNOW ID (SNW-...) or peer IP">
                                         <button id="btn-pairing-connect" class="btn btn-primary btn-sm btn-radius-md">Connect</button>
                                     </div>
                                     <div class="flex gap-2">
@@ -527,6 +530,15 @@
                                     </div>
                                     <div id="usb-unlock-status" class="text-xs text-muted d-none"></div>
                                 </div>
+                            </div>
+
+                            <!-- Pending Dual-Network Merge Proposals -->
+                            <div id="network-merge-card" class="card flex flex-col gap-3 d-none">
+                                <div class="card-header-row" style="margin-bottom: 4px;">
+                                    <h3 class="card-title">Network Merge Decisions</h3>
+                                    <span class="chip chip-sm chip-amber">Owner Consent</span>
+                                </div>
+                                <div id="network-merge-proposals-container" class="flex flex-col gap-2"></div>
                             </div>
 
                             <!-- Cross-Network Federation directly underneath Connect & Pair -->
@@ -980,21 +992,21 @@
                     <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                 </button>
             </div>
-            <p class="text-xs text-muted">Scan QR with SNOW Mobile (zero-PIN handshake), or connect using a SNOW ID or 9-digit network invite code.</p>
+            <p class="text-xs text-muted">Scan QR v2 with SNOW Mobile (zero-PIN handshake) or another PC, or connect using a peer SNOW ID.</p>
             <div class="flex gap-4 items-center">
                 <div id="modal-qr-container" class="qr-surface" style="width: 140px; height: 140px; flex-shrink: 0;">
                     <span class="text-xs text-muted text-center">No active QR</span>
                 </div>
                 <div class="flex flex-col gap-2 flex-1 min-w-0">
                     <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
-                        <span class="text-xs text-muted" style="display: block;">Network ID</span>
+                        <span class="text-xs text-muted" style="display: block;">Network / SNOW ID</span>
                         <div class="flex items-center justify-between gap-2">
-                            <span id="modal-network-id" class="text-xs font-bold text-cyan mono truncate">SNW-LOCAL</span>
+                            <span id="modal-network-id" class="text-xs font-bold text-cyan mono truncate">Standalone</span>
                             <button id="btn-copy-modal-netid" class="btn btn-xs btn-tonal btn-radius-md">Copy</button>
                         </div>
                     </div>
                     <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
-                        <span class="text-xs text-muted" style="display: block;">Pairing PIN</span>
+                        <span class="text-xs text-muted" style="display: block;">Unified 6-Digit PIN</span>
                         <div class="flex items-center justify-between gap-2">
                             <span id="modal-pairing-pin" class="text-xs font-bold text-primary mono">No active PIN</span>
                             <button id="btn-modal-generate-pin" class="btn btn-xs btn-tonal btn-radius-md">Generate Pairing QR &amp; PIN</button>
@@ -1004,9 +1016,9 @@
             </div>
 
             <div class="form-group">
-                <label class="form-label">SNOW ID or 9-Digit Network Invite Code</label>
+                <label class="form-label">Peer SNOW ID or IP:Port</label>
                 <div class="flex gap-2">
-                    <input type="text" id="modal-connect-input" class="form-input mono" placeholder="e.g. SNW-A1B2-C3D4 or 123-456-789">
+                    <input type="text" id="modal-connect-input" class="form-input mono" placeholder="e.g. SNW-A1B2-C3D4 or 192.168.1.50:8767">
                     <button id="btn-modal-connect-submit" class="btn btn-primary btn-sm">Connect</button>
                 </div>
             </div>

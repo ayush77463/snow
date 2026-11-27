@@ -163,6 +163,7 @@ class PairingManager:
                 "has_active_pin": has_pin,
                 "trust_tier": self._active_trust_tier,
                 "remaining_seconds": int(rem),
+                "expires_in_seconds": int(rem),
                 "is_locked": self._is_locked,
                 "is_paired": self._is_paired,
                 "pending_device_id": self._pending_device_id,
@@ -170,8 +171,6 @@ class PairingManager:
             }
             if include_pin and has_pin:
                 state["pin"] = self._active_pin or self._owner_pin
-                state["owner_pin"] = self._owner_pin
-                state["peer_pin"] = self._peer_pin
             return state
 
     def issue_handshake_token(
@@ -179,7 +178,7 @@ class PairingManager:
         host_device_id: str,
         network_id: str = "",
         trust_tier: str = "owner",
-        ttl_seconds: float = 120.0,
+        ttl_seconds: float = 60.0,
     ) -> str:
         """Issue a single-use, host-bound, short-lived QR handshake token.
 
@@ -367,32 +366,26 @@ class PairingManager:
             }
 
     def generate_pin(self, display_to_stderr: bool = True, trust_tier: str = "owner") -> str:
-        """Generate cryptographically secure 6-digit decimal PINs for Owner and Peer pairing.
+        """Generate one unified cryptographically secure 6-digit pairing PIN (60s TTL).
 
         Resets failed attempts and starts a fresh 60-second pairing window.
-        Outputs the generated PINs strictly to sys.stderr (never stdout).
+        Outputs the generated PIN strictly to sys.stderr (never stdout).
 
         Args:
             display_to_stderr: Whether to write pairing banner to sys.stderr.
             trust_tier: Targeted trust tier ('owner' or 'peer').
 
         Returns:
-            The primary active PIN string bound to the requested tier.
+            The unified 6-digit active PIN string.
         """
         with self._lock:
-            raw_owner = secrets.randbelow(1_000_000)
-            raw_peer = secrets.randbelow(1_000_000)
-            while raw_peer == raw_owner:
-                raw_peer = secrets.randbelow(1_000_000)
-
-            owner_pin = f"{raw_owner:06d}"
-            peer_pin = f"{raw_peer:06d}"
+            pin_val = f"{secrets.randbelow(1_000_000):06d}"
 
             clean_tier = "peer" if str(trust_tier).lower() == "peer" else "owner"
             self._active_trust_tier = clean_tier
-            self._active_pin = peer_pin if clean_tier == "peer" else owner_pin
-            self._owner_pin = owner_pin
-            self._peer_pin = peer_pin
+            self._active_pin = pin_val
+            self._owner_pin = pin_val if clean_tier == "owner" else None
+            self._peer_pin = pin_val if clean_tier == "peer" else None
             self._pin_generated_at = self.time_provider()
             self._failed_attempts = 0
             self._is_locked = False
@@ -401,24 +394,24 @@ class PairingManager:
             self._session_id = None
 
             if display_to_stderr:
-                self._display_pin_stderr(owner_pin, peer_pin)
+                self._display_pin_stderr(pin_val, clean_tier)
 
             return self._active_pin
 
-    def _display_pin_stderr(self, owner_pin: str, peer_pin: str) -> None:
-        """Display the active pairing PINs to sys.stderr."""
+    def _display_pin_stderr(self, pin: str, trust_tier: str = "owner") -> None:
+        """Display the unified active pairing PIN to sys.stderr."""
         lifetime_sec = int(self.pin_lifetime)
+        tier_label = "PEER" if str(trust_tier).lower() == "peer" else "OWNER"
         banner = (
             f"\n======================================================\n"
-            f" [SNOW PAIRING] Temporary Pairing PINs (Expires in {lifetime_sec}s):\n"
-            f"   - Owner Provisioning PIN: [ {owner_pin} ] -> Grants OWNER_MANUAL\n"
-            f"   - Peer Pairing PIN:       [ {peer_pin} ] -> Grants PEER\n"
-            f" Enter the appropriate PIN on your Android device.\n"
+            f" [SNOW PAIRING] Unified Pairing PIN (Expires in {lifetime_sec}s):\n"
+            f"   - Pairing PIN ({tier_label}): [ {pin} ]\n"
+            f" Enter this 6-digit PIN on your peer SNOW device.\n"
             f"======================================================\n"
         )
         sys.stderr.write(banner)
         sys.stderr.flush()
-        logger.info("Generated active pairing PINs (owner and peer, expires in %ds)", lifetime_sec)
+        logger.info("Generated unified pairing PIN (tier=%s, expires in %ds)", tier_label, lifetime_sec)
 
     def verify_pin(self, submitted_pin: str, client_device_id: Optional[str] = None) -> VerificationResult:
         """Verify a submitted 6-digit PIN.
@@ -582,34 +575,20 @@ def create_qr_pairing_payload(
     handshake_token: Optional[str] = None,
     network_id: Optional[str] = None,
     hub_url: Optional[str] = None,
+    device_type: Optional[str] = None,
+    transfer_port: Optional[int] = None,
+    rdv_id: Optional[str] = None,
+    expires_at: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Construct a validated QR pairing payload for SNOW zero-friction onboarding.
-
-    Payload schema:
-    {
-      "v": 1,
-      "id": "<node_id>",
-      "ips": ["<candidate_ip>"],
-      "port": 8765,
-      "fp": "<sha256_cert_fingerprint>",
-      "pin": "<optional_six_digit_pin>",
-      "handshake_token": "<optional_single_use_qr_token>",
-      "tier": "owner",
-      "network_id": "<optional_network_id>",
-      "hub_url": "<optional_default_hub_url>",
-      "relay_url": "<optional_relay_endpoint>",
-      "relay_ticket": "<optional_short_lived_ticket>",
-      "group_id": "<optional_group_id>"
-    }
-    """
-    if version != 1:
-        raise ValueError(f"Unsupported QR payload version: {version}. Expected 1.")
+    """Construct a validated QR pairing payload (v1 or v2) for universal SNOW onboarding."""
+    if version not in (1, 2):
+        raise ValueError(f"Unsupported QR payload version: {version}. Expected 1 or 2.")
 
     clean_id = (node_id or "").strip()
     if not clean_id:
         raise ValueError("node_id must not be empty.")
 
-    if not isinstance(port, int) or port < 1 or port > 65535:
+    if not isinstance(port, int) or isinstance(port, bool) or port < 1 or port > 65535:
         raise ValueError(f"Invalid port: {port}. Must be between 1 and 65535.")
 
     clean_handshake = str(handshake_token).strip() if handshake_token is not None else ""
@@ -631,6 +610,10 @@ def create_qr_pairing_payload(
             f"Certificate fingerprint must be a 64-character SHA-256 hex string, got {len(raw_fp)} chars."
         )
 
+    clean_rdv = str(rdv_id).strip() if rdv_id is not None else ""
+    if clean_rdv and (len(clean_rdv) < 4 or len(clean_rdv) > 128 or not re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_rdv)):
+        raise ValueError(f"Malformed rdv_id in QR payload: '{clean_rdv}'.")
+
     # Filter candidate IPs: exclude loopback, link-local, unspecified, and non-IPv4.
     # When allow_usb_loopback is True, 127.0.0.1 is permitted exclusively for USB tethering.
     filtered_ips: list[str] = []
@@ -650,7 +633,7 @@ def create_qr_pairing_payload(
         except Exception:
             continue
 
-    if not filtered_ips:
+    if not filtered_ips and not (version == 2 and clean_rdv):
         if allow_usb_loopback:
             raise ValueError("At least one reachable candidate IPv4 address (or 127.0.0.1 for USB) is required for QR pairing.")
         raise ValueError("At least one reachable, non-loopback candidate IPv4 address is required for QR pairing.")
@@ -663,8 +646,16 @@ def create_qr_pairing_payload(
         if not is_valid_snow_id(clean_snow_id):
             raise ValueError(f"Invalid snow_id in QR payload: '{clean_snow_id}'. Must match ^SNW-[A-Z0-9]{{4}}-[A-Z0-9]{{4}}$.")
 
+    clean_net: Optional[str] = None
+    if network_id is not None:
+        cand_net = str(network_id).strip().upper()
+        if cand_net:
+            if not re.match(r"^[A-Z0-9\-_]{4,64}$", cand_net):
+                raise ValueError(f"Malformed network_id in QR payload: '{cand_net}'.")
+            clean_net = cand_net
+
     payload: dict[str, Any] = {
-        "v": 1,
+        "v": version,
         "id": clean_id,
         "snow_id": clean_snow_id,
         "ips": filtered_ips,
@@ -672,16 +663,35 @@ def create_qr_pairing_payload(
         "fp": raw_fp,
         "tier": clean_tier,
     }
+    if version == 2:
+        payload["device_id"] = clean_id
+        payload["network_id"] = clean_net
+        if device_type is not None and str(device_type).strip():
+            payload["device_type"] = str(device_type).strip().lower()
+        if transfer_port is not None:
+            if not isinstance(transfer_port, int) or isinstance(transfer_port, bool) or transfer_port < 1 or transfer_port > 65535:
+                raise ValueError(f"Invalid transfer_port: {transfer_port}. Must be between 1 and 65535.")
+            payload["transfer_port"] = transfer_port
+        if clean_rdv:
+            payload["rdv_id"] = clean_rdv
+        exp_ts = int(expires_at) if expires_at is not None else int(time.time() + DEFAULT_PIN_LIFETIME_SECONDS)
+        if exp_ts <= 0:
+            raise ValueError(f"Invalid exp timestamp: {exp_ts}.")
+        payload["exp"] = exp_ts
+    else:
+        if device_type is not None and str(device_type).strip():
+            payload["device_type"] = str(device_type).strip().lower()
+        if transfer_port is not None and isinstance(transfer_port, int) and 1 <= transfer_port <= 65535:
+            payload["transfer_port"] = transfer_port
+        if clean_net:
+            payload["network_id"] = clean_net
+        if expires_at is not None:
+            payload["exp"] = int(expires_at)
+
     if clean_pin:
         payload["pin"] = clean_pin
     if clean_handshake:
         payload["handshake_token"] = clean_handshake
-    if network_id is not None:
-        clean_net = str(network_id).strip().upper()
-        if clean_net:
-            if not re.match(r"^[A-Z0-9\-_]{4,64}$", clean_net):
-                raise ValueError(f"Malformed network_id in QR payload: '{clean_net}'.")
-            payload["network_id"] = clean_net
     if hub_url is not None:
         clean_hub = str(hub_url).strip()
         if clean_hub:
@@ -721,10 +731,11 @@ def create_qr_pairing_payload(
 def validate_qr_pairing_payload(
     payload: dict[str, Any] | str,
     allow_usb_loopback: bool = False,
+    now_ts: Optional[float] = None,
 ) -> dict[str, Any]:
-    """Validate and normalize an incoming QR pairing payload.
+    """Validate and normalize an incoming QR pairing payload (v1 or v2).
 
-    Raises ValueError if payload violates format, schema version, or security rules.
+    Raises ValueError if payload violates format, schema version, expiry, or security rules.
     """
     if isinstance(payload, str):
         try:
@@ -736,15 +747,26 @@ def validate_qr_pairing_payload(
         raise ValueError("QR payload must be a JSON object.")
 
     v = payload.get("v")
-    if v != 1:
-        raise ValueError(f"Unsupported payload version: {v}. Expected 1.")
+    if v not in (1, 2):
+        raise ValueError(f"Unsupported payload version: {v}. Expected 1 or 2.")
 
-    node_id = payload.get("id")
+    raw_exp = payload.get("exp")
+    parsed_exp: Optional[int] = None
+    if raw_exp is not None:
+        if isinstance(raw_exp, bool) or not isinstance(raw_exp, (int, float)) or raw_exp <= 0:
+            raise ValueError(f"Invalid 'exp' timestamp in QR payload: {raw_exp}.")
+        parsed_exp = int(raw_exp)
+        check_now = float(now_ts) if now_ts is not None else time.time()
+        if check_now > float(parsed_exp):
+            raise ValueError("QR pairing payload has expired.")
+
+    raw_device_id = payload.get("device_id") if v == 2 else None
+    node_id = raw_device_id or payload.get("id")
     if not isinstance(node_id, str) or not node_id.strip():
         raise ValueError("Missing or invalid 'id' in QR payload.")
 
     port = payload.get("port")
-    if not isinstance(port, int) or port < 1 or port > 65535:
+    if not isinstance(port, int) or isinstance(port, bool) or port < 1 or port > 65535:
         raise ValueError(f"Missing or invalid 'port' in QR payload: {port}.")
 
     raw_handshake = payload.get("handshake_token")
@@ -765,8 +787,15 @@ def validate_qr_pairing_payload(
     if len(fp) != 64 or not all(c in "0123456789ABCDEF" for c in fp):
         raise ValueError("Invalid certificate fingerprint in QR payload. Must be 64-character SHA-256 hex.")
 
+    raw_rdv_id = payload.get("rdv_id")
+    clean_rdv_id = str(raw_rdv_id).strip() if raw_rdv_id is not None else ""
+    if clean_rdv_id and (len(clean_rdv_id) < 4 or len(clean_rdv_id) > 128 or not re.match(r"^[a-zA-Z0-9_\-\.]+$", clean_rdv_id)):
+        raise ValueError(f"Malformed 'rdv_id' in QR payload: '{clean_rdv_id}'.")
+
     raw_ips = payload.get("ips")
-    if not isinstance(raw_ips, list) or not raw_ips:
+    if not isinstance(raw_ips, list):
+        raise ValueError("Missing or empty 'ips' list in QR payload.")
+    if not raw_ips and not (v == 2 and clean_rdv_id):
         raise ValueError("Missing or empty 'ips' list in QR payload.")
 
     filtered_ips: list[str] = []
@@ -783,7 +812,7 @@ def validate_qr_pairing_payload(
         except Exception:
             continue
 
-    if not filtered_ips:
+    if not filtered_ips and not (v == 2 and clean_rdv_id):
         if allow_usb_loopback:
             raise ValueError("No reachable candidate IPv4 addresses found in QR payload.")
         raise ValueError("No reachable, non-loopback candidate IPv4 addresses found in QR payload.")
@@ -799,7 +828,7 @@ def validate_qr_pairing_payload(
         clean_snow_id = generate_snow_id(seed=node_id.strip())
 
     res: dict[str, Any] = {
-        "v": 1,
+        "v": v,
         "id": node_id.strip(),
         "snow_id": clean_snow_id,
         "ips": filtered_ips,
@@ -807,6 +836,21 @@ def validate_qr_pairing_payload(
         "fp": fp,
         "tier": clean_tier,
     }
+    if v == 2:
+        res["device_id"] = node_id.strip()
+        res["network_id"] = None
+    if parsed_exp is not None:
+        res["exp"] = parsed_exp
+    if clean_rdv_id:
+        res["rdv_id"] = clean_rdv_id
+    raw_dev_type = payload.get("device_type")
+    if raw_dev_type is not None and str(raw_dev_type).strip():
+        res["device_type"] = str(raw_dev_type).strip().lower()
+    raw_tp = payload.get("transfer_port")
+    if raw_tp is not None:
+        if isinstance(raw_tp, bool) or not isinstance(raw_tp, int) or raw_tp < 1 or raw_tp > 65535:
+            raise ValueError(f"Invalid 'transfer_port' in QR payload: {raw_tp}.")
+        res["transfer_port"] = raw_tp
     if pin:
         res["pin"] = pin
     if clean_handshake:

@@ -46,6 +46,12 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
+enum class ConnectionHandshakeMode {
+    STANDARD_OR_AUTO,
+    EXPLICIT_PAIRING_INITIATOR,
+    AUTHENTICATED_RECONNECT
+}
+
 /**
  * Authentication and authorization states for the SNOW connection lifecycle.
  */
@@ -209,6 +215,8 @@ class SnowWebSocketClient(
     var expectedTargetDeviceId: String? = null
     @Volatile
     var resolvedTargetDeviceId: String? = null
+    @Volatile
+    var handshakeMode: ConnectionHandshakeMode = ConnectionHandshakeMode.STANDARD_OR_AUTO
     var targetDeviceLookupByEndpoint: ((String, Int) -> String?)? = null
 
     var requestDispatcher: (suspend (action: String, data: Map<String, Any?>?) -> Pair<Map<String, Any?>?, SnowError?>)? = null
@@ -326,13 +334,19 @@ class SnowWebSocketClient(
      * Connect to the SNOW host at wss://host:port (or ws:// if useTls is false).
      */
     @JvmOverloads
-    fun connect(host: String, port: Int = Constants.DEFAULT_PORT, targetDeviceId: String? = null) {
+    fun connect(
+        host: String,
+        port: Int = Constants.DEFAULT_PORT,
+        targetDeviceId: String? = null,
+        mode: ConnectionHandshakeMode = ConnectionHandshakeMode.STANDARD_OR_AUTO
+    ) {
         val stalePending: List<PendingRequestEntry>
         synchronized(this) {
             targetHost = host.trim()
             targetPort = port
             expectedTargetDeviceId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
             resolvedTargetDeviceId = null
+            handshakeMode = mode
             userInitiatedDisconnect.set(false)
             backoffPolicy.reset()
 
@@ -1268,31 +1282,36 @@ class SnowWebSocketClient(
                         }
                         deliverPendingError(drained, "Manual disconnect by host.")
                     } else if (errCode == ErrorCode.UNAUTHORIZED) {
-                        log("Stored token is invalid. Clearing stale token and awaiting user pairing...")
+                        val activeMode = handshakeMode
+                        log("Stored token is invalid. Clearing stale token (mode=$activeMode)...")
                         synchronized(this) {
                             if (generation != socketGeneration.get() || this.webSocket !== socketRef) return@sendRequestForGeneration
                             clearStoredTokenForActiveTarget()
                             _authState.value = AuthState.ConnectedUnauthenticated
                         }
 
-                        // Immunize connection from timeout and register unauthenticated pending pairing
-                        val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
-                        val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
-                        sendRequestForGeneration(
-                            expectedGeneration = generation,
-                            expectedSocket = socketRef,
-                            action = "pair_request",
-                            data = mapOf(
-                                "device_id" to devId,
-                                "device_name" to (identity?.deviceName ?: "Android-Device"),
-                                "manifest" to manifestMap,
-                                "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
-                                "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
-                            )
-                        ) { pairResp ->
-                            if (isCurrentGeneration(generation, socketRef)) {
-                                log("Desktop pairing registration updated (status=${pairResp.payload?.get("status")})")
+                        if (activeMode == ConnectionHandshakeMode.STANDARD_OR_AUTO) {
+                            // Immunize desktop core connection from timeout and register unauthenticated pending pairing
+                            val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
+                            val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
+                            sendRequestForGeneration(
+                                expectedGeneration = generation,
+                                expectedSocket = socketRef,
+                                action = "pair_request",
+                                data = mapOf(
+                                    "device_id" to devId,
+                                    "device_name" to (identity?.deviceName ?: "Android-Device"),
+                                    "manifest" to manifestMap,
+                                    "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
+                                    "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
+                                )
+                            ) { pairResp ->
+                                if (isCurrentGeneration(generation, socketRef)) {
+                                    log("Desktop pairing registration updated (status=${pairResp.payload?.get("status")})")
+                                }
                             }
+                        } else {
+                            log("Skipping automatic unauthenticated pair_request in $activeMode mode.")
                         }
                     } else {
                         synchronized(this) {
@@ -1304,6 +1323,7 @@ class SnowWebSocketClient(
                 }
             }
         } else {
+            val activeMode = handshakeMode
             val shouldPair = synchronized(this) {
                 if (generation != socketGeneration.get() || this.webSocket !== socketRef) {
                     false
@@ -1313,6 +1333,10 @@ class SnowWebSocketClient(
                 }
             }
             if (!shouldPair) return
+            if (activeMode != ConnectionHandshakeMode.STANDARD_OR_AUTO) {
+                log("Connected over WSS in $activeMode mode; awaiting explicit credentialed pairing/auth handshake.")
+                return
+            }
             log("Connected over WSS. Device is not paired; initializing pairing on desktop...")
             if (!devId.isNullOrBlank()) {
                 val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()

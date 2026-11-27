@@ -120,6 +120,7 @@ fun SnowApp(
     val clipboardThumbnailVersion by repository.clipboardThumbnailVersion.collectAsState()
     val peerHostState by repository.peerHostState.collectAsState()
     val adoptedNetworkId by repository.adoptedNetworkId.collectAsState()
+    val pendingNetworkDecision by repository.pendingNetworkDecision.collectAsState()
     val desktopWallpaper by repository.desktopWallpaper.collectAsState()
     val activePermissionProfile by repository.permissionProfileState.collectAsState()
     val cameraDelivery by repository.cameraDelivery.collectAsState()
@@ -557,6 +558,15 @@ fun SnowApp(
                             isGeneratingFederationCode = isGeneratingFederationCode,
                             isJoiningFederation = isJoiningFederation,
                             isFederationActionInFlight = isFederationActionInFlight,
+                            myNetworkId = adoptedNetworkId,
+                            pendingNetworkDecision = pendingNetworkDecision,
+                            onResolveNetworkDecision = { merge ->
+                                repository.resolvePendingNetworkDecision(merge) { _, msg ->
+                                    if (!msg.isNullOrBlank()) {
+                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
                             onGenerateFederationCode = {
                                 if (isGeneratingFederationCode) return@DevicesScreen
                                 isGeneratingFederationCode = true
@@ -977,8 +987,58 @@ fun SnowApp(
                     onRegeneratePairingPin = {
                         repository.generatePeerHostPin()
                         connectQrJson = repository.generatePeerHostQrJson()
-                    }
+                    },
+                    onCancelPairingPin = {
+                        repository.cancelPeerHostPairing()
+                        connectQrJson = null
+                    },
+                    myNetworkId = adoptedNetworkId
                 )
+
+                val activeMergeDecision = pendingNetworkDecision
+                if (activeMergeDecision != null) {
+                    AlertDialog(
+                        onDismissRequest = {
+                            repository.resolvePendingNetworkDecision(false) { _, _ -> }
+                        },
+                        title = {
+                            Text(
+                                text = "Separate SNOW Networks Detected",
+                                style = SnowTypography.titleMedium
+                            )
+                        },
+                        text = {
+                            Text(
+                                text = "${activeMergeDecision.peerDeviceName} belongs to ${activeMergeDecision.remoteNetworkId}, while this device belongs to ${activeMergeDecision.localNetworkId}. Merge both into one shared network (requires mutual owner approval) or keep them separate?",
+                                style = SnowTypography.bodySmall
+                            )
+                        },
+                        confirmButton = {
+                            SnowTonalButton(
+                                text = "Merge Networks",
+                                onClick = {
+                                    repository.resolvePendingNetworkDecision(true) { _, msg ->
+                                        if (!msg.isNullOrBlank()) {
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            )
+                        },
+                        dismissButton = {
+                            SnowOutlinedButton(
+                                text = "Keep Separate",
+                                onClick = {
+                                    repository.resolvePendingNetworkDecision(false) { _, msg ->
+                                        if (!msg.isNullOrBlank()) {
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                    )
+                }
 
                 // Phase 27 Peer Host Mode Pairing QR Dialog
                 if (showPeerHostQrDialog && !peerHostQrJson.isNullOrBlank()) {

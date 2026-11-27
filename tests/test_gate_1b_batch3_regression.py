@@ -122,7 +122,7 @@ class TestWP1DatabaseClipboardPersistence(unittest.TestCase):
     def test_schema_version_7_applied(self):
         with self.db._get_connection() as conn:
             row = conn.execute("PRAGMA user_version").fetchone()
-            self.assertEqual(row[0], 7)
+            self.assertEqual(row[0], 8)
 
             # Verify clipboard_buffer_items table exists
             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clipboard_buffer_items'")

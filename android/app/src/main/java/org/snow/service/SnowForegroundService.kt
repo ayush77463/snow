@@ -199,7 +199,17 @@ class SnowForegroundService : Service() {
             ?: savedNetId.takeIf { it.isNotBlank() }
             ?: "default_group"
         val targetPeerId = prefs.getString("remote_relay_target_peer", null) ?: "desktop-core"
-        val expectedFingerprint = certPinStorage.getPinnedFingerprint()
+        val expectedFingerprint = resolveRelayTargetFingerprint(certPinStorage, targetPeerId)
+        if (expectedFingerprint.isNullOrBlank()) {
+            SafeLog.w("SnowForegroundService", "Refusing startRelay without pinned TLS certificate fingerprint for peer $targetPeerId.")
+            return
+        }
+        val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
+        val matchedSaved = repo.savedDevices.value.find { it.deviceId.equals(targetPeerId, ignoreCase = true) }
+        val defaultTransferPort = resolveRelayTransferPort(matchedSaved?.deviceType)
+        val usePublicCaOuter = effectiveEndpoint.startsWith("wss://") &&
+            !effectiveEndpoint.contains("127.0.0.1") &&
+            !effectiveEndpoint.contains("localhost")
         val isClientMode = (deviceId < targetPeerId)
 
         relayClient = org.snow.network.RelayClient(
@@ -213,14 +223,15 @@ class SnowForegroundService : Service() {
             isClientMode = isClientMode,
             bootstrapToken = authMaterial.bootstrapToken,
             hubToken = authMaterial.hubToken,
-            networkId = savedNetId
+            networkId = savedNetId,
+            usePublicCaForOuterRelay = usePublicCaOuter
         ).apply {
             requestDispatcher = { action, data ->
                 capabilityDispatcher.dispatch(
                     action = action,
                     data = data,
                     serverHost = effectiveEndpoint,
-                    defaultTransferPort = 8766
+                    defaultTransferPort = defaultTransferPort
                 )
             }
             mediaFrameHandler = { sourceId, meta, jpegBytes ->
@@ -292,10 +303,12 @@ class SnowForegroundService : Service() {
         peerHostManager.setHostModeSettingEnabled(true)
         val identity = DeviceIdentity.getOrCreate(applicationContext)
         val repo = SnowUiRepository.getInstance(applicationContext)
+        val snowId = SnowUiRepository.deriveCanonicalSnowId(identity.deviceId)
         val tokenStorage = SharedPreferencesTokenStorage(
             applicationContext,
             prefName = SharedPreferencesTokenStorage.PEER_HOST_PREFS_NAME
         )
+        val transferDir = java.io.File(applicationContext.filesDir, "peer_transfers").apply { mkdirs() }
         val success = peerHostManager.enableHostMode(
             port = org.snow.network.AndroidPeerHostManager.DEFAULT_HOST_PORT,
             tokenStorage = tokenStorage,
@@ -303,16 +316,35 @@ class SnowForegroundService : Service() {
             localDeviceId = identity.deviceId,
             manifestProvider = { org.snow.network.DeviceNode.buildAndroidManifest(applicationContext).toMap() },
             parentScope = serviceScope,
-            mediaPort = 8766,
-            snowId = SnowUiRepository.deriveCanonicalSnowId(identity.deviceId),
-            networkId = repo.getEffectiveNetworkId()
+            mediaPort = org.snow.network.AndroidPeerHostManager.DEFAULT_MEDIA_PORT,
+            snowId = snowId,
+            networkId = repo.getEffectiveNetworkId(),
+            transferStorageDir = transferDir,
+            perDeviceProfileProvider = { peerDevId ->
+                repo.savedDevices.value.find { it.deviceId.equals(peerDevId, ignoreCase = true) }?.permissionProfile
+                    ?: capabilityDispatcher.activePermissionProfile
+            },
+            onHostNetworkUpdated = { netId ->
+                repo.applyHostNegotiatedNetworkId(netId)
+            }
         )
         if (success) {
+            val hs = peerHostManager.hostState.value
+            discoveryManager.startPeerHostBeacon(
+                deviceId = identity.deviceId,
+                deviceName = identity.deviceName,
+                port = peerHostManager.activePort,
+                transferPort = peerHostManager.activeMediaPort,
+                certFingerprint = hs.certFingerprint,
+                snowId = snowId,
+                candidateIpsProvider = { peerHostManager.enumerateLocalIpv4Candidates() }
+            )
             updateNotification("Peer Host Active on Port ${peerHostManager.activePort}")
         }
     }
 
     fun stopPeerHost() {
+        discoveryManager.stopPeerHostBeacon()
         peerHostManager.setHostModeSettingEnabled(false)
         peerHostManager.disableHostMode()
         updateNotification("Peer Host Stopped")
@@ -400,6 +432,14 @@ class SnowForegroundService : Service() {
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, Constants.DEFAULT_PORT)
                 val targetDeviceId = intent.getStringExtra(EXTRA_DEVICE_ID)
+                val handshakeModeName = intent.getStringExtra(EXTRA_HANDSHAKE_MODE)
+                val handshakeMode = handshakeModeName?.let {
+                    try {
+                        org.snow.network.ConnectionHandshakeMode.valueOf(it)
+                    } catch (_: Exception) {
+                        null
+                    }
+                } ?: org.snow.network.ConnectionHandshakeMode.STANDARD_OR_AUTO
 
                 // In Android 8.0+ (and strictly enforced in Android 14/16), any service
                 // invoked via startForegroundService MUST call startForeground() synchronously
@@ -415,7 +455,7 @@ class SnowForegroundService : Service() {
                 startObservingState()
                 startObservingDiscovery()
                 startObservingAuth()
-                client.connect(host, port, targetDeviceId)
+                client.connect(host, port, targetDeviceId, handshakeMode)
             }
             ACTION_START_SCREEN_SHARE -> {
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, android.app.Activity.RESULT_CANCELED)
@@ -823,8 +863,9 @@ class SnowForegroundService : Service() {
         usbFallbackJob?.cancel()
         usbFallbackJob = null
 
-        // 0. Stop live screen sharing if active
+        // 0. Stop live screen sharing & discovery beacon if active
         liveScreenHandler.stopStreaming(client.currentTargetHost, 8766)
+        discoveryManager.stopPeerHostBeacon()
 
         // 1. Cancel observers first so that DISCONNECTED state does NOT trigger updateNotification()
         peerHostManager.disableHostMode()
@@ -1052,6 +1093,7 @@ class SnowForegroundService : Service() {
         unregisterNetworkCallback()
         liveScreenHandler.stopStreaming()
         org.snow.ui.SnowUiRepository.getInstance(applicationContext).unbindService()
+        discoveryManager.stopPeerHostBeacon()
         peerHostManager.disableHostMode()
         stateObserverJob?.cancel()
         stateObserverJob = null
@@ -1200,6 +1242,7 @@ class SnowForegroundService : Service() {
         const val EXTRA_HOST = "org.snow.extra.HOST"
         const val EXTRA_PORT = "org.snow.extra.PORT"
         const val EXTRA_DEVICE_ID = "org.snow.extra.DEVICE_ID"
+        const val EXTRA_HANDSHAKE_MODE = "org.snow.extra.HANDSHAKE_MODE"
         const val EXTRA_RESULT_CODE = "org.snow.extra.RESULT_CODE"
         const val EXTRA_RESULT_DATA = "org.snow.extra.RESULT_DATA"
         const val EXTRA_TARGET_IDS = "org.snow.extra.TARGET_IDS"
@@ -1254,11 +1297,22 @@ class SnowForegroundService : Service() {
             }
         }
 
-        fun startConnect(context: Context, host: String, port: Int) {
+        @JvmOverloads
+        fun startConnect(
+            context: Context,
+            host: String,
+            port: Int,
+            targetDeviceId: String? = null,
+            handshakeMode: org.snow.network.ConnectionHandshakeMode = org.snow.network.ConnectionHandshakeMode.STANDARD_OR_AUTO
+        ) {
             val intent = Intent(context, SnowForegroundService::class.java).apply {
                 action = ACTION_CONNECT
                 putExtra(EXTRA_HOST, host)
                 putExtra(EXTRA_PORT, port)
+                if (!targetDeviceId.isNullOrBlank()) {
+                    putExtra(EXTRA_DEVICE_ID, targetDeviceId)
+                }
+                putExtra(EXTRA_HANDSHAKE_MODE, handshakeMode.name)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -1312,6 +1366,33 @@ class SnowForegroundService : Service() {
                 context.startForegroundService(intent)
             } else {
                 context.startService(intent)
+            }
+        }
+
+        internal fun resolveRelayTargetFingerprint(
+            certPinStorage: org.snow.security.CertPinStorage,
+            targetPeerId: String
+        ): String? {
+            val cleanTarget = targetPeerId.trim()
+            if (cleanTarget.isNotBlank()) {
+                val perDevice = certPinStorage.getPinnedFingerprintForDevice(cleanTarget)
+                    ?.replace(":", "")?.replace(" ", "")?.trim()?.takeIf { it.isNotBlank() }
+                if (perDevice != null) return perDevice
+            }
+            return if (certPinStorage.listPinnedDeviceIds().isEmpty()) {
+                certPinStorage.getPinnedFingerprint()
+                    ?.replace(":", "")?.replace(" ", "")?.trim()?.takeIf { it.isNotBlank() }
+            } else {
+                null
+            }
+        }
+
+        internal fun resolveRelayTransferPort(deviceType: String?): Int {
+            val clean = deviceType?.trim()?.lowercase()
+            return if (clean == "phone" || clean == "android") {
+                org.snow.network.AndroidPeerHostManager.DEFAULT_MEDIA_PORT
+            } else {
+                8766
             }
         }
     }

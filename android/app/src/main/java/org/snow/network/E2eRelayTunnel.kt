@@ -121,6 +121,9 @@ class E2eRelayTunnel(
                         netOut.get(chunk)
                         outStream.write(chunk)
                     }
+                    if (res.status == SSLEngineResult.Status.CLOSED && !handshakeDone) {
+                        throw SecurityException("E2E TLS handshake closed before completion.")
+                    }
                     if (res.handshakeStatus == HandshakeStatus.FINISHED) {
                         verifyPeerCertificate()
                         handshakeDone = true
@@ -138,6 +141,9 @@ class E2eRelayTunnel(
                     val res = engine.unwrap(inNetBuffer, appOut)
                     inNetBuffer.compact()
 
+                    if (res.status == SSLEngineResult.Status.CLOSED && !handshakeDone) {
+                        throw SecurityException("E2E TLS handshake rejected or closed before completion.")
+                    }
                     if (res.status == SSLEngineResult.Status.BUFFER_UNDERFLOW) {
                         loop = false
                         break

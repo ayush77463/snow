@@ -734,25 +734,59 @@ class SnowMcpBridge:
             return err
         return await self.send_device_request(target_id, "list_apps", {"limit": limit})
 
-    async def android_file_send(self, file_path: str, device_id: str = "") -> dict[str, Any]:
+    async def android_file_send(
+        self,
+        file_path: str,
+        device_id: str = "",
+        precomputed_sha256: str = "",
+        precomputed_size: Optional[int] = None,
+        file_name: str = "",
+        staged_handoff: bool = False,
+    ) -> dict[str, Any]:
         """Send a local file from Desktop to Android phone."""
         target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
             return err
+        payload: dict[str, Any] = {"file_path": file_path, "device_id": target_id or ""}
+        if precomputed_sha256:
+            payload["precomputed_sha256"] = precomputed_sha256
+        if precomputed_size is not None:
+            payload["precomputed_size"] = int(precomputed_size)
+        if file_name:
+            payload["file_name"] = file_name
+        if staged_handoff:
+            payload["staged_handoff"] = True
         return await self.call_cross_device(
             "android_file_send",
-            payload={"file_path": file_path, "device_id": target_id or ""},
+            payload=payload,
             timeout=60.0,
         )
 
-    async def android_file_send_async(self, file_path: str, device_id: str = "") -> dict[str, Any]:
+    async def android_file_send_async(
+        self,
+        file_path: str,
+        device_id: str = "",
+        precomputed_sha256: str = "",
+        precomputed_size: Optional[int] = None,
+        file_name: str = "",
+        staged_handoff: bool = False,
+    ) -> dict[str, Any]:
         """Initiate an async decoupled Desktop -> Android file transfer returning ACCEPTED + transfer_id."""
         target_id, err = await self._resolve_android_target(device_id)
         if not target_id:
             return err
+        payload: dict[str, Any] = {"file_path": file_path, "device_id": target_id or "", "async_transfer": True}
+        if precomputed_sha256:
+            payload["precomputed_sha256"] = precomputed_sha256
+        if precomputed_size is not None:
+            payload["precomputed_size"] = int(precomputed_size)
+        if file_name:
+            payload["file_name"] = file_name
+        if staged_handoff:
+            payload["staged_handoff"] = True
         return await self.call_cross_device(
             "android_file_send",
-            payload={"file_path": file_path, "device_id": target_id or "", "async_transfer": True},
+            payload=payload,
             timeout=30.0,
         )
 

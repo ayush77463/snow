@@ -1341,10 +1341,14 @@ class SnowWebServer:
             ident = net_mgr.get_network_identity().to_dict()
             key_ident = load_or_create_network_key_identity()
             hub_url = resolve_default_hub_url(db_manager=db_mgr)
+            ident["network_formed"] = bool(ident.get("network_id"))
+            ident["hub_key_id"] = key_ident.network_id
             ident["network_key_id"] = key_ident.network_id
             ident["public_key_b64"] = key_ident.public_key_b64
             ident["default_hub_url"] = hub_url
-            ident["permanent_mcp_url"] = f"{hub_url}/u/{key_ident.network_id}/mcp" if hub_url else ""
+            ident["permanent_mcp_url"] = (
+                f"{hub_url}/u/{key_ident.network_id}/mcp" if (hub_url and ident.get("network_id")) else ""
+            )
             return web.json_response({
                 "success": True,
                 "status": "SUCCESS",
@@ -1446,6 +1450,91 @@ class SnowWebServer:
         except Exception as exc:
             return web.json_response({"success": False, "error": str(exc)}, status=500)
 
+    async def handle_api_network_merge_pending(self, request: web.Request) -> web.Response:
+        """List pending cross-network merge proposals awaiting explicit owner consent."""
+        try:
+            if await self.bridge.daemon_manager.is_ipc_ready(timeout=0.1):
+                ipc_res = await self.bridge.call("resolve_network_merge", payload={"decision": "list"}, timeout=5.0)
+                if ipc_res.get("success") and isinstance(ipc_res.get("data"), dict):
+                    return web.json_response({"success": True, "proposals": ipc_res["data"].get("proposals", [])})
+            db_mgr = getattr(self, "db_manager", None) or self.bridge.capability_engine.db_manager
+            with db_mgr._get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM network_merge_proposals WHERE status = 'PENDING' ORDER BY created_timestamp DESC;"
+                ).fetchall()
+            return web.json_response({"success": True, "proposals": [dict(r) for r in rows]})
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=500)
+
+    async def handle_api_network_merge_approve(self, request: web.Request) -> web.Response:
+        """Approve a pending network merge as host owner and commit atomically once dual-approved."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        tx_id = str(body.get("tx_id") or "").strip()
+        if not tx_id:
+            return web.json_response({"success": False, "error": "tx_id is required."}, status=400)
+        try:
+            if await self.bridge.daemon_manager.is_ipc_ready(timeout=0.1):
+                ipc_res = await self.bridge.call(
+                    "resolve_network_merge",
+                    payload={"tx_id": tx_id, "decision": "merge"},
+                    timeout=5.0,
+                )
+                if ipc_res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                    if not ipc_res.get("success"):
+                        err_status = 403 if ipc_res.get("status") == "POLICY_DENIED" else 400
+                        return web.json_response({"success": False, "error": ipc_res.get("error", "Merge failed.")}, status=err_status)
+                    data_obj = ipc_res.get("data") or {}
+                    return web.json_response({
+                        "success": True,
+                        "committed": bool(data_obj.get("committed")),
+                        "proposal": data_obj.get("proposal"),
+                    })
+            from snow.security.identity import load_or_create_device_identity
+            db_mgr = getattr(self, "db_manager", None) or self.bridge.capability_engine.db_manager
+            local_ident = load_or_create_device_identity()
+            updated = db_mgr.approve_network_merge(tx_id, local_ident.device_id)
+            committed = False
+            if int(updated["source_owner_approved"]) == 1 and int(updated["target_owner_approved"]) == 1:
+                updated = db_mgr.commit_network_merge(tx_id)
+                committed = True
+            return web.json_response({"success": True, "committed": committed, "proposal": updated})
+        except PermissionError as pex:
+            return web.json_response({"success": False, "error": str(pex)}, status=403)
+        except KeyError as kex:
+            return web.json_response({"success": False, "error": str(kex)}, status=404)
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=400)
+
+    async def handle_api_network_merge_keep_separate(self, request: web.Request) -> web.Response:
+        """Reject merge proposal and preserve peer as an external_network relationship."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        tx_id = str(body.get("tx_id") or "").strip()
+        if not tx_id:
+            return web.json_response({"success": False, "error": "tx_id is required."}, status=400)
+        try:
+            if await self.bridge.daemon_manager.is_ipc_ready(timeout=0.1):
+                ipc_res = await self.bridge.call(
+                    "resolve_network_merge",
+                    payload={"tx_id": tx_id, "decision": "keep_separate"},
+                    timeout=5.0,
+                )
+                if ipc_res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
+                    if not ipc_res.get("success"):
+                        return web.json_response({"success": False, "error": ipc_res.get("error", "Reject failed.")}, status=400)
+                    data_obj = ipc_res.get("data") or {}
+                    return web.json_response({"success": True, "rejected": bool(data_obj.get("rejected")), "tx_id": tx_id})
+            db_mgr = getattr(self, "db_manager", None) or self.bridge.capability_engine.db_manager
+            ok = db_mgr.reject_network_merge(tx_id, reason="Owner chose Keep Separate")
+            return web.json_response({"success": True, "rejected": ok, "tx_id": tx_id})
+        except Exception as exc:
+            return web.json_response({"success": False, "error": str(exc)}, status=400)
+
     async def handle_api_network_topology(self, request: web.Request) -> web.Response:
         """Query mesh topology with OWNER_MANUAL principal view."""
         try:
@@ -1501,26 +1590,23 @@ class SnowWebServer:
 
         payload = res.get("data", {})
 
-        # Master QR: Include network identity and default hub URL for zero-setup discovery
+        # Enrich with default hub URL cleanly (never invent a shared mesh network_id on standalone hosts)
         try:
             from snow.core.config import resolve_default_hub_url
-            from snow.security.identity import load_or_create_network_key_identity
             cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
             db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
             hub_url = resolve_default_hub_url(db_manager=db_mgr)
-            key_ident = load_or_create_network_key_identity()
-            if key_ident and key_ident.network_id:
-                payload.setdefault("network_id", key_ident.network_id)
             if hub_url:
                 payload.setdefault("hub_url", hub_url)
         except Exception as exc:
-            logger.debug("Could not enrich QR with default hub/network identity: %s", exc)
+            logger.debug("Could not enrich QR with default hub URL: %s", exc)
 
         cfg = getattr(self, "config", None)
         group_id = (
             os.getenv("SNOW_RELAY_GROUP_ID")
             or (getattr(cfg, "relay_group_id", None) if cfg else None)
-            or "default_group"
+            or payload.get("network_id")
+            or ""
         )
         raw_relay_secret = os.getenv("SNOW_RELAY_SECRET") or (getattr(cfg, "relay_secret", None) if cfg else None)
         relay_secret = raw_relay_secret.strip() if isinstance(raw_relay_secret, str) else ""
@@ -4519,13 +4605,17 @@ class SnowWebServer:
             if not ws_url.endswith("/v1/tunnel"):
                 ws_url = f"{ws_url}/v1/tunnel"
 
-            network_id = "default_group"
+            network_id = ""
             try:
-                key_ident = load_or_create_network_key_identity()
-                if key_ident and getattr(key_ident, "network_id", ""):
-                    network_id = str(key_ident.network_id)
+                active_net = db_mgr.get_active_network() if db_mgr and hasattr(db_mgr, "get_active_network") else None
+                if active_net and active_net.get("network_id"):
+                    network_id = str(active_net["network_id"])
+                else:
+                    key_ident = load_or_create_network_key_identity()
+                    if key_ident and getattr(key_ident, "network_id", ""):
+                        network_id = str(key_ident.network_id)
             except Exception as exc:
-                logger.debug("Using fallback relay group_id: %s", exc)
+                logger.debug("Relay hub network_key_id resolution fallback: %s", exc)
 
             if db_mgr is not None and hasattr(db_mgr, "set_setting"):
                 try:
@@ -4831,10 +4921,30 @@ class SnowWebServer:
             part_file = None
 
             use_async = async_requested or (total_bytes > 16 * 1024 * 1024)
+            handoff_accepted = False
             if use_async and hasattr(self.bridge, "android_file_send_async") and not type(self.bridge).__name__.endswith("Mock"):
-                res = await self.bridge.android_file_send_async(file_path=str(staged_file), device_id=device_id)
+                res = await self.bridge.android_file_send_async(
+                    file_path=str(staged_file),
+                    device_id=device_id,
+                    precomputed_sha256=computed_sha256,
+                    precomputed_size=total_bytes,
+                    file_name=filename,
+                    staged_handoff=True,
+                )
+                handoff_accepted = bool(res.get("success") and (str(res.get("status") or "").upper() == "ACCEPTED" or res.get("accepted")))
             else:
-                res = await self.bridge.android_file_send(file_path=str(staged_file), device_id=device_id)
+                bridge_fn = self.bridge.android_file_send
+                if not type(self.bridge).__name__.endswith("Mock"):
+                    res = await bridge_fn(
+                        file_path=str(staged_file),
+                        device_id=device_id,
+                        precomputed_sha256=computed_sha256,
+                        precomputed_size=total_bytes,
+                        file_name=filename,
+                        staged_handoff=False,
+                    )
+                else:
+                    res = await bridge_fn(file_path=str(staged_file), device_id=device_id)
 
             res_status = str(res.get("status") or "SUCCESS").upper()
             res_data = dict(res.get("data") or {})
@@ -4845,6 +4955,9 @@ class SnowWebServer:
                 res_data.setdefault("sha256", computed_sha256)
 
             is_accepted = res_status == "ACCEPTED" or bool(res.get("accepted"))
+            if handoff_accepted or (use_async and res.get("success") and is_accepted):
+                # Ownership of staged_file was transferred cleanly to background Core finalization
+                staged_file = None
             http_code = 202 if (res.get("success") and is_accepted) else (200 if res.get("success", False) else 500)
             return web.json_response(
                 {
@@ -5110,6 +5223,9 @@ class SnowWebServer:
         app.router.add_get("/api/network/identity", self.handle_api_network_identity)
         app.router.add_post("/api/network/identity", self.handle_api_network_identity_update)
         app.router.add_get("/api/network/topology", self.handle_api_network_topology)
+        app.router.add_get("/api/network/merge/pending", self.handle_api_network_merge_pending)
+        app.router.add_post("/api/network/merge/approve", self.handle_api_network_merge_approve)
+        app.router.add_post("/api/network/merge/keep-separate", self.handle_api_network_merge_keep_separate)
         app.router.add_get("/api/pair/state", self.handle_api_pair_state)
         app.router.add_get("/api/pair/qr", self.handle_api_pair_qr)
         app.router.add_post("/api/pair/qr", self.handle_api_pair_qr)

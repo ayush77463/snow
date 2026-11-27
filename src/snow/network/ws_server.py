@@ -186,10 +186,17 @@ class SnowWebSocketServer:
         self.manually_disconnected_devices: set[str] = set()
         # Phase 30 / Stage 4A: Cross-Network Federation Manager
         from snow.network.federation import FederationManager
+        _init_active_net = (
+            self.db_manager.get_active_network()
+            if self.db_manager and hasattr(self.db_manager, "get_active_network")
+            else None
+        )
         self.federation_manager = FederationManager(
             db_manager=self.db_manager,
-            local_network_id=getattr(self.config, "network_id", "local-network"),
-            local_network_name=getattr(self.config, "network_name", "SNOW Network"),
+            local_network_id=getattr(self.config, "network_id", None)
+            or (_init_active_net.get("network_id") if _init_active_net else None)
+            or "",
+            local_network_name=getattr(self.config, "network_name", "My SNOW Network"),
             local_node_id=getattr(self.config, "device_id", "desktop-core"),
             local_node_name=getattr(self.config, "device_name", "Desktop Host"),
         )
@@ -562,6 +569,19 @@ class SnowWebSocketServer:
             await self._handle_pairing_request(client, message, action, data)
         elif action == "unpair_request":
             await self._handle_unpair_request(client, message, data)
+        elif action == "network_merge_decision":
+            session = None
+            if self.config.auth_required:
+                session = self.session_manager.get_session_by_connection(client.connection_id)
+                if session is None:
+                    err_resp = SnowMessage.create_error(
+                        code=ErrorCode.UNAUTHORIZED,
+                        message="Client is not authenticated.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(err_resp.to_json())
+                    return
+            await self._handle_network_merge_decision(client, message, data, session)
         else:
             # All other device operations require an authenticated session if auth is required
             session = None
@@ -2429,12 +2449,12 @@ class SnowWebSocketServer:
                 "has_unacked_latest": eligible is not None,
             }
 
-        host_network_id = None
-        try:
-            from snow.security.identity import load_or_create_network_key_identity
-            host_network_id = load_or_create_network_key_identity().network_id
-        except Exception:
-            host_network_id = None
+        active_net = (
+            self.db_manager.get_active_network()
+            if self.db_manager and hasattr(self.db_manager, "get_active_network")
+            else None
+        )
+        host_network_id = active_net.get("network_id") if active_net else None
 
         auth_data = {
             "device_id": device_id,
@@ -2444,6 +2464,7 @@ class SnowWebSocketServer:
             "session_id": session.session_id,
             "trust_tier": device_record.trust_tier,
             "permission_profile": auth_profile,
+            "relationship": getattr(device_record, "relationship", "member") or "member",
             "clipboard_state": clipboard_state,
             "manifest": build_windows_manifest().to_dict(),
         }
@@ -2578,16 +2599,158 @@ class SnowWebSocketServer:
                 else:
                     assigned_tier = getattr(result, "assigned_trust_tier", "peer")
 
+                from snow.relay.auth import is_valid_network_id
+                active_net = (
+                    self.db_manager.get_active_network()
+                    if hasattr(self.db_manager, "get_active_network")
+                    else None
+                )
+                host_net_id: Optional[str] = (
+                    str(active_net["network_id"]).strip().upper()
+                    if active_net and is_valid_network_id(active_net.get("network_id"))
+                    else None
+                )
+                raw_client_net = data.get("client_network_id")
+                client_net_id: Optional[str] = (
+                    str(raw_client_net).strip().upper()
+                    if isinstance(raw_client_net, str) and is_valid_network_id(raw_client_net)
+                    else None
+                )
+                client_platform = str(
+                    data.get("device_type")
+                    or data.get("platform")
+                    or (data.get("manifest") or {}).get("platform")
+                    or "android"
+                ).strip().lower()
+                client_cert_fp = (
+                    str(data.get("cert_fingerprint") or "").replace(":", "").replace(" ", "").strip().upper()
+                    or None
+                )
+
+                paired_net_id: Optional[str] = None
+                paired_rel = "member"
+                net_action = "FORMED"
+                network_conflict = False
+                merge_tx_id: Optional[str] = None
+                resp_network_id: Optional[str] = None
+
+                if host_net_id is None and client_net_id is None:
+                    # Case 1: Standalone + Standalone -> form one canonical SNW-NET-XXXXXXXX shared network
+                    seed_net_id: Optional[str] = None
+                    try:
+                        from snow.security.identity import load_or_create_network_key_identity
+                        db_parent = Path(self.db_manager.db_path).parent
+                        if (db_parent / "network_key.json").is_file():
+                            seed_net_id = load_or_create_network_key_identity(data_dir=db_parent).network_id
+                    except Exception:
+                        seed_net_id = None
+                    formed = self.db_manager.ensure_active_network(
+                        network_name="My SNOW Network",
+                        owner_device_id=self.device_identity.device_id,
+                        network_id=seed_net_id,
+                    )
+                    paired_net_id = formed["network_id"]
+                    paired_rel = "member"
+                    net_action = "FORMED"
+                    resp_network_id = paired_net_id
+                elif host_net_id is not None and client_net_id is None:
+                    # Case 2a: Standalone client joins existing host network
+                    paired_net_id = host_net_id
+                    paired_rel = "member"
+                    net_action = "JOINED"
+                    resp_network_id = host_net_id
+                elif host_net_id is None and client_net_id is not None:
+                    # Case 2b: Standalone host adopts existing canonical client network
+                    adopted = self.db_manager.ensure_active_network(
+                        network_name=str(data.get("client_network_name") or "My SNOW Network"),
+                        owner_device_id=self.device_identity.device_id,
+                        network_id=client_net_id,
+                    )
+                    paired_net_id = adopted["network_id"]
+                    paired_rel = "member"
+                    net_action = "ADOPTED"
+                    resp_network_id = paired_net_id
+                elif host_net_id == client_net_id:
+                    # Case 3: Both already share the same canonical network (idempotent)
+                    paired_net_id = host_net_id
+                    paired_rel = "member"
+                    net_action = "SAME_NETWORK"
+                    resp_network_id = host_net_id
+                else:
+                    # Case 4: Different canonical networks -> explicit Merge vs Keep Separate (never silent overwrite!)
+                    decision = str(data.get("network_decision") or "").strip().lower()
+                    surviving = str(data.get("surviving_network_id") or host_net_id).strip().upper()
+                    if surviving not in (host_net_id, client_net_id):
+                        surviving = host_net_id  # type: ignore[assignment]
+                    if decision == "keep_separate":
+                        paired_net_id = client_net_id
+                        paired_rel = "external_network"
+                        net_action = "KEEP_SEPARATE"
+                        network_conflict = False
+                        resp_network_id = host_net_id
+                    else:
+                        req_tx_id = str(data.get("merge_tx_id") or "").strip() or None
+                        existing_prop = (
+                            self.db_manager.get_network_merge_proposal(req_tx_id)
+                            if req_tx_id and hasattr(self.db_manager, "get_network_merge_proposal")
+                            else None
+                        )
+                        if existing_prop is None:
+                            existing_prop = self.db_manager.propose_network_merge(
+                                tx_id=req_tx_id,
+                                source_network_id=host_net_id,  # type: ignore[arg-type]
+                                target_network_id=client_net_id,  # type: ignore[arg-type]
+                                surviving_network_id=surviving,  # type: ignore[arg-type]
+                                source_owner_device_id=self.device_identity.device_id,
+                                target_owner_device_id=client_device_id,
+                            )
+                        merge_tx_id = existing_prop["tx_id"]
+                        # Always pair cautiously as external_network until BOTH owners explicitly confirm merge
+                        paired_net_id = client_net_id
+                        paired_rel = "external_network"
+                        network_conflict = True
+                        resp_network_id = host_net_id
+                        net_action = "DECISION_REQUIRED"
+
+                        if decision == "merge" and assigned_tier == "owner" and bool(data.get("client_merge_approved")):
+                            try:
+                                self.db_manager.approve_network_merge(merge_tx_id, client_device_id)
+                                if bool(data.get("host_owner_approved")):
+                                    self.db_manager.approve_network_merge(merge_tx_id, self.device_identity.device_id)
+                                    self.db_manager.commit_network_merge(merge_tx_id)
+                                    paired_net_id = surviving
+                                    paired_rel = "member"
+                                    network_conflict = False
+                                    resp_network_id = surviving
+                                    net_action = "MERGED"
+                                else:
+                                    net_action = "MERGE_APPROVAL_REQUIRED"
+                            except Exception as merge_exc:
+                                logger.warning("Merge pre-approval skipped (%s); keeping external until resolved", merge_exc)
+                                net_action = "MERGE_APPROVAL_REQUIRED"
+
                 self.db_manager.insert_paired_device(
                     device_id=client_device_id,
                     device_name=client_device_name,
                     auth_token_hash=token_hash,
                     trust_tier=assigned_tier,
+                    platform=client_platform,
+                    cert_fingerprint=client_cert_fp,
+                    network_id=paired_net_id,
+                    relationship=paired_rel,
                 )
+                if resp_network_id and getattr(self, "federation_manager", None):
+                    self.federation_manager.local_network_id = resp_network_id
                 self.db_manager.log_audit_event(
                     event_type="PAIR_SUCCESS",
                     device_id=client_device_id,
-                    details={"device_name": client_device_name, "connection_id": client.connection_id},
+                    details={
+                        "device_name": client_device_name,
+                        "connection_id": client.connection_id,
+                        "network_id": paired_net_id,
+                        "relationship": paired_rel,
+                        "network_action": net_action,
+                    },
                 )
                 self.session_manager.create_session(
                     device_id=client_device_id,
@@ -2629,15 +2792,19 @@ class SnowWebSocketServer:
                     "auth_token": auth_token,
                     "trust_tier": assigned_tier,
                     "permission_profile": pair_profile,
+                    "relationship": paired_rel,
+                    "network_action": net_action,
+                    "network_conflict": network_conflict,
                     "manifest": build_windows_manifest().to_dict(),
                 }
-                try:
-                    from snow.security.identity import load_or_create_network_key_identity
-                    net_id_val = load_or_create_network_key_identity().network_id
-                    if net_id_val:
-                        pair_data["network_id"] = net_id_val
-                except Exception:
-                    pass
+                if resp_network_id:
+                    pair_data["network_id"] = resp_network_id
+                if host_net_id:
+                    pair_data["host_network_id"] = host_net_id
+                if client_net_id:
+                    pair_data["client_network_id"] = client_net_id
+                if merge_tx_id:
+                    pair_data["merge_tx_id"] = merge_tx_id
 
                 response = SnowMessage.create_response(
                     correlation_id=message.id,
@@ -2724,6 +2891,93 @@ class SnowWebSocketServer:
                     },
                 )
             await client.websocket.send(response.to_json())
+
+    async def _handle_network_merge_decision(
+        self, client, message: SnowMessage, data: dict[str, Any], session
+    ) -> None:
+        """Handle explicit owner decision for a dual-network merge or keep-separate transition."""
+        tx_id = str(data.get("tx_id") or "").strip()
+        decision = str(data.get("decision") or "").strip().lower()
+        acting_dev_id = session.device_id if session else str(data.get("device_id") or "").strip()
+
+        if not tx_id or decision not in ("merge", "keep_separate", "reject"):
+            err = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message="Requires 'tx_id' and decision in ('merge', 'keep_separate', 'reject').",
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+            return
+
+        try:
+            prop = self.db_manager.get_network_merge_proposal(tx_id)
+            if not prop:
+                err = SnowMessage.create_error(
+                    code=ErrorCode.NOT_FOUND,
+                    message=f"Merge transaction '{tx_id}' not found.",
+                    correlation_id=message.id,
+                )
+                await client.websocket.send(err.to_json())
+                return
+
+            if decision in ("keep_separate", "reject"):
+                self.db_manager.reject_network_merge(tx_id, reason=f"Owner chose {decision}")
+                self.db_manager.assign_device_network(
+                    acting_dev_id,
+                    prop["target_network_id"] if acting_dev_id == prop["target_owner_device_id"] else prop["source_network_id"],
+                    relationship="external_network",
+                )
+                resp = SnowMessage.create_response(
+                    correlation_id=message.id,
+                    payload={
+                        "status": "success",
+                        "action": "network_merge_decision",
+                        "data": {
+                            "tx_id": tx_id,
+                            "network_action": "KEEP_SEPARATE",
+                            "relationship": "external_network",
+                            "network_id": prop["source_network_id"],
+                        },
+                    },
+                )
+                await client.websocket.send(resp.to_json())
+                return
+
+            # Merge decision: record calling device owner approval
+            updated = self.db_manager.approve_network_merge(tx_id, acting_dev_id)
+            committed = False
+            if int(updated["source_owner_approved"]) == 1 and int(updated["target_owner_approved"]) == 1:
+                updated = self.db_manager.commit_network_merge(tx_id)
+                committed = True
+            resp = SnowMessage.create_response(
+                correlation_id=message.id,
+                payload={
+                    "status": "success",
+                    "action": "network_merge_decision",
+                    "data": {
+                        "tx_id": tx_id,
+                        "committed": committed,
+                        "status": updated["status"],
+                        "network_id": updated["surviving_network_id"] if committed else prop["source_network_id"],
+                        "network_action": "MERGED" if committed else "MERGE_APPROVAL_REQUIRED",
+                    },
+                },
+            )
+            await client.websocket.send(resp.to_json())
+        except PermissionError as pex:
+            err = SnowMessage.create_error(
+                code=ErrorCode.UNAUTHORIZED,
+                message=str(pex),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
+        except Exception as exc:
+            err = SnowMessage.create_error(
+                code=ErrorCode.INVALID_PAYLOAD,
+                message=str(exc),
+                correlation_id=message.id,
+            )
+            await client.websocket.send(err.to_json())
 
     async def _handle_unpair_request(
         self, client, message: SnowMessage, data: dict[str, Any]

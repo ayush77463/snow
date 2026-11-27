@@ -64,7 +64,7 @@ class TestM41Unit4SchemaAndLazyHydration(unittest.TestCase):
     def test_01_fresh_db_keeps_schema_v7_and_has_canonical_columns(self) -> None:
         db_path = self.tmp_dir / "fresh.db"
         db = DatabaseManager(db_path)
-        self.assertEqual(SCHEMA_VERSION, 7)
+        self.assertEqual(SCHEMA_VERSION, 8)
         with sqlite3.connect(db_path) as conn:
             cols = {row[1] for row in conn.execute("PRAGMA table_info(clipboard_buffer_items);").fetchall()}
             indexes = {row[1] for row in conn.execute("PRAGMA index_list(clipboard_buffer_items);").fetchall()}

@@ -17,7 +17,10 @@ import org.snow.security.SafeLog
 import org.snow.security.TokenStorage
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 
@@ -78,6 +81,78 @@ class DiscoveryManager(
             return true
         }
 
+        private val secureRandom = SecureRandom()
+        const val DEFAULT_BEACON_INTERVAL_MS = 3000L
+        const val MIN_BEACON_INTERVAL_MS = 1500L
+
+        /**
+         * Serialize an untrusted SNOW UDP discovery beacon (<= 2048 bytes, zero secrets/PINs/tokens).
+         */
+        @JvmOverloads
+        fun createBeaconPayload(
+            deviceId: String,
+            deviceName: String,
+            deviceType: String = "android",
+            port: Int,
+            transferPort: Int,
+            certFingerprint: String,
+            snowId: String? = null,
+            ips: List<String> = emptyList(),
+            wakeTarget: String? = null,
+            timestampSec: Double = System.currentTimeMillis() / 1000.0,
+            nonce: String? = null
+        ): ByteArray {
+            require(deviceId.isNotBlank()) { "device_id must not be blank" }
+            require(port in 1..65535) { "Invalid discovery port: $port" }
+            require(transferPort in 0..65535) { "Invalid transfer port: $transferPort" }
+            val cleanNonce = nonce?.takeIf { it.isNotBlank() } ?: ByteArray(16).also {
+                secureRandom.nextBytes(it)
+            }.joinToString("") { "%02x".format(it) }
+            val cleanFp = certFingerprint.replace(":", "").replace(" ", "").trim().uppercase()
+
+            val obj = JSONObject().apply {
+                put("proto", "snow-discovery")
+                put("v", 1)
+                put("device_id", deviceId.trim())
+                put("device_name", deviceName.ifBlank { "Android Peer" })
+                put("device_type", deviceType.ifBlank { "android" })
+                put("port", port)
+                put("transfer_port", transferPort)
+                put("cert_fingerprint", cleanFp)
+                put("timestamp", timestampSec)
+                put("nonce", cleanNonce)
+                snowId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }?.let { put("snow_id", it) }
+                wakeTarget?.trim()?.takeIf { it.isNotBlank() }?.let { put("wake_target", it) }
+                val cleanIps = ips.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+                if (cleanIps.isNotEmpty()) {
+                    put("ips", org.json.JSONArray(cleanIps))
+                }
+            }
+            var raw = obj.toString().toByteArray(Charsets.UTF_8)
+            if (raw.size > MAX_BEACON_SIZE) {
+                obj.remove("ips")
+                raw = obj.toString().toByteArray(Charsets.UTF_8)
+            }
+            require(raw.size <= MAX_BEACON_SIZE) { "Discovery beacon exceeds $MAX_BEACON_SIZE bytes" }
+            return raw
+        }
+
+        fun resolveBroadcastDestinations(candidateIps: List<String>): List<String> {
+            val targets = linkedSetOf("255.255.255.255")
+            for (raw in candidateIps) {
+                val clean = raw.trim()
+                val octets = clean.split('.')
+                if (octets.size == 4 && octets.all { it.toIntOrNull() in 0..255 }) {
+                    val first = octets[0].toInt()
+                    val second = octets[1].toInt()
+                    if (first != 127 && !(first == 169 && second == 254) && first != 0 && first < 224) {
+                        targets.add("${octets[0]}.${octets[1]}.${octets[2]}.255")
+                    }
+                }
+            }
+            return targets.toList()
+        }
+
         /**
          * Pure parsing and validation function for an incoming discovery beacon datagram.
          */
@@ -98,8 +173,8 @@ class DiscoveryManager(
                 if (json.optString("proto") != "snow-discovery") return null
                 if (json.optInt("v", -1) != 1) return null
 
-                val devId = json.optString("device_id")
-                if (devId.isNullOrBlank()) return null
+                val devId = json.optString("device_id").trim()
+                if (devId.isEmpty()) return null
 
                 val devName = json.optString("device_name", "Unknown Desktop")
                 val devType = json.optString("device_type", "windows")
@@ -108,12 +183,14 @@ class DiscoveryManager(
                 if (peerPort !in 1..65535) return null
 
                 val xferPort = json.optInt("transfer_port", 0)
-                val certFp = json.optString("cert_fingerprint", "")
-                val snowId = json.optString("snow_id", "").takeIf { it.isNotBlank() }
-                val wakeTarget = json.optString("wake_target", "").takeIf { it.isNotBlank() }
+                if (xferPort !in 0..65535) return null
+
+                val certFp = json.optString("cert_fingerprint", "").trim()
+                val snowId = json.optString("snow_id", "").trim().takeIf { it.isNotBlank() }
+                val wakeTarget = json.optString("wake_target", "").trim().takeIf { it.isNotBlank() }
 
                 val ts = json.optDouble("timestamp", Double.NaN)
-                if (ts.isNaN()) return null
+                if (ts.isNaN() || ts.isInfinite()) return null
 
                 val nowSec = currentTimeMs / 1000.0
                 if (abs(nowSec - ts) > MAX_TIMESTAMP_DRIFT_SEC) {
@@ -144,10 +221,95 @@ class DiscoveryManager(
     val peers: StateFlow<List<DiscoveredPeer>> = _peers.asStateFlow()
 
     private val peerMap = ConcurrentHashMap<String, DiscoveredPeer>()
+    private val rateLimits = ConcurrentHashMap<String, ArrayDeque<Long>>()
     private var socket: DatagramSocket? = null
+    private var beaconSocket: DatagramSocket? = null
     private var listenJob: Job? = null
     private var pruneJob: Job? = null
+    private var beaconJob: Job? = null
     private var isListening = false
+    @Volatile
+    private var isBeaconActive = false
+
+    fun isPeerHostBeaconActive(): Boolean = isBeaconActive && beaconJob?.isActive == true
+
+    /**
+     * Broadcast a periodic UDP discovery beacon on port 8768 while Android Peer Host mode is active.
+     * Untrusted metadata only; never exposes PINs, tokens, or private keys.
+     */
+    @Synchronized
+    fun startPeerHostBeacon(
+        deviceId: String,
+        deviceName: String,
+        port: Int,
+        transferPort: Int,
+        certFingerprint: String,
+        snowId: String? = null,
+        candidateIpsProvider: () -> List<String> = { emptyList() },
+        intervalMs: Long = DEFAULT_BEACON_INTERVAL_MS
+    ): Boolean {
+        if (deviceId.isBlank() || port !in 1..65535) return false
+        stopPeerHostBeacon()
+        localDeviceId = deviceId.trim()
+        val effectiveIntervalMs = intervalMs.coerceAtLeast(MIN_BEACON_INTERVAL_MS)
+
+        return try {
+            val sock = DatagramSocket().apply {
+                broadcast = true
+                reuseAddress = true
+            }
+            beaconSocket = sock
+            isBeaconActive = true
+
+            beaconJob = scope.launch {
+                while (isActive && isBeaconActive) {
+                    try {
+                        val candidateIps = candidateIpsProvider()
+                        val payload = createBeaconPayload(
+                            deviceId = deviceId,
+                            deviceName = deviceName,
+                            deviceType = "android",
+                            port = port,
+                            transferPort = transferPort,
+                            certFingerprint = certFingerprint,
+                            snowId = snowId,
+                            ips = candidateIps
+                        )
+                        val destinations = resolveBroadcastDestinations(candidateIps)
+                        for (destIp in destinations) {
+                            try {
+                                val targetAddr = InetAddress.getByName(destIp)
+                                sock.send(DatagramPacket(payload, payload.size, targetAddr, this@DiscoveryManager.port))
+                            } catch (_: Exception) {
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (isActive && isBeaconActive) {
+                            SafeLog.w(TAG, "UDP beacon transmit error: ${e.message}")
+                        }
+                    }
+                    delay(effectiveIntervalMs)
+                }
+            }
+            SafeLog.i(TAG, "Started peer host UDP beacon on port $port (target UDP ${this.port}, interval=${effectiveIntervalMs}ms)")
+            true
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Failed starting peer host UDP beacon: ${e.message}")
+            stopPeerHostBeacon()
+            false
+        }
+    }
+
+    @Synchronized
+    fun stopPeerHostBeacon() {
+        isBeaconActive = false
+        beaconJob?.cancel()
+        beaconJob = null
+        try {
+            beaconSocket?.close()
+        } catch (_: Exception) {}
+        beaconSocket = null
+    }
 
     /**
      * Start background UDP socket listener and peer prune job.
@@ -180,10 +342,11 @@ class DiscoveryManager(
                     try {
                         sock.receive(packet)
                         val remoteIp = packet.address?.hostAddress ?: "127.0.0.1"
-                        val peer = parseBeacon(packet.data, packet.length, remoteIp)
-
-                        if (peer != null) {
-                            handleDiscoveredPeer(peer)
+                        if (!isRateLimited(remoteIp)) {
+                            val peer = parseBeacon(packet.data, packet.length, remoteIp)
+                            if (peer != null) {
+                                handleDiscoveredPeer(peer)
+                            }
                         }
                     } catch (e: Exception) {
                         if (isActive && isListening) {
@@ -205,29 +368,46 @@ class DiscoveryManager(
         }
     }
 
+    private fun isRateLimited(remoteIp: String, nowMs: Long = System.currentTimeMillis()): Boolean {
+        val queue = rateLimits.computeIfAbsent(remoteIp) { ArrayDeque() }
+        synchronized(queue) {
+            while (queue.isNotEmpty() && nowMs - queue.first() > 2000L) {
+                queue.removeFirst()
+            }
+            if (queue.size >= 25) return true
+            queue.addLast(nowMs)
+            return false
+        }
+    }
+
     /**
      * Ingest a valid parsed peer record, determine pairing status, and emit updated flow.
      */
     fun handleDiscoveredPeer(peer: DiscoveredPeer) {
+        val myId = localDeviceId?.trim()
+        if (!myId.isNullOrBlank() && peer.deviceId.equals(myId, ignoreCase = true)) {
+            return
+        }
         val pinnedFp = certPinStorage?.getPinnedFingerprintForDevice(peer.deviceId)
             ?: if (certPinStorage?.listPinnedDeviceIds().isNullOrEmpty()) certPinStorage?.getPinnedFingerprint() else null
-        val hasToken = (tokenStorage?.hasTokenForDevice(peer.deviceId) == true) ||
-            (tokenStorage?.listStoredDeviceIds().isNullOrEmpty() && tokenStorage?.hasToken() == true)
-
-        val isPaired = if (!pinnedFp.isNullOrBlank() && peer.certFingerprint.isNotBlank()) {
-            peer.certFingerprint.replace(":", "").equals(pinnedFp.replace(":", ""), ignoreCase = true)
-        } else if (!pinnedFp.isNullOrBlank()) {
-            hasToken
+        val tokStorage = tokenStorage
+        val hasToken = if (tokStorage == null) {
+            true
         } else {
-            hasToken && certPinStorage?.listPinnedDeviceIds().isNullOrEmpty()
+            tokStorage.hasTokenForDevice(peer.deviceId) ||
+                (tokStorage.listStoredDeviceIds().isEmpty() && tokStorage.hasToken())
         }
+
+        val isPaired = !pinnedFp.isNullOrBlank() &&
+            peer.certFingerprint.isNotBlank() &&
+            hasToken &&
+            peer.certFingerprint.replace(":", "").equals(pinnedFp.replace(":", ""), ignoreCase = true)
 
         val enriched = peer.copy(isPaired = isPaired)
         peerMap[peer.deviceId] = enriched
         publishPeers()
 
         val targetId = peer.wakeTarget?.trim()
-        val myId = localDeviceId?.trim()
         if (isPaired && !targetId.isNullOrBlank() && !myId.isNullOrBlank() && targetId == myId) {
             onWakeTargetMatched?.invoke(enriched)
         }
@@ -276,11 +456,12 @@ class DiscoveryManager(
     }
 
     /**
-     * Stop listener and prune jobs cleanly.
+     * Stop listener, beacon, and prune jobs cleanly.
      */
     @Synchronized
     fun stopListening() {
         isListening = false
+        stopPeerHostBeacon()
         listenJob?.cancel()
         listenJob = null
         pruneJob?.cancel()
@@ -292,6 +473,7 @@ class DiscoveryManager(
         socket = null
 
         peerMap.clear()
+        rateLimits.clear()
         _peers.value = emptyList()
         SafeLog.i(TAG, "DiscoveryManager stopped cleanly.")
     }

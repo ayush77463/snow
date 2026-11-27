@@ -181,6 +181,67 @@ def stream_copy_file(
         raise
 
 
+def finalize_staged_file(
+    src_path: Path,
+    dest_path: Path,
+    precomputed_sha256: Optional[str] = None,
+    chunk_size: int = CHUNK_SIZE,
+    remove_source: bool = True,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> tuple[str, str]:
+    """Move a verified staged file to dest_path atomically on same volume, else stream-copy boundedly.
+
+    Never assumes os.replace is atomic across filesystems, and never removes src_path
+    until dest_path is durably finalized on disk with matching byte size.
+    Returns (method_used, sha256_hex) where method_used is 'in_place', 'atomic_move', or 'stream_copy'.
+    """
+    import errno
+
+    src_res = src_path.resolve()
+    dest_res = dest_path.resolve()
+    clean_digest = precomputed_sha256.strip().lower() if isinstance(precomputed_sha256, str) and len(precomputed_sha256.strip()) == 64 else ""
+
+    if src_res == dest_res:
+        digest = clean_digest or compute_stream_sha256(src_res, chunk_size=chunk_size)
+        return "in_place", digest
+
+    if cancel_check is not None and cancel_check():
+        raise RuntimeError("Staged file finalization cancelled.")
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    src_stat = src_res.stat()
+    same_fs = False
+    try:
+        dest_dir_stat = dest_path.parent.stat()
+        same_fs = bool(src_stat.st_dev and dest_dir_stat.st_dev and src_stat.st_dev == dest_dir_stat.st_dev)
+    except OSError:
+        same_fs = False
+
+    if same_fs and remove_source:
+        try:
+            os.replace(src_res, dest_path)
+            digest = clean_digest or compute_stream_sha256(dest_path, chunk_size=chunk_size)
+            return "atomic_move", digest
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EACCES, errno.EPERM):
+                raise
+
+    # Cross-volume or non-destructive copy: bounded streaming write to .part -> atomic replace
+    copied_hash = stream_copy_file(
+        src_res,
+        dest_path,
+        chunk_size=chunk_size,
+        expected_sha256=clean_digest or None,
+        cancel_check=cancel_check,
+    )
+    if remove_source and dest_path.is_file() and dest_path.stat().st_size == src_stat.st_size:
+        try:
+            src_res.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return "stream_copy", (clean_digest or copied_hash)
+
+
 class TransferStorageManager:
     """Manages storage root, safe path isolation, temporary .part files, and atomic commits."""
 

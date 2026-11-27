@@ -76,7 +76,7 @@ class TestStage6CWS4VersionAndFrozenInvariants(unittest.TestCase):
 
     def test_frozen_protocol_schema_and_54_fastmcp_tools(self) -> None:
         self.assertEqual(PROTOCOL_VERSION, 1)
-        self.assertEqual(SCHEMA_VERSION, 7)
+        self.assertEqual(SCHEMA_VERSION, 8)
 
         ok, errors = validate_registry()
         self.assertTrue(ok, f"Registry validation failed: {errors}")

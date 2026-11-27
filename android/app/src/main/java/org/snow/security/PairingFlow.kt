@@ -28,7 +28,13 @@ sealed class PairingState {
         val deviceType: String? = null,
         val permissionProfile: String? = null,
         val peerSnowId: String? = null,
-        val peerNetworkId: String? = null
+        val peerNetworkId: String? = null,
+        val relationship: String = "member",
+        val networkAction: String? = null,
+        val networkConflict: Boolean = false,
+        val mergeTxId: String? = null,
+        val clientNetworkId: String? = null,
+        val hostNetworkId: String? = null
     ) : PairingState()
 
     data class WrongPin(
@@ -65,6 +71,7 @@ class PairingFlow(
 
     private val isSubmitting = AtomicBoolean(false)
     private var lastSubmitTimeMs: Long = 0L
+    internal var localNetworkIdProvider: (() -> String?)? = null
 
     /**
      * Validate whether a string is a valid 6-digit decimal PIN.
@@ -131,7 +138,7 @@ class PairingFlow(
         val manifestMap = DeviceNode.buildAndroidManifest(null).toMap()
         val host = client.currentTargetHost
         val isLoopback = host == "127.0.0.1" || host == "localhost" || host == "::1"
-        val requestData = mapOf(
+        val requestData = mutableMapOf<String, Any>(
             "device_id" to identity.deviceId,
             "device_name" to identity.deviceName,
             "pin" to cleanedPin,
@@ -139,6 +146,11 @@ class PairingFlow(
             "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
             "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
         )
+        localNetworkIdProvider?.invoke()?.trim()?.uppercase()?.takeIf {
+            it.matches(Regex("^SNW-NET-[A-Z0-9]{8}$"))
+        }?.let { cleanClientNet ->
+            requestData["client_network_id"] = cleanClientNet
+        }
 
         client.sendRequest(
             action = "pair_request",
@@ -199,6 +211,11 @@ class PairingFlow(
         )
         if (!networkId.isNullOrBlank()) {
             requestData["network_id"] = networkId.trim().uppercase()
+        }
+        localNetworkIdProvider?.invoke()?.trim()?.uppercase()?.takeIf {
+            it.matches(Regex("^SNW-NET-[A-Z0-9]{8}$"))
+        }?.let { cleanClientNet ->
+            requestData["client_network_id"] = cleanClientNet
         }
 
         client.sendRequest(
@@ -372,6 +389,16 @@ class PairingFlow(
                     ?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
                 val peerNetworkId = ((data?.get("network_id") as? String) ?: (manifest?.get("network_id") as? String))
                     ?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+                val relationship = (data?.get("relationship") as? String)?.trim()?.lowercase()
+                    ?.takeIf { it.isNotBlank() } ?: "member"
+                val networkAction = (data?.get("network_action") as? String)?.trim()?.uppercase()
+                    ?.takeIf { it.isNotBlank() }
+                val networkConflict = (data?.get("network_conflict") as? Boolean) == true
+                val mergeTxId = (data?.get("merge_tx_id") as? String)?.trim()?.takeIf { it.isNotBlank() }
+                val clientNetworkId = (data?.get("client_network_id") as? String)?.trim()?.uppercase()
+                    ?.takeIf { it.isNotBlank() }
+                val hostNetworkId = (data?.get("host_network_id") as? String)?.trim()?.uppercase()
+                    ?.takeIf { it.isNotBlank() } ?: peerNetworkId
                 val deviceType = (data?.get("device_type") as? String)
                     ?: (data?.get("platform") as? String)
                     ?: (manifest?.get("platform") as? String)
@@ -394,7 +421,13 @@ class PairingFlow(
                     deviceType = deviceType,
                     permissionProfile = permissionProfile,
                     peerSnowId = peerSnowId,
-                    peerNetworkId = peerNetworkId
+                    peerNetworkId = peerNetworkId,
+                    relationship = relationship,
+                    networkAction = networkAction,
+                    networkConflict = networkConflict,
+                    mergeTxId = mergeTxId,
+                    clientNetworkId = clientNetworkId,
+                    hostNetworkId = hostNetworkId
                 )
             }
 
@@ -427,6 +460,42 @@ class PairingFlow(
 
             else -> PairingState.Error("Unexpected response type: ${message.type}")
         }
+    }
+
+    fun sendNetworkMergeDecision(
+        txId: String,
+        decision: String,
+        client: SnowWebSocketClient,
+        onComplete: (Boolean, Map<String, Any?>?, String?) -> Unit
+    ): Boolean {
+        val cleanTx = txId.trim()
+        val cleanDecision = decision.trim().lowercase()
+        if (cleanTx.isBlank() || cleanDecision !in listOf("merge", "keep_separate", "reject")) {
+            onComplete(false, null, "Invalid merge decision request.")
+            return false
+        }
+        if (client.connectionState.value != ConnectionState.CONNECTED) {
+            onComplete(false, null, "Peer connection lost.")
+            return false
+        }
+        client.sendRequest(
+            action = "network_merge_decision",
+            data = mapOf(
+                "tx_id" to cleanTx,
+                "decision" to cleanDecision,
+                "device_id" to identity.deviceId
+            )
+        ) { resp ->
+            if (resp.type == MessageType.RESPONSE) {
+                val payload = resp.payload ?: emptyMap()
+                @Suppress("UNCHECKED_CAST")
+                val dataMap = (payload["data"] as? Map<String, Any?>) ?: payload
+                onComplete(true, dataMap, null)
+            } else {
+                onComplete(false, null, resp.error?.message ?: "Merge decision failed.")
+            }
+        }
+        return true
     }
 
     private fun extractRemainingAttempts(msg: String): Int {

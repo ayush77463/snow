@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Any, List, Optional
 
 from snow.capabilities.engine import CapabilityEngine
@@ -61,6 +62,8 @@ class SnowCoreServer:
         self.transfer_manager = TransferManager()
         self.storage_manager = TransferStorageManager(root_dir=self.config.transfer_root)
         self._maintenance_task: Optional[asyncio.Task] = None
+        self._active_rendezvous: Optional[dict[str, Any]] = None
+        self._rendezvous_task: Optional[asyncio.Task] = None
         self.ws_server = SnowWebSocketServer(
             config=self.config,
             connection_manager=self.connection_manager,
@@ -1440,6 +1443,150 @@ class SnowCoreServer:
         except Exception as exc:
             return False, "", "", f"Hub session request failed: {exc}"
 
+    def get_active_rendezvous_id(self) -> Optional[str]:
+        """Return currently cached unexpired rendezvous_id if open."""
+        entry = getattr(self, "_active_rendezvous", None)
+        if not isinstance(entry, dict):
+            return None
+        if time.time() >= float(entry.get("expires_at", 0.0)):
+            self._active_rendezvous = None
+            return None
+        rdv_id = str(entry.get("rendezvous_id") or "").strip()
+        return rdv_id or None
+
+    async def open_rendezvous_for_pairing(
+        self,
+        pin: str = "",
+        handshake_token: str = "",
+        trust_tier: str = "owner",
+        ttl_seconds: float = 60.0,
+        await_sync: Optional[bool] = None,
+    ) -> Optional[str]:
+        """Open (or return deduplicated) Render Hub rendezvous slot for active QR/PIN pairing.
+
+        Never fails local LAN onboarding if the Render Hub is offline or unreachable.
+        """
+        import hashlib
+        import aiohttp
+        from snow.core.config import resolve_default_hub_url
+
+        hub_raw = resolve_default_hub_url(db_manager=getattr(self, "db_manager", None))
+        if not hub_raw:
+            return None
+        _, hub_http_base = self._normalize_relay_ws_and_http_urls(hub_raw)
+        if not (hub_http_base.startswith("https://") or hub_http_base.startswith("http://")):
+            return None
+
+        cred_digest = hashlib.sha256(f"{pin}|{handshake_token}|{trust_tier}".encode("utf-8")).hexdigest()
+        now = time.time()
+        existing = getattr(self, "_active_rendezvous", None)
+        if (
+            isinstance(existing, dict)
+            and existing.get("cred_digest") == cred_digest
+            and now < float(existing.get("expires_at", 0.0))
+            and existing.get("rendezvous_id")
+        ):
+            return str(existing["rendezvous_id"])
+
+        async def _do_open() -> Optional[str]:
+            try:
+                ok_hub, hub_token, hub_net_id, err_hub = await self._acquire_relay_hub_session(
+                    hub_http_base, timeout=2.5
+                )
+                if not ok_hub or not hub_token:
+                    logger.warning("Skipping hub rendezvous open (%s): %s", hub_http_base, err_hub)
+                    return None
+                ws_srv = getattr(self, "ws_server", None)
+                cert_info = getattr(ws_srv, "certificate_info", None)
+                fp = getattr(cert_info, "fingerprint_sha256", "") if cert_info else ""
+                dev_ident = getattr(self, "device_identity", None)
+                host_dev_id = str(getattr(dev_ident, "device_id", "") or "").strip()
+                host_snow_id = str(getattr(dev_ident, "snow_id", "") or "").strip().upper()
+                body: dict[str, Any] = {
+                    "mode": "pairing",
+                    "host_device_id": host_dev_id,
+                    "host_snow_id": host_snow_id,
+                    "network_id": hub_net_id,
+                    "ttl_seconds": min(120.0, max(10.0, float(ttl_seconds))),
+                }
+                if fp:
+                    body["cert_fingerprint"] = fp
+                if pin:
+                    body["pin"] = pin
+                if handshake_token:
+                    body["handshake_token"] = handshake_token
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.0)) as sess:
+                    async with sess.post(
+                        f"{hub_http_base}/v1/rendezvous/open",
+                        headers={"Authorization": f"Bearer {hub_token}"},
+                        json=body,
+                    ) as resp:
+                        res_data = await resp.json(content_type=None)
+                        if resp.status == 200 and isinstance(res_data, dict) and res_data.get("success"):
+                            rdv_id = str(res_data.get("rendezvous_id") or "").strip()
+                            if rdv_id:
+                                self._active_rendezvous = {
+                                    "cred_digest": cred_digest,
+                                    "rendezvous_id": rdv_id,
+                                    "hub_http_base": hub_http_base,
+                                    "hub_token": hub_token,
+                                    "expires_at": float(res_data.get("expires_at") or (time.time() + ttl_seconds)),
+                                }
+                                logger.info("Opened Render Hub rendezvous slot %s", rdv_id)
+                                return rdv_id
+                        logger.warning("Hub rendezvous open returned HTTP %s: %s", resp.status, res_data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Non-fatal hub rendezvous open skip: %s", exc)
+            return None
+
+        is_local_hub = any(
+            host_tok in hub_http_base.lower() for host_tok in ("127.0.0.1", "localhost", "::1")
+        )
+        should_await = await_sync if await_sync is not None else is_local_hub
+        if should_await:
+            try:
+                return await asyncio.wait_for(_do_open(), timeout=2.0)
+            except Exception:
+                return None
+
+        prev_task = getattr(self, "_rendezvous_task", None)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        self._rendezvous_task = asyncio.create_task(_do_open())
+        return None
+
+    async def cancel_rendezvous_for_pairing(self) -> bool:
+        """Cancel any active Render Hub rendezvous slot cleanly."""
+        import aiohttp
+
+        prev_task = getattr(self, "_rendezvous_task", None)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+        self._rendezvous_task = None
+
+        entry = getattr(self, "_active_rendezvous", None)
+        self._active_rendezvous = None
+        if not isinstance(entry, dict) or not entry.get("rendezvous_id"):
+            return False
+        hub_base = str(entry.get("hub_http_base") or "").rstrip("/")
+        hub_tok = str(entry.get("hub_token") or "")
+        rdv_id = str(entry["rendezvous_id"])
+        if not hub_base or not hub_tok:
+            return False
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2.5)) as sess:
+                async with sess.post(
+                    f"{hub_base}/v1/rendezvous/cancel",
+                    headers={"Authorization": f"Bearer {hub_tok}"},
+                    json={"rendezvous_id": rdv_id},
+                ) as resp:
+                    return resp.status == 200
+        except Exception as exc:
+            logger.debug("Non-fatal hub rendezvous cancel failure: %s", exc)
+            return False
+
     async def configure_relay(
         self,
         enabled: bool,
@@ -1492,7 +1639,7 @@ class SnowCoreServer:
         # Zero-config Render Hub fallback when relay_url is unset
         if not (self.relay_url or "").strip():
             from snow.core.config import resolve_default_hub_url
-            default_hub = resolve_default_hub_url(config=self.config, db_manager=self.db_manager)
+            default_hub = resolve_default_hub_url(db_manager=self.db_manager)
             ws_default, _ = self._normalize_relay_ws_and_http_urls(default_hub)
             if ws_default:
                 self.relay_url = ws_default
@@ -1511,7 +1658,7 @@ class SnowCoreServer:
             if not ok_hub or not hub_token:
                 logger.warning("Render Hub session acquisition failed (%s): %s", hub_http_base, err_hub)
                 return self.get_relay_status()
-            if network_id and (not getattr(self, "relay_group_id", "") or self.relay_group_id == "default_group"):
+            if network_id and (not getattr(self, "relay_group_id", "") or self.relay_group_id in ("default_group", "local-network")):
                 self.relay_group_id = network_id
 
         # Resolve cert & key paths safely using config attributes
@@ -1542,10 +1689,21 @@ class SnowCoreServer:
         from snow.network.relay_client import RelayTunnelClient
         local_dev_id = getattr(self.device_identity, "device_id", "desktop-core") if hasattr(self, "device_identity") and self.device_identity else "desktop-core"
 
+        active_net = (
+            self.db_manager.get_active_network()
+            if self.db_manager and hasattr(self.db_manager, "get_active_network")
+            else None
+        )
+        resolved_group_id = (
+            network_id
+            or (active_net.get("network_id") if active_net else "")
+            or (self.relay_group_id if getattr(self, "relay_group_id", "") not in ("default_group", "local-network") else "")
+        )
+
         client = RelayTunnelClient(
             relay_url=self.relay_url,
             device_id=local_dev_id,
-            group_id=network_id or self.relay_group_id or "default_group",
+            group_id=resolved_group_id,
             ticket=self.relay_ticket,
             cert_path=cert_path,
             key_path=key_path,
@@ -2001,6 +2159,14 @@ class SnowCoreServer:
             except asyncio.CancelledError:
                 pass
             self._maintenance_task = None
+
+        if getattr(self, "_rendezvous_task", None):
+            self._rendezvous_task.cancel()
+            try:
+                await self._rendezvous_task
+            except asyncio.CancelledError:
+                pass
+            self._rendezvous_task = None
 
         # Stop automatic USB ADB watcher
         if getattr(self, "usb_watcher", None):

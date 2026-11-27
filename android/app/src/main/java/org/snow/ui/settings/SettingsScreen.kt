@@ -335,7 +335,7 @@ fun SettingsScreen(
                         statusText = liveBg.backgroundBadgeText(),
                         isGranted = liveBg.isBackgroundFullyHealthy(),
                         onClick = {
-                            context.startActivity(createBatteryOptimizationSettingsIntent())
+                            org.snow.ui.SnowUiRepository.openBatteryOptimizationSettings(context)
                         }
                     )
                 }

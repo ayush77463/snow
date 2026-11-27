@@ -20,19 +20,24 @@ import json
 import logging
 import os
 from pathlib import Path
+import secrets
 import sqlite3
 import threading
 import time
 from typing import Any, Generator, List, Optional
 import uuid
 
+from snow.relay.auth import generate_canonical_network_id, is_valid_network_id
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_FILENAME = "snow_devices.db"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 VALID_TRUST_TIERS = ("owner", "peer")
 VALID_CONNECTION_MODES = ("auto", "local_only", "remote_only")
+VALID_DEVICE_RELATIONSHIPS = ("member", "external_network")
+VALID_MERGE_STATUSES = ("PENDING", "COMMITTED", "REJECTED", "EXPIRED", "ROLLED_BACK")
 
 
 def current_utc_timestamp() -> str:
@@ -64,6 +69,8 @@ class PairedDeviceRecord:
     cert_fingerprint: Optional[str] = None
     endpoints_json: str = "[]"
     connection_mode: str = "auto"
+    network_id: Optional[str] = None
+    relationship: str = "member"
 
 
 @dataclass(frozen=True)
@@ -151,7 +158,9 @@ class DatabaseManager:
                         last_known_host TEXT,
                         last_known_port INTEGER DEFAULT 8765,
                         capabilities_json TEXT NOT NULL DEFAULT '{}',
-                        connection_mode TEXT NOT NULL DEFAULT 'auto'
+                        connection_mode TEXT NOT NULL DEFAULT 'auto',
+                        network_id TEXT,
+                        relationship TEXT NOT NULL DEFAULT 'member' CHECK (relationship IN ('member', 'external_network'))
                     );
                 """)
                 conn.execute("""
@@ -159,7 +168,7 @@ class DatabaseManager:
                     ON paired_devices(auth_token_hash);
                 """)
 
-                # Schema migration for existing tables created under versions 1 or 2
+                # Schema migration for existing tables created under versions 1..7
                 cursor = conn.execute("PRAGMA table_info(paired_devices);")
                 columns = [row["name"] for row in cursor.fetchall()]
                 if "trust_tier" not in columns:
@@ -192,10 +201,59 @@ class DatabaseManager:
                 if "connection_mode" not in columns:
                     logger.info("Migrating paired_devices table: adding connection_mode column")
                     conn.execute("ALTER TABLE paired_devices ADD COLUMN connection_mode TEXT NOT NULL DEFAULT 'auto';")
+                if "network_id" not in columns:
+                    logger.info("Migrating paired_devices table (v8): adding network_id column")
+                    conn.execute("ALTER TABLE paired_devices ADD COLUMN network_id TEXT;")
+                if "relationship" not in columns:
+                    logger.info("Migrating paired_devices table (v8): adding relationship column")
+                    conn.execute(
+                        "ALTER TABLE paired_devices ADD COLUMN relationship TEXT NOT NULL DEFAULT 'member' CHECK (relationship IN ('member', 'external_network'));"
+                    )
 
                 conn.execute("""
                     CREATE INDEX IF NOT EXISTS idx_paired_devices_trust_tier
                     ON paired_devices(trust_tier);
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_paired_devices_network
+                    ON paired_devices(network_id);
+                """)
+
+                # Schema v8: Canonical SNOW networks registry & dual-owner merge transactions
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS networks (
+                        network_id TEXT PRIMARY KEY,
+                        network_name TEXT NOT NULL,
+                        owner_device_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DISSOLVED', 'MERGED')),
+                        merged_into_network_id TEXT,
+                        created_timestamp TEXT NOT NULL,
+                        updated_timestamp TEXT NOT NULL
+                    );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_networks_status
+                    ON networks(status);
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS network_merge_proposals (
+                        tx_id TEXT PRIMARY KEY,
+                        source_network_id TEXT NOT NULL,
+                        target_network_id TEXT NOT NULL,
+                        surviving_network_id TEXT NOT NULL,
+                        source_owner_device_id TEXT NOT NULL,
+                        target_owner_device_id TEXT NOT NULL,
+                        source_owner_approved INTEGER NOT NULL DEFAULT 0,
+                        target_owner_approved INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMMITTED', 'REJECTED', 'EXPIRED', 'ROLLED_BACK')),
+                        expires_timestamp TEXT NOT NULL,
+                        created_timestamp TEXT NOT NULL,
+                        committed_timestamp TEXT
+                    );
+                """)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_network_merge_status
+                    ON network_merge_proposals(status);
                 """)
 
                 # Phase 27: Network identity and persistent endpoints
@@ -501,6 +559,114 @@ class DatabaseManager:
                 ON clipboard_buffer_items(canonical_sha256);
             """)
 
+            # Guarantee Schema v8 tables/columns & run idempotent backfill on existing v1..v7 DBs
+            pd_cols = {
+                row["name"] for row in conn.execute("PRAGMA table_info(paired_devices);").fetchall()
+            }
+            if pd_cols and "network_id" not in pd_cols:
+                conn.execute("ALTER TABLE paired_devices ADD COLUMN network_id TEXT;")
+            if pd_cols and "relationship" not in pd_cols:
+                conn.execute(
+                    "ALTER TABLE paired_devices ADD COLUMN relationship TEXT NOT NULL DEFAULT 'member' CHECK (relationship IN ('member', 'external_network'));"
+                )
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_paired_devices_network
+                ON paired_devices(network_id);
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS networks (
+                    network_id TEXT PRIMARY KEY,
+                    network_name TEXT NOT NULL,
+                    owner_device_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE', 'DISSOLVED', 'MERGED')),
+                    merged_into_network_id TEXT,
+                    created_timestamp TEXT NOT NULL,
+                    updated_timestamp TEXT NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_networks_status
+                ON networks(status);
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS network_merge_proposals (
+                    tx_id TEXT PRIMARY KEY,
+                    source_network_id TEXT NOT NULL,
+                    target_network_id TEXT NOT NULL,
+                    surviving_network_id TEXT NOT NULL,
+                    source_owner_device_id TEXT NOT NULL,
+                    target_owner_device_id TEXT NOT NULL,
+                    source_owner_approved INTEGER NOT NULL DEFAULT 0,
+                    target_owner_approved INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'COMMITTED', 'REJECTED', 'EXPIRED', 'ROLLED_BACK')),
+                    expires_timestamp TEXT NOT NULL,
+                    created_timestamp TEXT NOT NULL,
+                    committed_timestamp TEXT
+                );
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_network_merge_status
+                ON network_merge_proposals(status);
+            """)
+
+            # Transactional v7 -> v8 backfill: preserve every paired device without inventing standalone networks
+            if current_ver < 8:
+                member_count_row = conn.execute(
+                    "SELECT COUNT(*) FROM paired_devices WHERE relationship = 'member' OR relationship IS NULL;"
+                ).fetchone()
+                member_count = int(member_count_row[0]) if member_count_row else 0
+                active_nets_row = conn.execute(
+                    "SELECT COUNT(*) FROM networks WHERE status = 'ACTIVE';"
+                ).fetchone()
+                has_active_net = bool(active_nets_row and int(active_nets_row[0]) > 0)
+                if member_count > 0 and not has_active_net:
+                    legacy_row = conn.execute(
+                        "SELECT network_id, network_name, owner_id, created_timestamp FROM network_identity LIMIT 1;"
+                    ).fetchone()
+                    now_str = current_utc_timestamp()
+                    if legacy_row and is_valid_network_id(legacy_row["network_id"]):
+                        canon_id = str(legacy_row["network_id"]).strip().upper()
+                        net_name = str(legacy_row["network_name"] or "My SNOW Network")
+                        owner_id = str(legacy_row["owner_id"] or "")
+                        created_ts = str(legacy_row["created_timestamp"] or now_str)
+                    else:
+                        seed = (
+                            str(legacy_row["network_id"])
+                            if legacy_row and legacy_row["network_id"]
+                            else str(legacy_row["owner_id"] if legacy_row else uuid.uuid4())
+                        )
+                        canon_id = f"SNW-NET-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:8].upper()}"
+                        net_name = str(legacy_row["network_name"] or "My SNOW Network") if legacy_row else "My SNOW Network"
+                        owner_id = str(legacy_row["owner_id"] or "") if legacy_row else ""
+                        created_ts = str(legacy_row["created_timestamp"] or now_str) if legacy_row else now_str
+
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO networks (
+                            network_id, network_name, owner_device_id, status,
+                            merged_into_network_id, created_timestamp, updated_timestamp
+                        ) VALUES (?, ?, ?, 'ACTIVE', NULL, ?, ?);
+                        """,
+                        (canon_id, net_name, owner_id, created_ts, now_str),
+                    )
+                    conn.execute(
+                        "UPDATE paired_devices SET network_id = ? WHERE network_id IS NULL AND (relationship = 'member' OR relationship IS NULL);",
+                        (canon_id,),
+                    )
+                    conn.execute("DELETE FROM network_identity;")
+                    conn.execute(
+                        "INSERT INTO network_identity (network_id, network_name, owner_id, created_timestamp) VALUES (?, ?, ?, ?);",
+                        (canon_id, net_name, owner_id, created_ts),
+                    )
+                elif member_count == 0:
+                    # Standalone migrated install: scrub any previously fabricated UUIDv4/non-canonical network_identity ID
+                    legacy_row = conn.execute(
+                        "SELECT network_id FROM network_identity LIMIT 1;"
+                    ).fetchone()
+                    if legacy_row and not is_valid_network_id(legacy_row["network_id"]):
+                        conn.execute("DELETE FROM network_identity;")
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
+
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> PairedDeviceRecord:
         """Convert a database row into an immutable PairedDeviceRecord."""
@@ -521,6 +687,8 @@ class DatabaseManager:
             cert_fingerprint=row["cert_fingerprint"] if "cert_fingerprint" in keys else None,
             endpoints_json=row["endpoints_json"] if "endpoints_json" in keys else "[]",
             connection_mode=row["connection_mode"] if "connection_mode" in keys else "auto",
+            network_id=row["network_id"] if "network_id" in keys else None,
+            relationship=row["relationship"] if "relationship" in keys and row["relationship"] else "member",
         )
 
     def insert_paired_device(
@@ -540,6 +708,8 @@ class DatabaseManager:
         role: str = "member",
         cert_fingerprint: Optional[str] = None,
         endpoints_json: str = "[]",
+        network_id: Optional[str] = None,
+        relationship: str = "member",
     ) -> PairedDeviceRecord:
         """Insert a newly paired device record.
 
@@ -572,6 +742,17 @@ class DatabaseManager:
             raise ValueError(
                 f"Invalid connection_mode '{connection_mode}'. Must be one of: {', '.join(VALID_CONNECTION_MODES)}"
             )
+        clean_relationship = (relationship or "member").strip().lower()
+        if clean_relationship not in VALID_DEVICE_RELATIONSHIPS:
+            raise ValueError(
+                f"Invalid relationship '{relationship}'. Must be one of: {', '.join(VALID_DEVICE_RELATIONSHIPS)}"
+            )
+        clean_network_id: Optional[str] = None
+        if network_id is not None and str(network_id).strip():
+            cand = str(network_id).strip().upper()
+            if not is_valid_network_id(cand):
+                raise ValueError(f"Invalid canonical network_id '{network_id}'. Expected SNW-NET-XXXXXXXX.")
+            clean_network_id = cand
 
         now = current_utc_timestamp()
         p_time = pairing_timestamp or now
@@ -581,8 +762,8 @@ class DatabaseManager:
             INSERT INTO paired_devices (
                 device_id, device_name, pairing_timestamp, last_seen_timestamp, auth_token_hash,
                 trust_tier, platform, reachability_profile, last_known_host, last_known_port, capabilities_json,
-                connection_mode, role, cert_fingerprint, endpoints_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                connection_mode, role, cert_fingerprint, endpoints_json, network_id, relationship
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """
         with self._get_connection() as conn:
             conn.execute(
@@ -603,6 +784,8 @@ class DatabaseManager:
                     role,
                     cert_fingerprint,
                     endpoints_json,
+                    clean_network_id,
+                    clean_relationship,
                 ),
             )
 
@@ -622,6 +805,8 @@ class DatabaseManager:
             role=role,
             cert_fingerprint=cert_fingerprint,
             endpoints_json=endpoints_json,
+            network_id=clean_network_id,
+            relationship=clean_relationship,
         )
 
     def update_device_cert_fingerprint(self, device_id: str, cert_fingerprint: str) -> bool:
@@ -766,12 +951,26 @@ class DatabaseManager:
     def delete_paired_device(self, device_id: str) -> bool:
         """Remove a paired device from the database (unpairing).
 
-        Audit logs are intentionally preserved.
+        Audit logs are intentionally preserved. If the last home-network member is
+        removed, transitions any active network record back to DISSOLVED (standalone).
         """
         query = "DELETE FROM paired_devices WHERE device_id = ?;"
         with self._get_connection() as conn:
             cursor = conn.execute(query, (device_id,))
-            return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+            if deleted:
+                rem = conn.execute(
+                    "SELECT COUNT(*) FROM paired_devices WHERE relationship = 'member' OR relationship IS NULL;"
+                ).fetchone()
+                rem_count = int(rem[0]) if rem else 0
+                if rem_count == 0:
+                    now = current_utc_timestamp()
+                    conn.execute(
+                        "UPDATE networks SET status = 'DISSOLVED', updated_timestamp = ? WHERE status = 'ACTIVE';",
+                        (now,),
+                    )
+                    conn.execute("DELETE FROM network_identity;")
+            return deleted
 
     def verify_device_token(self, device_id: str, raw_token: str) -> bool:
         """Verify a device's raw token against its stored SHA-256 hash in constant time.
@@ -941,33 +1140,369 @@ class DatabaseManager:
         return results
 
     def get_network_identity(self) -> Optional[dict[str, Any]]:
-        """Retrieve the local SNOW Network identity record if present."""
+        """Retrieve the active canonical SNOW Network identity record if present."""
+        active = self.get_active_network()
+        if active:
+            return {
+                "network_id": active["network_id"],
+                "network_name": active["network_name"],
+                "owner_id": active["owner_device_id"],
+                "created_timestamp": active["created_timestamp"],
+            }
         with self._get_connection() as conn:
             cur = conn.execute(
                 "SELECT network_id, network_name, owner_id, created_timestamp FROM network_identity LIMIT 1;"
             )
             row = cur.fetchone()
-            if row:
+            if row and is_valid_network_id(row["network_id"]):
                 return dict(row)
             return None
 
     def save_network_identity(
         self, network_id: str, network_name: str, owner_id: str, created_timestamp: str
     ) -> None:
-        """Persist or update the SNOW Network identity."""
+        """Persist or update the canonical SNOW Network identity cleanly."""
+        clean_id = (network_id or "").strip().upper()
+        if not is_valid_network_id(clean_id):
+            raise ValueError(f"Refusing non-canonical network_id '{network_id}'. Expected SNW-NET-XXXXXXXX.")
+        now = current_utc_timestamp()
         with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE networks SET status = 'DISSOLVED', updated_timestamp = ? WHERE status = 'ACTIVE' AND network_id != ?;",
+                (now, clean_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO networks (
+                    network_id, network_name, owner_device_id, status,
+                    merged_into_network_id, created_timestamp, updated_timestamp
+                ) VALUES (?, ?, ?, 'ACTIVE', NULL, ?, ?)
+                ON CONFLICT(network_id) DO UPDATE SET
+                    network_name = excluded.network_name,
+                    owner_device_id = CASE
+                        WHEN networks.owner_device_id = '' THEN excluded.owner_device_id
+                        ELSE networks.owner_device_id
+                    END,
+                    status = 'ACTIVE',
+                    merged_into_network_id = NULL,
+                    updated_timestamp = excluded.updated_timestamp;
+                """,
+                (clean_id, network_name, owner_id, created_timestamp, now),
+            )
             conn.execute(
                 """
                 INSERT OR REPLACE INTO network_identity (network_id, network_name, owner_id, created_timestamp)
                 VALUES (?, ?, ?, ?);
                 """,
-                (network_id, network_name, owner_id, created_timestamp),
+                (clean_id, network_name, owner_id, created_timestamp),
             )
 
     def update_network_name(self, network_name: str) -> None:
-        """Update the user-facing network name."""
+        """Update the user-facing network name (persists even while standalone)."""
+        now = current_utc_timestamp()
         with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value) VALUES ('network_name', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """,
+                (network_name,),
+            )
+            conn.execute(
+                "UPDATE networks SET network_name = ?, updated_timestamp = ? WHERE status = 'ACTIVE';",
+                (network_name, now),
+            )
             conn.execute("UPDATE network_identity SET network_name = ?;", (network_name,))
+
+    def get_active_network(self) -> Optional[dict[str, Any]]:
+        """Return the current ACTIVE canonical network record, or None when standalone."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM networks WHERE status = 'ACTIVE' ORDER BY updated_timestamp DESC LIMIT 1;"
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_network(self, network_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve any recorded network row (ACTIVE, MERGED, DISSOLVED) by ID."""
+        clean = (network_id or "").strip().upper()
+        if not clean:
+            return None
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT * FROM networks WHERE network_id = ?;", (clean,)).fetchone()
+            return dict(row) if row else None
+
+    def ensure_active_network(
+        self,
+        network_name: str,
+        owner_device_id: str,
+        network_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return existing ACTIVE network or form/adopt one canonical SNW-NET-XXXXXXXX network."""
+        clean_name = (network_name or "").strip() or "My SNOW Network"
+        clean_owner = (owner_device_id or "").strip()
+        if not clean_owner:
+            raise ValueError("owner_device_id is required to form a network.")
+
+        with self._lock:
+            existing = self.get_active_network()
+            if existing and not network_id:
+                return existing
+
+            target_id = (
+                str(network_id).strip().upper()
+                if network_id is not None and str(network_id).strip()
+                else generate_canonical_network_id()
+            )
+            if not is_valid_network_id(target_id):
+                raise ValueError(f"Invalid canonical network_id '{target_id}'. Expected SNW-NET-XXXXXXXX.")
+
+            now = current_utc_timestamp()
+            self.save_network_identity(
+                network_id=target_id,
+                network_name=clean_name,
+                owner_id=clean_owner,
+                created_timestamp=now,
+            )
+            rec = self.get_network(target_id)
+            assert rec is not None
+            return rec
+
+    def assign_device_network(
+        self,
+        device_id: str,
+        network_id: Optional[str],
+        relationship: str = "member",
+    ) -> bool:
+        """Assign or update a paired device's canonical network_id and relationship."""
+        clean_rel = (relationship or "member").strip().lower()
+        if clean_rel not in VALID_DEVICE_RELATIONSHIPS:
+            raise ValueError(f"Invalid relationship '{relationship}'.")
+        clean_net: Optional[str] = None
+        if network_id is not None and str(network_id).strip():
+            clean_net = str(network_id).strip().upper()
+            if not is_valid_network_id(clean_net):
+                raise ValueError(f"Invalid canonical network_id '{network_id}'.")
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE paired_devices SET network_id = ?, relationship = ? WHERE device_id = ?;",
+                (clean_net, clean_rel, device_id),
+            )
+            return cur.rowcount > 0
+
+    def propose_network_merge(
+        self,
+        source_network_id: str,
+        target_network_id: str,
+        surviving_network_id: str,
+        source_owner_device_id: str,
+        target_owner_device_id: str,
+        tx_id: Optional[str] = None,
+        expires_in_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        """Create an unapproved multi-network merge transaction bound to exact owner IDs."""
+        src = (source_network_id or "").strip().upper()
+        dst = (target_network_id or "").strip().upper()
+        surv = (surviving_network_id or "").strip().upper()
+        if not is_valid_network_id(src) or not is_valid_network_id(dst):
+            raise ValueError("Both source_network_id and target_network_id must be valid SNW-NET-XXXXXXXX IDs.")
+        if src == dst:
+            raise ValueError("Cannot merge a network with itself.")
+        if surv not in (src, dst):
+            raise ValueError("surviving_network_id must equal either source_network_id or target_network_id.")
+        src_owner = (source_owner_device_id or "").strip()
+        dst_owner = (target_owner_device_id or "").strip()
+        if not src_owner or not dst_owner:
+            raise ValueError("Both source_owner_device_id and target_owner_device_id are required.")
+
+        tid = (tx_id or "").strip() or f"merge_{uuid.uuid4().hex[:16]}"
+        now_dt = datetime.now(timezone.utc)
+        now_str = now_dt.isoformat()
+        exp_str = datetime.fromtimestamp(now_dt.timestamp() + max(30.0, float(expires_in_seconds)), timezone.utc).isoformat()
+
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO network_merge_proposals (
+                    tx_id, source_network_id, target_network_id, surviving_network_id,
+                    source_owner_device_id, target_owner_device_id,
+                    source_owner_approved, target_owner_approved,
+                    status, expires_timestamp, created_timestamp, committed_timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'PENDING', ?, ?, NULL);
+                """,
+                (tid, src, dst, surv, src_owner, dst_owner, exp_str, now_str),
+            )
+        return self.get_network_merge_proposal(tid)  # type: ignore[return-value]
+
+    def get_network_merge_proposal(self, tx_id: str) -> Optional[dict[str, Any]]:
+        """Fetch a network merge transaction record by tx_id."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM network_merge_proposals WHERE tx_id = ?;",
+                ((tx_id or "").strip(),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def approve_network_merge(self, tx_id: str, approving_owner_device_id: str) -> dict[str, Any]:
+        """Record authenticated owner approval for either side of a merge proposal.
+
+        Enforces owner authority: non-owner 'peer' devices and unauthorized IDs are rejected.
+        """
+        approver = (approving_owner_device_id or "").strip()
+        if not approver:
+            raise ValueError("approving_owner_device_id is required.")
+
+        with self._lock:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT * FROM network_merge_proposals WHERE tx_id = ?;",
+                    ((tx_id or "").strip(),),
+                ).fetchone()
+                if not row:
+                    raise KeyError(f"Merge proposal '{tx_id}' not found.")
+                prop = dict(row)
+                if prop["status"] != "PENDING":
+                    raise ValueError(f"Merge proposal is not pending (status={prop['status']}).")
+
+                exp_dt = datetime.fromisoformat(prop["expires_timestamp"])
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) > exp_dt:
+                    conn.execute(
+                        "UPDATE network_merge_proposals SET status = 'EXPIRED' WHERE tx_id = ?;",
+                        (tx_id,),
+                    )
+                    raise ValueError("Merge proposal has expired.")
+
+                # If approver is in paired_devices, fail closed unless trust_tier == 'owner'
+                dev_row = conn.execute(
+                    "SELECT trust_tier FROM paired_devices WHERE device_id = ?;",
+                    (approver,),
+                ).fetchone()
+                if dev_row and str(dev_row["trust_tier"]).lower() != "owner":
+                    raise PermissionError("Only authenticated network owner devices can approve a network merge.")
+
+                if hmac.compare_digest(approver, str(prop["source_owner_device_id"])):
+                    conn.execute(
+                        "UPDATE network_merge_proposals SET source_owner_approved = 1 WHERE tx_id = ?;",
+                        (tx_id,),
+                    )
+                elif hmac.compare_digest(approver, str(prop["target_owner_device_id"])):
+                    conn.execute(
+                        "UPDATE network_merge_proposals SET target_owner_approved = 1 WHERE tx_id = ?;",
+                        (tx_id,),
+                    )
+                else:
+                    raise PermissionError("Device is not an authorized owner of either network in this merge transaction.")
+
+            updated = self.get_network_merge_proposal(tx_id)
+            assert updated is not None
+            return updated
+
+    def commit_network_merge(self, tx_id: str) -> dict[str, Any]:
+        """Atomically commit a dual-owner-approved network merge inside one SQLite transaction."""
+        with self._lock:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT * FROM network_merge_proposals WHERE tx_id = ?;",
+                    ((tx_id or "").strip(),),
+                ).fetchone()
+                if not row:
+                    raise KeyError(f"Merge proposal '{tx_id}' not found.")
+                prop = dict(row)
+                if prop["status"] != "PENDING":
+                    raise ValueError(f"Cannot commit merge proposal in status '{prop['status']}'.")
+
+                exp_dt = datetime.fromisoformat(prop["expires_timestamp"])
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) > exp_dt:
+                    conn.execute(
+                        "UPDATE network_merge_proposals SET status = 'EXPIRED' WHERE tx_id = ?;",
+                        (tx_id,),
+                    )
+                    raise ValueError("Merge proposal expired before commit.")
+
+                if not (int(prop["source_owner_approved"]) == 1 and int(prop["target_owner_approved"]) == 1):
+                    raise PermissionError("Merge requires explicit authenticated approval from BOTH network owners.")
+
+                src = prop["source_network_id"]
+                dst = prop["target_network_id"]
+                surv = prop["surviving_network_id"]
+                absorbed = dst if surv == src else src
+                now_str = current_utc_timestamp()
+
+                surv_row = conn.execute("SELECT * FROM networks WHERE network_id = ?;", (surv,)).fetchone()
+                surv_name = str(surv_row["network_name"]) if surv_row else "My SNOW Network"
+                surv_owner = str(surv_row["owner_device_id"]) if surv_row else str(prop["source_owner_device_id"])
+                surv_created = str(surv_row["created_timestamp"]) if surv_row else now_str
+
+                conn.execute(
+                    """
+                    INSERT INTO networks (
+                        network_id, network_name, owner_device_id, status,
+                        merged_into_network_id, created_timestamp, updated_timestamp
+                    ) VALUES (?, ?, ?, 'ACTIVE', NULL, ?, ?)
+                    ON CONFLICT(network_id) DO UPDATE SET
+                        status = 'ACTIVE',
+                        merged_into_network_id = NULL,
+                        updated_timestamp = excluded.updated_timestamp;
+                    """,
+                    (surv, surv_name, surv_owner, surv_created, now_str),
+                )
+                conn.execute(
+                    """
+                    UPDATE networks
+                    SET status = 'MERGED', merged_into_network_id = ?, updated_timestamp = ?
+                    WHERE network_id = ?;
+                    """,
+                    (surv, now_str, absorbed),
+                )
+                conn.execute(
+                    """
+                    UPDATE paired_devices
+                    SET network_id = ?, relationship = 'member'
+                    WHERE network_id = ? OR network_id IS NULL;
+                    """,
+                    (surv, absorbed),
+                )
+                conn.execute("DELETE FROM network_identity;")
+                conn.execute(
+                    "INSERT INTO network_identity (network_id, network_name, owner_id, created_timestamp) VALUES (?, ?, ?, ?);",
+                    (surv, surv_name, surv_owner, surv_created),
+                )
+                conn.execute(
+                    "UPDATE network_merge_proposals SET status = 'COMMITTED', committed_timestamp = ? WHERE tx_id = ?;",
+                    (now_str, tx_id),
+                )
+
+            self.log_audit_event(
+                event_type="NETWORK_MERGE_COMMITTED",
+                device_id=surv_owner,
+                details={
+                    "tx_id": tx_id,
+                    "surviving_network_id": surv,
+                    "absorbed_network_id": absorbed,
+                },
+            )
+            committed = self.get_network_merge_proposal(tx_id)
+            assert committed is not None
+            return committed
+
+    def reject_network_merge(self, tx_id: str, reason: str = "Rejected by owner") -> bool:
+        """Cancel/reject a pending network merge proposal cleanly without mutating either network."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cur = conn.execute(
+                    "UPDATE network_merge_proposals SET status = 'REJECTED' WHERE tx_id = ? AND status = 'PENDING';",
+                    ((tx_id or "").strip(),),
+                )
+                updated = cur.rowcount > 0
+        if updated:
+            self.log_audit_event(
+                event_type="NETWORK_MERGE_REJECTED",
+                details={"tx_id": tx_id, "reason": reason},
+            )
+        return updated
 
     def record_endpoint(
         self, device_id: str, host: str, port: int, last_success_timestamp: str

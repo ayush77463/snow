@@ -108,7 +108,10 @@ class Stage6CAndroidRegressionTest {
     @Test
     fun testAndroidPeerMediaServerSupportsAuthenticatedPhoneToPhoneFramesAndRejectsUnauthorized() {
         val cert = AndroidSelfSignedCertGenerator.generate()
-        val tokenStore = InMemoryTokenStorage().apply { saveToken("peer-token-123") }
+        val tokenStore = InMemoryTokenStorage().apply {
+            saveTokenForDevice("phone-a", "peer-token-123")
+            saveTokenForDevice("phone-b", "peer-token-123")
+        }
         val server = AndroidPeerMediaServer(
             requestedPort = 0,
             sslContext = cert.sslContext,

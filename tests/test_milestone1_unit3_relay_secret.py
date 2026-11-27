@@ -64,7 +64,7 @@ class TestMilestone1Unit3RelaySecretHandling(unittest.TestCase):
             self.assertNotIn("relay_ticket", qr)
             self.assertNotIn("group_id", qr)
             self.assertTrue(str(qr.get("hub_url", "")).startswith("https://"))
-            self.assertTrue(str(qr.get("network_id", "")).startswith("SNW-NET-"))
+            self.assertIsNone(qr.get("network_id"))
 
             # Explicit legacy ticket request without secret fails closed
             req_explicit = make_mocked_request("POST", "/api/pair/qr")

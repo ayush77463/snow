@@ -24,7 +24,13 @@ from snow.protocol.constants import ErrorCode
 from snow.protocol.models import SnowMessage
 from snow.security.db import DatabaseManager, hash_token
 from snow.security.identity import DeviceIdentity, is_valid_uuidv4, load_or_create_network_key_identity
-from snow.security.pairing import PairingManager, PairingOutcome, validate_qr_pairing_payload
+from snow.relay.auth import is_valid_network_id
+from snow.security.pairing import (
+    PairingManager,
+    PairingOutcome,
+    create_qr_pairing_payload,
+    validate_qr_pairing_payload,
+)
 from snow.security.tls import ensure_tls_certificate
 
 
@@ -108,20 +114,26 @@ class TestMilestone1Unit1QrPairingAndSeparation(unittest.IsolatedAsyncioTestCase
     async def test_01_02_end_to_end_ipc_qr_to_websocket_uses_authoritative_host_uuid(self) -> None:
         qr = await self._generate_qr_via_ipc(trust_tier="owner")
         # 2. Must use authoritative cs.device_identity.device_id, never "desktop-core"
+        self.assertEqual(qr["v"], 2)
         self.assertEqual(qr["id"], self.host_identity.device_id)
+        self.assertEqual(qr["device_id"], self.host_identity.device_id)
         self.assertTrue(is_valid_uuidv4(qr["id"]))
-        self.assertEqual(qr.get("network_id"), self.net_identity.network_id)
+        # Standalone host has no shared mesh network until first pairing succeeds
+        self.assertIsNone(qr.get("network_id"))
         self.assertIn("handshake_token", qr)
+        self.assertIn("exp", qr)
 
         state_res = await self._ipc_call("get_pairing_state")
         self.assertTrue(state_res["success"])
         self.assertEqual(state_res["data"]["node_id"], self.host_identity.device_id)
+        self.assertEqual(state_res["data"]["qr_payload"]["v"], 2)
         self.assertEqual(state_res["data"]["qr_payload"]["id"], self.host_identity.device_id)
 
         validated = validate_qr_pairing_payload(json.dumps(qr))
         self.assertEqual(validated["id"], self.host_identity.device_id)
+        self.assertIsNone(validated.get("network_id"))
 
-        # 1. End-to-end WS pair_request using QR handshake_token + network_id
+        # 1. End-to-end WS pair_request using QR v2 handshake_token forms canonical SNW-NET-XXXXXXXX
         client_uuid = str(uuid.uuid4())
         fake_client, sent = _make_fake_client("conn-qr-e2e")
         req_msg = SnowMessage.create_request(
@@ -130,7 +142,6 @@ class TestMilestone1Unit1QrPairingAndSeparation(unittest.IsolatedAsyncioTestCase
                 "device_id": client_uuid,
                 "device_name": "Realme P4",
                 "handshake_token": validated["handshake_token"],
-                "network_id": validated["network_id"],
             },
         )
         await self.core.ws_server._handle_request(fake_client, req_msg)
@@ -140,6 +151,7 @@ class TestMilestone1Unit1QrPairingAndSeparation(unittest.IsolatedAsyncioTestCase
         self.assertEqual(resp["type"], "response")
         self.assertEqual(resp["payload"]["status"], "success")
         self.assertEqual(resp["payload"]["data"]["device_id"], self.host_identity.device_id)
+        self.assertTrue(is_valid_network_id(resp["payload"]["data"].get("network_id")))
         raw_auth_tok = resp["payload"]["data"]["auth_token"]
 
         rec = self.db.get_paired_device(client_uuid)
@@ -147,6 +159,21 @@ class TestMilestone1Unit1QrPairingAndSeparation(unittest.IsolatedAsyncioTestCase
         self.assertEqual(rec.auth_token_hash, hash_token(raw_auth_tok))
         self.assertIsNotNone(self.core.session_manager.get_session_by_device(client_uuid))
         self.assertIsNotNone(self.core.node_registry.get_node(client_uuid))
+
+    async def test_02b_legacy_v1_qr_backward_compatibility(self) -> None:
+        v1_qr = create_qr_pairing_payload(
+            node_id=self.host_identity.device_id,
+            candidate_ips=["192.168.1.10"],
+            port=8765,
+            cert_fingerprint=self.cert_info.fingerprint_sha256,
+            pin=self.core.ws_server.pairing_manager.generate_pin(display_to_stderr=False),
+            version=1,
+            network_id=self.net_identity.network_id,
+        )
+        self.assertEqual(v1_qr["v"], 1)
+        parsed = validate_qr_pairing_payload(json.dumps(v1_qr))
+        self.assertEqual(parsed["v"], 1)
+        self.assertEqual(parsed["network_id"], self.net_identity.network_id)
 
     async def test_03_host_identity_mismatch_rejected(self) -> None:
         qr = await self._generate_qr_via_ipc()
@@ -175,7 +202,13 @@ class TestMilestone1Unit1QrPairingAndSeparation(unittest.IsolatedAsyncioTestCase
         self.assertIsNone(self.db.get_paired_device(client_uuid))
 
     async def test_04_05_06_strict_network_binding_rejects_missing_empty_and_mismatched(self) -> None:
+        self.db.ensure_active_network(
+            network_name="Strict Binding Mesh",
+            owner_device_id=self.host_identity.device_id,
+            network_id=self.net_identity.network_id,
+        )
         qr = await self._generate_qr_via_ipc()
+        self.assertEqual(qr["network_id"], self.net_identity.network_id)
         token = qr["handshake_token"]
         client_uuid = str(uuid.uuid4())
 

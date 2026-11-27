@@ -1,6 +1,6 @@
 package org.snow.network
 
-import android.util.Base64
+import java.util.Base64
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -18,12 +18,14 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 import org.snow.protocol.ErrorCode
 import org.snow.protocol.JsonSerialization
+import org.snow.protocol.MessageType
 import org.snow.protocol.SnowError
 import org.snow.protocol.SnowMessage
 import org.snow.security.CertPinStorage
 import org.snow.security.SafeLog
 import org.snow.security.SnowTrustManager
 import org.snow.security.TlsConfig
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 
@@ -49,7 +51,8 @@ class RelayClient @JvmOverloads constructor(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     val bootstrapToken: String = "",
     val hubToken: String = "",
-    val networkId: String = ""
+    val networkId: String = "",
+    val usePublicCaForOuterRelay: Boolean = false
 ) {
     companion object {
         private const val TAG = "RelayClient"
@@ -100,6 +103,9 @@ class RelayClient @JvmOverloads constructor(
 
     var requestDispatcher: (suspend (action: String, data: Map<String, Any?>?) -> Pair<Map<String, Any?>?, SnowError?>)? = null
     var mediaFrameHandler: ((sourceId: String, meta: Map<String, Any?>, jpegBytes: ByteArray) -> Unit)? = null
+    var onTunnelEstablished: (() -> Unit)? = null
+    var onTunnelFailed: ((String) -> Unit)? = null
+    private val pendingRequests = ConcurrentHashMap<String, (SnowMessage) -> Unit>()
 
     @Volatile
     private var shouldReconnect = false
@@ -108,13 +114,27 @@ class RelayClient @JvmOverloads constructor(
 
     val isServer: Boolean = !isClientMode
 
+    internal fun resolveExpectedPeerFingerprint(): String? {
+        val explicit = expectedPeerFingerprint?.replace(":", "")?.replace(" ", "")?.trim()?.takeIf { it.isNotBlank() }
+        if (explicit != null) return explicit
+        val storage = certPinStorage ?: return null
+        val perDevice = storage.getPinnedFingerprintForDevice(targetPeerId)
+            ?.replace(":", "")?.replace(" ", "")?.trim()?.takeIf { it.isNotBlank() }
+        if (perDevice != null) return perDevice
+        return if (storage.listPinnedDeviceIds().isEmpty()) {
+            storage.getPinnedFingerprint()?.replace(":", "")?.replace(" ", "")?.trim()?.takeIf { it.isNotBlank() }
+        } else {
+            null
+        }
+    }
+
     private val okHttpClient: OkHttpClient by lazy {
         val builder = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(30, TimeUnit.SECONDS)
 
-        if (relayUrl.startsWith("wss://")) {
+        if (relayUrl.startsWith("wss://") && !usePublicCaForOuterRelay) {
             val storage = certPinStorage
             if (storage != null) {
                 val trustManager = SnowTrustManager(storage)
@@ -128,15 +148,54 @@ class RelayClient @JvmOverloads constructor(
 
     var keyManagers: Array<javax.net.ssl.KeyManager>? = null
 
+    private fun verifyPinnedPeerChain(
+        chain: Array<out java.security.cert.X509Certificate>?,
+        expectedFp: String
+    ) {
+        if (chain.isNullOrEmpty()) {
+            throw java.security.cert.CertificateException("Peer certificate chain is empty.")
+        }
+        val presented = TlsConfig.computeSha256Fingerprint(chain[0])
+        if (!TlsConfig.fingerprintsMatch(expectedFp, presented)) {
+            throw java.security.cert.CertificateException(
+                "Relay peer certificate fingerprint mismatch! Expected: $expectedFp, Got: $presented"
+            )
+        }
+    }
+
     fun createTunnelSslContext(isServerRole: Boolean = isServer): SSLContext {
+        val expectedFp = resolveExpectedPeerFingerprint()
         val storage = certPinStorage
-        val trustManager = if (storage != null) SnowTrustManager(storage) else object : javax.net.ssl.X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+        val trustManager: javax.net.ssl.X509TrustManager = when {
+            expectedFp != null -> object : javax.net.ssl.X509TrustManager {
+                override fun checkClientTrusted(
+                    chain: Array<out java.security.cert.X509Certificate>?,
+                    authType: String?
+                ) {
+                    verifyPinnedPeerChain(chain, expectedFp)
+                }
+
+                override fun checkServerTrusted(
+                    chain: Array<out java.security.cert.X509Certificate>?,
+                    authType: String?
+                ) {
+                    verifyPinnedPeerChain(chain, expectedFp)
+                }
+
+                override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+            }
+            storage != null -> SnowTrustManager(
+                pinStorage = storage,
+                targetDeviceIdProvider = { targetPeerId }
+            )
+            else -> object : javax.net.ssl.X509TrustManager {
+                override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+                override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+            }
         }
         val sslContext = SSLContext.getInstance("TLS")
-        val km = if (isServerRole) keyManagers else null
+        val km = keyManagers
         sslContext.init(km, arrayOf(trustManager), java.security.SecureRandom())
         return sslContext
     }
@@ -159,7 +218,7 @@ class RelayClient @JvmOverloads constructor(
 
         try {
             val innerSslContext = createTunnelSslContext(isServer)
-            val expectedFp = expectedPeerFingerprint ?: certPinStorage?.getPinnedFingerprint()
+            val expectedFp = resolveExpectedPeerFingerprint()
             tunnel = E2eRelayTunnel(
                 sslContext = innerSslContext,
                 isServer = isServer,
@@ -206,6 +265,20 @@ class RelayClient @JvmOverloads constructor(
         }
     }
 
+    fun sendRequest(
+        action: String,
+        data: Map<String, Any?>,
+        onResponse: (SnowMessage) -> Unit
+    ): Boolean {
+        val req = SnowMessage.createRequest(action = action, data = data)
+        pendingRequests[req.id] = onResponse
+        val ok = sendRelayMessage(req)
+        if (!ok) {
+            pendingRequests.remove(req.id)
+        }
+        return ok
+    }
+
     fun sendRelayMessage(message: SnowMessage): Boolean {
         val tun = tunnel ?: return false
         val ws = webSocket ?: return false
@@ -214,7 +287,7 @@ class RelayClient @JvmOverloads constructor(
         return try {
             val plaintext = JsonSerialization.toJson(message).toByteArray(Charsets.UTF_8)
             val ciphertext = tun.encryptApplicationData(plaintext)
-            val payloadB64 = Base64.encodeToString(ciphertext, Base64.NO_WRAP)
+            val payloadB64 = Base64.getEncoder().encodeToString(ciphertext)
 
             val frame = JSONObject().apply {
                 put("type", "relay_frame")
@@ -242,7 +315,7 @@ class RelayClient @JvmOverloads constructor(
             System.arraycopy(jpegBytes, 0, plaintext, MEDIA_FRAME_MAGIC.size + metaJson.size + 1, jpegBytes.size)
 
             val ciphertext = tun.encryptApplicationData(plaintext)
-            val payloadB64 = Base64.encodeToString(ciphertext, Base64.NO_WRAP)
+            val payloadB64 = Base64.getEncoder().encodeToString(ciphertext)
             val frame = JSONObject().apply {
                 put("type", "relay_frame")
                 put("target", targetPeerId)
@@ -302,7 +375,7 @@ class RelayClient @JvmOverloads constructor(
                         val source = data.optString("source")
                         val payloadB64 = data.optString("payload_b64")
                         if (payloadB64.isNotBlank()) {
-                            val rawBytes = Base64.decode(payloadB64, Base64.NO_WRAP)
+                            val rawBytes = Base64.getMimeDecoder().decode(payloadB64)
                             handleIncomingRelayBytes(webSocket, source, rawBytes)
                         }
                     }
@@ -337,7 +410,7 @@ class RelayClient @JvmOverloads constructor(
                 val tun = tunnel ?: E2eRelayTunnel(
                     createTunnelSslContext(isServerRole = false),
                     isServer = false,
-                    expectedPeerFingerprint = expectedPeerFingerprint ?: certPinStorage?.getPinnedFingerprint()
+                    expectedPeerFingerprint = resolveExpectedPeerFingerprint()
                 ).also { tunnel = it }
                 val (_, outBytes) = tun.driveHandshake()
                 if (outBytes.isNotEmpty()) {
@@ -358,6 +431,7 @@ class RelayClient @JvmOverloads constructor(
                 }
                 if (done) {
                     SafeLog.i(TAG, "E2E TLS 1.3 inner tunnel established with peer [$source]")
+                    onTunnelEstablished?.invoke()
                 }
             }
 
@@ -397,10 +471,22 @@ class RelayClient @JvmOverloads constructor(
             }
         } catch (e: Exception) {
             SafeLog.e(TAG, "Failed handling incoming relay bytes: ${e.message}", e)
+            onTunnelFailed?.invoke(e.message ?: "E2E relay tunnel error")
+            if (e is SecurityException || e is javax.net.ssl.SSLException) {
+                disconnect()
+            }
         }
     }
 
     private fun handleDecryptedMessage(source: String, message: SnowMessage) {
+        if (message.type == MessageType.RESPONSE || message.type == MessageType.ERROR) {
+            val corrId = message.correlationId
+            val cb = if (!corrId.isNullOrBlank()) pendingRequests.remove(corrId) else null
+            if (cb != null) {
+                cb.invoke(message)
+                return
+            }
+        }
         val payloadMap = message.payload
         val action = payloadMap?.get("action") as? String
         @Suppress("UNCHECKED_CAST")
@@ -437,7 +523,7 @@ class RelayClient @JvmOverloads constructor(
     }
 
     private fun sendRelayFrame(ws: WebSocket, target: String, rawBytes: ByteArray) {
-        val payloadB64 = Base64.encodeToString(rawBytes, Base64.NO_WRAP)
+        val payloadB64 = Base64.getEncoder().encodeToString(rawBytes)
         val frame = JSONObject().apply {
             put("type", "relay_frame")
             put("target", target)

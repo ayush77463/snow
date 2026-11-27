@@ -242,7 +242,8 @@ class RelayTunnelClient:
         # Wait for handshake completion
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
-            return True
+            current = self._tunnels.get(target_id)
+            return bool(current and current.handshake_done)
         except asyncio.TimeoutError:
             logger.warning("E2E TLS 1.3 handshake with peer [%s] timed out.", target_id)
             self._tunnels.pop(target_id, None)
@@ -380,9 +381,16 @@ class RelayTunnelClient:
             except FingerprintMismatchError as fe:
                 logger.error("Fingerprint mismatch with peer [%s]: %s", source_id, fe)
                 self._tunnels.pop(source_id, None)
+                ev = self._handshake_events.get(source_id)
+                if ev:
+                    ev.set()
                 return
             except Exception as e:
                 logger.error("Error during inner TLS handshake with [%s]: %s", source_id, e)
+                self._tunnels.pop(source_id, None)
+                ev = self._handshake_events.get(source_id)
+                if ev:
+                    ev.set()
                 return
 
         # Decrypt any application data

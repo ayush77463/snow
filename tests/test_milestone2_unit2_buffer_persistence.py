@@ -373,11 +373,11 @@ class TestMilestone2Unit2ClipboardBufferV7(unittest.TestCase):
         # Run initialization twice (idempotent check)
         db1 = DatabaseManager(legacy_db_path)
         db2 = DatabaseManager(legacy_db_path)
-        self.assertEqual(SCHEMA_VERSION, 7)
+        self.assertEqual(SCHEMA_VERSION, 8)
 
         with db2._get_connection() as check_conn:
             ver = check_conn.execute("PRAGMA user_version;").fetchone()[0]
-            self.assertEqual(ver, 7)
+            self.assertEqual(ver, 8)
             cols = {row[1] for row in check_conn.execute("PRAGMA table_info(clipboard_buffer_items);").fetchall()}
             self.assertIn("event_id", cols)
             self.assertIn("seq", cols)
