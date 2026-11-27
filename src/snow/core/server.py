@@ -172,7 +172,12 @@ class SnowCoreServer:
             node_registry=self.node_registry,
         )
         self.peer_clients: dict[str, Any] = {}
-        self.usb_watcher = UsbWatcher(port=self.config.port)
+        self.usb_watcher = UsbWatcher(
+            port=self.config.port,
+            on_usb_attached=self._on_usb_attached,
+            on_usb_detached=self._on_usb_detached,
+        )
+        self.session_router.usb_status_provider = self._usb_status_for_device
         self.relay_client: Optional[Any] = None
         self.relay_enabled: bool = getattr(self.config, "relay_enabled", False)
         self.relay_url: str = getattr(self.config, "relay_url", "")
@@ -182,6 +187,57 @@ class SnowCoreServer:
         self.screen_stream_manager: Optional[Any] = None
         self._is_paused: bool = False
         self._paused_state: dict[str, Any] = {}
+
+    def _usb_status_for_device(self, device_id: str) -> dict[str, Any]:
+        """Lightweight in-memory USB status snapshot for SessionRouter candidate refresh."""
+        if not getattr(self, "usb_watcher", None):
+            return {"usb_ready": False}
+        snap = self.usb_watcher.get_status_snapshot()
+        return {
+            "usb_ready": bool(snap.get("usb_ready")),
+            "port": snap.get("port", self.config.port),
+            "transfer_port": snap.get("transfer_port", self.config.port + 1),
+            "forward_wss_port": snap.get("forward_wss_port", 8767),
+            "forward_media_port": snap.get("forward_media_port", 8769),
+            "configured_serials": snap.get("configured_serials", []),
+        }
+
+    async def _on_usb_attached(self, serial: str, snapshot: dict[str, Any]) -> None:
+        """Promote paired Android peers when an authorized ADB USB tunnel becomes active."""
+        try:
+            for dev in self.db_manager.list_paired_devices() or []:
+                dev_id = getattr(dev, "device_id", None)
+                if not dev_id:
+                    continue
+                self.session_router.register_discovered_route(
+                    dev_id,
+                    transport="usb",
+                    host="127.0.0.1",
+                    port=int(snapshot.get("forward_wss_port", 8767) or 8767),
+                    transfer_port=int(snapshot.get("forward_media_port", 8769) or 8769),
+                    direction="usb",
+                )
+        except Exception as exc:
+            logger.debug("USB attached handler error (%s): %s", serial, exc)
+
+    async def _on_usb_detached(self, serial: str) -> None:
+        """Demote active USB routes cleanly and trigger fallback when ADB disconnects."""
+        try:
+            for dev in self.db_manager.list_paired_devices() or []:
+                dev_id = getattr(dev, "device_id", None)
+                if not dev_id:
+                    continue
+                state = self.session_router.get_device_transport_state(dev_id)
+                if state.get("active_transport") == "usb":
+                    await self.session_router.handle_transport_loss(
+                        dev_id, "usb", f"USB device '{serial}' detached or unauthorized."
+                    )
+                else:
+                    self.session_router.mark_route_unavailable(
+                        dev_id, "usb", f"USB device '{serial}' detached."
+                    )
+        except Exception as exc:
+            logger.debug("USB detached handler error (%s): %s", serial, exc)
 
     def _ensure_screen_stream_manager(self):
         """Lazily initialize the PC WindowsScreenStreamManager without loading Pillow at startup."""
@@ -1915,6 +1971,9 @@ class SnowCoreServer:
             transfer_manager=self.transfer_manager,
             storage_manager=self.storage_manager,
             ssl_context=self.ws_server.ssl_context,
+            usb_ready_checker=lambda: bool(
+                getattr(self, "usb_watcher", None) and self.usb_watcher.get_status_snapshot().get("usb_ready")
+            ),
         )
         self.ws_server.http_transfer_server = self.http_transfer_server
         self.capability_engine.http_transfer_server = self.http_transfer_server

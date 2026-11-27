@@ -109,6 +109,7 @@ fun SnowApp(
     val connectedEndpoint by repository.connectedEndpoint.collectAsState()
     val revocationNotice by repository.revocationNotice.collectAsState()
     val savedDevices by repository.savedDevices.collectAsState()
+    val transportSnapshots by repository.transportSnapshots.collectAsState()
     val discoveredPeers by repository.discoveredPeers.collectAsState()
     val activeTransfer by repository.activeTransfer.collectAsState()
     val pendingApprovalsCount by repository.pendingApprovalsCount.collectAsState()
@@ -226,10 +227,10 @@ fun SnowApp(
 
     val transport = remember(connectedEndpoint) {
         val ep = connectedEndpoint ?: ""
-        if (ep.startsWith("127.0.0.1") || ep.startsWith("localhost")) "USB"
-        else if (ep.contains("relay") || ep.contains("tunnel") || ep.contains(":8770")) "Relay"
-        else if (ep.isNotBlank()) "Wi-Fi"
-        else "Auto"
+        when {
+            ep.isBlank() -> "Auto"
+            else -> org.snow.network.TransportClassifier.classifyRoute(host = ep).shortLabel
+        }
     }
 
     // Refresh files when navigating to Tools Files tab, or screen streams on Screen tab
@@ -563,6 +564,15 @@ fun SnowApp(
                             onResolveNetworkDecision = { merge ->
                                 repository.resolvePendingNetworkDecision(merge) { _, msg ->
                                     if (!msg.isNullOrBlank()) {
+                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            transportSnapshots = transportSnapshots,
+                            onSwitchDeviceTransport = { devId, mode ->
+                                scope.launch {
+                                    val (ok, msg) = repository.switchDeviceTransport(devId, mode)
+                                    if (!ok || msg.isNotBlank()) {
                                         Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                     }
                                 }

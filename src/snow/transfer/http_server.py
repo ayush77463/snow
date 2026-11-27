@@ -49,6 +49,8 @@ class SnowHttpTransferServer:
         storage_manager: TransferStorageManager,
         ssl_context: Optional[ssl.SSLContext] = None,
         cert_path: Optional[str | Path] = None,
+        usb_ready_checker: Optional[Any] = None,
+        max_relay_transfer_bytes: int = 100 * 1024 * 1024,
     ) -> None:
         self.config = config
         self.db_manager = db_manager
@@ -56,6 +58,8 @@ class SnowHttpTransferServer:
         self.storage_manager = storage_manager
         self.ssl_context = ssl_context
         self.cert_path = Path(cert_path) if cert_path else None
+        self.usb_ready_checker = usb_ready_checker
+        self.max_relay_transfer_bytes = int(max_relay_transfer_bytes)
 
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -69,6 +73,46 @@ class SnowHttpTransferServer:
             middlewares=[self._auth_middleware],
         )
         self._setup_routes()
+
+    def _resolve_request_route(
+        self,
+        request: web.Request,
+        hint: Optional[str] = None,
+    ) -> tuple[str, str, str]:
+        """Classify the actual socket carrying this HTTP transfer request."""
+        from snow.network.transport import classify_transfer_socket_route
+
+        peer_ip = ""
+        try:
+            if getattr(request, "transport", None) is not None:
+                pn = request.transport.get_extra_info("peername")
+                if isinstance(pn, (tuple, list)) and pn:
+                    peer_ip = str(pn[0])
+        except Exception:
+            peer_ip = ""
+        if not peer_ip:
+            peer_ip = str(getattr(request, "remote", "") or "")
+
+        usb_verified = False
+        if callable(self.usb_ready_checker):
+            try:
+                usb_verified = bool(self.usb_ready_checker())
+            except Exception:
+                usb_verified = False
+
+        iface_hint = request.headers.get("X-Snow-Interface-Name")
+        is_hotspot_hdr = request.headers.get("X-Snow-Is-Hotspot", "").strip().lower() in ("1", "true", "yes")
+        is_relay_hdr = request.headers.get("X-Snow-Relay", "").strip().lower() in ("1", "true", "yes")
+        ttype, badge = classify_transfer_socket_route(
+            host=request.headers.get("Host"),
+            peer_ip=peer_ip,
+            usb_mapping_verified=usb_verified,
+            transport_hint=hint or request.headers.get("X-Snow-Transport-Hint"),
+            interface_name=iface_hint,
+            is_hotspot=is_hotspot_hdr,
+            is_relay=is_relay_hdr,
+        )
+        return ttype.value, badge, peer_ip
 
     @property
     def is_running(self) -> bool:
@@ -234,6 +278,20 @@ class SnowHttpTransferServer:
             )
 
         device_id = request["device_id"]
+        route_type, route_badge, peer_ip = self._resolve_request_route(request, data.get("transport"))
+
+        if route_type == "remote_relay" and parsed_size > self.max_relay_transfer_bytes:
+            mib = max(1, self.max_relay_transfer_bytes // (1024 * 1024))
+            return web.json_response(
+                {
+                    "error": f"Transfer size ({parsed_size} bytes) exceeds the {mib} MiB Remote Relay quota. Connect via USB, Hotspot, or Wi-Fi LAN for Zero-Data multi-GB transfers.",
+                    "status": "RELAY_QUOTA_EXCEEDED",
+                    "transport": route_type,
+                    "transport_badge": route_badge,
+                    "max_relay_bytes": self.max_relay_transfer_bytes,
+                },
+                status=413,
+            )
 
         if direction == TransferDirection.UPLOAD and hasattr(self.storage_manager, "check_free_space"):
             try:
@@ -253,6 +311,10 @@ class SnowHttpTransferServer:
                 file_size=parsed_size,
                 sha256=sha256,
                 direction=direction,
+                transport=route_type,
+                transport_badge=route_badge,
+                pinned_host=peer_ip,
+                pinned_port=self._bound_port or 0,
             )
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
@@ -272,6 +334,10 @@ class SnowHttpTransferServer:
             "direction": record.direction.value,
             "resume_offset": resume_offset,
             "status": record.status.value,
+            "transport": record.transport,
+            "transport_badge": record.transport_badge,
+            "route_badge": record.transport_badge,
+            "pinned_host": record.pinned_host,
         })
 
     async def handle_list_transfers(self, request: web.Request) -> web.Response:
@@ -327,6 +393,10 @@ class SnowHttpTransferServer:
             "file_size": record.file_size,
             "status": record.status.value,
             "error_message": record.error_message,
+            "transport": record.transport,
+            "transport_badge": record.transport_badge,
+            "route_badge": record.transport_badge,
+            "pinned_host": record.pinned_host,
         })
 
     async def handle_upload(self, request: web.Request) -> web.Response:
@@ -340,6 +410,15 @@ class SnowHttpTransferServer:
 
         if record.device_id != device_id:
             return web.json_response({"error": "Forbidden: transfer not owned by device."}, status=403)
+
+        route_type, route_badge, peer_ip = self._resolve_request_route(request)
+        self.transfer_manager.set_route_metadata(
+            transfer_id,
+            route_type,
+            route_badge,
+            pinned_host=peer_ip,
+            pinned_port=self._bound_port or 0,
+        )
 
         if record.direction != TransferDirection.UPLOAD:
             return web.json_response(
@@ -578,6 +657,15 @@ class SnowHttpTransferServer:
             except Exception as exc:
                 return web.json_response({"error": str(exc)}, status=400)
 
+        route_type, route_badge, peer_ip = self._resolve_request_route(request)
+        self.transfer_manager.set_route_metadata(
+            transfer_id,
+            route_type,
+            route_badge,
+            pinned_host=peer_ip,
+            pinned_port=self._bound_port or 0,
+        )
+
         if not file_path.exists() or not file_path.is_file():
             return web.json_response({"error": "File does not exist on server storage."}, status=404)
 
@@ -614,6 +702,8 @@ class SnowHttpTransferServer:
             "Content-Length": str(content_length),
             "Accept-Ranges": "bytes",
             "X-Snow-SHA256": record.sha256,
+            "X-Snow-Transport-Route": str(record.transport),
+            "X-Snow-Transport-Badge": str(record.transport_badge).replace("•", "-").encode("latin-1", "replace").decode("latin-1"),
             "Content-Disposition": f'attachment; filename="{record.file_name}"',
         }
         if is_range:

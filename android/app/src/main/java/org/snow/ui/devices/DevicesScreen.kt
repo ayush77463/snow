@@ -46,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
@@ -117,6 +118,8 @@ fun DevicesScreen(
     myNetworkId: String? = null,
     pendingNetworkDecision: org.snow.ui.PendingNetworkDecision? = null,
     onResolveNetworkDecision: (merge: Boolean) -> Unit = {},
+    transportSnapshots: Map<String, org.snow.network.DeviceTransportSnapshot> = emptyMap(),
+    onSwitchDeviceTransport: (deviceId: String, mode: String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
@@ -260,10 +263,12 @@ fun DevicesScreen(
                     device = dev,
                     isActive = isActive,
                     isBusy = isConnectionBusy,
+                    transportSnapshot = transportSnapshots[dev.deviceId],
                     onConnect = { onConnectDevice(dev) },
                     onDisconnect = onDisconnectDevice,
                     onUnpair = { onUnpairDevice(dev) },
-                    onUpdateTier = { profile -> onUpdatePermissionProfile(dev.deviceId, profile) }
+                    onUpdateTier = { profile -> onUpdatePermissionProfile(dev.deviceId, profile) },
+                    onSelectTransport = { mode -> onSwitchDeviceTransport(dev.deviceId, mode) }
                 )
             }
         }
@@ -478,18 +483,29 @@ private fun DeviceListItem(
     device: SavedDevice,
     isActive: Boolean,
     isBusy: Boolean = false,
+    transportSnapshot: org.snow.network.DeviceTransportSnapshot? = null,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onUnpair: () -> Unit,
-    onUpdateTier: (String) -> Unit
+    onUpdateTier: (String) -> Unit,
+    onSelectTransport: (String) -> Unit = {}
 ) {
     val colors = LocalSnowColors.current
     val isPhone = device.isPhone
-    val transportLabel = when {
+    val transportLabel = transportSnapshot?.activeBadge ?: when {
         isPhone -> "Direct Peer"
-        device.host == "127.0.0.1" || device.host == "localhost" -> "USB • Zero Data"
-        device.host.contains("relay") || device.host.contains("tunnel") || device.connectionMode == "remote_only" -> "Remote • Uses Data"
-        else -> "Wi-Fi • Zero Data"
+        else -> when (
+            org.snow.network.TransportClassifier.classifyRoute(
+                transport = transportSnapshot?.activeRoute?.wireName,
+                host = device.host,
+                mode = device.connectionMode
+            )
+        ) {
+            org.snow.network.TransportRoute.USB -> "USB • Zero Data"
+            org.snow.network.TransportRoute.HOTSPOT -> "Hotspot • Zero Data"
+            org.snow.network.TransportRoute.WIFI_LAN -> "Wi-Fi • Zero Data"
+            org.snow.network.TransportRoute.REMOTE_RELAY -> "Remote • Uses Data"
+        }
     }
 
     SnowCard(
@@ -587,6 +603,42 @@ private fun DeviceListItem(
                         onClick = { onUpdateTier("not_allowed") }
                     )
                 }
+
+                // Transport Route Controls: Auto (Best) vs Verified Manual Single-Route Overrides
+                val currentModeWire = transportSnapshot?.mode?.wireName ?: device.connectionMode.ifBlank { "auto" }
+                val routeMap = transportSnapshot?.routes?.associateBy { it.route } ?: emptyMap()
+                val routeChoices = listOf(
+                    Triple("auto", "Auto", true),
+                    Triple("usb", "USB", routeMap[org.snow.network.TransportRoute.USB]?.verified == true || (isActive && device.host == "127.0.0.1")),
+                    Triple("hotspot", "Hotspot", routeMap[org.snow.network.TransportRoute.HOTSPOT]?.verified == true || (isActive && org.snow.network.TransportClassifier.isHotspotHostOrHint(device.host))),
+                    Triple("wifi_lan", "Wi-Fi", routeMap[org.snow.network.TransportRoute.WIFI_LAN]?.verified == true || (isActive && !org.snow.network.TransportClassifier.isHotspotHostOrHint(device.host) && device.host != "127.0.0.1" && !device.host.contains("relay"))),
+                    Triple("remote_relay", "Remote", routeMap[org.snow.network.TransportRoute.REMOTE_RELAY]?.verified == true || device.connectionMode == "remote_only" || device.connectionMode == "remote_relay")
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    routeChoices.forEach { (key, label, isVerified) ->
+                        val isSwitching = transportSnapshot?.switching == true
+                        TrustTierPill(
+                            label = if (isSwitching && currentModeWire == key) "..." else label,
+                            selected = currentModeWire.equals(key, ignoreCase = true),
+                            enabled = (key == "auto" || isVerified) && !isSwitching,
+                            onClick = { onSelectTransport(key) }
+                        )
+                    }
+                }
+                transportSnapshot?.lastSwitchReason?.takeIf { it.isNotBlank() }?.let { reason ->
+                    Text(
+                        text = reason,
+                        style = SnowTypography.bodySmall.copy(fontSize = 10.sp),
+                        color = colors.textMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -646,14 +698,16 @@ private fun DeviceListItem(
 private fun TrustTierPill(
     label: String,
     selected: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     val colors = LocalSnowColors.current
     Surface(
         modifier = Modifier
+            .alpha(if (enabled) 1f else 0.42f)
             .clip(RoundedCornerShape(9999.dp))
             .border(1.dp, if (selected) colors.accentCyan else colors.borderSubtle, RoundedCornerShape(9999.dp))
-            .clickable(onClick = onClick),
+            .clickable(enabled = enabled, onClick = onClick),
         color = if (selected) (if (colors.isDark) Color(0xFF1E3A8A) else Color(0xFFEFF6FF)) else Color.Transparent
     ) {
         Text(

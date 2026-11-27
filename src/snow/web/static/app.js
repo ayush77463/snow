@@ -257,10 +257,12 @@
     function resolveTransportLabel(dev) {
         if (!dev) return "Offline";
         if (isLocalNode(dev)) return "Host";
-        const t = String(dev.transport || "").toLowerCase();
-        const ep = String(dev.endpoint || "");
-        if (t === "usb" || ep.includes("127.0.0.1")) return "USB";
-        if (t === "relay" || ep.includes("/v1/tunnel")) return "Remote";
+        const t = String(dev.active_transport || dev.transport || "").toLowerCase();
+        const badge = String(dev.transport_badge || "").toLowerCase();
+        const ep = String(dev.remote_address || dev.host || dev.endpoint || "").toLowerCase();
+        if (t.includes("usb") || badge.startsWith("usb") || ep.includes("127.0.0.1")) return "USB";
+        if (t.includes("hotspot") || badge.startsWith("hotspot") || ep.startsWith("192.168.43.") || ep.startsWith("192.168.49.") || ep.startsWith("192.168.137.") || ep.startsWith("172.20.10.")) return "Hotspot";
+        if (t.includes("relay") || t.includes("remote") || badge.startsWith("remote") || ep.includes("/v1/tunnel")) return "Remote";
         if (t === "peer") return "Direct Peer";
         return "Wi-Fi";
     }
@@ -2386,13 +2388,38 @@
             const isConn = Boolean(dev.is_connected);
             const isSelected = dev.device_id === activeDeviceId;
             const transport = isConn ? resolveTransportLabel(dev) : "Offline";
-            const connMode = dev.connection_mode || "auto";
+            const tState = dev.transport_state || null;
+            const effMode = dev.effective_mode || tState?.mode || dev.connection_mode || "auto";
+            const activeBadge = isConn ? (tState?.active_badge || dev.transport_badge || getTransferRouteBadgeInfo(dev).text) : "Disconnected";
             const permProf = dev.permission_profile || "full_control";
             const isExternalNet = String(dev.relationship || "member").toLowerCase() === "external_network";
             const batVal = dev.telemetry?.battery_level ?? dev.battery?.level ?? dev.battery_level;
             const iconSvg = isAndroidDevice(dev)
                 ? `<svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="20" rx="2" ry="2" width="14" x="5" y="2"></rect><line x1="12" x2="12.01" y1="18" y2="18"></line></svg>`
                 : `<svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><rect height="12" rx="2" width="20" x="2" y="4"></rect><line x1="2" x2="22" y1="20" y2="20"></line></svg>`;
+
+            const routeOptions = [
+                { key: "auto", label: "Auto (Best)", verified: true, active: effMode === "auto", reason: null },
+                ...["usb", "hotspot", "wifi_lan", "remote_relay"].map(rk => {
+                    const entry = (tState?.routes || []).find(r => r.transport === rk);
+                    const labelMap = { usb: "USB", hotspot: "Hotspot", wifi_lan: "Wi-Fi", remote_relay: "Remote" };
+                    const fallbackVerified = (rk === "usb" && transport === "USB") || (rk === "hotspot" && transport === "Hotspot") || (rk === "wifi_lan" && transport === "Wi-Fi") || (rk === "remote_relay" && transport === "Remote");
+                    return {
+                        key: rk,
+                        label: labelMap[rk] || rk,
+                        verified: entry ? Boolean(entry.verified) : fallbackVerified,
+                        active: effMode === rk || (effMode === "auto" && entry?.active),
+                        reason: entry?.last_failure_reason || null,
+                    };
+                }),
+            ];
+
+            const routePillsHtml = routeOptions.map(opt => {
+                const isPinnedMode = effMode === opt.key;
+                const disabledAttr = (!opt.verified && opt.key !== "auto") ? `disabled title="${escapeHtml(opt.reason || `${opt.label} not verified`)}"` : "";
+                const cls = isPinnedMode ? "btn-primary" : (opt.active ? "btn-tonal" : "btn-ghost");
+                return `<button type="button" class="btn btn-xs ${cls} dev-route-pill" data-route="${opt.key}" ${disabledAttr}>${opt.label}</button>`;
+            }).join("");
 
             const card = document.createElement("div");
             card.className = "device-card";
@@ -2402,16 +2429,21 @@
                         <div class="island-icon-box">${iconSvg}</div>
                         <div class="flex flex-col min-w-0">
                             <span class="text-sm font-bold text-primary truncate">${escapeHtml(dev.device_name || "Device")}</span>
-                            <span class="text-xs text-muted">${isConn ? `Connected • ${transport}` : "Disconnected"}${batVal != null ? ` • ${batVal}%` : ""} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}${isExternalNet ? " • External Network" : ""}</span>
+                            <span class="text-xs text-muted">${isConn ? `Connected • ${escapeHtml(activeBadge)}` : "Disconnected"}${batVal != null ? ` • ${batVal}%` : ""} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}${isExternalNet ? " • External Network" : ""}</span>
                         </div>
                     </div>
                     <div class="flex items-center gap-1">
+                        ${tState?.switching ? `<span class="chip chip-sm chip-amber">Switching…</span>` : ""}
                         ${isExternalNet ? `<span class="chip chip-sm chip-amber">External</span>` : ""}
-                        <span class="chip ${isConn ? "chip-cyan" : "chip-amber"}">${transport}</span>
+                        <span class="chip ${isConn ? (transport === "Remote" ? "chip-amber" : "chip-cyan") : "chip-amber"}">${escapeHtml(transport)}</span>
                     </div>
                 </div>
 
-                <div class="flex items-center justify-between gap-2 flex-wrap">
+                <div class="flex items-center gap-1 flex-wrap mt-2">
+                    ${routePillsHtml}
+                </div>
+
+                <div class="flex items-center justify-between gap-2 flex-wrap mt-2">
                     <div class="flex items-center gap-2">
                         <select class="form-input text-xs dev-profile-select" style="width: auto; padding: 5px 8px;" title="Permission Profile">
                             <option value="full_control" ${permProf === "full_control" ? "selected" : ""}>Full Control</option>
@@ -2420,10 +2452,14 @@
                             <option value="clipboard_only" ${permProf === "clipboard_only" ? "selected" : ""}>Clipboard Only</option>
                             <option value="not_allowed" ${permProf === "not_allowed" ? "selected" : ""}>Not Allowed</option>
                         </select>
-                        <select class="form-input text-xs dev-connmode-select" style="width: auto; padding: 5px 8px;" title="Connection Mode">
-                            <option value="auto" ${connMode === "auto" ? "selected" : ""}>Auto</option>
-                            <option value="local_only" ${connMode === "local_only" ? "selected" : ""}>Local Only</option>
-                            <option value="remote_only" ${connMode === "remote_only" ? "selected" : ""}>Remote Only</option>
+                        <select class="form-input text-xs dev-connmode-select" style="width: auto; padding: 5px 8px;" title="Transport Policy">
+                            <option value="auto" ${effMode === "auto" ? "selected" : ""}>Auto (Best)</option>
+                            <option value="usb" ${effMode === "usb" ? "selected" : ""} ${routeOptions.find(o => o.key === "usb")?.verified ? "" : "disabled"}>USB Only</option>
+                            <option value="hotspot" ${effMode === "hotspot" ? "selected" : ""} ${routeOptions.find(o => o.key === "hotspot")?.verified ? "" : "disabled"}>Hotspot Only</option>
+                            <option value="wifi_lan" ${effMode === "wifi_lan" ? "selected" : ""} ${routeOptions.find(o => o.key === "wifi_lan")?.verified ? "" : "disabled"}>Wi-Fi Only</option>
+                            <option value="remote_relay" ${effMode === "remote_relay" ? "selected" : ""} ${routeOptions.find(o => o.key === "remote_relay")?.verified ? "" : "disabled"}>Remote Only</option>
+                            <option value="local_only" ${effMode === "local_only" ? "selected" : ""}>Local Only (Policy)</option>
+                            <option value="remote_only" ${effMode === "remote_only" ? "selected" : ""}>Remote Policy</option>
                         </select>
                     </div>
                     <div class="flex items-center gap-2">
@@ -2436,6 +2472,23 @@
                 </div>
             `;
 
+            const applyTransportSwitch = async (targetMode) => {
+                card.querySelectorAll(".dev-route-pill").forEach(b => { b.disabled = true; });
+                const selectEl = card.querySelector(".dev-connmode-select");
+                if (selectEl) selectEl.disabled = true;
+                const res = await apiRequest("/api/devices/transport", "POST", { device_id: dev.device_id, mode: targetMode });
+                if (res && res.success) {
+                    showNotificationToast(`Switched transport for ${dev.device_name || "device"} to ${res.data?.active_transport || targetMode}.`, "success");
+                } else {
+                    showNotificationToast(res?.error || `Cannot switch to ${targetMode}: route not verified.`, "error");
+                }
+                refreshAllData();
+            };
+
+            card.querySelectorAll(".dev-route-pill").forEach(btn => {
+                btn.onclick = () => applyTransportSwitch(btn.dataset.route);
+            });
+
             card.querySelector(".dev-profile-select").onchange = async (e) => {
                 const res = await apiRequest("/api/devices/permission-profile", "POST", { device_id: dev.device_id, profile: e.target.value });
                 if (res && res.success) showNotificationToast(`Updated profile for ${dev.device_name || "device"}.`, "success");
@@ -2443,9 +2496,7 @@
             };
 
             card.querySelector(".dev-connmode-select").onchange = async (e) => {
-                const res = await apiRequest("/api/devices/connection-mode", "POST", { device_id: dev.device_id, connection_mode: e.target.value });
-                if (res && res.success) showNotificationToast(`Updated connection mode for ${dev.device_name || "device"}.`, "success");
-                else showNotificationToast(res?.error || "Failed updating connection mode", "error");
+                await applyTransportSwitch(e.target.value);
             };
 
             card.querySelector(".btn-dev-select").onclick = () => {
@@ -2932,11 +2983,21 @@
 
     function getTransferRouteBadgeInfo(devObj) {
         if (!devObj) return { text: "Wi-Fi • Zero Data", cls: "chip chip-sm chip-cyan" };
+        const explicitBadge = String(devObj.transport_badge || "").trim();
+        if (explicitBadge) {
+            const low = explicitBadge.toLowerCase();
+            if (low.includes("usb") || low.includes("hotspot")) return { text: explicitBadge, cls: "chip chip-sm chip-emerald" };
+            if (low.includes("remote")) return { text: explicitBadge, cls: "chip chip-sm chip-amber" };
+            return { text: explicitBadge, cls: "chip chip-sm chip-cyan" };
+        }
         const raw = String(
             devObj.active_transport || devObj.transport || devObj.connection_mode || devObj.remote_address || ""
         ).toLowerCase();
         if (raw.includes("usb") || raw.includes("adb") || raw.includes("127.0.0.1")) {
             return { text: "USB • Zero Data", cls: "chip chip-sm chip-emerald" };
+        }
+        if (raw.includes("hotspot") || raw.startsWith("192.168.43.") || raw.startsWith("192.168.49.") || raw.startsWith("192.168.137.") || raw.startsWith("172.20.10.")) {
+            return { text: "Hotspot • Zero Data", cls: "chip chip-sm chip-emerald" };
         }
         if (raw.includes("relay") || raw.includes("remote") || raw.includes("tunnel")) {
             return { text: "Remote • Uses Data", cls: "chip chip-sm chip-amber" };

@@ -115,7 +115,13 @@ class SnowForegroundService : Service() {
             tokenStorage = tokenStorage,
             useTls = true,
             targetDeviceIdProvider = { client.activeTargetDeviceId() }
-        )
+        ).apply {
+            transportOrchestrator = this@SnowForegroundService.transportOrchestrator
+            usbMappingVerifiedProvider = {
+                org.snow.network.TransportClassifier.isLoopbackHost(client.currentTargetHost) &&
+                    client.connectionState.value == ConnectionState.CONNECTED
+            }
+        }
     }
 
     val capabilityDispatcher: AndroidCapabilityDispatcher by lazy {
@@ -141,6 +147,9 @@ class SnowForegroundService : Service() {
     }
 
     var relayClient: org.snow.network.RelayClient? = null
+    val transportOrchestrator: org.snow.network.TransportOrchestrator by lazy {
+        org.snow.network.TransportOrchestrator()
+    }
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile internal var userDisconnected = false
     private var autoConnectJob: Job? = null
@@ -211,6 +220,21 @@ class SnowForegroundService : Service() {
             !effectiveEndpoint.contains("127.0.0.1") &&
             !effectiveEndpoint.contains("localhost")
         val isClientMode = (deviceId < targetPeerId)
+        val localKeyManagers: Array<javax.net.ssl.KeyManager>? = try {
+            org.snow.security.AndroidSelfSignedCertGenerator.loadOrCreate(
+                org.snow.security.EncryptedFilePeerHostCertStorage(applicationContext)
+            ).keyManagers
+        } catch (e: Exception) {
+            if (!isClientMode) {
+                SafeLog.e("SnowForegroundService", "Refusing startRelay server role without valid TLS keyManagers: ${e.message}")
+                return
+            }
+            null
+        }
+        if (!isClientMode && (localKeyManagers == null || localKeyManagers.isEmpty())) {
+            SafeLog.e("SnowForegroundService", "Refusing startRelay server role: keyManagers empty.")
+            return
+        }
 
         relayClient = org.snow.network.RelayClient(
             relayUrl = effectiveEndpoint,
@@ -226,6 +250,7 @@ class SnowForegroundService : Service() {
             networkId = savedNetId,
             usePublicCaForOuterRelay = usePublicCaOuter
         ).apply {
+            keyManagers = localKeyManagers
             requestDispatcher = { action, data ->
                 capabilityDispatcher.dispatch(
                     action = action,
@@ -693,6 +718,11 @@ class SnowForegroundService : Service() {
     internal suspend fun tryPromoteUsbIfReachable(force: Boolean = false): Boolean {
         val isConn = client.connectionState.value == ConnectionState.CONNECTED
         val isAuth = client.authState.value is AuthState.Authenticated
+        val devKey = client.activeTargetDeviceId() ?: (client.authState.value as? AuthState.Authenticated)?.peerDeviceId ?: ""
+        if (devKey.isNotBlank() && transportOrchestrator.hasActivePinnedTransfer(devKey)) {
+            SafeLog.i("SnowForegroundService", "Skipping background USB promotion: large transfer pinned for [$devKey].")
+            return false
+        }
         val nowMs = clockMsProvider()
         val effectiveLastAttempt = if (force) Long.MIN_VALUE / 2 else lastUsbProbeAttemptMs
         if (!shouldProbeUsbPromotion(
@@ -708,10 +738,17 @@ class SnowForegroundService : Service() {
             return false
         }
         lastUsbProbeAttemptMs = nowMs
+        if (devKey.isNotBlank()) {
+            transportOrchestrator.registerDiscovered(devKey, org.snow.network.TransportRoute.USB, "127.0.0.1", Constants.DEFAULT_PORT)
+            transportOrchestrator.markProbing(devKey, org.snow.network.TransportRoute.USB)
+        }
         if (!usbReachableProbe()) {
+            if (devKey.isNotBlank()) {
+                transportOrchestrator.markUnavailable(devKey, org.snow.network.TransportRoute.USB, "USB loopback tunnel unreachable.")
+            }
             return false
         }
-        // Preserve active Wi-Fi host before switching socket target to USB 127.0.0.1
+        // Preserve active Wi-Fi/Hotspot host before Make-Before-Break cutover to USB 127.0.0.1
         val currentHost = client.currentTargetHost.trim()
         val currentPort = client.currentTargetPort
         if (currentHost.isNotBlank() && !isLoopbackHost(currentHost) && !DiscoveryManager.isRelayEndpoint(currentHost)) {
@@ -721,8 +758,36 @@ class SnowForegroundService : Service() {
                 .putInt(PREF_LAST_WIFI_PORT, currentPort)
                 .apply()
         }
-        SafeLog.i("SnowForegroundService", "USB reverse tunnel detected on 127.0.0.1:${Constants.DEFAULT_PORT}; promoting active session...")
-        return client.updateTargetEndpoint("127.0.0.1", Constants.DEFAULT_PORT, client.activeTargetDeviceId())
+        SafeLog.i("SnowForegroundService", "USB reverse tunnel detected on 127.0.0.1:${Constants.DEFAULT_PORT}; probing Make-Before-Break promotion...")
+        if (devKey.isNotBlank()) {
+            transportOrchestrator.setSwitching(devKey, true, "Probing USB • Zero Data")
+        }
+        val promo = client.probeAndPromoteEndpoint(
+            newHost = "127.0.0.1",
+            newPort = Constants.DEFAULT_PORT,
+            targetDeviceId = client.activeTargetDeviceId(),
+            timeoutMs = 2_500L,
+            verifyPing = true
+        )
+        if (devKey.isNotBlank()) {
+            if (promo.promoted) {
+                transportOrchestrator.markVerified(
+                    deviceId = devKey,
+                    route = org.snow.network.TransportRoute.USB,
+                    host = "127.0.0.1",
+                    port = Constants.DEFAULT_PORT,
+                    isActive = true
+                )
+            } else {
+                transportOrchestrator.markUnavailable(
+                    deviceId = devKey,
+                    route = org.snow.network.TransportRoute.USB,
+                    reason = promo.error ?: "USB standby verification failed."
+                )
+            }
+            transportOrchestrator.setSwitching(devKey, false)
+        }
+        return promo.promoted
     }
 
     private fun startUsbPromotionLoop() {
@@ -750,16 +815,45 @@ class SnowForegroundService : Service() {
                         wasLoopbackConnected = true
                     } else if (state == ConnectionState.DISCONNECTED && wasLoopbackConnected && !userDisconnected) {
                         wasLoopbackConnected = false
-                        if (getTargetConnectionMode() != "remote_only") {
+                        val devKey = client.activeTargetDeviceId() ?: ""
+                        if (devKey.isNotBlank()) {
+                            transportOrchestrator.handleTransportLoss(
+                                deviceId = devKey,
+                                lostRoute = org.snow.network.TransportRoute.USB,
+                                reason = "USB cable or ADB tunnel disconnected."
+                            )
+                        }
+                        val effMode = org.snow.network.TransportMode.normalize(getTargetConnectionMode())
+                            ?: org.snow.network.TransportMode.AUTO
+                        if (effMode == org.snow.network.TransportMode.USB) {
+                            SafeLog.w("SnowForegroundService", "USB disconnected while pinned to manual USB mode; failing closed.")
+                            updateNotification("Manual USB route unavailable")
+                        } else if (effMode != org.snow.network.TransportMode.REMOTE_ONLY &&
+                            effMode != org.snow.network.TransportMode.REMOTE_RELAY
+                        ) {
                             val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
-                            val fallback = resolveUsbFallbackTarget(
+                            val discCandidate = discoveryManager.getCandidateForPairedDesktop()
+                            val savedPair = resolveUsbFallbackTarget(
                                 lastWifiHost = prefs.getString(PREF_LAST_WIFI_HOST, null),
                                 lastWifiPort = prefs.getInt(PREF_LAST_WIFI_PORT, Constants.DEFAULT_PORT),
                                 savedHost = prefs.getString(PREF_SAVED_HOST, null),
                                 savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
                             )
-                            if (fallback != null) {
-                                SafeLog.i("SnowForegroundService", "USB disconnected; falling back smoothly to Wi-Fi ${fallback.first}:${fallback.second}.")
+                            val fallback = when {
+                                discCandidate != null && org.snow.network.TransportClassifier.isHotspotHostOrHint(discCandidate.ipAddress) ->
+                                    discCandidate.ipAddress to discCandidate.port
+                                savedPair != null && org.snow.network.TransportClassifier.isHotspotHostOrHint(savedPair.first) ->
+                                    savedPair
+                                discCandidate != null -> discCandidate.ipAddress to discCandidate.port
+                                else -> savedPair
+                            }
+                            if (fallback != null && (
+                                    !effMode.isSingleRouteOverride() ||
+                                        effMode.targetRouteOrNull() == org.snow.network.TransportClassifier.classifyRoute(host = fallback.first)
+                                    )
+                            ) {
+                                val fbBadge = org.snow.network.TransportClassifier.classifyTransportBadge(host = fallback.first)
+                                SafeLog.i("SnowForegroundService", "USB disconnected; failing over to $fbBadge (${fallback.first}:${fallback.second}).")
                                 prefs.edit()
                                     .putString(PREF_SAVED_HOST, fallback.first)
                                     .putInt(PREF_SAVED_PORT, fallback.second)
@@ -768,6 +862,10 @@ class SnowForegroundService : Service() {
                             } else {
                                 executeAutoConnectCascade()
                             }
+                        } else if (effMode == org.snow.network.TransportMode.REMOTE_ONLY ||
+                            effMode == org.snow.network.TransportMode.REMOTE_RELAY
+                        ) {
+                            executeAutoConnectCascade()
                         }
                     }
                 }
@@ -777,31 +875,68 @@ class SnowForegroundService : Service() {
 
     fun promoteLocalRouteFromDiscoveryIfAvailable(): Boolean {
         if (userDisconnected) return false
-        if (getTargetConnectionMode() == "remote_only") return false
+        val effMode = org.snow.network.TransportMode.normalize(getTargetConnectionMode())
+            ?: org.snow.network.TransportMode.AUTO
+        if (effMode == org.snow.network.TransportMode.REMOTE_ONLY ||
+            effMode == org.snow.network.TransportMode.REMOTE_RELAY
+        ) {
+            return false
+        }
+        val devKey = client.activeTargetDeviceId() ?: ""
+        if (devKey.isNotBlank() && transportOrchestrator.hasActivePinnedTransfer(devKey)) {
+            return false
+        }
         val currentHost = client.currentTargetHost.trim().lowercase()
         if (isLoopbackHost(currentHost)) {
             return false
         }
-        // Kick off immediate USB loopback check alongside LAN discovery promotion
-        serviceScope.launch {
-            tryPromoteUsbIfReachable(force = true)
+        // Kick off immediate USB loopback check alongside LAN/Hotspot discovery promotion
+        if (effMode == org.snow.network.TransportMode.AUTO ||
+            effMode == org.snow.network.TransportMode.LOCAL_ONLY ||
+            effMode == org.snow.network.TransportMode.USB
+        ) {
+            serviceScope.launch {
+                tryPromoteUsbIfReachable(force = true)
+            }
         }
         val candidate = discoveryManager.getCandidateForPairedDesktop() ?: return false
+        val candRoute = org.snow.network.TransportClassifier.classifyRoute(host = candidate.ipAddress)
+        if (effMode.isSingleRouteOverride() && effMode.targetRouteOrNull() != candRoute) {
+            return false
+        }
+        val curRoute = org.snow.network.TransportClassifier.classifyRoute(host = client.currentTargetHost)
         val isLocalAuth = client.connectionState.value == ConnectionState.CONNECTED &&
             client.authState.value is AuthState.Authenticated &&
             !DiscoveryManager.isRelayEndpoint(client.currentTargetHost) &&
-            client.currentTargetHost == candidate.ipAddress &&
-            client.currentTargetPort == candidate.port
+            (curRoute.priority < candRoute.priority ||
+                (client.currentTargetHost == candidate.ipAddress && client.currentTargetPort == candidate.port))
         if (isLocalAuth) {
             return false
         }
-        // Keep relay alive until the promoted local route completes authentication.
-        if (client.connectionState.value == ConnectionState.DISCONNECTED ||
-            DiscoveryManager.isRelayEndpoint(client.currentTargetHost)
+        val orchId = devKey.ifBlank { candidate.deviceId }
+        transportOrchestrator.registerDiscovered(orchId, candRoute, candidate.ipAddress, candidate.port, candidate.transferPort)
+        // Make-Before-Break: when already connected (e.g. Relay or lower-priority Wi-Fi), probe standby socket first!
+        if (client.connectionState.value == ConnectionState.CONNECTED &&
+            client.authState.value is AuthState.Authenticated
         ) {
-            client.connect(candidate.ipAddress, candidate.port)
+            serviceScope.launch {
+                transportOrchestrator.setSwitching(orchId, true, "Probing ${candRoute.badge}")
+                val res = client.probeAndPromoteEndpoint(
+                    newHost = candidate.ipAddress,
+                    newPort = candidate.port,
+                    targetDeviceId = candidate.deviceId,
+                    timeoutMs = 2_500L,
+                    verifyPing = true
+                )
+                if (res.promoted) {
+                    transportOrchestrator.markVerified(orchId, candRoute, candidate.ipAddress, candidate.port, isActive = true)
+                } else {
+                    transportOrchestrator.markUnavailable(orchId, candRoute, res.error ?: "Standby verification failed.")
+                }
+                transportOrchestrator.setSwitching(orchId, false)
+            }
         } else {
-            client.updateTargetEndpoint(candidate.ipAddress, candidate.port)
+            client.connect(candidate.ipAddress, candidate.port, candidate.deviceId)
         }
         return true
     }
@@ -829,6 +964,7 @@ class SnowForegroundService : Service() {
                 if (auth is AuthState.Authenticated) {
                     val host = client.currentTargetHost
                     val port = client.currentTargetPort
+                    val devKey = auth.peerDeviceId?.takeIf { it.isNotBlank() } ?: client.activeTargetDeviceId() ?: ""
                     if (host.isNotBlank()) {
                         val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
                         val editor = prefs.edit()
@@ -841,6 +977,16 @@ class SnowForegroundService : Service() {
                             }
                         }
                         editor.apply()
+                        if (devKey.isNotBlank()) {
+                            val activeRoute = org.snow.network.TransportClassifier.classifyRoute(host = host)
+                            transportOrchestrator.markVerified(
+                                deviceId = devKey,
+                                route = activeRoute,
+                                host = host,
+                                port = port,
+                                isActive = true
+                            )
+                        }
                     }
                     startUsbPromotionLoop()
                 }
@@ -905,64 +1051,106 @@ class SnowForegroundService : Service() {
                 return@launch
             }
 
-            if (client.connectionState.value == ConnectionState.CONNECTED) {
+            if (client.connectionState.value == ConnectionState.CONNECTED &&
+                client.authState.value is AuthState.Authenticated
+            ) {
                 return@launch
             }
 
-            // Step 1: USB Loopback (127.0.0.1:8765)
-            SafeLog.i("SnowForegroundService", "AutoConnect Step 1: Probing USB loopback 127.0.0.1:8765...")
-            client.connect("127.0.0.1", Constants.DEFAULT_PORT)
-            val usbConnected = withTimeoutOrNull(1500) {
-                client.connectionState.first { it == ConnectionState.CONNECTED }
-            }
-            if (usbConnected != null) {
-                SafeLog.i("SnowForegroundService", "Connected via USB loopback.")
-                return@launch
-            }
+            val effMode = org.snow.network.TransportMode.normalize(getTargetConnectionMode())
+                ?: org.snow.network.TransportMode.AUTO
 
-            if (userDisconnected) return@launch
-
-            // Step 2: Saved trusted Wi-Fi endpoint from PREFS_ENDPOINT
-            val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
-            val savedHost = prefs.getString(PREF_SAVED_HOST, null)
-            val savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
-            if (!savedHost.isNullOrBlank() && savedHost != "127.0.0.1" && savedHost != "localhost") {
-                SafeLog.i("SnowForegroundService", "AutoConnect Step 2: Connecting to saved endpoint $savedHost:$savedPort...")
-                client.connect(savedHost, savedPort)
-                val wifiConnected = withTimeoutOrNull(2500) {
-                    client.connectionState.first { it == ConnectionState.CONNECTED }
+            // Step 1: USB Loopback (127.0.0.1:8765) when allowed by mode
+            if (effMode in setOf(
+                    org.snow.network.TransportMode.AUTO,
+                    org.snow.network.TransportMode.LOCAL_ONLY,
+                    org.snow.network.TransportMode.USB
+                )
+            ) {
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 1: Probing USB loopback 127.0.0.1:8765...")
+                client.connect("127.0.0.1", Constants.DEFAULT_PORT)
+                val usbAuth = withTimeoutOrNull(1800) {
+                    client.authState.first { it is AuthState.Authenticated }
                 }
-                if (wifiConnected != null) {
-                    SafeLog.i("SnowForegroundService", "Connected via saved Wi-Fi endpoint.")
+                if (usbAuth != null) {
+                    SafeLog.i("SnowForegroundService", "Connected & authenticated via USB loopback.")
+                    return@launch
+                }
+                if (effMode == org.snow.network.TransportMode.USB) {
+                    SafeLog.w("SnowForegroundService", "AutoConnect stopped: pinned to manual USB mode and loopback unavailable.")
                     return@launch
                 }
             }
 
             if (userDisconnected) return@launch
 
-            // Step 3: Bounded UDP discovery burst (12s)
-            SafeLog.i("SnowForegroundService", "AutoConnect Step 3: Starting bounded UDP discovery (12s)...")
-            discoveryManager.startListening()
-            val discoveryConnected = withTimeoutOrNull(12000) {
-                while (isActive) {
-                    val candidate = discoveryManager.getCandidateForPairedDesktop()
-                    if (candidate != null) {
-                        SafeLog.i("SnowForegroundService", "AutoConnect: Discovered desktop candidate ${candidate.ipAddress}:${candidate.port}")
-                        client.connect(candidate.ipAddress, candidate.port)
-                        val connected = withTimeoutOrNull(3000) {
-                            client.connectionState.first { it == ConnectionState.CONNECTED }
-                        }
-                        if (connected != null) return@withTimeoutOrNull true
+            val prefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+            val savedHost = prefs.getString(PREF_SAVED_HOST, null)
+            val savedPort = prefs.getInt(PREF_SAVED_PORT, Constants.DEFAULT_PORT)
+            val lastWifiHost = prefs.getString(PREF_LAST_WIFI_HOST, null)
+            val lastWifiPort = prefs.getInt(PREF_LAST_WIFI_PORT, Constants.DEFAULT_PORT)
+
+            // Step 2: Saved local Hotspot / Wi-Fi endpoint prioritized strictly (Hotspot before Wi-Fi LAN)
+            if (effMode !in setOf(org.snow.network.TransportMode.REMOTE_ONLY, org.snow.network.TransportMode.REMOTE_RELAY)) {
+                val localSaved = listOfNotNull(
+                    lastWifiHost?.trim()?.takeIf { it.isNotBlank() && !isLoopbackHost(it) && !DiscoveryManager.isRelayEndpoint(it) }?.let { it to lastWifiPort },
+                    savedHost?.trim()?.takeIf { it.isNotBlank() && !isLoopbackHost(it) && !DiscoveryManager.isRelayEndpoint(it) }?.let { it to savedPort }
+                ).distinctBy { "${it.first}:${it.second}" }
+                    .sortedBy { (h, _) -> org.snow.network.TransportClassifier.classifyRoutePriority(host = h) }
+                    .filter { (h, _) ->
+                        !effMode.isSingleRouteOverride() ||
+                            effMode.targetRouteOrNull() == org.snow.network.TransportClassifier.classifyRoute(host = h)
                     }
-                    delay(1000)
+
+                for ((candHost, candPort) in localSaved) {
+                    if (userDisconnected) return@launch
+                    val candBadge = org.snow.network.TransportClassifier.classifyTransportBadge(host = candHost)
+                    SafeLog.i("SnowForegroundService", "AutoConnect Step 2: Connecting to $candBadge ($candHost:$candPort)...")
+                    client.connect(candHost, candPort)
+                    val localAuth = withTimeoutOrNull(2500) {
+                        client.authState.first { it is AuthState.Authenticated }
+                    }
+                    if (localAuth != null) {
+                        SafeLog.i("SnowForegroundService", "Connected & authenticated via $candBadge.")
+                        return@launch
+                    }
                 }
-                false
             }
-            if (discoveryConnected == true) {
-                SafeLog.i("SnowForegroundService", "Connected via UDP discovery.")
-                return@launch
+
+            if (userDisconnected) return@launch
+
+            // Step 3: Bounded UDP discovery burst (12s), preferring Hotspot over Wi-Fi LAN
+            if (effMode !in setOf(org.snow.network.TransportMode.REMOTE_ONLY, org.snow.network.TransportMode.REMOTE_RELAY)) {
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 3: Starting bounded UDP discovery (12s)...")
+                discoveryManager.startListening()
+                val discoveryConnected = withTimeoutOrNull(12000) {
+                    while (isActive) {
+                        val candidate = discoveryManager.getCandidateForPairedDesktop()
+                        if (candidate != null) {
+                            val candRoute = org.snow.network.TransportClassifier.classifyRoute(host = candidate.ipAddress)
+                            if (!effMode.isSingleRouteOverride() || effMode.targetRouteOrNull() == candRoute) {
+                                SafeLog.i("SnowForegroundService", "AutoConnect: Discovered ${candRoute.badge} ${candidate.ipAddress}:${candidate.port}")
+                                client.connect(candidate.ipAddress, candidate.port, candidate.deviceId)
+                                val connected = withTimeoutOrNull(3000) {
+                                    client.authState.first { it is AuthState.Authenticated }
+                                }
+                                if (connected != null) return@withTimeoutOrNull true
+                            }
+                        }
+                        delay(1000)
+                    }
+                    false
+                }
+                if (discoveryConnected == true) {
+                    SafeLog.i("SnowForegroundService", "Connected & authenticated via UDP discovery.")
+                    return@launch
+                }
+                discoveryManager.stopListening()
+                if (effMode.isSingleRouteOverride() || effMode == org.snow.network.TransportMode.LOCAL_ONLY) {
+                    SafeLog.w("SnowForegroundService", "AutoConnect stopped: mode=${effMode.wireName} forbids remote relay fallback.")
+                    return@launch
+                }
             }
-            discoveryManager.stopListening()
 
             if (userDisconnected) return@launch
 
@@ -978,7 +1166,9 @@ class SnowForegroundService : Service() {
                 hubToken = relaySecurityPrefs.getString(PREF_RELAY_HUB_TOKEN, null)
             )
 
-            if (relayEnabled && relayEndpoint.isNotBlank() && authMaterial != null) {
+            if ((relayEnabled || effMode == org.snow.network.TransportMode.REMOTE_ONLY || effMode == org.snow.network.TransportMode.REMOTE_RELAY) &&
+                relayEndpoint.isNotBlank() && authMaterial != null
+            ) {
                 SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Falling back to Render Hub / Remote Relay endpoint $relayEndpoint...")
                 startRelay(relayEndpoint)
             } else {
@@ -1176,7 +1366,8 @@ class SnowForegroundService : Service() {
             cooldownMs: Long = USB_PROMOTION_COOLDOWN_MS
         ): Boolean {
             if (userDisconnected) return false
-            if (connectionMode?.trim()?.lowercase() == "remote_only") return false
+            val normMode = connectionMode?.trim()?.lowercase() ?: "auto"
+            if (normMode in setOf("remote_only", "remote_relay", "hotspot", "wifi_lan")) return false
             if (!isConnected || !isAuthenticated) return false
             if (isLoopbackHost(currentHost)) return false
             if (lastAttemptMs != Long.MIN_VALUE / 2 && (nowMs - lastAttemptMs) < cooldownMs) return false

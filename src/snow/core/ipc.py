@@ -917,7 +917,7 @@ class SnowIpcServer:
                 "data": {"state": "STOPPING", "reason": reason},
             }, now_authed
 
-        if op == "device_set_connection_mode":
+        if op in ("device_set_connection_mode", "device_set_transport"):
             if not ctx or ctx.principal != ExecutionPrincipal.OWNER_MANUAL:
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -928,8 +928,9 @@ class SnowIpcServer:
                 }, now_authed
 
             device_id = payload.get("device_id")
-            mode = payload.get("connection_mode")
-            if not device_id or not mode:
+            raw_mode = payload.get("mode") or payload.get("connection_mode")
+            allow_probe = bool(payload.get("allow_probe", True))
+            if not device_id or not raw_mode:
                 return {
                     "version": IPC_PROTOCOL_VERSION,
                     "request_id": request_id,
@@ -938,19 +939,70 @@ class SnowIpcServer:
                     "error": "Missing required 'device_id' or 'connection_mode' in payload.",
                 }, now_authed
 
+            from snow.network.transport import VALID_TRANSPORT_MODES, normalize_transport_mode
             from snow.security.db import VALID_CONNECTION_MODES
-            if mode not in VALID_CONNECTION_MODES:
+
+            norm_mode = normalize_transport_mode(str(raw_mode))
+            if not norm_mode:
                 return {
                     "version": IPC_PROTOCOL_VERSION,
                     "request_id": request_id,
                     "success": False,
                     "status": "INVALID_ARGUMENT",
-                    "error": f"Invalid connection_mode '{mode}'. Must be one of: {', '.join(sorted(VALID_CONNECTION_MODES))}",
+                    "error": f"Invalid connection_mode '{raw_mode}'. Must be one of: {', '.join(VALID_TRANSPORT_MODES)}",
                 }, now_authed
 
-            db = getattr(self.core_server, "db_manager", None)
+            sr = getattr(self, "session_router", None) or (
+                getattr(self.core_server, "session_router", None) if self.core_server else None
+            )
+            if sr is not None and hasattr(sr, "set_manual_transport_mode"):
+                res = await sr.set_manual_transport_mode(
+                    device_id, norm_mode, allow_probe=allow_probe
+                )
+                if res.get("success"):
+                    if hasattr(self, "node_registry") and self.node_registry:
+                        node = self.node_registry.get_node(device_id)
+                        if node:
+                            node.connection_mode = (
+                                "remote_only"
+                                if norm_mode in ("remote_only", "remote_relay")
+                                else ("local_only" if norm_mode in ("local_only", "usb", "hotspot", "wifi_lan") else "auto")
+                            )
+                    return {
+                        "version": IPC_PROTOCOL_VERSION,
+                        "request_id": request_id,
+                        "success": True,
+                        "status": "SUCCESS",
+                        "data": {
+                            "device_id": device_id,
+                            "connection_mode": res.get("mode", norm_mode),
+                            "mode": res.get("mode", norm_mode),
+                            "active_transport": res.get("active_transport"),
+                            "transport_badge": res.get("transport_badge"),
+                            "transport_state": res.get("transport_state"),
+                        },
+                    }, now_authed
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": res.get("status", "ROUTE_UNAVAILABLE"),
+                    "error": res.get("error", "Requested transport route is unavailable."),
+                    "data": res,
+                }, now_authed
+
+            if norm_mode not in VALID_CONNECTION_MODES:
+                return {
+                    "version": IPC_PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "success": False,
+                    "status": "ROUTE_VERIFICATION_UNAVAILABLE",
+                    "error": f"Cannot verify single transport '{norm_mode}' while SessionRouter is offline.",
+                }, now_authed
+
+            db = getattr(self.core_server, "db_manager", None) if self.core_server else None
             if db:
-                ok = db.update_device_connection_mode(device_id, mode)
+                ok = db.update_device_connection_mode(device_id, norm_mode)
                 if not ok:
                     return {
                         "version": IPC_PROTOCOL_VERSION,
@@ -964,14 +1016,14 @@ class SnowIpcServer:
                 if hasattr(self, "node_registry") and self.node_registry:
                     node = self.node_registry.get_node(device_id)
                     if node:
-                        node.connection_mode = mode
+                        node.connection_mode = norm_mode
 
                 return {
                     "version": IPC_PROTOCOL_VERSION,
                     "request_id": request_id,
                     "success": True,
                     "status": "SUCCESS",
-                    "data": {"device_id": device_id, "connection_mode": mode},
+                    "data": {"device_id": device_id, "connection_mode": norm_mode, "mode": norm_mode},
                 }, now_authed
             else:
                 return {
@@ -2443,12 +2495,37 @@ class SnowIpcServer:
             "devices": device_summaries,
         }
 
+    def _enrich_device_transport(self, item: dict[str, Any]) -> dict[str, Any]:
+        sr = getattr(self, "session_router", None) or (
+            getattr(self.core_server, "session_router", None) if self.core_server else None
+        )
+        dev_id = item.get("device_id") or ""
+        is_local = bool(item.get("is_local") or item.get("transport") == "local" or dev_id == "desktop-core")
+        if sr is not None and dev_id and not is_local and hasattr(sr, "get_device_transport_state"):
+            try:
+                ts = sr.get_device_transport_state(dev_id)
+                item["transport_state"] = ts
+                item["effective_mode"] = ts.get("mode", item.get("connection_mode", "auto"))
+                if ts.get("active_transport"):
+                    item["active_transport"] = ts["active_transport"]
+                    item["transport_badge"] = ts.get("active_badge")
+            except Exception:
+                pass
+        if not item.get("transport_badge") and not is_local:
+            from snow.network.router import classify_transport_badge
+            item["transport_badge"] = classify_transport_badge(
+                transport=item.get("active_transport") or item.get("transport"),
+                host=item.get("remote_address") or item.get("host"),
+                connection_mode=item.get("effective_mode") or item.get("connection_mode"),
+            )
+        return item
+
     def _handle_list_devices(self) -> list[dict]:
         """Compile detailed, secret-redacted paired and connected device records (excludes unpaired discovery ghosts)."""
         if getattr(self, "node_registry", None):
             nodes = self.node_registry.list_nodes(filter_paired=True)
             return [
-                node.to_summary_dict()
+                self._enrich_device_transport(node.to_summary_dict())
                 for node in nodes
                 if getattr(node, "is_paired", False) or getattr(node, "transport", None) == "local"
             ]
@@ -2471,7 +2548,7 @@ class SnowIpcServer:
                         is_connected = True
                         remote_addr = conn.remote_address
 
-            results.append({
+            results.append(self._enrich_device_transport({
                 "device_id": p.device_id,
                 "device_name": p.device_name,
                 "is_paired": True,
@@ -2480,8 +2557,9 @@ class SnowIpcServer:
                 "session_id": session_id[:8] + "..." if session_id else None,
                 "paired_at": p.pairing_timestamp,
                 "last_seen": p.last_seen_timestamp,
+                "connection_mode": getattr(p, "connection_mode", "auto"),
                 "permission_profile": cs.db_manager.get_setting(f"device_profile:{p.device_id}", "full_control"),
-            })
+            }))
 
         return results
 
@@ -2857,6 +2935,11 @@ class SnowIpcServer:
                 "transfer_status": record.status.value,
                 "state": record.status.value,
                 "error_message": record.error_message,
+                "transport": getattr(record, "transport", "wifi_lan"),
+                "transport_badge": getattr(record, "transport_badge", "Wi-Fi • Zero Data"),
+                "route_badge": getattr(record, "transport_badge", "Wi-Fi • Zero Data"),
+                "pinned_host": getattr(record, "pinned_host", ""),
+                "pinned_route": getattr(record, "pinned_route", True),
             },
         }
 
@@ -2880,6 +2963,14 @@ class SnowIpcServer:
 
         owner_id = record.device_id
         cancelled = cs.transfer_manager.cancel_transfer(transfer_id, owner_id)
+        router_cancel = getattr(self, "session_router", None) or (
+            getattr(cs, "session_router", None) if cs else None
+        )
+        if router_cancel is not None and hasattr(router_cancel, "clear_pinned_transfer_route"):
+            try:
+                router_cancel.clear_pinned_transfer_route(transfer_id)
+            except Exception:
+                pass
         task = getattr(self, "_async_transfer_tasks", {}).pop(transfer_id, None)
         if task and not task.done():
             task.cancel()
@@ -3042,6 +3133,41 @@ class SnowIpcServer:
                     "message": f"File '{transfer_filename}' with identical hash already exists on destination; transfer skipped.",
                 }
 
+        from snow.network.transport import transport_badge_for, normalize_transport_type
+        router = getattr(self, "session_router", None) or (
+            getattr(cs, "session_router", None) if cs else None
+        )
+        eff_transport = "wifi_lan"
+        eff_host = ""
+        if router is not None and hasattr(router, "get_device_transport_state"):
+            try:
+                ts_snap = router.get_device_transport_state(device_id)
+                eff_transport = ts_snap.get("active_transport") or ts_snap.get("recommended_transport") or "wifi_lan"
+                active_entry = next((r for r in ts_snap.get("routes", []) if r.get("transport") == eff_transport), None)
+                eff_host = (active_entry or {}).get("host", "")
+            except Exception:
+                pass
+        eff_badge = transport_badge_for(normalize_transport_type(transport=eff_transport, host=eff_host))
+        raw_relay_quota = getattr(getattr(cs, "config", None), "max_relay_transfer_bytes", None)
+        max_relay_bytes = (
+            raw_relay_quota
+            if isinstance(raw_relay_quota, int) and not isinstance(raw_relay_quota, bool) and raw_relay_quota > 0
+            else 100 * 1024 * 1024
+        )
+        if eff_transport == "remote_relay" and file_size > max_relay_bytes:
+            mib = max(1, max_relay_bytes // (1024 * 1024))
+            return {
+                "success": False,
+                "status": "RELAY_QUOTA_EXCEEDED",
+                "transport": eff_transport,
+                "transport_badge": eff_badge,
+                "max_relay_bytes": max_relay_bytes,
+                "error": (
+                    f"File size ({file_size} bytes) exceeds the {mib} MiB Remote Relay quota. "
+                    "Connect via USB, Hotspot, or Wi-Fi LAN for Zero-Data multi-GB transfers."
+                ),
+            }
+
         dest_path = cs.storage_manager.resolve_destination_path(transfer_filename)
         needs_finalize = dest_path.resolve() != safe_path.resolve()
         if needs_finalize and not async_transfer:
@@ -3060,6 +3186,9 @@ class SnowIpcServer:
             sha256=file_sha256,
             direction=TransferDirection.DOWNLOAD,
             file_path=str(safe_path if (async_transfer and needs_finalize) else dest_path),
+            transport=eff_transport,
+            transport_badge=eff_badge,
+            pinned_host=eff_host,
         )
 
         transfer_port = (
@@ -3067,6 +3196,11 @@ class SnowIpcServer:
             if cs.http_transfer_server
             else cs.config.transfer_port
         )
+        if router is not None and hasattr(router, "pin_transfer_route"):
+            try:
+                router.pin_transfer_route(record.transfer_id, device_id, eff_transport, host=eff_host, port=transfer_port)
+            except Exception:
+                pass
 
         req_data = {
             "transfer_id": record.transfer_id,
@@ -3079,9 +3213,6 @@ class SnowIpcServer:
             req_data["async"] = True
 
         # 2. Prefer SessionRouter for capability-aware multi-transport dispatch
-        router = getattr(self, "session_router", None) or (
-            getattr(cs, "session_router", None) if cs else None
-        )
         has_real_router = router is not None and (
             type(router).__name__ == "SessionRouter"
             or getattr(router, "_is_router_mock", False) is True
@@ -3167,6 +3298,11 @@ class SnowIpcServer:
                         cs.transfer_manager.mark_failed(record.transfer_id, str(exc))
                 finally:
                     self._async_transfer_tasks.pop(record.transfer_id, None)
+                    if router is not None and hasattr(router, "clear_pinned_transfer_route"):
+                        try:
+                            router.clear_pinned_transfer_route(record.transfer_id)
+                        except Exception:
+                            pass
 
             if not hasattr(self, "_async_transfer_tasks"):
                 self._async_transfer_tasks = {}
@@ -3181,15 +3317,27 @@ class SnowIpcServer:
                 "file_size": file_size,
                 "sha256": file_sha256,
                 "transfer_port": transfer_port,
+                "transport": record.transport,
+                "transport_badge": record.transport_badge,
+                "route_badge": record.transport_badge,
             }
 
         if has_real_router:
-            route_res = await router.route_request(
-                action="file_send_request",
-                target=device_id,
-                data=req_data,
-                timeout=timeout,
-            )
+            try:
+                route_res = await router.route_request(
+                    action="file_send_request",
+                    target=device_id,
+                    data=req_data,
+                    timeout=timeout,
+                )
+            finally:
+                if hasattr(router, "clear_pinned_transfer_route"):
+                    try:
+                        router.clear_pinned_transfer_route(record.transfer_id)
+                    except Exception:
+                        pass
+            res_transport = route_res.get("transport_type") or route_res.get("transport") or record.transport
+            res_badge = route_res.get("transport_badge") or record.transport_badge
             if route_res.get("success"):
                 cs.transfer_manager.complete_transfer(record.transfer_id)
                 return {
@@ -3200,6 +3348,9 @@ class SnowIpcServer:
                     "sha256": file_sha256,
                     "bytes_transferred": file_size,
                     "skipped_duplicate": False,
+                    "transport": res_transport,
+                    "transport_badge": res_badge,
+                    "route_badge": res_badge,
                     "data": route_res.get("data"),
                 }
             else:

@@ -42,6 +42,11 @@ class TransferRecord:
     status: TransferState = TransferState.QUEUED
     error_message: Optional[str] = None
     file_path: Optional[str] = None
+    transport: str = "wifi_lan"
+    transport_badge: str = "Wi-Fi • Zero Data"
+    pinned_host: str = ""
+    pinned_port: int = 0
+    pinned_route: bool = True
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -61,6 +66,12 @@ class TransferRecord:
             "status": self.status.value,
             "error_message": self.error_message,
             "file_path": self.file_path,
+            "transport": self.transport,
+            "transport_badge": self.transport_badge,
+            "route_badge": self.transport_badge,
+            "pinned_host": self.pinned_host,
+            "pinned_port": self.pinned_port,
+            "pinned_route": self.pinned_route,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -88,6 +99,10 @@ class TransferManager:
         direction: TransferDirection = TransferDirection.UPLOAD,
         transfer_id: Optional[str] = None,
         file_path: Optional[str] = None,
+        transport: str = "wifi_lan",
+        transport_badge: str = "Wi-Fi • Zero Data",
+        pinned_host: str = "",
+        pinned_port: int = 0,
     ) -> TransferRecord:
         """Register a new transfer session for a verified device."""
         if not device_id or not isinstance(device_id, str):
@@ -108,14 +123,41 @@ class TransferManager:
             current_offset=0,
             status=TransferState.QUEUED,
             file_path=file_path,
+            transport=transport or "wifi_lan",
+            transport_badge=transport_badge or "Wi-Fi • Zero Data",
+            pinned_host=pinned_host or "",
+            pinned_port=int(pinned_port or 0),
         )
         with self._lock:
             self._transfers[tid] = record
         logger.info(
-            "Created transfer record [%s] (%s, %s, %d bytes) for device [%s]",
-            tid, direction.value, file_name, file_size, device_id
+            "Created transfer record [%s] (%s, %s, %d bytes) for device [%s] via %s",
+            tid, direction.value, file_name, file_size, device_id, record.transport_badge,
         )
         return record
+
+    def set_route_metadata(
+        self,
+        transfer_id: str,
+        transport: str,
+        transport_badge: str,
+        *,
+        pinned_host: str = "",
+        pinned_port: int = 0,
+    ) -> bool:
+        """Update authoritative carrying-socket transport attribution for a transfer."""
+        with self._lock:
+            record = self._transfers.get(transfer_id)
+            if not record:
+                return False
+            record.transport = transport or record.transport
+            record.transport_badge = transport_badge or record.transport_badge
+            if pinned_host:
+                record.pinned_host = pinned_host
+            if pinned_port:
+                record.pinned_port = int(pinned_port)
+            record.updated_at = datetime.now(timezone.utc).isoformat()
+            return True
 
     def get_transfer(self, transfer_id: str) -> Optional[TransferRecord]:
         """Retrieve a transfer record by transfer_id."""

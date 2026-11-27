@@ -2033,11 +2033,14 @@ class SnowWebSocketServer:
         clean_decl = (client_declaration or "").strip().lower()
 
         if not is_loopback:
-            # Non-loopback IP (e.g. 192.168.x.x, 10.x.x.x) is always wifi_lan
+            # Cross-check non-loopback local interfaces: separate mobile hotspot subnets/hints from Wi-Fi LAN
+            from snow.network.transport import is_hotspot_host_or_hint
+            if is_hotspot_host_or_hint(clean_host, transport=clean_decl):
+                return "hotspot"
             return "wifi_lan"
 
         # Socket is loopback
-        if clean_decl == "usb_adb":
+        if clean_decl in ("usb_adb", "usb"):
             from snow.cli import find_adb_binary, get_connected_adb_devices
             try:
                 adb_bin = find_adb_binary()
@@ -2050,8 +2053,8 @@ class SnowWebSocketServer:
                 logger.debug("ADB verification check failed: %s", e)
             return "loopback"
 
-        if clean_decl == "wifi_lan":
-            # Contradiction: client says wifi_lan but socket is loopback
+        if clean_decl in ("wifi_lan", "hotspot"):
+            # Contradiction: client says Wi-Fi/Hotspot LAN but socket is loopback
             return "unknown"
 
         return "loopback"

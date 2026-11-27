@@ -405,32 +405,290 @@ def remove_usb_reverse(
         return False, f"Exception removing ADB reverse mappings: {exc}"
 
 
+DEFAULT_ANDROID_HOST_WSS_PORT: int = 8767
+DEFAULT_ANDROID_HOST_MEDIA_PORT: int = 8769
+
+
+def get_usb_forward_mappings(
+    serial: str,
+    adb_bin: Optional[Path] = None,
+) -> list[dict[str, str]]:
+    """Inspect active ADB forward mappings (`adb -s <serial> forward --list`) for a serial."""
+    bin_path = adb_bin or find_adb_binary()
+    if not bin_path or not serial:
+        return []
+    parsed: list[dict[str, str]] = []
+    try:
+        res = subprocess.run(
+            [str(bin_path), "-s", serial, "forward", "--list"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+            **get_no_window_subprocess_kwargs(),
+        )
+        for line in (res.stdout or "").splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                parsed.append(
+                    {
+                        "serial": parts[0],
+                        "local": parts[1],
+                        "remote": parts[2],
+                        "raw": line.strip(),
+                    }
+                )
+    except Exception as exc:
+        logger.debug("Failed checking forward mappings for %s: %s", serial, exc)
+    return parsed
+
+
+def setup_usb_forward(
+    serial: Optional[str] = None,
+    forward_wss_port: int = DEFAULT_ANDROID_HOST_WSS_PORT,
+    forward_media_port: int = DEFAULT_ANDROID_HOST_MEDIA_PORT,
+    adb_bin: Optional[Path] = None,
+    local_wss_port: Optional[int] = None,
+    local_media_port: Optional[int] = None,
+    skip_if_conflict: bool = True,
+) -> tuple[bool, str, list[str]]:
+    """Establish ADB forward mappings (`tcp:local -> tcp:remote`) for Android Peer Host mode.
+
+    Checks existing ADB forward mappings first to avoid silently clobbering unrelated
+    third-party forwards on the same local port. Returns `(ok, message, snow_owned_locals)`.
+    """
+    bin_path = adb_bin or find_adb_binary()
+    if not bin_path:
+        return False, "ADB executable not found.", []
+
+    devices = get_connected_adb_devices(bin_path)
+    authorized = [d for d in devices if d.get("status") == "device"]
+    if not authorized:
+        if devices:
+            return False, "USB device connected but unauthorized or offline.", []
+        return False, "No connected Android devices detected via USB.", []
+
+    target_device = None
+    if serial:
+        target_device = next((d for d in authorized if d.get("serial") == serial), None)
+        if not target_device:
+            return False, f"Specified device serial '{serial}' is not authorized.", []
+    else:
+        target_device = authorized[0]
+
+    dev_serial = target_device["serial"]
+    loc_wss = int(local_wss_port or forward_wss_port)
+    loc_media = int(local_media_port or forward_media_port)
+    desired = [
+        (f"tcp:{loc_wss}", f"tcp:{int(forward_wss_port)}"),
+        (f"tcp:{loc_media}", f"tcp:{int(forward_media_port)}"),
+    ]
+
+    existing = get_usb_forward_mappings(dev_serial, bin_path)
+    existing_by_local = {m["local"]: m["remote"] for m in existing if m.get("serial") == dev_serial}
+    owned_locals: list[str] = []
+    conflicts: list[str] = []
+
+    for loc_spec, rem_spec in desired:
+        current_rem = existing_by_local.get(loc_spec)
+        if current_rem == rem_spec:
+            owned_locals.append(loc_spec)
+            continue
+        if current_rem is not None and skip_if_conflict:
+            conflicts.append(f"{loc_spec} already mapped to {current_rem}")
+            continue
+        try:
+            r = subprocess.run(
+                [str(bin_path), "-s", dev_serial, "forward", loc_spec, rem_spec],
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+                check=False,
+                **get_no_window_subprocess_kwargs(),
+            )
+            if r.returncode == 0:
+                owned_locals.append(loc_spec)
+            else:
+                conflicts.append((r.stderr or r.stdout or f"forward {loc_spec} failed").strip())
+        except Exception as exc:
+            conflicts.append(str(exc))
+
+    if len(owned_locals) == len(desired):
+        return (
+            True,
+            f"SNOW USB forward mappings active for {dev_serial} ({', '.join(owned_locals)}).",
+            owned_locals,
+        )
+    if owned_locals:
+        return (
+            False,
+            f"Partial USB forward setup for {dev_serial}: active={owned_locals}; conflicts={'; '.join(conflicts)}",
+            owned_locals,
+        )
+    return (
+        False,
+        f"USB forward setup skipped/failed for {dev_serial}: {'; '.join(conflicts) or 'unknown error'}",
+        [],
+    )
+
+
+def remove_usb_forward(
+    serial: Optional[str] = None,
+    adb_bin: Optional[Path] = None,
+    owned_locals: Optional[list[str]] = None,
+) -> tuple[bool, str]:
+    """Remove only SNOW-owned ADB forward mappings, preserving unrelated user forwards."""
+    bin_path = adb_bin or find_adb_binary()
+    if not bin_path:
+        return False, "ADB executable not found."
+    target_locals = list(owned_locals or [])
+    if not target_locals:
+        return True, "No SNOW-owned USB forward mappings to remove."
+
+    dev_serial = serial
+    if not dev_serial:
+        devices = get_connected_adb_devices(bin_path)
+        auth = [d for d in devices if d.get("status") == "device"]
+        if not auth:
+            return False, "No authorized devices connected."
+        dev_serial = auth[0]["serial"]
+
+    removed = 0
+    for loc_spec in target_locals:
+        try:
+            r = subprocess.run(
+                [str(bin_path), "-s", dev_serial, "forward", "--remove", loc_spec],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+                **get_no_window_subprocess_kwargs(),
+            )
+            if r.returncode == 0:
+                removed += 1
+        except Exception:
+            pass
+    return True, f"Removed {removed} SNOW-owned forward mapping(s) from {dev_serial}."
+
+
+def get_usb_bidirectional_status(
+    adb_bin: Optional[Path] = None,
+    serial: Optional[str] = None,
+    port: int = 8765,
+    forward_wss_port: int = DEFAULT_ANDROID_HOST_WSS_PORT,
+    forward_media_port: int = DEFAULT_ANDROID_HOST_MEDIA_PORT,
+) -> dict[str, Any]:
+    """Return full bidirectional USB ADB status (reverse + forward + unauthorized/offline checks)."""
+    base = get_usb_status(adb_bin=adb_bin, serial=serial, port=port)
+    bin_path = Path(base["adb_path"]) if base.get("adb_path") else adb_bin
+    devices = base.get("devices") or []
+    unauthorized = [d for d in devices if d.get("status") == "unauthorized"]
+    offline = [d for d in devices if d.get("status") == "offline"]
+    target_dev = base.get("target_device")
+    fwd_mappings: list[dict[str, str]] = []
+    forward_active = False
+
+    if target_dev and bin_path:
+        fwd_mappings = get_usb_forward_mappings(target_dev["serial"], bin_path)
+        req_wss = f"tcp:{int(forward_wss_port)}"
+        req_media = f"tcp:{int(forward_media_port)}"
+        has_fwd_wss = any(m.get("local") == req_wss or req_wss in m.get("remote", "") for m in fwd_mappings)
+        has_fwd_media = any(m.get("local") == req_media or req_media in m.get("remote", "") for m in fwd_mappings)
+        forward_active = bool(has_fwd_wss and has_fwd_media)
+
+    enriched = dict(base)
+    enriched["forward_active"] = forward_active
+    enriched["forward_mappings"] = fwd_mappings
+    enriched["bidirectional_active"] = bool(base.get("reverse_active") and forward_active)
+    enriched["unauthorized_devices"] = unauthorized
+    enriched["offline_devices"] = offline
+    enriched["usb_ready"] = bool(base.get("connected") and base.get("reverse_active"))
+    return enriched
+
+
+def setup_usb_bidirectional(
+    serial: Optional[str] = None,
+    port: int = 8765,
+    forward_wss_port: int = DEFAULT_ANDROID_HOST_WSS_PORT,
+    forward_media_port: int = DEFAULT_ANDROID_HOST_MEDIA_PORT,
+    adb_bin: Optional[Path] = None,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Configure both ADB reverse (Android->PC) and ADB forward (PC->Android Peer Host)."""
+    rev_ok, rev_msg = setup_usb_reverse(serial=serial, port=port, adb_bin=adb_bin)
+    fwd_ok, fwd_msg, owned_forwards = setup_usb_forward(
+        serial=serial,
+        forward_wss_port=forward_wss_port,
+        forward_media_port=forward_media_port,
+        adb_bin=adb_bin,
+    )
+    meta = {
+        "reverse_ok": rev_ok,
+        "reverse_message": rev_msg,
+        "forward_ok": fwd_ok,
+        "forward_message": fwd_msg,
+        "owned_forwards": owned_forwards,
+        "bidirectional_active": bool(rev_ok and fwd_ok),
+    }
+    if rev_ok and fwd_ok:
+        return True, f"{rev_msg}; forward active ({', '.join(owned_forwards)})", meta
+    if rev_ok:
+        return True, f"{rev_msg} (forward note: {fwd_msg})", meta
+    return False, f"{rev_msg}; {fwd_msg}", meta
+
+
 class UsbWatcher:
-    """Background task monitoring connected ADB USB devices and establishing reverse tunnels.
+    """Background task monitoring connected ADB USB devices and establishing bidirectional tunnels.
 
     Periodically checks for authorized ADB devices and ensures reverse socket mappings
-    for ports 8765 (WSS) and 8766 (HTTPS) exist. Uses an adaptive bounded polling interval
-    (8s idle, extending to 20s if no changes; drops back to 8s on state changes), avoids
-    redundant ADB status checks for already configured active serials, and runs off-thread.
+    (8765/8766) plus non-conflicting forward mappings (8767/8769) exist. Uses an adaptive
+    bounded polling interval (8s idle, extending to 20s), skips redundant status checks on
+    consecutive polls until periodic repair interval, and notifies attach/detach listeners.
     """
 
     MIN_POLL_INTERVAL: float = 8.0
     MAX_POLL_INTERVAL: float = 20.0
+    DEFAULT_REPAIR_CHECK_POLLS: int = 4
 
     def __init__(
         self,
         port: int = 8765,
         poll_interval: Optional[float] = None,
         adb_bin: Optional[Path] = None,
+        forward_wss_port: int = DEFAULT_ANDROID_HOST_WSS_PORT,
+        forward_media_port: int = DEFAULT_ANDROID_HOST_MEDIA_PORT,
+        target_serial: Optional[str] = None,
+        on_usb_attached: Optional[Any] = None,
+        on_usb_detached: Optional[Any] = None,
+        repair_check_polls: int = DEFAULT_REPAIR_CHECK_POLLS,
     ) -> None:
         self.port = port
         self.base_interval = poll_interval if poll_interval is not None else self.MIN_POLL_INTERVAL
         self.current_interval = self.base_interval
         self.adb_bin = adb_bin or find_adb_binary()
+        self.forward_wss_port = int(forward_wss_port)
+        self.forward_media_port = int(forward_media_port)
+        self.target_serial = target_serial
+        self.on_usb_attached = on_usb_attached
+        self.on_usb_detached = on_usb_detached
+        self.repair_check_polls = max(2, int(repair_check_polls))
         self._task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._paused: bool = False
         self._configured_serials: set[str] = set()
+        self._owned_forwards: dict[str, list[str]] = {}
+        self._serial_poll_counts: dict[str, int] = {}
+
+    def get_status_snapshot(self) -> dict[str, Any]:
+        """Return lightweight in-memory readiness summary without spawning blocking ADB calls."""
+        return {
+            "usb_ready": bool(self._configured_serials),
+            "configured_serials": sorted(self._configured_serials),
+            "owned_forwards": {s: list(v) for s, v in self._owned_forwards.items()},
+            "port": self.port,
+            "transfer_port": self.port + 1,
+            "forward_wss_port": self.forward_wss_port,
+            "forward_media_port": self.forward_media_port,
+        }
 
     def pause(self) -> None:
         """Temporarily suspend USB polling during system pause mode."""
@@ -457,7 +715,7 @@ class UsbWatcher:
         logger.info("UsbWatcher started (base_interval=%.1fs, port=%d)", self.base_interval, self.port)
 
     async def stop(self) -> None:
-        """Stop the USB device monitoring loop cleanly."""
+        """Stop the USB device monitoring loop and clean up SNOW-owned forward mappings."""
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -466,8 +724,28 @@ class UsbWatcher:
             except asyncio.CancelledError:
                 pass
         self._task = None
+        if self._owned_forwards:
+            bin_path = self.adb_bin or find_adb_binary()
+            for serial, owned in list(self._owned_forwards.items()):
+                if owned and bin_path:
+                    try:
+                        await asyncio.to_thread(remove_usb_forward, serial, bin_path, owned)
+                    except Exception:
+                        pass
+        self._owned_forwards.clear()
         self._configured_serials.clear()
+        self._serial_poll_counts.clear()
         logger.info("UsbWatcher stopped cleanly.")
+
+    async def _notify_callback(self, cb: Optional[Any], *args: Any) -> None:
+        if cb is None:
+            return
+        try:
+            res = cb(*args)
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as exc:
+            logger.debug("UsbWatcher callback error: %s", exc)
 
     async def _monitor_loop(self) -> None:
         """Periodic non-blocking check of USB devices and reverse mappings with adaptive backoff."""
@@ -498,7 +776,7 @@ class UsbWatcher:
                 break
 
     async def _poll_once(self) -> bool:
-        """Inspect connected devices and configure reverse mappings on authorized devices.
+        """Inspect connected devices and configure bidirectional USB mappings on authorized devices.
 
         Returns True if a relevant USB device state change occurred.
         """
@@ -511,15 +789,28 @@ class UsbWatcher:
 
         # Run ADB device check in thread pool to avoid blocking the event loop
         devices = await asyncio.to_thread(get_connected_adb_devices, bin_path)
-        authorized = [d for d in devices if d.get("status") == "device"]
+        authorized = [
+            d
+            for d in devices
+            if d.get("status") == "device"
+            and (not self.target_serial or d.get("serial") == self.target_serial)
+        ]
         current_serials = {d["serial"] for d in authorized if "serial" in d}
 
-        # Clean up stale devices no longer connected
+        # Clean up disconnected, unauthorized, or offline serials immediately
         disconnected = self._configured_serials - current_serials
         if disconnected:
             state_changed = True
             for s in disconnected:
-                logger.info("USB device disconnected: %s", s)
+                logger.info("USB device disconnected or lost authorization: %s", s)
+                self._serial_poll_counts.pop(s, None)
+                owned = self._owned_forwards.pop(s, None)
+                if owned:
+                    try:
+                        await asyncio.to_thread(remove_usb_forward, s, bin_path, owned)
+                    except Exception:
+                        pass
+                await self._notify_callback(self.on_usb_detached, s)
             self._configured_serials -= disconnected
 
         # Inspect and setup newly connected or unconfigured authorized devices
@@ -528,8 +819,31 @@ class UsbWatcher:
             if not serial:
                 continue
 
-            # If already configured and still connected, skip redundant status checks
+            # Skip redundant status checks on immediate consecutive polls, but periodically repair dropped mappings
             if serial in self._configured_serials:
+                poll_num = self._serial_poll_counts.get(serial, 0) + 1
+                self._serial_poll_counts[serial] = poll_num
+                if poll_num < self.repair_check_polls:
+                    continue
+                self._serial_poll_counts[serial] = 0
+                status = await asyncio.to_thread(get_usb_status, bin_path, serial, self.port)
+                if not status.get("reverse_active"):
+                    logger.info("Repairing dropped USB reverse mappings for %s...", serial)
+                    success, msg = await asyncio.to_thread(setup_usb_reverse, serial, self.port, bin_path)
+                    if not success:
+                        self._configured_serials.discard(serial)
+                        await self._notify_callback(self.on_usb_detached, serial)
+                        continue
+                    _, _, owned_fwd = await asyncio.to_thread(
+                        setup_usb_forward,
+                        serial,
+                        self.forward_wss_port,
+                        self.forward_media_port,
+                        bin_path,
+                    )
+                    if owned_fwd:
+                        self._owned_forwards[serial] = owned_fwd
+                    state_changed = True
                 continue
 
             state_changed = True
@@ -538,10 +852,32 @@ class UsbWatcher:
                 success, msg = await asyncio.to_thread(setup_usb_reverse, serial, self.port, bin_path)
                 if success:
                     self._configured_serials.add(serial)
+                    self._serial_poll_counts[serial] = 0
                     logger.info("Automatically established USB reverse mode: %s", msg)
+                    _, _, owned_fwd = await asyncio.to_thread(
+                        setup_usb_forward,
+                        serial,
+                        self.forward_wss_port,
+                        self.forward_media_port,
+                        bin_path,
+                    )
+                    if owned_fwd:
+                        self._owned_forwards[serial] = owned_fwd
+                    await self._notify_callback(self.on_usb_attached, serial, self.get_status_snapshot())
                 else:
                     logger.debug("Failed establishing USB reverse mode for %s: %s", serial, msg)
             else:
                 self._configured_serials.add(serial)
+                self._serial_poll_counts[serial] = 0
+                _, _, owned_fwd = await asyncio.to_thread(
+                    setup_usb_forward,
+                    serial,
+                    self.forward_wss_port,
+                    self.forward_media_port,
+                    bin_path,
+                )
+                if owned_fwd:
+                    self._owned_forwards[serial] = owned_fwd
+                await self._notify_callback(self.on_usb_attached, serial, self.get_status_snapshot())
 
         return state_changed

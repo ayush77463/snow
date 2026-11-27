@@ -633,7 +633,25 @@ class Milestone3BSection1IdentityTrustTest {
             assertEquals("Never call /v1/directory/resolve unauthenticated", 0, unauthCalls.get())
             assertTrue("Never silently fall back to 127.0.0.1", startedServiceIntents.isEmpty())
 
-            // Supplying SNOW ID + 6-digit PIN uses /v1/rendezvous/join and adopts host network_id
+            // Supplying SNOW ID + 6-digit PIN uses /v1/rendezvous/join and completes E2E tunnel pairing before adopting network_id
+            repo.customRendezvousTunnelPairerForTest = { rdvData, pin, _, onComplete ->
+                val hostDevId = rdvData["host_device_id"] as? String
+                val hostSnowId = rdvData["host_snow_id"] as? String
+                val hostFp = (rdvData["host_cert_fingerprint"] as? String)?.replace(":", "")
+                val relayUrl = rdvData["relay_ws_url"] as? String
+                val bootstrapToken = rdvData["bootstrap_token"] as? String
+                val networkId = rdvData["network_id"] as? String
+                assertEquals("pc-rdv-1", hostDevId)
+                assertEquals("SNW-7777-CCCC", hostSnowId)
+                assertEquals(fakeFp("99").replace(":", ""), hostFp)
+                assertEquals("wss://snow-relay.onrender.com/v1/tunnel", relayUrl)
+                assertEquals("bs-tok-1", bootstrapToken)
+                assertEquals("654321", pin)
+                repo.adoptNetworkId(networkId)
+                val (_, curHub) = repo.getRemoteAiLinkDiagnostics()
+                repo.updateRemoteRelayConfig(true, curHub)
+                onComplete(true, "E2E paired via tunnel")
+            }
             val rdvLatch = CountDownLatch(1)
             var rdvRes: Triple<Boolean, String, String?>? = null
             repo.connectByInput("SNW-7777-CCCC 654321") { ok, msg, tag ->
@@ -647,6 +665,7 @@ class Milestone3BSection1IdentityTrustTest {
             val (linkedUrl, _) = repo.getRemoteAiLinkDiagnostics()
             assertEquals("https://snow-relay.onrender.com/u/SNW-NET-ABCD1234/mcp", linkedUrl)
         } finally {
+            repo.customRendezvousTunnelPairerForTest = null
             try { mockHubSocket.close() } catch (_: Exception) {}
             hubExecutor.shutdownNow()
         }

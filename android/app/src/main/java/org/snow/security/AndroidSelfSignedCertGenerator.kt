@@ -168,7 +168,8 @@ object AndroidSelfSignedCertGenerator {
         val sslContext: SSLContext,
         val certificate: X509Certificate,
         val keyPair: KeyPair,
-        val fingerprint: String
+        val fingerprint: String,
+        val keyManagers: Array<javax.net.ssl.KeyManager> = emptyArray()
     )
 
     private fun openPkcs12KeyStore(): KeyStore {
@@ -200,7 +201,8 @@ object AndroidSelfSignedCertGenerator {
             sslContext = sslContext,
             certificate = cert,
             keyPair = keyPair,
-            fingerprint = formattedFp
+            fingerprint = formattedFp,
+            keyManagers = kmf.keyManagers
         )
     }
 
@@ -303,7 +305,8 @@ object AndroidSelfSignedCertGenerator {
             sslContext = sslContext,
             certificate = cert,
             keyPair = keyPair,
-            fingerprint = formattedFp
+            fingerprint = formattedFp,
+            keyManagers = kmf.keyManagers
         )
     }
 

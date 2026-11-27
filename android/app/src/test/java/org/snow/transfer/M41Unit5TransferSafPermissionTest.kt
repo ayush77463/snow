@@ -384,6 +384,12 @@ class M41Unit5TransferSafPermissionTest {
         srv.close()
         t.join(1000)
         assertEquals("COMPLETED", reportedStatus)
+        val resolvedDownloadsDir = context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+        val committedFile = File(File(resolvedDownloadsDir, "SNOW"), "async_doc.txt")
+        assertTrue("async_doc.txt must be committed into isolated test tempDir, not CWD: ${committedFile.absolutePath}", committedFile.isFile)
+        assertTrue(committedFile.canonicalPath.startsWith(tempDir.canonicalPath))
+        assertFalse("Must never create CWD relative SNOW/ directory", File("SNOW").exists())
+        assertFalse("Must never create android/app/SNOW/ directory", File("android/app/SNOW").exists())
     }
 
     @Test

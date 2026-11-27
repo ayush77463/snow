@@ -133,11 +133,14 @@ class SafFolderManager(
      * Fallback standard file directory if SAF URI is unset.
      */
     fun getDefaultDownloadDir(): File {
+        val publicDownloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val target = fallbackDownloadDirOverride
-            ?: File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                "SNOW"
-            )
+            ?: if (publicDownloads != null) {
+                File(publicDownloads, "SNOW")
+            } else {
+                val appExternalDownloads = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                File(appExternalDownloads ?: File(context.filesDir, "downloads"), "SNOW")
+            }
         if (!target.exists()) {
             target.mkdirs()
         }

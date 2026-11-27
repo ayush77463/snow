@@ -1,11 +1,13 @@
 package org.snow.network
 
 import android.content.Context
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -73,6 +75,15 @@ sealed class AuthState {
     data class FingerprintConfirmationRequired(val fingerprint: String) : AuthState()
     data class FingerprintMismatch(val pinned: String, val presented: String) : AuthState()
 }
+
+data class StandbyProbeResult(
+    val promoted: Boolean,
+    val status: String,
+    val error: String? = null,
+    val peerDeviceId: String? = null,
+    val host: String,
+    val port: Int
+)
 
 /**
  * WebSocket client implementing SNOW Device Protocol v1 with single connection lifecycle,
@@ -208,6 +219,7 @@ class SnowWebSocketClient(
     )
 
     private val pendingRequests = ConcurrentHashMap<String, PendingRequestEntry>()
+    private val retiringSockets = ConcurrentHashMap<WebSocket, Long>()
     @Volatile
     private var currentTrustManager: SnowTrustManager? = null
 
@@ -231,7 +243,7 @@ class SnowWebSocketClient(
     }
 
     private fun isLoopbackTargetHost(): Boolean =
-        targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
+        TransportClassifier.isLoopbackHost(targetHost)
 
     private fun resolveScopedPinnedFingerprint(presentedFp: String? = null): String? {
         val storage = certPinStorage ?: return null
@@ -476,7 +488,173 @@ class SnowWebSocketClient(
         onUnconfirmedFingerprint?.invoke(fingerprint)
     }
 
-    private fun buildClientForGeneration(generation: Long): Pair<OkHttpClient, SnowTrustManager?> {
+    internal fun isCurrentOrRetiringGeneration(expectedGeneration: Long, incomingSocket: WebSocket? = null): Boolean {
+        synchronized(this) {
+            if (expectedGeneration == socketGeneration.get() && (incomingSocket == null || this.webSocket === incomingSocket)) {
+                return true
+            }
+            if (incomingSocket != null && retiringSockets[incomingSocket] == expectedGeneration) {
+                return true
+            }
+            return false
+        }
+    }
+
+    private fun retireSocketGracefully(oldWs: WebSocket?, oldGen: Long, drainGraceMs: Long = 1200L) {
+        if (oldWs == null) return
+        val hasPending = pendingRequests.values.any { it.generation == oldGen }
+        if (!hasPending) {
+            try {
+                oldWs.close(1000, "Promoted to higher-priority transport")
+            } catch (_: Exception) {
+                try {
+                    oldWs.cancel()
+                } catch (_: Exception) {}
+            }
+            return
+        }
+        retiringSockets[oldWs] = oldGen
+        scope.launch {
+            val deadline = System.currentTimeMillis() + drainGraceMs
+            while (System.currentTimeMillis() < deadline) {
+                if (pendingRequests.values.none { it.generation == oldGen }) {
+                    break
+                }
+                delay(40L)
+            }
+            retiringSockets.remove(oldWs)
+            try {
+                oldWs.close(1000, "Promoted to higher-priority transport")
+            } catch (_: Exception) {
+                try {
+                    oldWs.cancel()
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    /**
+     * Make-Before-Break standby probe and atomic promotion to [newHost]:[newPort].
+     *
+     * Probing happens on an isolated standby WebSocket without closing or modifying
+     * the existing active session or Relay fallback. Cutover occurs ONLY after TLS
+     * certificate pinning, SNOW mutual authentication, identity check, and optional ping
+     * readiness verification succeed, draining in-flight requests on the prior socket.
+     */
+    suspend fun probeAndPromoteEndpoint(
+        newHost: String,
+        newPort: Int = Constants.DEFAULT_PORT,
+        targetDeviceId: String? = null,
+        timeoutMs: Long = 2_500L,
+        verifyPing: Boolean = true
+    ): StandbyProbeResult {
+        val cleanHost = newHost.trim()
+        if (cleanHost.isEmpty()) {
+            return StandbyProbeResult(
+                promoted = false,
+                status = "INVALID_ENDPOINT",
+                error = "Endpoint host is blank.",
+                host = cleanHost,
+                port = newPort
+            )
+        }
+        val scopedExpectedId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: activeTargetDeviceId()
+
+        val alreadyActive = synchronized(this) {
+            val auth = _authState.value as? AuthState.Authenticated
+            cleanHost == targetHost &&
+                newPort == targetPort &&
+                _connectionState.value == ConnectionState.CONNECTED &&
+                auth != null &&
+                webSocket != null
+        }
+        if (alreadyActive) {
+            val curId = (_authState.value as? AuthState.Authenticated)?.peerDeviceId
+            return StandbyProbeResult(
+                promoted = true,
+                status = "ALREADY_ACTIVE",
+                peerDeviceId = curId,
+                host = cleanHost,
+                port = newPort
+            )
+        }
+
+        val devId = identity?.deviceId?.trim().orEmpty()
+        val token = scopedExpectedId?.let { tokenStorage?.getTokenForDevice(it) }
+            ?: resolveStoredTokenForActiveTarget()
+        if (devId.isEmpty() || token.isNullOrBlank()) {
+            return StandbyProbeResult(
+                promoted = false,
+                status = "AUTH_TOKEN_MISSING",
+                error = "Missing device identity or authentication token for standby probe.",
+                host = cleanHost,
+                port = newPort
+            )
+        }
+
+        val preSwitchGen = synchronized(this) { socketGeneration.get() }
+        val scheme = if (useTls) "wss" else "ws"
+        val wsUrl = "$scheme://$cleanHost:$newPort"
+        val (client, standbyTrustManager) = buildClientForGeneration(
+            generation = preSwitchGen,
+            probeHost = cleanHost,
+            probeDeviceId = scopedExpectedId
+        )
+        val resultDeferred = CompletableDeferred<StandbyProbeResult>()
+        val listener = StandbyProbeListener(
+            probeHost = cleanHost,
+            probePort = newPort,
+            preSwitchGeneration = preSwitchGen,
+            expectedDeviceId = scopedExpectedId,
+            authToken = token,
+            verifyPing = verifyPing,
+            standbyTrustManager = standbyTrustManager,
+            resultDeferred = resultDeferred
+        )
+        val request = Request.Builder().url(wsUrl).build()
+        val standbyWs = try {
+            webSocketFactory?.invoke(request, listener) ?: client.newWebSocket(request, listener)
+        } catch (e: Exception) {
+            return StandbyProbeResult(
+                promoted = false,
+                status = "PROBE_SOCKET_ERROR",
+                error = TransportClassifier.sanitizeTransportError(e.message),
+                host = cleanHost,
+                port = newPort
+            )
+        }
+        listener.bindSocket(standbyWs)
+
+        val awaited = withTimeoutOrNull(timeoutMs.coerceAtLeast(300L)) {
+            resultDeferred.await()
+        }
+        if (awaited != null) {
+            if (!awaited.promoted) {
+                try {
+                    standbyWs.cancel()
+                } catch (_: Exception) {}
+            }
+            return awaited
+        }
+
+        listener.abortOnTimeout()
+        try {
+            standbyWs.cancel()
+        } catch (_: Exception) {}
+        return StandbyProbeResult(
+            promoted = false,
+            status = "PROBE_TIMEOUT",
+            error = "Standby handshake timed out after ${timeoutMs}ms.",
+            host = cleanHost,
+            port = newPort
+        )
+    }
+
+    private fun buildClientForGeneration(
+        generation: Long,
+        probeHost: String? = null,
+        probeDeviceId: String? = null
+    ): Pair<OkHttpClient, SnowTrustManager?> {
         val baseClient = okHttpClient ?: OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -488,14 +666,21 @@ class SnowWebSocketClient(
             return baseClient to null
         }
 
+        val effectiveDeviceProvider = { probeDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: activeTargetDeviceId() }
+        val effectiveLoopbackProvider = {
+            if (probeHost != null) TransportClassifier.isLoopbackHost(probeHost) else isLoopbackTargetHost()
+        }
+
         val storage = certPinStorage ?: InMemoryCertPinStorage()
         val trustManager = SnowTrustManager(
             pinStorage = storage,
             onUnconfirmedFingerprint = { fp ->
-                handleUnconfirmedFingerprintCallback(generation, fp)
+                if (probeHost == null) {
+                    handleUnconfirmedFingerprintCallback(generation, fp)
+                }
             },
-            targetDeviceIdProvider = { activeTargetDeviceId() },
-            allowAnyPinnedMatchProvider = { isLoopbackTargetHost() }
+            targetDeviceIdProvider = effectiveDeviceProvider,
+            allowAnyPinnedMatchProvider = effectiveLoopbackProvider
         )
         val sslContext = TlsConfig.createSslContext(trustManager)
         val scopedClient = baseClient.newBuilder()
@@ -503,8 +688,8 @@ class SnowWebSocketClient(
             .hostnameVerifier(
                 TlsConfig.createHostnameVerifier(
                     pinStorage = storage,
-                    targetDeviceIdProvider = { activeTargetDeviceId() },
-                    allowAnyPinnedMatchProvider = { isLoopbackTargetHost() }
+                    targetDeviceIdProvider = effectiveDeviceProvider,
+                    allowAnyPinnedMatchProvider = effectiveLoopbackProvider
                 )
             )
             .build()
@@ -1077,7 +1262,7 @@ class SnowWebSocketClient(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
-            if (!isCurrentGeneration(generation, webSocket)) {
+            if (!isCurrentOrRetiringGeneration(generation, webSocket)) {
                 log("Ignoring onMessage from stale generation=$generation.")
                 return
             }
@@ -1215,7 +1400,11 @@ class SnowWebSocketClient(
         if (!devId.isNullOrBlank() && !token.isNullOrBlank()) {
             log("Initiating automatic authentication handshake (device_id=${devId.take(8)}...)...")
             val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
-            val isLoopback = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == "::1"
+            val routeHint = when {
+                TransportClassifier.isLoopbackHost(targetHost) -> "usb_adb"
+                TransportClassifier.isHotspotHostOrHint(targetHost) -> "hotspot"
+                else -> "wifi_lan"
+            }
             sendRequestForGeneration(
                 expectedGeneration = generation,
                 expectedSocket = socketRef,
@@ -1224,8 +1413,8 @@ class SnowWebSocketClient(
                     "device_id" to devId,
                     "auth_token" to token,
                     "manifest" to manifestMap,
-                    "connection_mode" to if (isLoopback) "usb_adb" else "wifi_lan",
-                    "transport_mode" to if (isLoopback) "usb_adb" else "wifi_lan"
+                    "connection_mode" to routeHint,
+                    "transport_mode" to routeHint
                 )
             ) { response ->
                 if (!isCurrentGeneration(generation, socketRef)) {
@@ -1386,11 +1575,16 @@ class SnowWebSocketClient(
         rawText: String,
         expectedGeneration: Long? = null
     ) {
+        var isRetiringOnly = false
         // Guard against stale socket / obsolete generation deliveries
         synchronized(this) {
             val activeGen = socketGeneration.get()
             if (expectedGeneration != null) {
-                if (expectedGeneration != activeGen || this.webSocket !== incomingSocket) {
+                if (expectedGeneration == activeGen && this.webSocket === incomingSocket) {
+                    isRetiringOnly = false
+                } else if (retiringSockets[incomingSocket] == expectedGeneration) {
+                    isRetiringOnly = true
+                } else {
                     log("Dropping incoming message from obsolete gen=$expectedGeneration (active=$activeGen).")
                     return
                 }
@@ -1405,13 +1599,27 @@ class SnowWebSocketClient(
             ProtocolValidator.validateRawMessage(rawText)
         } catch (e: ProtocolValidationError) {
             log("Received invalid message: ${e.message}")
-            if (e.correlationId != null && (expectedGeneration == null || isCurrentGeneration(capturedGeneration, incomingSocket))) {
+            if (!isRetiringOnly && e.correlationId != null && (expectedGeneration == null || isCurrentGeneration(capturedGeneration, incomingSocket))) {
                 val err = SnowMessage.createError(
                     code = e.code,
                     message = e.message,
                     correlationId = e.correlationId
                 )
                 incomingSocket.send(JsonSerialization.toJson(err))
+            }
+            return
+        }
+
+        if (isRetiringOnly) {
+            if (message.type == MessageType.RESPONSE || message.type == MessageType.ERROR) {
+                message.correlationId?.let { corrId ->
+                    val entry = pendingRequests[corrId]
+                    if (entry != null && entry.generation == capturedGeneration) {
+                        if (pendingRequests.remove(corrId, entry)) {
+                            entry.callback.invoke(message)
+                        }
+                    }
+                }
             }
             return
         }
@@ -1560,6 +1768,270 @@ class SnowWebSocketClient(
                     incomingSocket.send(JsonSerialization.toJson(err))
                 }
             }
+        }
+    }
+
+    private inner class StandbyProbeListener(
+        private val probeHost: String,
+        private val probePort: Int,
+        private val preSwitchGeneration: Long,
+        private val expectedDeviceId: String?,
+        private val authToken: String,
+        private val verifyPing: Boolean,
+        private val standbyTrustManager: SnowTrustManager?,
+        private val resultDeferred: CompletableDeferred<StandbyProbeResult>
+    ) : WebSocketListener() {
+        @Volatile
+        private var socketRef: WebSocket? = null
+        @Volatile
+        private var activeDelegate: SnowListener? = null
+        @Volatile
+        private var authReqId: String? = null
+        @Volatile
+        private var pingReqId: String? = null
+        @Volatile
+        private var pendingAuthState: AuthState.Authenticated? = null
+        private val timedOut = AtomicBoolean(false)
+
+        fun bindSocket(ws: WebSocket) {
+            socketRef = ws
+        }
+
+        fun abortOnTimeout() {
+            timedOut.set(true)
+            completeFailure("PROBE_TIMEOUT", "Standby handshake timed out.")
+        }
+
+        private fun completeFailure(status: String, error: String) {
+            if (!resultDeferred.isCompleted) {
+                resultDeferred.complete(
+                    StandbyProbeResult(
+                        promoted = false,
+                        status = status,
+                        error = TransportClassifier.sanitizeTransportError(error),
+                        host = probeHost,
+                        port = probePort
+                    )
+                )
+            }
+        }
+
+        private fun promoteWithAuthState(ws: WebSocket, authState: AuthState.Authenticated) {
+            if (timedOut.get()) {
+                try {
+                    ws.cancel()
+                } catch (_: Exception) {}
+                return
+            }
+            var oldWsToRetire: WebSocket? = null
+            var oldGenToRetire: Long = -1L
+            var staleReason: String? = null
+            synchronized(this@SnowWebSocketClient) {
+                val curGen = socketGeneration.get()
+                if (userInitiatedDisconnect.get() || curGen != preSwitchGeneration) {
+                    staleReason = "Connection state changed during standby probe."
+                } else {
+                    oldWsToRetire = this@SnowWebSocketClient.webSocket
+                    oldGenToRetire = curGen
+                    val promotedGen = socketGeneration.incrementAndGet()
+                    heartbeatJob?.cancel()
+                    heartbeatJob = null
+                    pendingHeartbeatId = null
+                    missedHeartbeatAcks.set(0)
+                    reconnectJob?.cancel()
+                    reconnectJob = null
+
+                    val canonicalPeerId = authState.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+                        ?: expectedDeviceId
+                        ?: activeTargetDeviceId()
+                    if (canonicalPeerId != null) {
+                        resolvedTargetDeviceId = canonicalPeerId
+                        standbyTrustManager?.lastPresentedFingerprint?.let { fp ->
+                            if (certPinStorage?.getPinnedFingerprintForDevice(canonicalPeerId) == null) {
+                                certPinStorage?.pinFingerprintForDevice(canonicalPeerId, fp)
+                            }
+                        }
+                        if (tokenStorage?.getTokenForDevice(canonicalPeerId) == null) {
+                            tokenStorage?.saveTokenForDevice(canonicalPeerId, authToken)
+                        }
+                    }
+
+                    this@SnowWebSocketClient.webSocket = ws
+                    this@SnowWebSocketClient.targetHost = probeHost
+                    this@SnowWebSocketClient.targetPort = probePort
+                    this@SnowWebSocketClient.currentTrustManager = standbyTrustManager
+                    userInitiatedDisconnect.set(false)
+                    backoffPolicy.reset()
+                    lastAckTimestamp = System.currentTimeMillis()
+                    _connectionState.value = ConnectionState.CONNECTED
+                    _authState.value = authState
+                    activeDelegate = SnowListener(promotedGen, standbyTrustManager)
+                    startHeartbeatLoop(ws, promotedGen)
+                    log("Make-Before-Break promoted active socket to $probeHost:$probePort (gen=$promotedGen)")
+                }
+            }
+            if (staleReason != null) {
+                try {
+                    ws.close(1000, "Stale standby probe")
+                } catch (_: Exception) {
+                    try {
+                        ws.cancel()
+                    } catch (_: Exception) {}
+                }
+                completeFailure("STALE_GENERATION", staleReason!!)
+                return
+            }
+            if (oldWsToRetire != null && oldWsToRetire !== ws) {
+                retireSocketGracefully(oldWsToRetire, oldGenToRetire)
+            }
+            resultDeferred.complete(
+                StandbyProbeResult(
+                    promoted = true,
+                    status = "PROMOTED",
+                    peerDeviceId = authState.peerDeviceId ?: expectedDeviceId,
+                    host = probeHost,
+                    port = probePort
+                )
+            )
+        }
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            socketRef = webSocket
+            if (timedOut.get()) {
+                try {
+                    webSocket.cancel()
+                } catch (_: Exception) {}
+                return
+            }
+            val devId = identity?.deviceId?.trim().orEmpty()
+            val manifestMap = DeviceNode.buildAndroidManifest(context).toMap()
+            val routeHint = when {
+                TransportClassifier.isLoopbackHost(probeHost) -> "usb_adb"
+                TransportClassifier.isHotspotHostOrHint(probeHost) -> "hotspot"
+                else -> "wifi_lan"
+            }
+            val req = SnowMessage.createRequest(
+                action = "auth_request",
+                data = mapOf(
+                    "device_id" to devId,
+                    "auth_token" to authToken,
+                    "manifest" to manifestMap,
+                    "connection_mode" to routeHint,
+                    "transport_mode" to routeHint
+                )
+            )
+            authReqId = req.id
+            val sent = try {
+                webSocket.send(JsonSerialization.toJson(req))
+            } catch (_: Exception) {
+                false
+            }
+            if (!sent) {
+                completeFailure("PROBE_SEND_FAILED", "Failed sending standby auth request.")
+            }
+        }
+
+        override fun onMessage(webSocket: WebSocket, text: String) {
+            val del = activeDelegate
+            if (del != null) {
+                del.onMessage(webSocket, text)
+                return
+            }
+            if (timedOut.get()) return
+            val message = try {
+                ProtocolValidator.validateRawMessage(text)
+            } catch (_: Exception) {
+                return
+            }
+            if (message.type == MessageType.HEARTBEAT) {
+                try {
+                    webSocket.send(JsonSerialization.toJson(SnowMessage.createHeartbeatAck(message.id)))
+                } catch (_: Exception) {}
+                return
+            }
+            val corrId = message.correlationId ?: return
+            if (corrId == authReqId) {
+                if (message.type == MessageType.RESPONSE && message.payload?.get("status") == "success") {
+                    val data = (message.payload["data"] as? Map<*, *>) ?: message.payload
+                    val parsed = parseAuthenticatedState(data)
+                    if (!expectedDeviceId.isNullOrBlank() &&
+                        !parsed.peerDeviceId.isNullOrBlank() &&
+                        parsed.peerDeviceId != expectedDeviceId
+                    ) {
+                        completeFailure("IDENTITY_MISMATCH", "Expected peer '$expectedDeviceId', got '${parsed.peerDeviceId}'.")
+                        return
+                    }
+                    if (!verifyPing) {
+                        promoteWithAuthState(webSocket, parsed)
+                        return
+                    }
+                    pendingAuthState = parsed
+                    val ping = SnowMessage.createRequest(action = "ping", data = emptyMap())
+                    pingReqId = ping.id
+                    val pingSent = try {
+                        webSocket.send(JsonSerialization.toJson(ping))
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (!pingSent) {
+                        completeFailure("PROBE_PING_SEND_FAILED", "Failed sending standby readiness ping.")
+                    }
+                } else {
+                    val reason = message.error?.message ?: "Standby authentication rejected."
+                    completeFailure("PROBE_AUTH_FAILED", reason)
+                }
+                return
+            }
+            if (corrId == pingReqId) {
+                val auth = pendingAuthState
+                if (message.type == MessageType.RESPONSE && auth != null) {
+                    promoteWithAuthState(webSocket, auth)
+                } else {
+                    completeFailure("PROBE_PING_FAILED", message.error?.message ?: "Standby readiness ping failed.")
+                }
+            }
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            val del = activeDelegate
+            if (del != null) {
+                del.onClosing(webSocket, code, reason)
+                return
+            }
+            completeFailure("PROBE_CLOSED", "Standby socket closed ($code: $reason)")
+            try {
+                webSocket.close(code, reason)
+            } catch (_: Exception) {}
+        }
+
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            val del = activeDelegate
+            if (del != null) {
+                del.onClosed(webSocket, code, reason)
+                return
+            }
+            completeFailure("PROBE_CLOSED", "Standby socket closed ($code: $reason)")
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            val del = activeDelegate
+            if (del != null) {
+                del.onFailure(webSocket, t, response)
+                return
+            }
+            var cur: Throwable? = t
+            while (cur != null) {
+                if (cur is UnconfirmedCertificateException) {
+                    completeFailure("PROBE_UNCONFIRMED_CERT", "Standby host certificate is not yet pinned.")
+                    return
+                }
+                if (cur is CertificateMismatchException) {
+                    completeFailure("PROBE_FINGERPRINT_MISMATCH", "Standby certificate fingerprint mismatch.")
+                    return
+                }
+                cur = cur.cause
+            }
+            completeFailure("PROBE_FAILED", t.message ?: t.javaClass.simpleName)
         }
     }
 }

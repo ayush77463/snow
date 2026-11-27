@@ -998,6 +998,15 @@ class SnowWebServer:
             if not dev.get("snow_id") and dev_id:
                 dev["snow_id"] = generate_snow_id(seed=dev_id)
 
+            if not is_local:
+                from snow.network.router import classify_transport_badge
+                if not dev.get("transport_badge"):
+                    dev["transport_badge"] = classify_transport_badge(
+                        transport=dev.get("active_transport") or dev.get("transport"),
+                        host=dev.get("remote_address") or dev.get("host"),
+                        connection_mode=dev.get("effective_mode") or dev.get("connection_mode"),
+                    )
+
             if not is_local and dev.get("is_connected") and (
                 dev.get("platform") == "android"
                 or dev.get("device_type") in ("phone", "android")
@@ -1246,30 +1255,56 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_devices_connection_mode(self, request: web.Request) -> web.Response:
-        """Update per-device connection mode (auto, local_only, remote_only)."""
+        """Update per-device transport/connection mode with verified route validation."""
         try:
             body = await request.json()
         except Exception:
             return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
 
         device_id = (body.get("device_id") or "").strip()
-        conn_mode = (body.get("connection_mode") or "").strip().lower()
+        raw_mode = (body.get("mode") or body.get("connection_mode") or "").strip().lower()
 
         if not device_id:
             return web.json_response({"success": False, "error": "Missing required field 'device_id'."}, status=400)
 
-        from snow.security.db import VALID_CONNECTION_MODES
-        if conn_mode not in VALID_CONNECTION_MODES:
+        from snow.network.transport import VALID_TRANSPORT_MODES, normalize_transport_mode
+        norm_mode = normalize_transport_mode(raw_mode)
+        if not norm_mode:
             return web.json_response(
                 {
                     "success": False,
-                    "error": f"Invalid connection_mode '{conn_mode}'. Must be one of: {', '.join(sorted(VALID_CONNECTION_MODES))}",
+                    "status": "INVALID_ARGUMENT",
+                    "error": f"Invalid connection_mode '{raw_mode}'. Must be one of: {', '.join(VALID_TRANSPORT_MODES)}",
                 },
                 status=400,
             )
 
-        res = await self.bridge.set_device_connection_mode(device_id, conn_mode)
-        return web.json_response(res)
+        if "allow_probe" in body:
+            res = await self.bridge.set_device_connection_mode(
+                device_id, norm_mode, allow_probe=bool(body.get("allow_probe", True))
+            )
+        else:
+            res = await self.bridge.set_device_connection_mode(device_id, norm_mode)
+        if not isinstance(res, dict):
+            return web.json_response({"success": False, "error": "Unexpected bridge response."}, status=500)
+        if res.get("success"):
+            return web.json_response(res, status=200)
+        status_name = str(res.get("status") or "").upper()
+        http_code = (
+            404
+            if status_name in ("DEVICE_NOT_FOUND", "DEVICE_NOT_PAIRED")
+            else (
+                409
+                if status_name
+                in ("ROUTE_UNAVAILABLE", "MANUAL_ROUTE_UNAVAILABLE", "CORE_OFFLINE_CANNOT_VERIFY_ROUTE", "ROUTE_VERIFICATION_UNAVAILABLE")
+                else 400
+            )
+        )
+        return web.json_response(res, status=http_code)
+
+    async def handle_api_devices_transport(self, request: web.Request) -> web.Response:
+        """Manual single-route or auto transport switcher endpoint sharing validation rules."""
+        return await self.handle_api_devices_connection_mode(request)
 
     async def handle_api_devices_permission_profile(self, request: web.Request) -> web.Response:
         """Update permission profile preset for a device."""
@@ -4069,10 +4104,10 @@ class SnowWebServer:
     # =========================================================================
 
     async def handle_api_usb_status(self, request: web.Request) -> web.Response:
-        """Query USB ADB status, connected devices, and reverse socket mappings."""
-        from snow.core.usb import get_usb_status
+        """Query USB ADB status, connected devices, and bidirectional socket mappings."""
+        from snow.core.usb import get_usb_bidirectional_status
         try:
-            stat = await asyncio.to_thread(get_usb_status)
+            stat = await asyncio.to_thread(get_usb_bidirectional_status)
             return web.json_response({
                 "success": True,
                 "status": "SUCCESS",
@@ -4087,19 +4122,20 @@ class SnowWebServer:
             }, status=500)
 
     async def handle_api_usb_connect(self, request: web.Request) -> web.Response:
-        """Establish ADB reverse mappings for zero-data USB tethering."""
+        """Establish bidirectional ADB USB mappings for zero-data tethering and Peer Host."""
         try:
             body = await request.json()
         except Exception:
             body = {}
         serial = body.get("serial")
-        from snow.core.usb import setup_usb_reverse
+        from snow.core.usb import setup_usb_bidirectional
         try:
-            ok, msg = await asyncio.to_thread(setup_usb_reverse, serial=serial)
+            ok, msg, meta = await asyncio.to_thread(setup_usb_bidirectional, serial=serial)
             return web.json_response({
                 "success": ok,
                 "status": "SUCCESS" if ok else "ERROR",
                 "message": msg,
+                **meta,
             }, status=200 if ok else 400)
         except Exception as exc:
             logger.error("Failed establishing USB reverse mappings: %s", exc)
@@ -4958,7 +4994,13 @@ class SnowWebServer:
             if handoff_accepted or (use_async and res.get("success") and is_accepted):
                 # Ownership of staged_file was transferred cleanly to background Core finalization
                 staged_file = None
-            http_code = 202 if (res.get("success") and is_accepted) else (200 if res.get("success", False) else 500)
+            route_badge = res.get("transport_badge") or res.get("route_badge") or res_data.get("route_badge") or ""
+            route_type = res.get("transport") or res_data.get("transport") or ""
+            http_code = (
+                202
+                if (res.get("success") and is_accepted)
+                else (200 if res.get("success", False) else (413 if res_status == "RELAY_QUOTA_EXCEEDED" else 500))
+            )
             return web.json_response(
                 {
                     "success": res.get("success", False),
@@ -4968,6 +5010,9 @@ class SnowWebServer:
                     "filename": filename,
                     "size_bytes": total_bytes,
                     "sha256": computed_sha256,
+                    "transport": route_type,
+                    "transport_badge": route_badge,
+                    "route_badge": route_badge,
                     "data": res_data,
                     "error": res.get("error"),
                 },
@@ -5219,6 +5264,7 @@ class SnowWebServer:
         app.router.add_post("/api/devices/reconnect", self.handle_api_devices_reconnect)
         app.router.add_post("/api/devices/connect-peer", self.handle_api_devices_connect_peer)
         app.router.add_post("/api/devices/connection-mode", self.handle_api_devices_connection_mode)
+        app.router.add_post("/api/devices/transport", self.handle_api_devices_transport)
         app.router.add_post("/api/devices/permission-profile", self.handle_api_devices_permission_profile)
         app.router.add_get("/api/network/identity", self.handle_api_network_identity)
         app.router.add_post("/api/network/identity", self.handle_api_network_identity_update)

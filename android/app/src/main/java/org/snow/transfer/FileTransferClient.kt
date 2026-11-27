@@ -55,9 +55,19 @@ open class FileTransferClient(
     private val maxRetryAttempts: Int = 3,
     private val retryBaseDelayMs: Long = 200L
 ) {
+    @Volatile
+    var transportOrchestrator: org.snow.network.TransportOrchestrator? = null
+    @Volatile
+    var usbMappingVerifiedProvider: (() -> Boolean)? = null
+    @Volatile
+    var fallbackTargetProvider: (suspend (failedHost: String, failedRoute: org.snow.network.TransportRoute) -> Pair<String, Int>?)? = null
+    @Volatile
+    var maxRelayTransferBytes: Long = DEFAULT_MAX_RELAY_TRANSFER_BYTES
+
     companion object {
         const val TAG = "FileTransferClient"
         const val CHUNK_SIZE = 64 * 1024 // 64 KiB bounded streaming chunks
+        const val DEFAULT_MAX_RELAY_TRANSFER_BYTES = 100L * 1024L * 1024L // 100 MiB relay cap
         private val OCTET_STREAM = "application/octet-stream".toMediaType()
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
@@ -126,7 +136,9 @@ open class FileTransferClient(
         val transferId: String,
         val bytesTransferred: Long,
         val totalBytes: Long,
-        val percent: Int
+        val percent: Int,
+        val transportRoute: String = "",
+        val routeBadge: String = ""
     )
 
     data class DuplicateCheckResult(
@@ -136,7 +148,13 @@ open class FileTransferClient(
     )
 
     sealed class TransferResult {
-        data class Success(val transferId: String, val sha256: String, val file: File) : TransferResult()
+        data class Success(
+            val transferId: String,
+            val sha256: String,
+            val file: File,
+            val transportRoute: String = "",
+            val routeBadge: String = ""
+        ) : TransferResult()
         data class Duplicate(val fileName: String, val sha256: String) : TransferResult()
         data class Error(val transferId: String?, val message: String, val code: Int? = null) : TransferResult()
     }
@@ -201,6 +219,41 @@ open class FileTransferClient(
 
     private fun isRetryableHttpCode(code: Int): Boolean {
         return code == 408 || code == 429 || code in 500..599
+    }
+
+    internal fun resolveSocketRouteAndBadge(
+        host: String,
+        serverRouteHint: String? = null,
+        serverBadgeHint: String? = null
+    ): Pair<org.snow.network.TransportRoute, String> {
+        val usbVerified = usbMappingVerifiedProvider?.invoke() ?: false
+        val isRelay = host.contains("relay", ignoreCase = true) ||
+            host.contains("tunnel", ignoreCase = true) ||
+            serverRouteHint.equals("remote_relay", ignoreCase = true)
+        val (classifiedRoute, _) = org.snow.network.TransportClassifier.classifyTransferSocketRoute(
+            host = host,
+            peerIp = host,
+            usbMappingVerified = usbVerified || org.snow.network.TransportClassifier.isLoopbackHost(host) && usbMappingVerifiedProvider == null,
+            transportHint = serverRouteHint,
+            isRelay = isRelay
+        )
+        val wireRoute = org.snow.network.TransportRoute.fromWireName(serverRouteHint)
+        val finalRoute = wireRoute ?: classifiedRoute
+        // Prefer canonical UTF-8 TransportRoute.badge over HTTP ISO-8859-1 headers where '•' may become '?'
+        val cleanHeaderBadge = serverBadgeHint?.trim()?.takeIf { it.isNotBlank() && '?' !in it }
+        val finalBadge = wireRoute?.badge ?: cleanHeaderBadge ?: finalRoute.badge
+        return finalRoute to finalBadge
+    }
+
+    private fun checkRelayQuotaPreflight(
+        route: org.snow.network.TransportRoute,
+        fileSize: Long
+    ): String? {
+        if (route == org.snow.network.TransportRoute.REMOTE_RELAY && fileSize > maxRelayTransferBytes) {
+            val mib = maxOf(1L, maxRelayTransferBytes / (1024L * 1024L))
+            return "File size ($fileSize bytes) exceeds the ${mib} MiB Remote Relay limit. Connect via USB, Hotspot, or Wi-Fi LAN for Zero-Data multi-GB transfers."
+        }
+        return null
     }
 
     private suspend fun queryUploadResumeOffset(
@@ -371,15 +424,23 @@ open class FileTransferClient(
         val fileSize = file.length()
         val sha256 = computeSha256(file)
 
+        // 0. Check relay quota upfront before hashing/uploading over metered relay
+        var activeHost = serverHost
+        var activePort = transferPort
+        val (initialRoute, initialBadge) = resolveSocketRouteAndBadge(activeHost)
+        checkRelayQuotaPreflight(initialRoute, fileSize)?.let { quotaMsg ->
+            return@withContext TransferResult.Error(null, quotaMsg, 413)
+        }
+
         // 1. Check duplicate
-        val dupResult = checkDuplicate(serverHost, transferPort, fileName, sha256)
+        val dupResult = checkDuplicate(activeHost, activePort, fileName, sha256)
         if (dupResult.alreadyExists) {
             SafeLog.i(TAG, "File '$fileName' already exists on desktop core with matching SHA-256.")
             return@withContext TransferResult.Duplicate(fileName, sha256)
         }
 
         // 2. Initialize transfer session
-        val init = initTransfer(serverHost, transferPort, fileName, fileSize, sha256, "UPLOAD")
+        val init = initTransfer(activeHost, activePort, fileName, fileSize, sha256, "UPLOAD")
             ?: return@withContext TransferResult.Error(null, "Failed to initialize upload session.")
         val transferId = init.first
         var resumeOffset = init.second
@@ -387,123 +448,152 @@ open class FileTransferClient(
         transferCancelled.set(false)
         cancelledIds.remove(transferId)
 
-        val baseUrl = getBaseUrl(serverHost, transferPort)
-        val uploadUrl = "$baseUrl/api/v1/transfers/upload/$transferId"
+        var activeRoute = initialRoute
+        var activeBadge = initialBadge
+        val peerKey = targetDeviceIdProvider?.invoke()?.takeIf { it.isNotBlank() } ?: activeHost
+        transportOrchestrator?.pinTransfer(transferId, peerKey, activeRoute, activeHost, activePort)
+
         var lastError: TransferResult.Error? = null
 
-        for (attempt in 0..maxRetryAttempts) {
-            if (isCancelledFor(transferId)) {
-                return@withContext TransferResult.Error(transferId, "Transfer cancelled")
-            }
-            if (attempt > 0) {
-                val backoffMs = minOf(retryBaseDelayMs * (1L shl (attempt - 1)), 4000L)
-                delay(backoffMs)
+        try {
+            for (attempt in 0..maxRetryAttempts) {
                 if (isCancelledFor(transferId)) {
                     return@withContext TransferResult.Error(transferId, "Transfer cancelled")
                 }
-                queryUploadResumeOffset(serverHost, transferPort, transferId)?.let { serverOffset ->
-                    resumeOffset = serverOffset.coerceIn(0L, fileSize)
-                }
-            }
-
-            val attemptOffset = resumeOffset.coerceIn(0L, fileSize)
-            val requestBody = object : RequestBody() {
-                override fun contentType() = OCTET_STREAM
-                override fun contentLength() = fileSize - attemptOffset
-
-                override fun writeTo(sink: BufferedSink) {
-                    FileInputStream(file).use { input ->
-                        if (attemptOffset > 0L) {
-                            skipExactBytes(input, attemptOffset)
+                if (attempt > 0) {
+                    val backoffMs = minOf(retryBaseDelayMs * (1L shl (attempt - 1)), 4000L)
+                    delay(backoffMs)
+                    if (isCancelledFor(transferId)) {
+                        return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                    }
+                    fallbackTargetProvider?.invoke(activeHost, activeRoute)?.let { (fbHost, fbPort) ->
+                        if (fbHost.isNotBlank() && (fbHost != activeHost || fbPort != activePort)) {
+                            activeHost = fbHost
+                            activePort = fbPort
+                            val updatedRoute = resolveSocketRouteAndBadge(activeHost)
+                            activeRoute = updatedRoute.first
+                            activeBadge = updatedRoute.second
+                            transportOrchestrator?.pinTransfer(transferId, peerKey, activeRoute, activeHost, activePort)
                         }
-                        val buffer = ByteArray(CHUNK_SIZE)
-                        var bytesRead: Int
-                        var totalWritten = attemptOffset
+                    }
+                    checkRelayQuotaPreflight(activeRoute, fileSize)?.let { quotaMsg ->
+                        return@withContext TransferResult.Error(transferId, quotaMsg, 413)
+                    }
+                    queryUploadResumeOffset(activeHost, activePort, transferId)?.let { serverOffset ->
+                        resumeOffset = serverOffset.coerceIn(0L, fileSize)
+                    }
+                }
 
-                        while (input.read(buffer).also { bytesRead = it } != -1) {
-                            if (isCancelledFor(transferId)) {
-                                throw IOException("Transfer cancelled")
+                val baseUrl = getBaseUrl(activeHost, activePort)
+                val uploadUrl = "$baseUrl/api/v1/transfers/upload/$transferId"
+                val attemptOffset = resumeOffset.coerceIn(0L, fileSize)
+                val requestBody = object : RequestBody() {
+                    override fun contentType() = OCTET_STREAM
+                    override fun contentLength() = fileSize - attemptOffset
+
+                    override fun writeTo(sink: BufferedSink) {
+                        FileInputStream(file).use { input ->
+                            if (attemptOffset > 0L) {
+                                skipExactBytes(input, attemptOffset)
                             }
-                            sink.write(buffer, 0, bytesRead)
-                            totalWritten += bytesRead
-                            val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
-                            onProgress?.invoke(
-                                TransferProgress(
-                                    transferId = transferId,
-                                    bytesTransferred = totalWritten,
-                                    totalBytes = fileSize,
-                                    percent = percent
+                            val buffer = ByteArray(CHUNK_SIZE)
+                            var bytesRead: Int
+                            var totalWritten = attemptOffset
+
+                            while (input.read(buffer).also { bytesRead = it } != -1) {
+                                if (isCancelledFor(transferId)) {
+                                    throw IOException("Transfer cancelled")
+                                }
+                                sink.write(buffer, 0, bytesRead)
+                                totalWritten += bytesRead
+                                val percent = if (fileSize > 0L) ((totalWritten * 100L) / fileSize).toInt().coerceIn(0, 100) else 100
+                                onProgress?.invoke(
+                                    TransferProgress(
+                                        transferId = transferId,
+                                        bytesTransferred = totalWritten,
+                                        totalBytes = fileSize,
+                                        percent = percent,
+                                        transportRoute = activeRoute.wireName,
+                                        routeBadge = activeBadge
+                                    )
                                 )
-                            )
+                            }
                         }
                     }
                 }
-            }
 
-            val token = getAuthToken() ?: ""
-            val reqBuilder = Request.Builder()
-                .url(uploadUrl)
-                .addHeader("Authorization", "Bearer $token")
-                .addHeader("X-Snow-Device-Id", deviceId)
-                .addHeader("X-Snow-Filename", fileName)
-                .addHeader("X-Snow-Filesize", fileSize.toString())
-                .addHeader("X-Snow-SHA256", sha256)
+                val token = getAuthToken() ?: ""
+                val reqBuilder = Request.Builder()
+                    .url(uploadUrl)
+                    .addHeader("Authorization", "Bearer $token")
+                    .addHeader("X-Snow-Device-Id", deviceId)
+                    .addHeader("X-Snow-Filename", fileName)
+                    .addHeader("X-Snow-Filesize", fileSize.toString())
+                    .addHeader("X-Snow-SHA256", sha256)
+                    .addHeader("X-Snow-Transport-Hint", activeRoute.wireName)
 
-            if (attemptOffset > 0L && fileSize > attemptOffset) {
-                reqBuilder.addHeader("Content-Range", "bytes $attemptOffset-${fileSize - 1}/$fileSize")
-            }
+                if (attemptOffset > 0L && fileSize > attemptOffset) {
+                    reqBuilder.addHeader("Content-Range", "bytes $attemptOffset-${fileSize - 1}/$fileSize")
+                }
 
-            val request = reqBuilder.post(requestBody).build()
-            val call = httpClient.newCall(request)
-            activeCall.set(call)
-            activeCallsById[transferId] = call
+                val request = reqBuilder.post(requestBody).build()
+                val call = httpClient.newCall(request)
+                activeCall.set(call)
+                activeCallsById[transferId] = call
 
-            try {
-                val resOrNull = call.execute().use { response ->
-                    if (response.isSuccessful) {
-                        val bodyStr = response.body?.string() ?: "{}"
-                        val json = JSONObject(bodyStr)
-                        val verifiedHash = json.optString("sha256", sha256)
-                        SafeLog.i(TAG, "Upload completed successfully. Verified SHA-256: $verifiedHash")
-                        TransferResult.Success(transferId, verifiedHash, file)
-                    } else if (response.code == 416 && attempt < maxRetryAttempts) {
-                        lastError = TransferResult.Error(transferId, "Range mismatch (HTTP 416).", 416)
-                        null
-                    } else if (isRetryableHttpCode(response.code) && attempt < maxRetryAttempts) {
-                        SafeLog.w(TAG, "Upload transient HTTP ${response.code}; retrying...")
-                        lastError = TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
-                        null
-                    } else if (response.code == 422) {
-                        SafeLog.e(TAG, "SHA-256 integrity verification rejected by desktop core (422).")
-                        TransferResult.Error(transferId, "Integrity verification failed (HTTP 422).", 422)
-                    } else {
-                        SafeLog.w(TAG, "Upload failed with HTTP ${response.code}")
-                        TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+                try {
+                    val resOrNull = call.execute().use { response ->
+                        if (response.isSuccessful) {
+                            val bodyStr = response.body?.string() ?: "{}"
+                            val json = JSONObject(bodyStr)
+                            val verifiedHash = json.optString("sha256", sha256)
+                            val respRoute = json.optString("transport", "").takeIf { it.isNotBlank() }
+                            val respBadge = json.optString("transport_badge", "").takeIf { it.isNotBlank() }
+                            val finalRoute = resolveSocketRouteAndBadge(activeHost, respRoute, respBadge)
+                            SafeLog.i(TAG, "Upload completed successfully via ${finalRoute.second}. Verified SHA-256: $verifiedHash")
+                            TransferResult.Success(
+                                transferId = transferId,
+                                sha256 = verifiedHash,
+                                file = file,
+                                transportRoute = finalRoute.first.wireName,
+                                routeBadge = finalRoute.second
+                            )
+                        } else if (response.code == 416 && attempt < maxRetryAttempts) {
+                            lastError = TransferResult.Error(transferId, "Range mismatch (HTTP 416).", 416)
+                            null
+                        } else if (isRetryableHttpCode(response.code) && attempt < maxRetryAttempts) {
+                            lastError = TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+                            null
+                        } else if (response.code == 422) {
+                            TransferResult.Error(transferId, "Integrity verification failed (HTTP 422).", 422)
+                        } else {
+                            TransferResult.Error(transferId, "Upload failed with HTTP ${response.code}", response.code)
+                        }
                     }
+                    if (resOrNull != null) {
+                        return@withContext resOrNull
+                    }
+                } catch (e: CancellationException) {
+                    call.cancel()
+                    throw e
+                } catch (e: Exception) {
+                    if (isCancelledFor(transferId) || call.isCanceled()) {
+                        return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                    }
+                    lastError = TransferResult.Error(transferId, e.message ?: "Upload network exception")
+                    if (attempt >= maxRetryAttempts) {
+                        return@withContext lastError!!
+                    }
+                    SafeLog.w(TAG, "Upload attempt ${attempt + 1} failed (${e.message}); resuming via Range...")
+                } finally {
+                    activeCall.compareAndSet(call, null)
+                    activeCallsById.remove(transferId, call)
                 }
-                if (resOrNull != null) {
-                    return@withContext resOrNull
-                }
-            } catch (e: CancellationException) {
-                call.cancel()
-                throw e
-            } catch (e: Exception) {
-                if (isCancelledFor(transferId) || call.isCanceled()) {
-                    SafeLog.i(TAG, "Upload cancelled by user: $fileName")
-                    return@withContext TransferResult.Error(transferId, "Transfer cancelled")
-                }
-                lastError = TransferResult.Error(transferId, e.message ?: "Upload network exception")
-                if (attempt >= maxRetryAttempts) {
-                    SafeLog.e(TAG, "Upload failed after retries: ${e.message}", e)
-                    return@withContext lastError!!
-                }
-                SafeLog.w(TAG, "Upload attempt ${attempt + 1} failed (${e.message}); resuming via Range...")
-            } finally {
-                activeCall.compareAndSet(call, null)
-                activeCallsById.remove(transferId, call)
             }
+            lastError ?: TransferResult.Error(transferId, "Upload failed after retries.")
+        } finally {
+            transportOrchestrator?.unpinTransfer(transferId)
         }
-        lastError ?: TransferResult.Error(transferId, "Upload failed after retries.")
     }
 
     /**
@@ -517,7 +607,10 @@ open class FileTransferClient(
         fileSize: Long,
         onProgress: ((TransferProgress) -> Unit)? = null
     ): TransferResult = withContext(Dispatchers.IO) {
-        // Compute SHA-256
+        val (initialRoute, initialBadge) = resolveSocketRouteAndBadge(serverHost)
+        checkRelayQuotaPreflight(initialRoute, fileSize)?.let { quotaMsg ->
+            return@withContext TransferResult.Error(null, quotaMsg, 413)
+        }
         val sha256 = context.contentResolver.openInputStream(uri)?.use { computeSha256(it) }
             ?: return@withContext TransferResult.Error(null, "Unable to read URI stream for digest.")
 
@@ -536,11 +629,14 @@ open class FileTransferClient(
         transferCancelled.set(false)
         cancelledIds.remove(transferId)
 
+        val peerKey = targetDeviceIdProvider?.invoke()?.takeIf { it.isNotBlank() } ?: serverHost
+        transportOrchestrator?.pinTransfer(transferId, peerKey, initialRoute, serverHost, transferPort)
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val uploadUrl = "$baseUrl/api/v1/transfers/upload/$transferId"
         var lastError: TransferResult.Error? = null
 
-        for (attempt in 0..maxRetryAttempts) {
+        try {
+            for (attempt in 0..maxRetryAttempts) {
             if (isCancelledFor(transferId)) {
                 return@withContext TransferResult.Error(transferId, "Transfer cancelled")
             }
@@ -577,13 +673,15 @@ open class FileTransferClient(
                             }
                             sink.write(buffer, 0, bytesRead)
                             totalWritten += bytesRead
-                            val percent = if (fileSize > 0) ((totalWritten * 100) / fileSize).toInt() else 100
+                            val percent = if (fileSize > 0L) ((totalWritten * 100L) / fileSize).toInt().coerceIn(0, 100) else 100
                             onProgress?.invoke(
                                 TransferProgress(
                                     transferId = transferId,
                                     bytesTransferred = totalWritten,
                                     totalBytes = fileSize,
-                                    percent = percent
+                                    percent = percent,
+                                    transportRoute = initialRoute.wireName,
+                                    routeBadge = initialBadge
                                 )
                             )
                         }
@@ -615,7 +713,16 @@ open class FileTransferClient(
                         val bodyStr = response.body?.string() ?: "{}"
                         val json = JSONObject(bodyStr)
                         val verifiedHash = json.optString("sha256", sha256)
-                        TransferResult.Success(transferId, verifiedHash, File(fileName))
+                        val respRoute = json.optString("transport", "").takeIf { it.isNotBlank() }
+                        val respBadge = json.optString("transport_badge", "").takeIf { it.isNotBlank() }
+                        val finalRoute = resolveSocketRouteAndBadge(serverHost, respRoute, respBadge)
+                        TransferResult.Success(
+                            transferId = transferId,
+                            sha256 = verifiedHash,
+                            file = File(fileName),
+                            transportRoute = finalRoute.first.wireName,
+                            routeBadge = finalRoute.second
+                        )
                     } else if (response.code == 416 && attempt < maxRetryAttempts) {
                         lastError = TransferResult.Error(transferId, "Range mismatch (HTTP 416).", 416)
                         null
@@ -651,6 +758,9 @@ open class FileTransferClient(
             }
         }
         lastError ?: TransferResult.Error(transferId, "Upload failed after retries.")
+        } finally {
+            transportOrchestrator?.unpinTransfer(transferId)
+        }
     }
 
     /**
@@ -672,35 +782,55 @@ open class FileTransferClient(
         transferCancelled.set(false)
         cancelledIds.remove(transferId)
 
-        val baseUrl = getBaseUrl(serverHost, transferPort)
-        val downloadUrl = "$baseUrl/api/v1/transfers/download/$transferId"
+        var activeHost = serverHost
+        var activePort = transferPort
+        var resolvedRoutePair = resolveSocketRouteAndBadge(activeHost)
+        var activeRoute = resolvedRoutePair.first
+        var activeBadge = resolvedRoutePair.second
+        val peerKey = targetDeviceIdProvider?.invoke()?.takeIf { it.isNotBlank() } ?: activeHost
+        transportOrchestrator?.pinTransfer(transferId, peerKey, activeRoute, activeHost, activePort)
+
         var lastError: TransferResult.Error? = null
         var handled416Once = false
 
-        for (attempt in 0..maxRetryAttempts) {
-            if (isCancelledFor(transferId)) {
-                partFile.delete()
-                return@withContext TransferResult.Error(transferId, "Transfer cancelled")
-            }
-            if (attempt > 0) {
-                val backoffMs = minOf(retryBaseDelayMs * (1L shl (attempt - 1)), 4000L)
-                delay(backoffMs)
+        try {
+            for (attempt in 0..maxRetryAttempts) {
                 if (isCancelledFor(transferId)) {
                     partFile.delete()
                     return@withContext TransferResult.Error(transferId, "Transfer cancelled")
                 }
-            }
+                if (attempt > 0) {
+                    val backoffMs = minOf(retryBaseDelayMs * (1L shl (attempt - 1)), 4000L)
+                    delay(backoffMs)
+                    if (isCancelledFor(transferId)) {
+                        partFile.delete()
+                        return@withContext TransferResult.Error(transferId, "Transfer cancelled")
+                    }
+                    fallbackTargetProvider?.invoke(activeHost, activeRoute)?.let { (fbHost, fbPort) ->
+                        if (fbHost.isNotBlank() && (fbHost != activeHost || fbPort != activePort)) {
+                            activeHost = fbHost
+                            activePort = fbPort
+                            resolvedRoutePair = resolveSocketRouteAndBadge(activeHost)
+                            activeRoute = resolvedRoutePair.first
+                            activeBadge = resolvedRoutePair.second
+                            transportOrchestrator?.pinTransfer(transferId, peerKey, activeRoute, activeHost, activePort)
+                        }
+                    }
+                }
 
-            val resumeOffset = if (resume && partFile.exists()) partFile.length() else 0L
-            val token = getAuthToken() ?: ""
-            val reqBuilder = Request.Builder()
-                .url(downloadUrl)
-                .addHeader("Authorization", "Bearer $token")
-                .addHeader("X-Snow-Device-Id", deviceId)
+                val baseUrl = getBaseUrl(activeHost, activePort)
+                val downloadUrl = "$baseUrl/api/v1/transfers/download/$transferId"
+                val resumeOffset = if (resume && partFile.exists()) partFile.length() else 0L
+                val token = getAuthToken() ?: ""
+                val reqBuilder = Request.Builder()
+                    .url(downloadUrl)
+                    .addHeader("Authorization", "Bearer $token")
+                    .addHeader("X-Snow-Device-Id", deviceId)
+                    .addHeader("X-Snow-Transport-Hint", activeRoute.wireName)
 
-            if (resumeOffset > 0L) {
-                reqBuilder.addHeader("Range", "bytes=$resumeOffset-")
-            }
+                if (resumeOffset > 0L) {
+                    reqBuilder.addHeader("Range", "bytes=$resumeOffset-")
+                }
 
             val request = reqBuilder.get().build()
             val call = httpClient.newCall(request)
@@ -745,6 +875,12 @@ open class FileTransferClient(
                         return@use
                     }
 
+                    val respRoute = response.header("X-Snow-Transport-Route")?.takeIf { it.isNotBlank() }
+                    val respBadge = response.header("X-Snow-Transport-Badge")?.takeIf { it.isNotBlank() }
+                    val headerResolved = resolveSocketRouteAndBadge(activeHost, respRoute, respBadge)
+                    activeRoute = headerResolved.first
+                    activeBadge = headerResolved.second
+
                     val append = response.code == 206 && resumeOffset > 0L
                     val body = response.body
                     if (body == null) {
@@ -775,13 +911,15 @@ open class FileTransferClient(
                                 }
                                 output.write(buffer, 0, bytesRead)
                                 downloaded += bytesRead
-                                val percent = if (totalExpected > 0L) ((downloaded * 100) / totalExpected).toInt().coerceIn(0, 100) else 100
+                                val percent = if (totalExpected > 0L) ((downloaded * 100L) / totalExpected).toInt().coerceIn(0, 100) else 100
                                 onProgress?.invoke(
                                     TransferProgress(
                                         transferId = transferId,
                                         bytesTransferred = downloaded,
                                         totalBytes = totalExpected,
-                                        percent = percent
+                                        percent = percent,
+                                        transportRoute = activeRoute.wireName,
+                                        routeBadge = activeBadge
                                     )
                                 )
                             }
@@ -820,8 +958,14 @@ open class FileTransferClient(
                         partFile.delete()
                     }
 
-                    SafeLog.i(TAG, "Download completed and verified: ${destinationFile.name}")
-                    return@withContext TransferResult.Success(transferId, actualSha256, destinationFile)
+                    SafeLog.i(TAG, "Download completed via $activeBadge: ${destinationFile.name}")
+                    return@withContext TransferResult.Success(
+                        transferId = transferId,
+                        sha256 = actualSha256,
+                        file = destinationFile,
+                        transportRoute = activeRoute.wireName,
+                        routeBadge = activeBadge
+                    )
                 }
             } catch (e: CancellationException) {
                 call.cancel()
@@ -845,6 +989,9 @@ open class FileTransferClient(
             }
         }
         lastError ?: TransferResult.Error(transferId, "Download failed after retries.")
+        } finally {
+            transportOrchestrator?.unpinTransfer(transferId)
+        }
     }
 
     data class ScreenSenderInfo(

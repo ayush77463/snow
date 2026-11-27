@@ -407,14 +407,21 @@ class RelayClient @JvmOverloads constructor(
         // Check for out-of-band tunnel init signal
         if (rawBytes.contentEquals(TUNNEL_INIT_SIGNAL)) {
             if (isClientMode) {
-                val tun = tunnel ?: E2eRelayTunnel(
-                    createTunnelSslContext(isServerRole = false),
-                    isServer = false,
-                    expectedPeerFingerprint = resolveExpectedPeerFingerprint()
-                ).also { tunnel = it }
-                val (_, outBytes) = tun.driveHandshake()
-                if (outBytes.isNotEmpty()) {
-                    sendRelayFrame(ws, source, outBytes)
+                val existing = tunnel
+                val tun = if (existing != null && existing.handshakeDone) {
+                    existing
+                } else {
+                    E2eRelayTunnel(
+                        createTunnelSslContext(isServerRole = false),
+                        isServer = false,
+                        expectedPeerFingerprint = resolveExpectedPeerFingerprint()
+                    ).also { tunnel = it }
+                }
+                if (!tun.handshakeDone) {
+                    val (_, outBytes) = tun.driveHandshake()
+                    if (outBytes.isNotEmpty()) {
+                        sendRelayFrame(ws, source, outBytes)
+                    }
                 }
             }
             return

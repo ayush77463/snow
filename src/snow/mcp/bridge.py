@@ -1851,28 +1851,63 @@ class SnowMcpBridge:
     # Phase 28A: Connection Mode & Relay Management Methods
     # =========================================================================
 
-    async def set_device_connection_mode(self, device_id: str, connection_mode: str) -> dict[str, Any]:
-        """Update connection mode ('auto', 'local_only', 'remote_only') for a paired device."""
+    async def set_device_connection_mode(
+        self,
+        device_id: str,
+        connection_mode: str,
+        allow_probe: bool = True,
+    ) -> dict[str, Any]:
+        """Update transport mode ('auto', 'usb', 'hotspot', 'wifi_lan', 'remote_relay', 'local_only', 'remote_only')."""
+        from snow.network.transport import VALID_TRANSPORT_MODES, normalize_transport_mode
+        from snow.security.db import VALID_CONNECTION_MODES
+
+        norm_mode = normalize_transport_mode(connection_mode)
+        if not norm_mode:
+            return {
+                "success": False,
+                "status": "INVALID_ARGUMENT",
+                "error": f"Invalid transport mode '{connection_mode}'. Must be one of: {', '.join(VALID_TRANSPORT_MODES)}.",
+            }
+
         if await self.daemon_manager.is_ipc_ready(timeout=0.1):
             res = await self.call(
                 "device_set_connection_mode",
-                payload={"device_id": device_id, "connection_mode": connection_mode},
-                timeout=5.0,
+                payload={
+                    "device_id": device_id,
+                    "connection_mode": norm_mode,
+                    "mode": norm_mode,
+                    "allow_probe": allow_probe,
+                },
+                timeout=6.0,
             )
             if res.get("status") not in ("CORE_OFFLINE", "UNKNOWN_OPERATION"):
                 return res
 
-        # In-process fallback
+        # Offline fallback: reject unverified manual single-route switch fail-closed
+        if norm_mode not in VALID_CONNECTION_MODES:
+            return {
+                "success": False,
+                "status": "CORE_OFFLINE_CANNOT_VERIFY_ROUTE",
+                "error": f"Core daemon must be online to verify '{norm_mode}' before switching.",
+            }
+
+        # In-process fallback for policy modes
         db = self.capability_engine.db_manager
         if db:
-            ok = db.update_device_connection_mode(device_id, connection_mode)
+            ok = db.update_device_connection_mode(device_id, norm_mode)
             if ok:
+                if hasattr(db, "set_setting"):
+                    db.set_setting(f"device_transport_override:{device_id}", "")
                 node_reg = getattr(self.capability_engine, "node_registry", None)
                 if node_reg:
                     node = node_reg.get_node(device_id)
                     if node:
-                        node.connection_mode = connection_mode
-                return {"success": True, "status": "SUCCESS", "data": {"device_id": device_id, "connection_mode": connection_mode}}
+                        node.connection_mode = norm_mode
+                return {
+                    "success": True,
+                    "status": "SUCCESS",
+                    "data": {"device_id": device_id, "connection_mode": norm_mode, "mode": norm_mode},
+                }
             return {"success": False, "status": "DEVICE_NOT_FOUND", "error": f"Device '{device_id}' not found."}
         return {"success": False, "status": "DATABASE_UNAVAILABLE", "error": "Database unavailable."}
 

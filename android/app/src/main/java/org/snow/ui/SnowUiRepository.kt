@@ -651,11 +651,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     val certPinStorage: EncryptedCertPinStorage by lazy { EncryptedCertPinStorage(appContext) }
     internal var tokenStorageOverrideForTest: org.snow.security.TokenStorage? = null
     internal var certPinStorageOverrideForTest: org.snow.security.CertPinStorage? = null
+    internal var peerHostCertStorageOverrideForTest: org.snow.security.PeerHostCertStorage? = null
 
     internal val activeTokenStorage: org.snow.security.TokenStorage
         get() = tokenStorageOverrideForTest ?: tokenStorage
     internal val activeCertPinStorage: org.snow.security.CertPinStorage
         get() = certPinStorageOverrideForTest ?: certPinStorage
+    internal val activePeerHostCertStorage: org.snow.security.PeerHostCertStorage
+        get() = peerHostCertStorageOverrideForTest ?: org.snow.security.EncryptedFilePeerHostCertStorage(appContext)
 
     val safFolderManager: SafFolderManager by lazy { SafFolderManager(appContext) }
     val pairingFlow: PairingFlow by lazy { PairingFlow(identity, activeTokenStorage) }
@@ -689,6 +692,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     private val _savedDevices = MutableStateFlow<List<SavedDevice>>(emptyList())
     val savedDevices: StateFlow<List<SavedDevice>> = _savedDevices.asStateFlow()
+
+    private val localTransportOrchestrator = org.snow.network.TransportOrchestrator()
+    private val _transportSnapshots = MutableStateFlow<Map<String, org.snow.network.DeviceTransportSnapshot>>(emptyMap())
+    val transportSnapshots: StateFlow<Map<String, org.snow.network.DeviceTransportSnapshot>> = _transportSnapshots.asStateFlow()
+
+    fun activeTransportOrchestrator(): org.snow.network.TransportOrchestrator =
+        serviceRef?.transportOrchestrator ?: localTransportOrchestrator
 
     private val _activeTransfer = MutableStateFlow<ActiveTransferInfo?>(null)
     val activeTransfer: StateFlow<ActiveTransferInfo?> = _activeTransfer.asStateFlow()
@@ -2169,6 +2179,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 }
 
                 // Step 4: If user included 6-digit pairing PIN, redeem via authenticated /v1/rendezvous/join
+                // and complete full E2E TLS tunnel pairing BEFORE reporting success.
                 if (!pairedPinCandidate.isNullOrBlank()) {
                     joinRendezvousOnboarding(
                         snowId = upperSnowId,
@@ -2177,22 +2188,39 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     ) { ok, rdvData, err ->
                         if (ok && rdvData != null) {
                             val hostDevId = (rdvData["host_device_id"] as? String)?.trim().orEmpty()
-                            val fp = (rdvData["host_cert_fingerprint"] as? String)?.trim().orEmpty()
-                            val netId = (rdvData["network_id"] as? String)?.trim().orEmpty()
+                            val fp = (rdvData["host_cert_fingerprint"] as? String)?.replace(":", "")?.trim().orEmpty()
                             val relayWs = (rdvData["relay_ws_url"] as? String)?.trim().orEmpty()
-                            if (hostDevId.isNotBlank() && fp.length == 64) {
-                                certPinStorage.pinFingerprintForDevice(hostDevId, fp)
+                            val bootstrapTok = (rdvData["bootstrap_token"] as? String)?.trim().orEmpty()
+                            if (hostDevId.isBlank() || fp.length != 64 || relayWs.isBlank() || bootstrapTok.isBlank()) {
+                                onResult(
+                                    false,
+                                    "Rendezvous response missing required E2E tunnel identity or credentials for $upperSnowId.",
+                                    "hub_unavailable"
+                                )
+                                return@joinRendezvousOnboarding
                             }
-                            if (netId.isNotBlank()) applyNonConflictingNetworkAdoption(netId)
-                            if (relayWs.isNotBlank()) {
-                                val prefs = appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
-                                prefs.edit().apply {
-                                    if (netId.isNotBlank()) putString("remote_relay_group_id", netId)
-                                    if (hostDevId.isNotBlank()) putString("remote_relay_target_peer", hostDevId)
-                                }.apply()
-                                onResult(true, "Connecting to $upperSnowId via Render Hub rendezvous", "rendezvous")
+                            val dataWithMeta = rdvData.toMutableMap().apply {
+                                if ((get("host_snow_id") as? String).isNullOrBlank()) {
+                                    put("host_snow_id", upperSnowId)
+                                }
+                            }
+                            val pairCallback: (Boolean, String?) -> Unit = { pairedOk, pairErr ->
+                                if (pairedOk) {
+                                    onResult(true, "Paired & connected to $upperSnowId via Render Hub E2E tunnel", "rendezvous")
+                                } else {
+                                    onResult(false, pairErr ?: "E2E tunnel pairing failed for $upperSnowId.", "hub_auth_failed")
+                                }
+                            }
+                            val hook = customRendezvousTunnelPairerForTest
+                            if (hook != null) {
+                                hook.invoke(dataWithMeta, pairedPinCandidate, null, pairCallback)
                             } else {
-                                onResult(false, "Rendezvous returned no relay endpoint for $upperSnowId.", "hub_unavailable")
+                                completeRendezvousPairingOverTunnel(
+                                    rdvData = dataWithMeta,
+                                    pin = pairedPinCandidate,
+                                    handshakeToken = null,
+                                    onResult = pairCallback
+                                )
                             }
                         } else {
                             onResult(false, err ?: "Render Hub rendezvous failed for $upperSnowId.", "hub_auth_failed")
@@ -2472,6 +2500,148 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
+    fun refreshTransportSnapshot(deviceId: String? = null) {
+        val orch = activeTransportOrchestrator()
+        val devList = if (deviceId != null) {
+            _savedDevices.value.filter { it.deviceId == deviceId }
+        } else {
+            _savedDevices.value
+        }
+        val activeEp = _connectedEndpoint.value.orEmpty()
+        val isAuthConn = isSessionTrulyConnected(_uiConnectionState.value, _authState.value)
+        val authDevId = (_authState.value as? AuthState.Authenticated)?.peerDeviceId
+        val nextMap = _transportSnapshots.value.toMutableMap()
+        val relayOn = isRemoteRelayEnabled() && (serviceRef?.relayClient != null || activeEp.contains("relay") || activeEp.contains("tunnel"))
+
+        for (dev in devList) {
+            val discPeer = _discoveredPeers.value.firstOrNull { it.deviceId.equals(dev.deviceId, ignoreCase = true) }
+            if (discPeer != null) {
+                val discRoute = org.snow.network.TransportClassifier.classifyRoute(host = discPeer.ipAddress)
+                orch.registerDiscovered(dev.deviceId, discRoute, discPeer.ipAddress, discPeer.port, discPeer.transferPort)
+            }
+            if (relayOn) {
+                orch.markVerified(dev.deviceId, org.snow.network.TransportRoute.REMOTE_RELAY, host = "relay", port = 443, isActive = false)
+            }
+            if (isAuthConn && (authDevId == null || authDevId.equals(dev.deviceId, ignoreCase = true))) {
+                val epHost = activeEp.substringBefore(":").ifBlank { dev.host }
+                val activeRoute = org.snow.network.TransportClassifier.classifyRoute(host = epHost, mode = dev.connectionMode)
+                orch.markVerified(dev.deviceId, activeRoute, host = epHost, port = dev.port, isActive = true)
+            }
+            nextMap[dev.deviceId] = orch.snapshotFor(dev.deviceId)
+        }
+        _transportSnapshots.value = nextMap
+    }
+
+    suspend fun switchDeviceTransport(deviceId: String, requestedMode: String): Pair<Boolean, String> {
+        val mode = org.snow.network.TransportMode.normalize(requestedMode)
+            ?: return false to "Unsupported transport mode '$requestedMode'."
+        val dev = _savedDevices.value.firstOrNull { it.deviceId == deviceId }
+            ?: return false to "Device not found."
+
+        val orch = activeTransportOrchestrator()
+        refreshTransportSnapshot(deviceId)
+        val svc = serviceRef
+        val wsClient = svc?.client
+
+        if (mode.isSingleRouteOverride()) {
+            val targetRoute = mode.targetRouteOrNull()!!
+            orch.setSwitching(deviceId, true, "Verifying ${targetRoute.badge}")
+            _transportSnapshots.value = _transportSnapshots.value.toMutableMap().apply {
+                this[deviceId] = orch.snapshotFor(deviceId)
+            }
+            try {
+                if (targetRoute == org.snow.network.TransportRoute.REMOTE_RELAY) {
+                    val endpoint = getEffectiveRelayEndpointForHub()
+                    if (!isRemoteRelayEnabled() && endpoint.isBlank()) {
+                        return false to "Remote relay endpoint is not configured."
+                    }
+                    if (svc != null && wsClient != null) {
+                        svc.startRelay(endpoint)
+                    }
+                    orch.markVerified(deviceId, org.snow.network.TransportRoute.REMOTE_RELAY, host = "relay", port = 443, isActive = true)
+                    orch.setMode(deviceId, mode, "Manual switch to Remote")
+                } else {
+                    val candHost = when (targetRoute) {
+                        org.snow.network.TransportRoute.USB -> "127.0.0.1"
+                        org.snow.network.TransportRoute.HOTSPOT -> {
+                            _discoveredPeers.value.firstOrNull {
+                                it.deviceId.equals(deviceId, ignoreCase = true) &&
+                                    org.snow.network.TransportClassifier.isHotspotHostOrHint(it.ipAddress)
+                            }?.ipAddress
+                                ?: dev.recentEndpoints.firstOrNull {
+                                    org.snow.network.TransportClassifier.isHotspotHostOrHint(it.host)
+                                }?.host
+                                ?: dev.host.takeIf { org.snow.network.TransportClassifier.isHotspotHostOrHint(it) }
+                                ?: ""
+                        }
+                        org.snow.network.TransportRoute.WIFI_LAN -> {
+                            _discoveredPeers.value.firstOrNull {
+                                it.deviceId.equals(deviceId, ignoreCase = true) &&
+                                    org.snow.network.TransportClassifier.classifyRoute(host = it.ipAddress) == org.snow.network.TransportRoute.WIFI_LAN
+                            }?.ipAddress
+                                ?: dev.recentEndpoints.firstOrNull {
+                                    org.snow.network.TransportClassifier.classifyRoute(host = it.host) == org.snow.network.TransportRoute.WIFI_LAN
+                                }?.host
+                                ?: dev.host.takeIf { org.snow.network.TransportClassifier.classifyRoute(host = it) == org.snow.network.TransportRoute.WIFI_LAN }
+                                ?: ""
+                        }
+                        else -> ""
+                    }
+                    if (candHost.isBlank()) {
+                        val reason = "No verified ${targetRoute.shortLabel} endpoint known."
+                        orch.markUnavailable(deviceId, targetRoute, reason)
+                        return false to reason
+                    }
+                    if (wsClient == null) {
+                        return false to "Connection service is offline; cannot verify ${targetRoute.shortLabel}."
+                    }
+                    val probeRes = wsClient.probeAndPromoteEndpoint(
+                        newHost = candHost,
+                        newPort = dev.port,
+                        targetDeviceId = deviceId,
+                        timeoutMs = 2_500L,
+                        verifyPing = true
+                    )
+                    if (!probeRes.promoted) {
+                        val reason = probeRes.error ?: "Verification failed for ${targetRoute.shortLabel}."
+                        orch.markUnavailable(deviceId, targetRoute, reason)
+                        return false to reason
+                    }
+                    orch.markVerified(deviceId, targetRoute, host = candHost, port = dev.port, isActive = true)
+                    orch.setMode(deviceId, mode, "Manual switch to ${targetRoute.shortLabel}")
+                }
+            } finally {
+                orch.setSwitching(deviceId, false)
+            }
+        } else {
+            val (ok, msg) = orch.setMode(deviceId, mode, "Mode updated to ${mode.wireName}")
+            if (!ok) {
+                refreshTransportSnapshot(deviceId)
+                return false to msg
+            }
+            if (mode == org.snow.network.TransportMode.LOCAL_ONLY) {
+                svc?.stopRelay()
+            } else if (mode == org.snow.network.TransportMode.REMOTE_ONLY) {
+                val endpoint = getEffectiveRelayEndpointForHub()
+                updateRemoteRelayConfig(true, endpoint)
+                svc?.startRelay(endpoint)
+            } else if (mode == org.snow.network.TransportMode.AUTO && svc != null) {
+                svc.promoteLocalRouteFromDiscoveryIfAvailable()
+            }
+        }
+
+        val current = _savedDevices.value.toMutableList()
+        val idx = current.indexOfFirst { it.deviceId == deviceId }
+        if (idx >= 0) {
+            current[idx] = current[idx].copy(connectionMode = mode.wireName)
+            _savedDevices.value = current
+            val prefsV2 = appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE)
+            prefsV2.edit().putString("devices_json", serializeSavedDevices(current)).apply()
+        }
+        refreshTransportSnapshot(deviceId)
+        return true to "Switched to ${mode.wireName.uppercase()}"
+    }
+
     fun updateDeviceConnectionMode(deviceId: String, mode: String) {
         val current = _savedDevices.value.toMutableList()
         val idx = current.indexOfFirst { it.deviceId == deviceId }
@@ -2486,7 +2656,6 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     serviceRef?.stopRelay()
                 }
                 "remote_only" -> {
-                    serviceRef?.client?.disconnect()
                     val endpoint = getEffectiveRelayEndpointForHub()
                     updateRemoteRelayConfig(true, endpoint)
                     serviceRef?.startRelay(endpoint)
@@ -2497,9 +2666,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         if (isRemoteRelayEnabled() && endpoint.isNotBlank()) {
                             serviceRef?.startRelay(endpoint)
                         }
+                    } else {
+                        serviceRef?.promoteLocalRouteFromDiscoveryIfAvailable()
                     }
                 }
             }
+            refreshTransportSnapshot(deviceId)
         }
     }
 
@@ -4064,6 +4236,26 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             onResult(false, "Incomplete rendezvous bootstrap parameters for E2E tunnel.")
             return
         }
+        if (identity.deviceId == hostDevId) {
+            onResult(false, "Cannot open E2E relay tunnel to own device identity.")
+            return
+        }
+
+        val deterministicClientMode = (identity.deviceId < hostDevId)
+        val localKeyManagers: Array<javax.net.ssl.KeyManager>? = try {
+            val loaded = org.snow.security.AndroidSelfSignedCertGenerator.loadOrCreate(activePeerHostCertStorage)
+            loaded.keyManagers
+        } catch (e: Exception) {
+            if (!deterministicClientMode) {
+                onResult(false, "Cannot take E2E TLS server role: persisted local TLS key material unavailable (${e.message}).")
+                return
+            }
+            null
+        }
+        if (!deterministicClientMode && (localKeyManagers == null || localKeyManagers.isEmpty())) {
+            onResult(false, "Cannot take E2E TLS server role: persisted local TLS keyManagers missing.")
+            return
+        }
 
         val completed = java.util.concurrent.atomic.AtomicBoolean(false)
         fun finish(ok: Boolean, msg: String?, rc: org.snow.network.RelayClient?) {
@@ -4089,12 +4281,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             targetPeerId = hostDevId,
             certPinStorage = activeCertPinStorage,
             expectedPeerFingerprint = hostFp,
-            isClientMode = true,
+            isClientMode = deterministicClientMode,
             scope = repoScope,
             bootstrapToken = bootstrapToken,
             networkId = hubRouteNetId,
             usePublicCaForOuterRelay = usePublicCa
-        )
+        ).apply {
+            keyManagers = localKeyManagers
+        }
         rc.onTunnelFailed = { errMsg ->
             finish(false, errMsg, rc)
         }
