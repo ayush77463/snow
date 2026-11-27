@@ -132,6 +132,18 @@ fun SettingsScreen(
     onResetTrust: () -> Unit,
     onClearLogs: () -> Unit,
     onCopyLogs: () -> Unit,
+    permanentDeviceSnowId: String = "",
+    permanentDeviceMcpUrl: String = "",
+    identityError: String? = null,
+    onExportRecoveryKey: (Boolean) -> Pair<Boolean, String> = { false to "Unavailable" },
+    onExportEncryptedBackupToUri: (Uri, String) -> Pair<Boolean, String> = { _, _ -> false to "Unavailable" },
+    onRestoreDeviceIdentity: (String, String?) -> Pair<Boolean, String> = { _, _ -> false to "Unavailable" },
+    androidRemoteMcpEnabled: Boolean = true,
+    onToggleAndroidRemoteMcp: (Boolean) -> Unit = {},
+    androidMcpConnected: Boolean = false,
+    androidMcpError: String? = null,
+    authorizedOAuthClients: List<org.snow.mcp.AuthorizedOAuthClientSummary> = emptyList(),
+    onRevokeOAuthClient: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -141,8 +153,27 @@ fun SettingsScreen(
     var showNotificationGuide by remember { mutableStateOf(false) }
     var showAdvancedDiagnostics by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
+    var showRecoveryExportWarning by remember { mutableStateOf(false) }
+    var revealedRecoveryKey by remember { mutableStateOf<String?>(null) }
+    var showEncryptedBackupDialog by remember { mutableStateOf(false) }
+    var backupPassphrase by remember { mutableStateOf("") }
+    var showRestoreDialog by remember { mutableStateOf(false) }
+    var restoreInput by remember { mutableStateOf("") }
+    var restorePassphrase by remember { mutableStateOf("") }
+    var recoveryFeedback by remember { mutableStateOf<String?>(null) }
     var relayInput by remember { mutableStateOf(relayEndpoint) }
     var manualConnectInput by remember { mutableStateOf("") }
+
+    val encryptedBackupSafLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { pickedUri ->
+        val pass = backupPassphrase
+        backupPassphrase = ""
+        if (pickedUri != null) {
+            val (_, msg) = onExportEncryptedBackupToUri(pickedUri, pass)
+            recoveryFeedback = msg
+        }
+    }
 
     fun queryNotificationAccess(): Boolean =
         androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
@@ -434,7 +465,7 @@ fun SettingsScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(text = "My SNOW ID", style = SnowTypography.labelSmall, color = colors.textMuted)
                                 Text(
-                                    text = mySnowId.ifBlank { myDeviceId },
+                                    text = permanentDeviceSnowId.ifBlank { mySnowId.ifBlank { myDeviceId } },
                                     style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
                                     color = colors.textPrimary
                                 )
@@ -443,8 +474,127 @@ fun SettingsScreen(
                                 text = "Copy",
                                 icon = Icons.Default.ContentCopy,
                                 onClick = {
-                                    clipboardManager.setText(AnnotatedString(mySnowId.ifBlank { myDeviceId }))
+                                    clipboardManager.setText(AnnotatedString(permanentDeviceSnowId.ifBlank { mySnowId.ifBlank { myDeviceId } }))
                                 }
+                            )
+                        }
+
+                        if (permanentDeviceMcpUrl.isNotBlank()) {
+                            Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(text = "Permanent Android MCP URL", style = SnowTypography.labelSmall, color = colors.textMuted)
+                                    Text(
+                                        text = permanentDeviceMcpUrl,
+                                        style = SnowTypography.monospaceSmall,
+                                        color = colors.accentCyan
+                                    )
+                                }
+                                SnowTonalButton(
+                                    text = "Copy",
+                                    icon = Icons.Default.ContentCopy,
+                                    onClick = { clipboardManager.setText(AnnotatedString(permanentDeviceMcpUrl)) }
+                                )
+                            }
+                        }
+
+                        if (!identityError.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = identityError,
+                                style = SnowTypography.bodySmall,
+                                color = Color(0xFFEF4444)
+                            )
+                        }
+
+                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                        SettingsSwitchRow(
+                            title = "Standalone Android MCP Endpoint",
+                            subtitle = when {
+                                !androidRemoteMcpEnabled -> "Disabled by owner — remote AI clients cannot connect"
+                                androidMcpConnected -> "Connected directly to Render Hub (/u/$permanentDeviceSnowId/mcp)"
+                                !androidMcpError.isNullOrBlank() -> "Reconnecting: $androidMcpError"
+                                else -> "Enabled by default — connecting standalone without Windows PC"
+                            },
+                            checked = androidRemoteMcpEnabled,
+                            onCheckedChange = onToggleAndroidRemoteMcp
+                        )
+
+                        if (authorizedOAuthClients.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Text(
+                                text = "Authorized AI Clients (${authorizedOAuthClients.size})",
+                                style = SnowTypography.labelSmall,
+                                color = colors.textMuted
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            authorizedOAuthClients.forEach { oauthClient ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = oauthClient.clientName,
+                                            style = SnowTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                                            color = colors.textPrimary
+                                        )
+                                        Text(
+                                            text = "${oauthClient.scopes.joinToString(" ")} • ${oauthClient.clientId}",
+                                            style = SnowTypography.monospaceSmall,
+                                            color = colors.textMuted
+                                        )
+                                    }
+                                    SnowOutlinedButton(
+                                        text = "Revoke",
+                                        onClick = { onRevokeOAuthClient(oauthClient.clientId) }
+                                    )
+                                }
+                            }
+                        }
+
+                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                        Text(
+                            text = "Cryptographic Identity Recovery",
+                            style = SnowTypography.labelSmall,
+                            color = colors.textMuted
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            SnowTonalButton(
+                                text = "Export Key",
+                                onClick = { showRecoveryExportWarning = true },
+                                modifier = Modifier.weight(1f)
+                            )
+                            SnowOutlinedButton(
+                                text = "Encrypted Backup",
+                                onClick = { showEncryptedBackupDialog = true },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        SnowOutlinedButton(
+                            text = "Restore From Recovery Key / Backup",
+                            icon = Icons.Default.Security,
+                            onClick = { showRestoreDialog = true },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (!recoveryFeedback.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = recoveryFeedback.orEmpty(),
+                                style = SnowTypography.bodySmall,
+                                color = colors.accentCyan
                             )
                         }
 
@@ -663,6 +813,168 @@ fun SettingsScreen(
                 SnowOutlinedButton(
                     text = "Cancel",
                     onClick = { showResetConfirm = false }
+                )
+            },
+            containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+        )
+    }
+
+    if (showRecoveryExportWarning) {
+        AlertDialog(
+            onDismissRequest = {
+                showRecoveryExportWarning = false
+                revealedRecoveryKey = null
+            },
+            title = {
+                Text(text = "Export Device Recovery Key?", style = SnowTypography.titleMedium, color = colors.textPrimary)
+            },
+            text = {
+                Column {
+                    Text(
+                        text = "WARNING: Anyone holding your SNW-REC-V1 recovery key can impersonate this device on SNOW. Store it offline and never share it.",
+                        style = SnowTypography.bodySmall,
+                        color = colors.textSecondary
+                    )
+                    if (!revealedRecoveryKey.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = revealedRecoveryKey.orEmpty(),
+                            style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
+                            color = colors.accentCyan
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                if (revealedRecoveryKey.isNullOrBlank()) {
+                    SnowTonalButton(
+                        text = "Reveal Recovery Key",
+                        onClick = {
+                            val (ok, res) = onExportRecoveryKey(true)
+                            if (ok) revealedRecoveryKey = res else recoveryFeedback = res
+                        }
+                    )
+                } else {
+                    SnowTonalButton(
+                        text = "Copy Key",
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(revealedRecoveryKey.orEmpty()))
+                        }
+                    )
+                }
+            },
+            dismissButton = {
+                SnowOutlinedButton(
+                    text = "Close",
+                    onClick = {
+                        showRecoveryExportWarning = false
+                        revealedRecoveryKey = null
+                    }
+                )
+            },
+            containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+        )
+    }
+
+    if (showEncryptedBackupDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showEncryptedBackupDialog = false
+                backupPassphrase = ""
+            },
+            title = { Text("Save AES-GCM Encrypted Backup", style = SnowTypography.titleMedium, color = colors.textPrimary) },
+            text = {
+                Column {
+                    Text(
+                        text = "Choose a strong passphrase (minimum 10 characters) to encrypt your device identity via PBKDF2-SHA256 + AES-256-GCM before saving via SAF.",
+                        style = SnowTypography.bodySmall,
+                        color = colors.textSecondary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = backupPassphrase,
+                        onValueChange = { backupPassphrase = it },
+                        placeholder = { Text("Passphrase (min 10 chars)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                SnowTonalButton(
+                    text = "Choose Location (SAF)",
+                    onClick = {
+                        val snowTag = permanentDeviceSnowId.ifBlank { "snow-device" }
+                        showEncryptedBackupDialog = false
+                        encryptedBackupSafLauncher.launch("$snowTag-backup.snowkey.json")
+                    }
+                )
+            },
+            dismissButton = {
+                SnowOutlinedButton(
+                    text = "Cancel",
+                    onClick = {
+                        showEncryptedBackupDialog = false
+                        backupPassphrase = ""
+                    }
+                )
+            },
+            containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+        )
+    }
+
+    if (showRestoreDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showRestoreDialog = false
+                restoreInput = ""
+                restorePassphrase = ""
+            },
+            title = { Text("Restore Device Identity", style = SnowTypography.titleMedium, color = colors.textPrimary) },
+            text = {
+                Column {
+                    Text(
+                        text = "Restoring recovers ONLY your cryptographic identity and permanent URL. All existing peer pairing credentials, TLS pins, and active OAuth sessions will be wiped.",
+                        style = SnowTypography.bodySmall,
+                        color = colors.textSecondary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = restoreInput,
+                        onValueChange = { restoreInput = it },
+                        placeholder = { Text("SNW-REC-V1-... or encrypted JSON") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    OutlinedTextField(
+                        value = restorePassphrase,
+                        onValueChange = { restorePassphrase = it },
+                        placeholder = { Text("Passphrase (if encrypted backup)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                SnowTonalButton(
+                    text = "Restore & Reset Trust",
+                    onClick = {
+                        val (_, msg) = onRestoreDeviceIdentity(restoreInput, restorePassphrase.takeIf { it.isNotEmpty() })
+                        recoveryFeedback = msg
+                        restoreInput = ""
+                        restorePassphrase = ""
+                        showRestoreDialog = false
+                    }
+                )
+            },
+            dismissButton = {
+                SnowOutlinedButton(
+                    text = "Cancel",
+                    onClick = {
+                        showRestoreDialog = false
+                        restoreInput = ""
+                        restorePassphrase = ""
+                    }
                 )
             },
             containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White

@@ -1,7 +1,7 @@
 """Unified static MCP tool registry for SNOW.
 
 Exposes standardized MCP tools for both Windows and Android capabilities to AI assistants.
-All 54 tools are statically discoverable via list_tools, even when the Core or Android
+All 60 tools are statically discoverable via list_tools, even when the Core or Android
 device is currently offline.
 
 In Phase 8:
@@ -25,7 +25,7 @@ ALL_TOOL_NAMES: List[str] = [meta.name for meta in list_capabilities()]
 
 
 def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
-    """Register all 54 static MCP tools onto the provided FastMCP server instance."""
+    """Register all 60 static MCP tools onto the provided FastMCP server instance."""
     # Wrap server.tool to automatically populate MCP ToolAnnotations (readOnlyHint, destructiveHint)
     _orig_tool = server.tool
 
@@ -1068,6 +1068,91 @@ def register_all_tools(server: FastMCP, bridge: SnowMcpBridge) -> None:
             params=params,
             grant_token=grant_token,
         )
+        return json.dumps(result, indent=2)
+
+    # =========================================================================
+    # M4.4 Stage 5 Additions (55..60 -> 60 Total Tools)
+    # =========================================================================
+
+    @server.tool(
+        name="snow_android_file_read",
+        description="Read a UTF-8 text file (up to 256 KiB) inside Android's persisted SAF folder using a strict relative path.",
+    )
+    async def snow_android_file_read(path: str, device_id: str = "") -> str:
+        """Read UTF-8 file text inside the configured SAF folder on a connected Android device."""
+        result = await bridge.android_file_read(path=path, device_id=device_id)
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_android_file_write",
+        description=(
+            "Write a UTF-8 text file (up to 256 KiB) inside Android's persisted SAF folder. "
+            "Requires explicit owner approval for AI callers and explicit overwrite=True to replace existing files."
+        ),
+    )
+    async def snow_android_file_write(
+        path: str,
+        content: str,
+        overwrite: bool = False,
+        approval_id: str = "",
+        device_id: str = "",
+    ) -> str:
+        """Write UTF-8 text into Android's persisted SAF folder subject to approval and overwrite controls."""
+        result = await bridge.android_file_write(
+            path=path,
+            content=content,
+            overwrite=overwrite,
+            approval_id=approval_id,
+            device_id=device_id,
+        )
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_android_file_search",
+        description="Search filenames inside Android's persisted SAF folder with bounded depth and result count.",
+    )
+    async def snow_android_file_search(
+        query: str,
+        subpath: str = "",
+        max_results: int = 25,
+        max_depth: int = 3,
+        device_id: str = "",
+    ) -> str:
+        """Search filenames in Android's configured SAF folder."""
+        result = await bridge.android_file_search(
+            query=query,
+            subpath=subpath,
+            max_results=max_results,
+            max_depth=max_depth,
+            device_id=device_id,
+        )
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_android_device_info",
+        description="Read Android device model, OS version, RAM, storage summary, lock state, and live M4.3 transport state.",
+    )
+    async def snow_android_device_info(device_id: str = "") -> str:
+        """Query read-only Android device and transport info."""
+        result = await bridge.android_device_info(device_id=device_id)
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_android_audio_status",
+        description="Read Android media/ring/alarm volume levels, ringer mode, and Do Not Disturb status without altering audio settings.",
+    )
+    async def snow_android_audio_status(device_id: str = "") -> str:
+        """Query read-only Android audio and DND state."""
+        result = await bridge.android_audio_status(device_id=device_id)
+        return json.dumps(result, indent=2)
+
+    @server.tool(
+        name="snow_android_clipboard_get",
+        description="Read text from the paired Android clipboard strictly when SNOW is in the visible foreground.",
+    )
+    async def snow_android_clipboard_get(device_id: str = "") -> str:
+        """Read current Android clipboard text subject to foreground lifecycle enforcement."""
+        result = await bridge.android_clipboard_get(device_id=device_id)
         return json.dumps(result, indent=2)
 
 

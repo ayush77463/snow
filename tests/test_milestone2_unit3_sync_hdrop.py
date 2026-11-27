@@ -567,7 +567,7 @@ class TestMilestone2Unit3SyncAckAndPort8766(unittest.IsolatedAsyncioTestCase):
         bridge.capability_engine = self.engine
         mcp = create_snow_mcp_server(bridge)
         tools = await mcp.list_tools()
-        self.assertEqual(len(tools), 54)
+        self.assertEqual(len(tools), 60)
         self.cb_buf.add_files([{"name": "mcp_doc.txt", "data": b"mcp-body"}], source_device_id="desktop_windows")
         list_res = await bridge.clipboard_buffer_list(limit=15)
         self.assertTrue(list_res["success"])

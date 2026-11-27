@@ -210,6 +210,10 @@ class _TunnelInstance:
         self._lock = asyncio.Lock()
         self._background_active: bool = False
         self._mcp_forwarder: Optional[Any] = None
+        self._legacy_network_forwarder: Optional[Any] = None
+        self._device_snow_id: Optional[str] = None
+        self._legacy_network_url: Optional[str] = None
+        self._last_error: Optional[str] = None
 
     async def _drain_stderr(
         self,
@@ -251,13 +255,18 @@ class _TunnelInstance:
                 pass
         self._reader_task = None
 
-        # 1b. Close active Render/relay reverse tunnel forwarder if running
-        if self._mcp_forwarder is not None:
-            try:
-                await self._mcp_forwarder.stop()
-            except Exception as exc:
-                logger.warning("[%s tunnel] Error stopping reverse tunnel forwarder: %s", self.purpose, exc)
-            self._mcp_forwarder = None
+        # 1b. Close active Render/relay reverse tunnel forwarder(s) if running
+        for fwd_attr in ("_mcp_forwarder", "_legacy_network_forwarder"):
+            fwd = getattr(self, fwd_attr, None)
+            if fwd is not None:
+                try:
+                    await fwd.stop()
+                except Exception as exc:
+                    logger.warning("[%s tunnel] Error stopping %s: %s", self.purpose, fwd_attr, exc)
+                setattr(self, fwd_attr, None)
+        self._device_snow_id = None
+        self._legacy_network_url = None
+        self._last_error = None
 
         # 1c. Disable background Tailscale Funnel if active
         if self._provider == "tailscale" and self._background_active:
@@ -684,7 +693,7 @@ class _TunnelInstance:
                     res["relay_endpoint"] = f"wss://{clean_host}/v1/tunnel"
                 return res
 
-            # Case D: SNOW Render Relay reverse tunnel (permanent /u/{network_id}/mcp URL)
+            # Case D: SNOW Render Relay reverse tunnel (permanent /u/{device_snow_id}/mcp + legacy /u/{network_id}/mcp alias)
             elif provider_lower == "render":
                 if self.purpose != "mcp":
                     return {
@@ -713,61 +722,108 @@ class _TunnelInstance:
                         "error": str(url_exc),
                     }
                 from snow.security.identity import (
+                    DeviceIdentityError,
+                    NetworkIdentityError,
                     load_or_create_device_identity,
+                    load_or_create_device_key_identity,
                     load_or_create_network_key_identity,
                 )
                 dev_ident = load_or_create_device_identity()
-                snow_id = str(tunnel_cfg.get("snow_id") or dev_ident.snow_id).strip().upper()
+                try:
+                    dev_key = load_or_create_device_key_identity()
+                except DeviceIdentityError as dev_exc:
+                    self._last_error = str(dev_exc)
+                    return {
+                        "success": False,
+                        "status": "IDENTITY_ERROR",
+                        "error": str(dev_exc),
+                    }
                 ticket = token or tunnel_cfg.get("relay_ticket") or ""
                 ws_scheme = "wss://" if base_url.startswith("https://") else "ws://"
                 clean_host = base_url.split("://", 1)[1]
                 relay_ws_url = f"{ws_scheme}{clean_host}/v1/tunnel"
                 from snow.relay.mcp_forwarder import RelayMcpForwarder
 
-                if ticket:
-                    forwarder = RelayMcpForwarder(
-                        relay_ws_url=relay_ws_url,
-                        snow_id=snow_id,
-                        ticket=ticket,
-                        local_gateway_url=f"http://127.0.0.1:{target_port}",
-                        device_id=dev_ident.device_id,
-                        device_name=dev_ident.device_name,
-                    )
-                    route_id = snow_id
-                else:
-                    net_ident = load_or_create_network_key_identity()
-                    forwarder = RelayMcpForwarder(
-                        relay_ws_url=relay_ws_url,
-                        snow_id=snow_id,
-                        local_gateway_url=f"http://127.0.0.1:{target_port}",
-                        network_key_identity=net_ident,
-                        hub_http_url=base_url,
-                        device_id=dev_ident.device_id,
-                        device_name=dev_ident.device_name,
-                    )
-                    route_id = net_ident.network_id
+                # Stop any prior forwarders before creating fresh non-duplicate forwarders
+                for fwd_attr in ("_mcp_forwarder", "_legacy_network_forwarder"):
+                    old_fwd = getattr(self, fwd_attr, None)
+                    if old_fwd is not None:
+                        try:
+                            await old_fwd.stop()
+                        except Exception:
+                            pass
+                        setattr(self, fwd_attr, None)
 
-                ok, err = await forwarder.start(timeout=timeout)
+                net_ident = None
+                if not ticket:
+                    try:
+                        net_ident = load_or_create_network_key_identity()
+                    except NetworkIdentityError:
+                        net_ident = None
+
+                # Primary permanent per-device forwarder (URL never changes on network join/merge/dissolve)
+                device_forwarder = RelayMcpForwarder(
+                    relay_ws_url=relay_ws_url,
+                    snow_id=dev_key.snow_id,
+                    ticket=ticket,
+                    local_gateway_url=f"http://127.0.0.1:{target_port}",
+                    device_key_identity=dev_key if not ticket else None,
+                    hub_http_url=base_url,
+                    device_id=dev_ident.device_id,
+                    network_id=net_ident.network_id if net_ident else "",
+                    device_name=dev_ident.device_name,
+                    auto_reconnect=True,
+                )
+                ok, err = await device_forwarder.start(timeout=timeout)
                 if not ok:
+                    self._last_error = err or "Failed connecting Render reverse MCP tunnel."
                     return {
                         "success": False,
                         "status": "RELAY_CONNECT_FAILED",
-                        "error": err or "Failed connecting Render reverse MCP tunnel.",
+                        "error": self._last_error,
                     }
-                self._mcp_forwarder = forwarder
+
+                # Optional backward-compatible legacy /u/SNW-NET-XXXXXXXX/mcp alias forwarder
+                legacy_net_fwd = None
+                legacy_net_url = None
+                if net_ident is not None and not ticket:
+                    legacy_net_fwd = RelayMcpForwarder(
+                        relay_ws_url=relay_ws_url,
+                        snow_id=str(tunnel_cfg.get("snow_id") or dev_key.snow_id).strip().upper(),
+                        local_gateway_url=f"http://127.0.0.1:{target_port}",
+                        network_key_identity=net_ident,
+                        hub_http_url=base_url,
+                        device_id=f"{dev_ident.device_id}:net",
+                        device_name=dev_ident.device_name,
+                        auto_reconnect=True,
+                    )
+                    net_ok, net_err = await legacy_net_fwd.start(timeout=timeout)
+                    if net_ok:
+                        legacy_net_url = f"{base_url}/u/{net_ident.network_id}/mcp"
+                    else:
+                        logger.debug("Optional legacy network MCP alias registration skipped: %s", net_err)
+                        await legacy_net_fwd.stop()
+                        legacy_net_fwd = None
+
+                self._mcp_forwarder = device_forwarder
+                self._legacy_network_forwarder = legacy_net_fwd
+                self._device_snow_id = dev_key.snow_id
+                self._legacy_network_url = legacy_net_url
+                self._last_error = None
                 self._provider = "render"
                 self._background_active = True
-                self._public_url = f"{base_url}/u/{route_id}"
+                self._public_url = f"{base_url}/u/{dev_key.snow_id}"
                 self._started_at = time.time()
                 return {
                     "success": True,
                     "status": "STARTED",
                     "purpose": self.purpose,
                     "provider": "render",
-                    "snow_id": snow_id,
-                    "network_id": getattr(forwarder, "network_id", "") or route_id,
+                    "snow_id": dev_key.snow_id,
+                    "network_id": net_ident.network_id if net_ident else "",
                     "public_url": self._public_url,
                     "mcp_endpoint": f"{self._public_url}/mcp",
+                    "legacy_network_url": legacy_net_url,
                 }
 
             else:
@@ -808,7 +864,10 @@ class _TunnelInstance:
             "purpose": self.purpose,
             "provider": self._provider if is_active else None,
             "public_url": self._public_url if is_active else None,
-            "mcp_endpoint": mcp_ep,
+            "mcp_endpoint": mcp_ep if is_active else None,
+            "device_snow_id": self._device_snow_id,
+            "legacy_network_url": self._legacy_network_url if is_active else None,
+            "last_error": self._last_error or (getattr(self._mcp_forwarder, "last_error", None) if self._mcp_forwarder else None),
             "target_port": self.target_port,
             "pid": pid,
         }

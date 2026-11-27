@@ -143,6 +143,9 @@ dependencies {
     // OkHttp WebSocket Client
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Pure-Java Ed25519 cryptography for minSdk 26+ (no Android permissions added)
+    implementation("org.bouncycastle:bcprov-jdk15on:1.67")
+
     // QR Code Scanning (ZXing Embedded)
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 

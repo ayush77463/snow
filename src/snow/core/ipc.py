@@ -2436,6 +2436,36 @@ class SnowIpcServer:
                     "error": str(exc),
                 }, now_authed
 
+        if op in (
+            "android_file_read",
+            "snow_android_file_read",
+            "android_file_write",
+            "snow_android_file_write",
+            "android_file_search",
+            "snow_android_file_search",
+            "android_device_info",
+            "snow_android_device_info",
+            "android_audio_status",
+            "snow_android_audio_status",
+            "android_clipboard_get",
+            "snow_android_clipboard_get",
+        ):
+            payload_dict = dict(payload) if isinstance(payload, dict) else {}
+            req = CapabilityRequest(
+                action=op,
+                params=payload_dict,
+                target_device=payload_dict.get("device_id") or payload_dict.get("target"),
+            )
+            res = await self.capability_engine.execute(req, ctx=ctx)
+            return {
+                "version": IPC_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "success": res.success,
+                "status": res.status,
+                "data": res.data,
+                "error": res.error,
+            }, now_authed
+
         return {
             "version": IPC_PROTOCOL_VERSION,
             "request_id": request_id,
@@ -3339,7 +3369,7 @@ class SnowIpcServer:
             res_transport = route_res.get("transport_type") or route_res.get("transport") or record.transport
             res_badge = route_res.get("transport_badge") or record.transport_badge
             if route_res.get("success"):
-                cs.transfer_manager.complete_transfer(record.transfer_id)
+                cs.transfer_manager.mark_completed(record.transfer_id)
                 return {
                     "success": True,
                     "status": "SUCCESS",
@@ -3355,7 +3385,7 @@ class SnowIpcServer:
                 }
             else:
                 err_msg = route_res.get("error") or "Transfer failed on target device."
-                cs.transfer_manager.fail_transfer(record.transfer_id, err_msg)
+                cs.transfer_manager.mark_failed(record.transfer_id, err_msg)
                 return {
                     "success": False,
                     "status": route_res.get("status") or "TRANSFER_FAILED",
@@ -3370,12 +3400,12 @@ class SnowIpcServer:
         # 3. Fallback direct WebSocket dispatch
         session = cs.session_manager.get_session_by_device(device_id)
         if not session or not session.connection_id:
-            cs.transfer_manager.fail_transfer(record.transfer_id, "Device offline")
+            cs.transfer_manager.mark_failed(record.transfer_id, "Device offline")
             return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' is not connected."}
 
         conn = cs.connection_manager.get(session.connection_id)
         if not conn or not conn.is_active:
-            cs.transfer_manager.fail_transfer(record.transfer_id, "Device connection inactive")
+            cs.transfer_manager.mark_failed(record.transfer_id, "Device connection inactive")
             return {"success": False, "status": "DEVICE_OFFLINE", "error": f"Device '{device_id}' connection is inactive."}
 
         try:

@@ -21,9 +21,11 @@ from aiohttp import web, WSMsgType
 import hmac
 
 from snow.relay.auth import (
+    canonical_device_hub_challenge_message,
     canonical_hub_challenge_message,
     create_relay_ticket,
     decode_ed25519_pubkey,
+    derive_device_snow_id_from_pubkey,
     derive_network_id_from_pubkey,
     encode_ed25519_pubkey,
     extract_ticket_claims,
@@ -146,14 +148,36 @@ class _NetworkCoordinatorState:
         return winner, changed
 
 
-def _sanitize_forwarded_subpath(raw_subpath: Optional[str]) -> Tuple[bool, str]:
-    """Validate and normalize forwarded subpaths under /u/{id}/ to prevent traversal & open-proxy abuse."""
+def _sanitize_forwarded_subpath(
+    raw_subpath: Optional[str],
+    raw_request_path: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Validate and normalize forwarded subpaths under /u/{id}/ to prevent traversal & double-decoding."""
+    if raw_request_path:
+        raw_path_only = raw_request_path.split("?", 1)[0]
+        raw_lower = raw_path_only.lower()
+        if (
+            ".." in raw_path_only
+            or "\\" in raw_path_only
+            or "%25" in raw_lower
+            or "%2e" in raw_lower
+            or "%2f" in raw_lower
+            or "%5c" in raw_lower
+            or "%00" in raw_lower
+            or "\x00" in raw_path_only
+        ):
+            return False, ""
+
     if raw_subpath is None:
         return True, "/mcp"
     decoded = urllib.parse.unquote(raw_subpath)
+    twice_decoded = urllib.parse.unquote(decoded)
+    if decoded != twice_decoded and "%" in raw_subpath:
+        return False, ""
     if (
         ".." in raw_subpath
         or ".." in decoded
+        or ".." in twice_decoded
         or "\\" in raw_subpath
         or "\\" in decoded
         or "\x00" in decoded
@@ -166,12 +190,26 @@ def _sanitize_forwarded_subpath(raw_subpath: Optional[str]) -> Tuple[bool, str]:
     clean = raw_subpath.lstrip("/")
     if not clean:
         return True, "/mcp"
-    if "//" in clean:
+    if "//" in clean or clean.startswith("/"):
         return False, ""
     lower = clean.lower()
     if lower in _ALLOWED_MCP_SUBPATHS_EXACT or any(lower.startswith(p) for p in _ALLOWED_MCP_SUBPATH_PREFIXES):
         return True, f"/{clean}"
     return False, ""
+
+
+def _is_method_allowed_for_subpath(method: str, fwd_path: str) -> bool:
+    m = method.upper().strip()
+    lower = fwd_path.lower()
+    if lower == "/mcp" or lower.startswith("/mcp/"):
+        return m in ("GET", "POST", "DELETE", "OPTIONS")
+    if lower == "/oauth" or lower.startswith("/oauth/"):
+        return m in ("GET", "POST", "OPTIONS")
+    if lower.startswith("/.well-known/"):
+        return m in ("GET", "OPTIONS")
+    if lower.lstrip("/") in _ALLOWED_MCP_SUBPATHS_EXACT:
+        return m in ("GET", "HEAD", "OPTIONS")
+    return False
 
 
 class SnowRelayServer:
@@ -204,6 +242,7 @@ class SnowRelayServer:
         self._hub_lock = asyncio.Lock()
         self._hub_challenges: Dict[str, Dict[str, Any]] = {}
         self._hub_sessions: Dict[str, Dict[str, Any]] = {}
+        self._device_key_bindings: Dict[str, Dict[str, Any]] = {}
         self._network_coordinators: Dict[str, _NetworkCoordinatorState] = {}
         self._rendezvous_openings: Dict[str, Dict[str, Any]] = {}
         self._bootstrap_sessions: Dict[str, Dict[str, Any]] = {}
@@ -331,6 +370,8 @@ class SnowRelayServer:
         sess = self._hub_sessions.get(tok_hash)
         if not sess:
             return False, None, "Hub session token is invalid or expired."
+        if not hmac.compare_digest(tok_hash, str(sess.get("token_hash") or tok_hash)):
+            return False, None, "Hub session token is invalid or expired."
         now = time.time()
         if sess.get("revoked") or now > float(sess.get("expires_at", 0.0)):
             self._hub_sessions.pop(tok_hash, None)
@@ -378,8 +419,10 @@ class SnowRelayServer:
         if ok_hub and sess:
             return True, None, {
                 "role": "hub",
-                "network_id": sess["network_id"],
-                "group_id": sess["network_id"],
+                "auth_kind": sess.get("auth_kind", "network"),
+                "network_id": sess.get("network_id") or "",
+                "group_id": sess.get("network_id") or "",
+                "snow_id": sess.get("snow_id") or "",
                 "device_id": sess.get("device_id", ""),
             }
         return self._authenticate_control_bearer(request)
@@ -403,6 +446,36 @@ class SnowRelayServer:
             oldest = next(iter(self._hub_sessions))
             self._hub_sessions.pop(oldest, None)
 
+        expired_bindings = [
+            sid
+            for sid, b in self._device_key_bindings.items()
+            if t > float(b.get("expires_at", 0.0))
+            and (
+                sid not in self._snow_routes
+                or self._snow_routes[sid].get("ws") is None
+                or self._snow_routes[sid]["ws"].closed
+            )
+        ]
+        for sid in expired_bindings:
+            self._device_key_bindings.pop(sid, None)
+            route = self._snow_routes.get(sid)
+            if route and (route.get("ws") is None or route["ws"].closed):
+                self._snow_routes.pop(sid, None)
+        while len(self._device_key_bindings) >= self.config.max_hub_sessions:
+            oldest_sid = next(
+                (
+                    sid
+                    for sid in self._device_key_bindings
+                    if sid not in self._snow_routes
+                    or self._snow_routes[sid].get("ws") is None
+                    or self._snow_routes[sid]["ws"].closed
+                ),
+                None,
+            )
+            if oldest_sid is None:
+                break
+            self._device_key_bindings.pop(oldest_sid, None)
+
         expired_rdv = [
             rid for rid, r in self._rendezvous_openings.items()
             if r.get("revoked") or r.get("consumed") or t > float(r.get("expires_at", 0.0))
@@ -424,6 +497,11 @@ class SnowRelayServer:
             self._bootstrap_sessions.pop(oldest, None)
 
     async def _read_bounded_hub_json(self, request: web.Request) -> Tuple[Optional[Dict[str, Any]], Optional[web.Response]]:
+        raw_ct = request.headers.get("Content-Type", "")
+        if raw_ct:
+            ct_media = raw_ct.split(";", 1)[0].strip().lower()
+            if ct_media and ct_media != "application/json":
+                return None, web.json_response({"success": False, "error": "Unsupported Content-Type; expected application/json."}, status=415)
         if request.content_length is not None and request.content_length > MAX_HUB_JSON_BYTES:
             return None, web.json_response({"success": False, "error": "Request body exceeds hub size limit."}, status=413)
         try:
@@ -440,8 +518,29 @@ class SnowRelayServer:
             return None, web.json_response({"success": False, "error": "JSON object expected."}, status=400)
         return parsed, None
 
+    @staticmethod
+    def _is_clean_hub_field(val: str, max_len: int = 128) -> bool:
+        if len(val) > max_len:
+            return False
+        return not any(c in ("|", "\n", "\r", "\x00") or ord(c) < 32 for c in val)
+
+    def _has_key_collision_unlocked(self, snow_id: str, canonical_pub: str, now: float) -> bool:
+        route = self._snow_routes.get(snow_id)
+        if route and route.get("public_key_b64"):
+            ws = route.get("ws")
+            is_live = ws is not None and not ws.closed
+            if is_live and route["public_key_b64"] != canonical_pub:
+                return True
+        binding = self._device_key_bindings.get(snow_id)
+        if binding:
+            bound_pub = str(binding.get("public_key_b64") or "")
+            bound_exp = float(binding.get("expires_at", 0.0))
+            if bound_pub and bound_pub != canonical_pub and (now <= bound_exp or (route and route.get("ws") is not None and not route["ws"].closed)):
+                return True
+        return False
+
     async def handle_hub_challenge(self, request: web.Request) -> web.Response:
-        """Issue a cryptographically unpredictable single-use Ed25519 challenge for a network ID."""
+        """Issue a cryptographically unpredictable single-use Ed25519 challenge for a device or network."""
         client_ip = request.remote or "unknown"
         allowed, retry_after = self._hub_challenge_limiter.check(client_ip)
         if not allowed:
@@ -457,44 +556,77 @@ class SnowRelayServer:
         assert body is not None
 
         raw_net_id = str(body.get("network_id") or "").strip().upper()
+        raw_snow_id = str(body.get("snow_id") or "").strip().upper()
         raw_pub = body.get("public_key") or body.get("pubkey")
         device_id = str(body.get("device_id") or "").strip()
-        if len(device_id) > 128:
-            return web.json_response({"success": False, "error": "Invalid device_id."}, status=400, headers={"Cache-Control": "no-store"})
+        audience = str(body.get("audience") or "render-hub-tunnel").strip()
 
-        if not is_valid_network_id(raw_net_id) or not isinstance(raw_pub, str):
-            return web.json_response({"success": False, "error": "Invalid network credentials."}, status=400, headers={"Cache-Control": "no-store"})
+        if not self._is_clean_hub_field(device_id, 128) or not self._is_clean_hub_field(audience, 64) or not isinstance(raw_pub, str):
+            return web.json_response({"success": False, "error": "Invalid identity credentials."}, status=400, headers={"Cache-Control": "no-store"})
+        if raw_snow_id and not is_valid_snow_id(raw_snow_id):
+            return web.json_response({"success": False, "error": "Invalid snow_id format."}, status=400, headers={"Cache-Control": "no-store"})
+        if raw_net_id and not is_valid_network_id(raw_net_id):
+            return web.json_response({"success": False, "error": "Invalid network_id format."}, status=400, headers={"Cache-Control": "no-store"})
 
         try:
             raw_pub_bytes = decode_ed25519_pubkey(raw_pub)
-            derived_net_id = derive_network_id_from_pubkey(raw_pub_bytes)
             canonical_pub = encode_ed25519_pubkey(raw_pub_bytes)
         except Exception:
-            return web.json_response({"success": False, "error": "Invalid network credentials."}, status=400, headers={"Cache-Control": "no-store"})
+            return web.json_response({"success": False, "error": "Invalid Ed25519 public key."}, status=400, headers={"Cache-Control": "no-store"})
 
-        if derived_net_id != raw_net_id:
-            return web.json_response({"success": False, "error": "Network identity verification failed."}, status=403, headers={"Cache-Control": "no-store"})
-
+        # Mode A: legacy network identity when network_id matches public_key (and snow_id is absent or not per-device pubkey)
+        derived_net_id = derive_network_id_from_pubkey(raw_pub_bytes)
+        derived_dev_snow_id = derive_device_snow_id_from_pubkey(raw_pub_bytes)
         now = time.time()
         ttl = int(max(10.0, self.config.hub_challenge_ttl_seconds))
         expires_at = int(now + ttl)
         challenge_id = secrets.token_urlsafe(16)
         nonce = secrets.token_urlsafe(32)
-        challenge_msg = canonical_hub_challenge_message(
-            challenge_id=challenge_id,
-            network_id=raw_net_id,
-            nonce=nonce,
-            expires_at=expires_at,
-            device_id=device_id,
-        ).decode("utf-8")
+
+        if raw_net_id and derived_net_id == raw_net_id:
+            auth_kind = "network"
+            challenge_msg = canonical_hub_challenge_message(
+                challenge_id=challenge_id,
+                network_id=raw_net_id,
+                nonce=nonce,
+                expires_at=expires_at,
+                device_id=device_id,
+            ).decode("utf-8")
+        elif raw_snow_id:
+            if derived_dev_snow_id != raw_snow_id:
+                return web.json_response({"success": False, "error": "Device SNOW ID does not match public key."}, status=403, headers={"Cache-Control": "no-store"})
+            if not device_id:
+                return web.json_response({"success": False, "error": "device_id is required for per-device hub authentication."}, status=400, headers={"Cache-Control": "no-store"})
+            auth_kind = "device"
+            challenge_msg = canonical_device_hub_challenge_message(
+                challenge_id=challenge_id,
+                nonce=nonce,
+                expires_at=expires_at,
+                snow_id=raw_snow_id,
+                public_key_b64=canonical_pub,
+                device_id=device_id,
+                network_id=raw_net_id,
+                audience=audience or "render-hub-tunnel",
+            ).decode("utf-8")
+        else:
+            return web.json_response({"success": False, "error": "Identity verification failed."}, status=403, headers={"Cache-Control": "no-store"})
 
         async with self._hub_lock:
             self._prune_hub_stores_unlocked(now)
+            if auth_kind == "device" and self._has_key_collision_unlocked(raw_snow_id, canonical_pub, now):
+                return web.json_response(
+                    {"success": False, "error": "SNOW ID collision or active ownership conflict rejected."},
+                    status=409,
+                    headers={"Cache-Control": "no-store"},
+                )
             self._hub_challenges[challenge_id] = {
                 "challenge_id": challenge_id,
+                "kind": auth_kind,
                 "network_id": raw_net_id,
+                "snow_id": raw_snow_id,
                 "public_key_b64": canonical_pub,
                 "device_id": device_id,
+                "audience": audience or "render-hub-tunnel",
                 "nonce": nonce,
                 "expires_at": expires_at,
                 "created_at": now,
@@ -503,9 +635,12 @@ class SnowRelayServer:
         return web.json_response(
             {
                 "success": True,
+                "auth_kind": auth_kind,
                 "challenge_id": challenge_id,
                 "nonce": nonce,
                 "network_id": raw_net_id,
+                "snow_id": raw_snow_id,
+                "audience": audience or "render-hub-tunnel",
                 "expires_in": ttl,
                 "expires_at": expires_at,
                 "challenge_message": challenge_msg,
@@ -535,17 +670,20 @@ class SnowRelayServer:
         signature_b64 = str(body.get("signature") or "").strip()
         device_id = str(body.get("device_id") or "").strip()
         snow_id = str(body.get("snow_id") or "").strip().upper()
+        audience = str(body.get("audience") or "render-hub-tunnel").strip()
 
-        if not challenge_id or not signature_b64 or not is_valid_network_id(raw_net_id) or not isinstance(raw_pub, str):
+        if not challenge_id or not signature_b64 or not isinstance(raw_pub, str):
             return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
         if snow_id and not is_valid_snow_id(snow_id):
             return web.json_response({"success": False, "error": "Invalid snow_id format."}, status=400, headers={"Cache-Control": "no-store"})
+        if raw_net_id and not is_valid_network_id(raw_net_id):
+            return web.json_response({"success": False, "error": "Invalid network_id format."}, status=400, headers={"Cache-Control": "no-store"})
+        if not self._is_clean_hub_field(device_id, 128) or not self._is_clean_hub_field(audience, 64):
+            return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
 
         try:
             raw_pub_bytes = decode_ed25519_pubkey(raw_pub)
             canonical_pub = encode_ed25519_pubkey(raw_pub_bytes)
-            if derive_network_id_from_pubkey(raw_pub_bytes) != raw_net_id:
-                return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
         except Exception:
             return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
 
@@ -558,18 +696,46 @@ class SnowRelayServer:
             return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
         if now > float(challenge.get("expires_at", 0.0)):
             return web.json_response({"success": False, "error": "Challenge expired."}, status=401, headers={"Cache-Control": "no-store"})
-        if challenge.get("network_id") != raw_net_id or challenge.get("public_key_b64") != canonical_pub:
-            return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
-        if challenge.get("device_id") and device_id != challenge.get("device_id"):
+        if challenge.get("public_key_b64") != canonical_pub:
             return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
 
-        msg = canonical_hub_challenge_message(
-            challenge_id=challenge_id,
-            network_id=raw_net_id,
-            nonce=str(challenge["nonce"]),
-            expires_at=int(challenge["expires_at"]),
-            device_id=str(challenge.get("device_id") or ""),
-        )
+        auth_kind = str(challenge.get("kind") or "network")
+        if auth_kind == "device":
+            if not snow_id or snow_id != challenge.get("snow_id"):
+                return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
+            if derive_device_snow_id_from_pubkey(raw_pub_bytes) != snow_id:
+                return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
+            if not device_id or device_id != challenge.get("device_id"):
+                return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
+            if raw_net_id != str(challenge.get("network_id") or ""):
+                return web.json_response({"success": False, "error": "Challenge network scope mismatch."}, status=401, headers={"Cache-Control": "no-store"})
+            if (audience or "render-hub-tunnel") != str(challenge.get("audience") or "render-hub-tunnel"):
+                return web.json_response({"success": False, "error": "Challenge audience mismatch."}, status=401, headers={"Cache-Control": "no-store"})
+            msg = canonical_device_hub_challenge_message(
+                challenge_id=challenge_id,
+                nonce=str(challenge["nonce"]),
+                expires_at=int(challenge["expires_at"]),
+                snow_id=snow_id,
+                public_key_b64=canonical_pub,
+                device_id=device_id,
+                network_id=raw_net_id,
+                audience=str(challenge.get("audience") or "render-hub-tunnel"),
+            )
+        else:
+            if not is_valid_network_id(raw_net_id) or challenge.get("network_id") != raw_net_id:
+                return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
+            if derive_network_id_from_pubkey(raw_pub_bytes) != raw_net_id:
+                return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
+            if challenge.get("device_id") and device_id != challenge.get("device_id"):
+                return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
+            msg = canonical_hub_challenge_message(
+                challenge_id=challenge_id,
+                network_id=raw_net_id,
+                nonce=str(challenge["nonce"]),
+                expires_at=int(challenge["expires_at"]),
+                device_id=str(challenge.get("device_id") or ""),
+            )
+
         if not verify_ed25519_signature(raw_pub_bytes, msg, signature_b64):
             return web.json_response({"success": False, "error": "Challenge verification failed."}, status=401, headers={"Cache-Control": "no-store"})
 
@@ -578,11 +744,36 @@ class SnowRelayServer:
         tok_hash = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
         async with self._hub_lock:
             self._prune_hub_stores_unlocked(now)
+            next_gen = 1
+            if auth_kind == "device":
+                if self._has_key_collision_unlocked(snow_id, canonical_pub, now):
+                    return web.json_response(
+                        {"success": False, "error": "SNOW ID collision or active ownership conflict rejected."},
+                        status=409,
+                        headers={"Cache-Control": "no-store"},
+                    )
+                prev_binding = self._device_key_bindings.get(snow_id)
+                prev_route = self._snow_routes.get(snow_id)
+                prev_gen = max(
+                    int((prev_binding or {}).get("session_generation", 0) or 0),
+                    int((prev_route or {}).get("session_generation", 0) or 0),
+                )
+                next_gen = prev_gen + 1
+                self._device_key_bindings[snow_id] = {
+                    "snow_id": snow_id,
+                    "public_key_b64": canonical_pub,
+                    "device_id": device_id,
+                    "session_generation": next_gen,
+                    "expires_at": now + ttl,
+                }
             self._hub_sessions[tok_hash] = {
+                "token_hash": tok_hash,
+                "auth_kind": auth_kind,
                 "network_id": raw_net_id,
                 "public_key_b64": canonical_pub,
                 "device_id": device_id,
                 "snow_id": snow_id,
+                "session_generation": next_gen,
                 "created_at": now,
                 "expires_at": now + ttl,
                 "revoked": False,
@@ -591,9 +782,12 @@ class SnowRelayServer:
         return web.json_response(
             {
                 "success": True,
+                "auth_kind": auth_kind,
                 "token": raw_token,
                 "token_type": "Bearer",
                 "network_id": raw_net_id,
+                "snow_id": snow_id,
+                "session_generation": next_gen,
                 "expires_in": ttl,
             },
             headers={"Cache-Control": "no-store"},
@@ -610,7 +804,12 @@ class SnowRelayServer:
             sess = self._hub_sessions.pop(tok_hash, None)
         if not sess:
             return web.json_response({"success": False, "error": "Session not found."}, status=401)
-        return web.json_response({"success": True, "revoked": True, "network_id": sess["network_id"]})
+        return web.json_response({
+            "success": True,
+            "revoked": True,
+            "network_id": sess.get("network_id", ""),
+            "snow_id": sess.get("snow_id", ""),
+        })
 
     async def handle_rendezvous_open(self, request: web.Request) -> web.Response:
         """Open a short-lived (<=120s), network-scoped rendezvous slot for unpaired remote onboarding."""
@@ -1059,6 +1258,8 @@ class SnowRelayServer:
             return web.json_response({"success": False, "error": auth_err}, status=status_code)
 
         caller_net = (claims or {}).get("network_id") or (claims or {}).get("group_id")
+        caller_snow_id = str((claims or {}).get("snow_id") or "").strip().upper()
+        auth_kind = str((claims or {}).get("auth_kind") or "")
         is_admin = (claims or {}).get("role") == "admin"
 
         # 1. Search network-scoped coordinator host entries first
@@ -1077,8 +1278,11 @@ class SnowRelayServer:
         host = request.host
 
         if matched_host is not None:
-            if not is_admin and caller_net and matched_host.network_id != caller_net:
+            is_self = caller_snow_id and caller_snow_id == raw_snow_id
+            if not is_admin and not is_self and caller_net and matched_host.network_id != caller_net:
                 return web.json_response({"success": False, "error": "Cross-network directory lookup denied."}, status=403)
+            if auth_kind == "device" and not caller_net and not is_self:
+                return web.json_response({"success": False, "error": "Cross-device directory lookup denied."}, status=403)
             return web.json_response(
                 {
                     "success": True,
@@ -1096,19 +1300,22 @@ class SnowRelayServer:
                 headers={"Cache-Control": "no-store"},
             )
 
-        # 2. Fallback to legacy _snow_routes within same group
+        # 2. Check per-device / legacy _snow_routes within authorized scope
         route = self._snow_routes.get(raw_snow_id)
         if not route:
             return web.json_response({"success": False, "error": f"SNOW ID '{raw_snow_id}' not found."}, status=404)
-        if not is_admin and caller_net and route.get("group_id") != caller_net:
-            return web.json_response({"success": False, "error": "Cross-network directory lookup denied."}, status=403)
+        route_group = route.get("network_id") or route.get("group_id") or ""
+        is_self = caller_snow_id and caller_snow_id == raw_snow_id
+        if not is_admin and not is_self:
+            if not caller_net or route_group != caller_net:
+                return web.json_response({"success": False, "error": "Cross-network directory lookup denied."}, status=403)
         ws = route.get("ws")
         online = bool(ws is not None and not ws.closed)
         return web.json_response(
             {
                 "success": True,
                 "snow_id": raw_snow_id,
-                "network_id": route.get("group_id"),
+                "network_id": route.get("network_id") or route.get("group_id"),
                 "device_id": route.get("device_id"),
                 "online": online,
                 "mcp_tunnel_active": bool(online and route.get("mcp_tunnel")),
@@ -1257,13 +1464,16 @@ class SnowRelayServer:
 
         subpath = request.match_info.get("subpath")
         if request.path.startswith("/u/"):
-            ok_sub, fwd_path = _sanitize_forwarded_subpath(subpath)
+            ok_sub, fwd_path = _sanitize_forwarded_subpath(subpath, raw_request_path=request.raw_path)
             if not ok_sub:
                 return web.json_response({"error": "Forbidden or invalid MCP path."}, status=404)
         else:
-            ok_sub, fwd_path = _sanitize_forwarded_subpath(request.path.lstrip("/"))
+            ok_sub, fwd_path = _sanitize_forwarded_subpath(request.path.lstrip("/"), raw_request_path=request.raw_path)
             if not ok_sub:
                 return web.json_response({"error": "Forbidden or invalid MCP path."}, status=404)
+
+        if not _is_method_allowed_for_subpath(request.method, fwd_path):
+            return web.json_response({"error": f"HTTP method '{request.method}' not allowed for '{fwd_path}'."}, status=405)
 
         skip_req_headers = {
             "connection",
@@ -1274,6 +1484,7 @@ class SnowRelayServer:
             "trailers",
             "content-length",
             "x-snow-network-id",
+            "x-snow-device-snow-id",
             "x-forwarded-prefix",
         }
         fwd_headers = {
@@ -1282,7 +1493,10 @@ class SnowRelayServer:
         }
         if request.path.startswith("/u/"):
             fwd_headers["X-Forwarded-Prefix"] = f"/u/{target_route_id}"
-            fwd_headers["X-Snow-Network-Id"] = target_route_id
+            if is_valid_network_id(target_route_id):
+                fwd_headers["X-Snow-Network-Id"] = target_route_id
+            elif is_valid_snow_id(target_route_id):
+                fwd_headers["X-Snow-Device-Snow-Id"] = target_route_id
         fwd_headers["X-Forwarded-Host"] = request.host
         fwd_headers["X-Forwarded-Proto"] = request.headers.get("X-Forwarded-Proto", request.scheme or "http").split(",")[0].strip()
 
@@ -1372,6 +1586,7 @@ class SnowRelayServer:
 
         device_id: Optional[str] = None
         group_id: Optional[str] = None
+        ws_registered: bool = False
 
         try:
             # 1. Initial Handshake Hello message
@@ -1400,6 +1615,9 @@ class SnowRelayServer:
             ticket = str(hello_data.get("ticket") or "").strip()
             authed_network_id: Optional[str] = None
             raw_hello_snow_id = ""
+            authed_pub_b64 = ""
+            auth_mode = "ticket"
+            hub_session_gen = 1
             bootstrap_allowed_target: Optional[str] = None
 
             if hub_token:
@@ -1411,18 +1629,59 @@ class SnowRelayServer:
                 if not ok_hub or not hub_sess:
                     await ws.close(code=4001, message=f"Auth failed: {hub_err}".encode("utf-8"))
                     return ws
-                authed_network_id = str(hub_sess["network_id"])
+                auth_kind = str(hub_sess.get("auth_kind") or "network")
                 sess_dev = str(hub_sess.get("device_id") or "").strip()
                 claimed_dev = str(hello_data.get("device_id") or sess_dev or "").strip()
                 if not claimed_dev or (sess_dev and claimed_dev != sess_dev):
                     await ws.close(code=4003, message=b"Device identity does not match authenticated hub session.")
                     return ws
                 device_id = claimed_dev
-                group_id = authed_network_id
-                raw_hello_snow_id = str(hello_data.get("snow_id") or hub_sess.get("snow_id") or "").strip().upper()
-                if raw_hello_snow_id and not is_valid_snow_id(raw_hello_snow_id):
-                    await ws.close(code=4002, message=b"Invalid SNOW ID format.")
-                    return ws
+                authed_pub_b64 = str(hub_sess.get("public_key_b64") or "")
+                hub_session_gen = int(hub_sess.get("session_generation", 1) or 1)
+
+                if auth_kind == "device":
+                    auth_mode = "ed25519_device"
+                    authed_snow_id = str(hub_sess.get("snow_id") or "").strip().upper()
+                    claimed_snow_id = str(hello_data.get("snow_id") or authed_snow_id).strip().upper()
+                    if not is_valid_snow_id(authed_snow_id) or claimed_snow_id != authed_snow_id:
+                        await ws.close(code=4003, message=b"SNOW ID does not match authenticated device Ed25519 session.")
+                        return ws
+                    raw_hello_snow_id = authed_snow_id
+                    opt_net = str(hub_sess.get("network_id") or "").strip().upper()
+                    authed_network_id = opt_net if (opt_net and bool(hello_data.get("register_network_coordinator", False))) else None
+                    group_id = opt_net or f"dev_{authed_snow_id}"
+
+                    existing_route = self._snow_routes.get(raw_hello_snow_id)
+                    if existing_route:
+                        existing_pub = str(existing_route.get("public_key_b64") or "")
+                        existing_ws = existing_route.get("ws")
+                        if existing_pub and existing_pub != authed_pub_b64:
+                            await ws.close(code=4003, message=b"Collision rejected: SNOW ID bound to a different public key.")
+                            return ws
+                        if existing_ws is not None and not existing_ws.closed and existing_ws is not ws:
+                            recovery_takeover = bool(hello_data.get("recovery_takeover", False))
+                            try:
+                                claimed_gen = int(hello_data.get("session_generation", hub_session_gen) or hub_session_gen)
+                            except (TypeError, ValueError):
+                                claimed_gen = 0
+                            cur_gen = int(existing_route.get("session_generation", 0) or 0)
+                            if recovery_takeover and claimed_gen > cur_gen:
+                                try:
+                                    await existing_ws.close(code=4009, message=b"SESSION_SUPERSEDED: authenticated recovery takeover.")
+                                except Exception:
+                                    pass
+                                hub_session_gen = claimed_gen
+                            else:
+                                await ws.close(code=4009, message=b"IDENTITY_CONFLICT_FENCED: active session already owns this SNOW ID.")
+                                return ws
+                else:
+                    auth_mode = "ed25519_network"
+                    authed_network_id = str(hub_sess["network_id"])
+                    group_id = authed_network_id
+                    raw_hello_snow_id = str(hello_data.get("snow_id") or hub_sess.get("snow_id") or "").strip().upper()
+                    if raw_hello_snow_id and not is_valid_snow_id(raw_hello_snow_id):
+                        await ws.close(code=4002, message=b"Invalid SNOW ID format.")
+                        return ws
             elif bootstrap_token:
                 claimed_net_id = str(hello_data.get("network_id") or "").strip().upper()
                 claimed_dev = str(hello_data.get("device_id") or "").strip()
@@ -1461,6 +1720,9 @@ class SnowRelayServer:
                     existing_route = self._snow_routes.get(raw_hello_snow_id)
                     if existing_route:
                         existing_ws = existing_route.get("ws")
+                        if existing_route.get("auth_mode") == "ed25519_device" and existing_ws is not None and not existing_ws.closed:
+                            await ws.close(code=4003, message=b"SNOW ID owned by an authenticated Ed25519 device key.")
+                            return ws
                         if existing_route.get("device_id") != device_id and existing_ws is not None and not existing_ws.closed:
                             await ws.close(code=4003, message=b"SNOW ID owned by another active session.")
                             return ws
@@ -1469,6 +1731,7 @@ class SnowRelayServer:
             if not reg_ok:
                 await ws.close(code=4003, message=reg_err.encode("utf-8"))
                 return ws
+            ws_registered = True
 
             now = time.time()
             raw_endpoints = hello_data.get("lan_endpoints") or []
@@ -1480,6 +1743,7 @@ class SnowRelayServer:
             coord_epoch = 0
             primary_device_id: Optional[str] = None
             is_primary = False
+            changed = False
 
             if authed_network_id and not bootstrap_allowed_target:
                 coord = self._network_coordinators.get(authed_network_id)
@@ -1525,12 +1789,29 @@ class SnowRelayServer:
                 primary_device_id, changed = coord.elect_primary(now)
                 coord_epoch = coord.epoch
                 is_primary = primary_device_id == device_id
-            elif raw_hello_snow_id:
+
+            if raw_hello_snow_id and auth_mode == "ed25519_device":
                 self._device_snow_ids[device_id] = raw_hello_snow_id
                 self._snow_routes[raw_hello_snow_id] = {
                     "snow_id": raw_hello_snow_id,
                     "device_id": device_id,
                     "group_id": group_id,
+                    "network_id": str(hub_sess.get("network_id") or "") if hub_token else "",
+                    "public_key_b64": authed_pub_b64,
+                    "auth_mode": auth_mode,
+                    "session_generation": hub_session_gen,
+                    "ws": ws,
+                    "mcp_tunnel": bool(hello_data.get("mcp_tunnel", False)),
+                    "lan_endpoints": clean_endpoints,
+                    "last_seen": now,
+                }
+            elif raw_hello_snow_id and not authed_network_id:
+                self._device_snow_ids[device_id] = raw_hello_snow_id
+                self._snow_routes[raw_hello_snow_id] = {
+                    "snow_id": raw_hello_snow_id,
+                    "device_id": device_id,
+                    "group_id": group_id,
+                    "auth_mode": auth_mode,
                     "ws": ws,
                     "mcp_tunnel": bool(hello_data.get("mcp_tunnel", False)),
                     "lan_endpoints": clean_endpoints,
@@ -1747,7 +2028,7 @@ class SnowRelayServer:
 
         finally:
             self._active_sockets.discard(ws)
-            if device_id:
+            if device_id and ws_registered:
                 self.registry.mark_dormant(device_id)
                 if authed_network_id and authed_network_id in self._network_coordinators:
                     coord = self._network_coordinators[authed_network_id]

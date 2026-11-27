@@ -764,7 +764,8 @@ class AndroidPeerHostManager(
             },
             mergeDecisionHandler = { txId, decision, actingDev ->
                 resolveMergeDecision(txId, decision, actingDev)
-            }
+            },
+            perDeviceProfileProvider = perDeviceProfileProvider
         )
 
         val success = newServer.start()
@@ -859,6 +860,18 @@ class AndroidPeerHostManager(
      */
     fun isHostModeActive(): Boolean {
         return isRunning.get() && server != null && server!!.isListening()
+    }
+
+    fun listAuthenticatedPeers(): List<String> = server?.listAuthenticatedPeerDeviceIds() ?: emptyList()
+
+    suspend fun sendRequestToPeer(
+        targetDeviceId: String,
+        action: String,
+        data: Map<String, Any?> = emptyMap(),
+        timeoutMs: Long = 20_000L
+    ): Pair<Map<String, Any?>?, String?> {
+        val srv = server ?: return null to "DEVICE_OFFLINE: Android Peer Host is not active."
+        return srv.sendRequestToPeer(targetDeviceId, action, data, timeoutMs)
     }
 
     /**

@@ -1,7 +1,12 @@
 package org.snow.network
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -210,5 +215,138 @@ class M43Unit2MakeBeforeBreakAndFallbackTest {
         assertTrue(orch.setMode("pc-1", TransportMode.HOTSPOT).first)
         val blocked = orch.handleTransportLoss("pc-1", TransportRoute.HOTSPOT, "Hotspot off")
         assertNull(blocked)
+    }
+
+    @Test
+    fun relayClientVerifiesHandshakeBeforeEstablishedAndFailsOnRejectedAuth() = runBlocking {
+        val relayClient = RelayClient(
+            relayUrl = "wss://relay.snow.example/v1/relay",
+            deviceId = "android-a",
+            groupId = "grp-1",
+            ticket = "tick-1",
+            targetPeerId = "pc-b",
+            usePublicCaForOuterRelay = true
+        )
+        var capturedListener: WebSocketListener? = null
+        lateinit var wsSocket: FakeWebSocket
+        relayClient.webSocketFactory = { req, listener ->
+            capturedListener = listener
+            wsSocket = FakeWebSocket(req.url.toString())
+            wsSocket
+        }
+
+        val failedReason = CompletableDeferred<String>()
+        relayClient.onTunnelFailed = { msg ->
+            if (!failedReason.isCompleted) failedReason.complete(msg)
+        }
+
+        relayClient.connect()
+        assertNotNull(capturedListener)
+        capturedListener!!.onOpen(
+            wsSocket,
+            Response.Builder().request(wsSocket.request()).protocol(okhttp3.Protocol.HTTP_1_1).code(101).message("OK").build()
+        )
+        // Session hello_ack(success=true) alone must NOT mark the E2E tunnel verified yet!
+        capturedListener!!.onMessage(wsSocket, """{"type":"hello_ack","success":true}""")
+        assertEquals(ReachabilityState.ONLINE_RELAYED, relayClient.reachabilityState.value)
+        assertFalse(relayClient.tunnelEstablished.value)
+        assertFalse(relayClient.isSessionAndTunnelVerified())
+
+        // Now simulate hub rejecting auth -> must emit onTunnelFailed and clear state
+        capturedListener!!.onMessage(wsSocket, """{"type":"hello_ack","success":false,"error":"Invalid signature"}""")
+        assertEquals("Invalid signature", failedReason.await())
+        assertEquals(ReachabilityState.UNREACHABLE_OFFLINE, relayClient.reachabilityState.value)
+        assertFalse(relayClient.isSessionAndTunnelVerified())
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun manualRemoteRelaySelectionFailsClosedPreservingWorkingRouteAndSucceedsOnlyWhenVerified() = runBlocking {
+        val mainExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val mainDisp = mainExec.asCoroutineDispatcher()
+        Dispatchers.setMain(mainDisp)
+        val tempDir = java.nio.file.Files.createTempDirectory("m43_polish_repo_").toFile()
+        val prefsMap = mutableMapOf<String, android.content.SharedPreferences>()
+        fun newPrefs(): android.content.SharedPreferences = object : android.content.SharedPreferences {
+            val map = mutableMapOf<String, Any?>()
+            override fun getAll(): MutableMap<String, *> = HashMap(map)
+            override fun getString(k: String?, d: String?) = map[k] as? String ?: d
+            override fun getStringSet(k: String?, d: MutableSet<String>?) = d
+            override fun getInt(k: String?, d: Int) = (map[k] as? Int) ?: d
+            override fun getLong(k: String?, d: Long) = (map[k] as? Long) ?: d
+            override fun getFloat(k: String?, d: Float) = (map[k] as? Float) ?: d
+            override fun getBoolean(k: String?, d: Boolean) = (map[k] as? Boolean) ?: d
+            override fun contains(k: String?) = map.containsKey(k)
+            override fun edit() = object : android.content.SharedPreferences.Editor {
+                val p = mutableMapOf<String, Any?>(); val r = mutableSetOf<String>(); var c = false
+                override fun putString(k: String?, v: String?) = apply { if (k != null) p[k] = v }
+                override fun putStringSet(k: String?, v: MutableSet<String>?) = apply {}
+                override fun putInt(k: String?, v: Int) = apply { if (k != null) p[k] = v }
+                override fun putLong(k: String?, v: Long) = apply { if (k != null) p[k] = v }
+                override fun putFloat(k: String?, v: Float) = apply { if (k != null) p[k] = v }
+                override fun putBoolean(k: String?, v: Boolean) = apply { if (k != null) p[k] = v }
+                override fun remove(k: String?) = apply { if (k != null) r.add(k) }
+                override fun clear() = apply { c = true }
+                override fun commit(): Boolean {
+                    if (c) map.clear(); r.forEach { map.remove(it) }
+                    p.forEach { (k, v) -> if (v == null) map.remove(k) else map[k] = v }
+                    return true
+                }
+                override fun apply() { commit() }
+            }
+            override fun registerOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun unregisterOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+        }
+
+        val ctx = object : android.content.ContextWrapper(null) {
+            override fun getApplicationContext(): android.content.Context = this
+            override fun getFilesDir(): java.io.File = tempDir
+            override fun getCacheDir(): java.io.File = tempDir
+            override fun getPackageName(): String = "org.snow"
+            override fun getSharedPreferences(name: String?, mode: Int) = prefsMap.getOrPut(name ?: "def") { newPrefs() }
+        }
+        val instField = org.snow.ui.SnowUiRepository::class.java.getDeclaredField("instance").apply { isAccessible = true }
+        instField.set(null, null)
+        try {
+            val repo = org.snow.ui.SnowUiRepository.getInstance(ctx)
+            val savedField = org.snow.ui.SnowUiRepository::class.java.getDeclaredField("_savedDevices").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            val savedFlow = savedField.get(repo) as kotlinx.coroutines.flow.MutableStateFlow<List<org.snow.ui.SavedDevice>>
+            savedFlow.value = listOf(
+                org.snow.ui.SavedDevice(
+                    deviceId = "pc-polish-1",
+                    deviceName = "Laptop",
+                    host = "192.168.1.30",
+                    port = 8765,
+                    connectionMode = "auto"
+                )
+            )
+            repo.setRemoteRelayEndpoint("https://snow-relay.onrender.com")
+            repo.activeTransportOrchestrator().markVerified("pc-polish-1", TransportRoute.WIFI_LAN, host = "192.168.1.30", isActive = true)
+
+            // 1. Auth/handshake failure -> must fail closed, preserve Wi-Fi active, set honest error
+            repo.relayActivationVerifierForTest = { _, _ -> false to "Hub challenge signature rejected" }
+            val (okFail, errFail) = repo.switchDeviceTransport("pc-polish-1", "remote_relay")
+            assertFalse(okFail)
+            assertTrue(errFail.contains("Hub challenge signature rejected"))
+            assertEquals("Hub challenge signature rejected", repo.lastTransportError.value)
+            val snapAfterFail = repo.activeTransportOrchestrator().snapshotFor("pc-polish-1")
+            assertEquals(TransportRoute.WIFI_LAN, snapAfterFail.activeRoute)
+            assertEquals(TransportMode.AUTO, snapAfterFail.mode)
+
+            // 2. Real authenticated handshake success -> activates REMOTE_RELAY and clears error
+            repo.relayActivationVerifierForTest = { _, _ -> true to "Remote relay authenticated and verified." }
+            val (okPass, _) = repo.switchDeviceTransport("pc-polish-1", "remote_relay")
+            assertTrue(okPass)
+            assertNull(repo.lastTransportError.value)
+            val snapAfterPass = repo.activeTransportOrchestrator().snapshotFor("pc-polish-1")
+            assertEquals(TransportRoute.REMOTE_RELAY, snapAfterPass.activeRoute)
+            assertEquals(TransportMode.REMOTE_RELAY, snapAfterPass.mode)
+        } finally {
+            instField.set(null, null)
+            tempDir.deleteRecursively()
+            Dispatchers.resetMain()
+            mainExec.shutdownNow()
+        }
     }
 }

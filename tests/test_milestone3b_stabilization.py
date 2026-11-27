@@ -462,7 +462,7 @@ class TestMilestone3BSection4WebUiDisconnectAllAndRemoteAiLink(unittest.Isolated
                 if web_srv._remote_ai_autostart_task:
                     await asyncio.wait_for(web_srv._remote_ai_autostart_task, timeout=5.0)
                 self.assertEqual(gw_starts, 1)
-                self.assertEqual(start_calls, 1)
+                self.assertEqual(start_calls, 2)
                 self.assertTrue(web_srv.tunnel_manager.get_status()["active"])
 
                 # Deduplication: repeat call does NOT spawn duplicate gateway or forwarder
@@ -470,7 +470,7 @@ class TestMilestone3BSection4WebUiDisconnectAllAndRemoteAiLink(unittest.Isolated
                 self.assertTrue(dup_res["success"])
                 self.assertEqual(dup_res["status"], "ALREADY_RUNNING")
                 self.assertEqual(gw_starts, 1)
-                self.assertEqual(start_calls, 1)
+                self.assertEqual(start_calls, 2)
         finally:
             await web_srv.stop()
 

@@ -1392,6 +1392,177 @@ class SnowWebServer:
         except Exception as exc:
             return web.json_response({"success": False, "error": str(exc)}, status=500)
 
+    async def handle_api_device_identity(self, request: web.Request) -> web.Response:
+        """Query permanent per-device Ed25519 identity and permanent /u/SNW-XXXX-XXXX/mcp URL."""
+        try:
+            from snow.core.config import resolve_default_hub_url
+            from snow.security.identity import DeviceIdentityError, load_or_create_device_key_identity
+
+            db_mgr = getattr(self, "db_manager", None) or getattr(
+                getattr(self, "bridge", None), "capability_engine", None
+            )
+            if hasattr(db_mgr, "db_manager"):
+                db_mgr = db_mgr.db_manager
+            hub_url = resolve_default_hub_url(db_manager=db_mgr)
+            dev_key = load_or_create_device_key_identity()
+            return web.json_response({
+                "success": True,
+                "status": "SUCCESS",
+                "device_identity": dev_key.to_public_dict(),
+                "snow_id": dev_key.snow_id,
+                "public_key_b64": dev_key.public_key_b64,
+                "default_hub_url": hub_url,
+                "permanent_mcp_url": f"{hub_url.rstrip('/')}/u/{dev_key.snow_id}/mcp" if hub_url else "",
+            })
+        except Exception as exc:
+            status = 409 if exc.__class__.__name__ == "DeviceIdentityError" else 500
+            return web.json_response({"success": False, "status": "IDENTITY_ERROR", "error": str(exc)}, status=status)
+
+    async def handle_api_device_recovery_export(self, request: web.Request) -> web.Response:
+        """Explicit owner-confirmed export of SNW-REC-V1 recovery key or encrypted AES-GCM backup."""
+        from snow.security.identity import (
+            DeviceIdentityError,
+            export_device_recovery_key,
+            export_encrypted_device_backup,
+            load_or_create_device_key_identity,
+        )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "CONFIRMATION_REQUIRED",
+                    "error": (
+                        "Explicit owner confirmation (confirm=true) is required to export recovery material. "
+                        "Anyone holding the recovery key can impersonate this device."
+                    ),
+                },
+                status=400,
+            )
+
+        passphrase = body.get("passphrase")
+        save_path_raw = str(body.get("save_path") or "").strip()
+        try:
+            dev_key = load_or_create_device_key_identity()
+            if passphrase is not None or save_path_raw:
+                if not isinstance(passphrase, str) or len(passphrase) < 10:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "status": "WEAK_PASSPHRASE",
+                            "error": "Encrypted backup requires a passphrase of at least 10 characters.",
+                        },
+                        status=400,
+                    )
+                backup_json = export_encrypted_device_backup(dev_key, passphrase)
+                saved_to = ""
+                if save_path_raw:
+                    from pathlib import Path
+                    target = Path(save_path_raw).expanduser().resolve()
+                    if target.is_dir():
+                        return web.json_response(
+                            {"success": False, "error": "save_path must point to a file, not a directory."},
+                            status=400,
+                        )
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(backup_json + "\n", encoding="utf-8")
+                    saved_to = str(target)
+                return web.json_response({
+                    "success": True,
+                    "status": "ENCRYPTED_BACKUP_EXPORTED",
+                    "snow_id": dev_key.snow_id,
+                    "encrypted_backup_json": backup_json if not saved_to else None,
+                    "saved_path": saved_to or None,
+                    "kdf": "pbkdf2_sha256",
+                    "iterations": 310000,
+                    "cipher": "aes-256-gcm",
+                    "warning": "Store this encrypted backup and passphrase separately. Never share your recovery material.",
+                })
+
+            rec_key = export_device_recovery_key(dev_key)
+            return web.json_response(
+                {
+                    "success": True,
+                    "status": "RECOVERY_KEY_EXPORTED",
+                    "snow_id": dev_key.snow_id,
+                    "recovery_key": rec_key,
+                    "warning": (
+                        "CRITICAL SECURITY WARNING: Anyone possessing this recovery key can sign challenges "
+                        "and impersonate this device on SNOW. Store offline and never share it."
+                    ),
+                },
+                headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+            )
+        except DeviceIdentityError as exc:
+            return web.json_response({"success": False, "status": "RECOVERY_ERROR", "error": str(exc)}, status=400)
+
+    async def handle_api_device_recovery_restore(self, request: web.Request) -> web.Response:
+        """Restore permanent device Ed25519 keypair from SNW-REC-V1 or encrypted backup and wipe prior trust."""
+        from snow.core.config import resolve_default_hub_url
+        from snow.security.identity import DeviceIdentityError, restore_device_key_identity
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "CONFIRMATION_REQUIRED",
+                    "error": (
+                        "Explicit owner confirmation (confirm=true) is required. Restoring wipes existing "
+                        "peer pairing tokens, TLS trust, and active OAuth sessions."
+                    ),
+                },
+                status=400,
+            )
+
+        recovery_input = str(body.get("backup_json") or body.get("recovery_key") or "").strip()
+        passphrase = body.get("passphrase")
+        if not recovery_input:
+            return web.json_response(
+                {"success": False, "status": "MISSING_RECOVERY_INPUT", "error": "Provide recovery_key or backup_json."},
+                status=400,
+            )
+
+        db_mgr = getattr(self, "db_manager", None) or getattr(
+            getattr(getattr(self, "bridge", None), "capability_engine", None), "db_manager", None
+        )
+        oauth_srv = getattr(getattr(self, "remote_gateway", None), "oauth_server", None)
+
+        def _revoke_oauth() -> None:
+            if oauth_srv is not None and hasattr(oauth_srv, "revoke_all_on_recovery"):
+                oauth_srv.revoke_all_on_recovery()
+
+        try:
+            restored, _ = restore_device_key_identity(
+                recovery_input,
+                passphrase=passphrase if isinstance(passphrase, str) else None,
+                db_manager=db_mgr,
+                oauth_revoke_callback=_revoke_oauth,
+                confirm_replace=True,
+            )
+            hub_url = resolve_default_hub_url(db_manager=db_mgr)
+            return web.json_response({
+                "success": True,
+                "status": "IDENTITY_RESTORED",
+                "device_identity": restored.to_public_dict(),
+                "snow_id": restored.snow_id,
+                "permanent_mcp_url": f"{hub_url.rstrip('/')}/u/{restored.snow_id}/mcp" if hub_url else "",
+                "trust_reset": True,
+                "message": (
+                    "Permanent cryptographic identity restored. Prior pairing credentials, peer trust, "
+                    "and OAuth sessions were wiped; re-pair peers and re-approve AI clients explicitly."
+                ),
+            })
+        except DeviceIdentityError as exc:
+            return web.json_response({"success": False, "status": "INVALID_RECOVERY", "error": str(exc)}, status=400)
+
     async def handle_api_settings_hub_get(self, request: web.Request) -> web.Response:
         """Return configured Default Hub URL setting and permanent Ed25519 network metadata."""
         from snow.core.config import resolve_default_hub_url
@@ -4333,7 +4504,7 @@ class SnowWebServer:
                 "status": "SUCCESS",
                 "tools_count": tools_count,
                 "tools": tool_names,
-                "expected_count": 54,
+                "expected_count": 60,
                 "is_frozen": getattr(sys, "frozen", False),
                 "command": cmd,
                 "args": args,
@@ -4500,17 +4671,26 @@ class SnowWebServer:
 
         status = self.tunnel_manager.get_status()
         configured_render_url = ""
+        legacy_network_url = ""
+        device_snow_id = ""
         try:
             from snow.core.config import resolve_default_hub_url
-            from snow.security.identity import load_or_create_network_key_identity
+            from snow.security.identity import (
+                load_or_create_device_key_identity,
+                load_or_create_network_key_identity,
+            )
 
             db_mgr = getattr(self, "db_manager", None) or getattr(
                 getattr(self.bridge, "capability_engine", None), "db_manager", None
             )
             hub_url = resolve_default_hub_url(db_manager=db_mgr)
-            key_ident = load_or_create_network_key_identity()
-            if hub_url and key_ident and getattr(key_ident, "network_id", ""):
-                configured_render_url = f"{hub_url.rstrip('/')}/u/{key_ident.network_id}/mcp"
+            dev_key = load_or_create_device_key_identity()
+            device_snow_id = dev_key.snow_id
+            if hub_url and device_snow_id:
+                configured_render_url = f"{hub_url.rstrip('/')}/u/{device_snow_id}/mcp"
+            net_ident = load_or_create_network_key_identity()
+            if hub_url and net_ident and getattr(net_ident, "network_id", ""):
+                legacy_network_url = f"{hub_url.rstrip('/')}/u/{net_ident.network_id}/mcp"
         except Exception as exc:
             logger.debug("Unable to resolve configured Render Hub route: %s", exc)
         return web.json_response(
@@ -4518,8 +4698,10 @@ class SnowWebServer:
                 "success": True,
                 **status,
                 "enabled": is_remote_ai_link_enabled(),
-                "last_error": None if status.get("active") else self._remote_ai_link_last_error,
+                "last_error": None if status.get("active") else (self._remote_ai_link_last_error or status.get("last_error")),
+                "device_snow_id": device_snow_id,
                 "configured_render_url": configured_render_url,
+                "legacy_network_url": legacy_network_url,
             }
         )
 
@@ -5268,6 +5450,9 @@ class SnowWebServer:
         app.router.add_post("/api/devices/permission-profile", self.handle_api_devices_permission_profile)
         app.router.add_get("/api/network/identity", self.handle_api_network_identity)
         app.router.add_post("/api/network/identity", self.handle_api_network_identity_update)
+        app.router.add_get("/api/identity/device", self.handle_api_device_identity)
+        app.router.add_post("/api/identity/recovery/export", self.handle_api_device_recovery_export)
+        app.router.add_post("/api/identity/recovery/restore", self.handle_api_device_recovery_restore)
         app.router.add_get("/api/network/topology", self.handle_api_network_topology)
         app.router.add_get("/api/network/merge/pending", self.handle_api_network_merge_pending)
         app.router.add_post("/api/network/merge/approve", self.handle_api_network_merge_approve)

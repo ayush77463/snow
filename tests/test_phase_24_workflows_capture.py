@@ -91,8 +91,8 @@ class TestPhase24RegistryAndAnnotations(unittest.TestCase):
     def test_01_tool_registry_contains_exactly_34_capabilities(self):
         """1. Registry contains exactly 48 capabilities including Stage 6A additions."""
         all_caps = list_capabilities()
-        self.assertEqual(len(all_caps), 54)
-        self.assertEqual(len(CAPABILITY_REGISTRY), 54)
+        self.assertEqual(len(all_caps), 60)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 60)
 
         expected_new_tools = [
             "snow_windows_screenshot",

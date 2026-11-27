@@ -3785,7 +3785,7 @@
             await withButtonLoading(e.currentTarget, "Testing...", async () => {
                 const res = await apiRequest("/api/mcp/test-local", "POST", {});
                 if (res && res.success) {
-                    showNotificationToast(`All ${res.tools_count || 54} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
+                    showNotificationToast(`All ${res.tools_count || 60} FastMCP tools verified! (${res.latency_ms?.toFixed(1) || "OK"} ms)`, "success");
                 } else {
                     showNotificationToast(res?.error || "MCP self-test failed", "error");
                 }
@@ -4136,7 +4136,7 @@
         if (isActive) {
             const activeEndpoint = statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`;
             if (statusBadge) {
-                statusBadge.textContent = "Active • 54 Tools Ready";
+                statusBadge.textContent = "Active • 60 Tools Ready";
                 statusBadge.className = "chip chip-emerald";
             }
             if (btnStart) btnStart.disabled = true;

@@ -28,6 +28,7 @@ class ClipboardHandler(
     private val context: Context,
     private val textClipSetterOverride: ((String) -> Unit)? = null
 ) {
+    internal var primaryClipTextProviderOverride: (() -> String?)? = null
 
     companion object {
         private const val TAG = "ClipboardHandler"
@@ -282,40 +283,64 @@ class ClipboardHandler(
         }
 
         try {
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            if (clipboard == null) {
-                return@withContext mapOf(
-                    "status" to "error",
-                    "error" to "SERVICE_UNAVAILABLE",
-                    "message" to "ClipboardManager service unavailable."
-                )
-            }
+            val overrideReader = primaryClipTextProviderOverride
+            val text = if (overrideReader != null) {
+                val raw = overrideReader.invoke()
+                if (raw.isNullOrEmpty()) {
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "error" to "EMPTY_CLIPBOARD",
+                        "message" to "Android clipboard is empty."
+                    )
+                }
+                raw
+            } else {
+                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                if (clipboard == null) {
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "error" to "SERVICE_UNAVAILABLE",
+                        "message" to "ClipboardManager service unavailable."
+                    )
+                }
 
-            if (!clipboard.hasPrimaryClip()) {
-                return@withContext mapOf(
-                    "status" to "error",
-                    "error" to "EMPTY_CLIPBOARD",
-                    "message" to "Android clipboard is empty."
-                )
-            }
+                if (!clipboard.hasPrimaryClip()) {
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "error" to "EMPTY_CLIPBOARD",
+                        "message" to "Android clipboard is empty."
+                    )
+                }
 
-            val clip = clipboard.primaryClip
-            if (clip == null || clip.itemCount == 0) {
-                return@withContext mapOf(
-                    "status" to "error",
-                    "error" to "EMPTY_CLIPBOARD",
-                    "message" to "Android clipboard contains no clip items."
-                )
-            }
+                val clip = clipboard.primaryClip
+                if (clip == null || clip.itemCount == 0) {
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "error" to "EMPTY_CLIPBOARD",
+                        "message" to "Android clipboard contains no clip items."
+                    )
+                }
 
-            val item = clip.getItemAt(0)
-            val text = item.coerceToText(context)?.toString()
-            if (text.isNullOrEmpty()) {
-                return@withContext mapOf(
-                    "status" to "error",
-                    "error" to "EMPTY_CLIPBOARD",
-                    "message" to "Android clipboard contains no text content."
-                )
+                val item = clip.getItemAt(0)
+                val isTextClip = clip.description?.hasMimeType(ClipDescription.MIMETYPE_TEXT_PLAIN) == true ||
+                    clip.description?.hasMimeType(ClipDescription.MIMETYPE_TEXT_HTML) == true ||
+                    item.text != null
+                if (!isTextClip) {
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "error" to "EMPTY_CLIPBOARD",
+                        "message" to "Android clipboard contains non-text content."
+                    )
+                }
+                val coerced = item.text?.toString() ?: item.coerceToText(context)?.toString()
+                if (coerced.isNullOrEmpty()) {
+                    return@withContext mapOf(
+                        "status" to "error",
+                        "error" to "EMPTY_CLIPBOARD",
+                        "message" to "Android clipboard contains no text content."
+                    )
+                }
+                coerced
             }
 
             val rawBytes = text.toByteArray(Charsets.UTF_8)

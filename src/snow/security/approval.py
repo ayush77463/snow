@@ -224,6 +224,8 @@ class ApprovalPolicyEngine:
                 "android_notification_reply",
                 "snow_android_notification_reply",
                 "notification_reply",
+                "android_file_write",
+                "snow_android_file_write",
                 "cross_network_execute",
                 "snow_cross_network_execute",
             ):

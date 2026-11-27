@@ -166,7 +166,7 @@ class TestMilestone3AWebServerRenderAndClipboardEndpoints(AioHTTPTestCase):
         self.assertEqual(r_status.status, 200)
         j_status = await r_status.json()
         self.assertFalse(j_status["active"])
-        self.assertRegex(j_status["configured_render_url"], r"^https://.+/u/SNW-NET-[A-F0-9]{8}/mcp$")
+        self.assertRegex(j_status["configured_render_url"], r"^https://.+/u/SNW-[A-Z0-9]{4}-[A-Z0-9]{4}/mcp$")
 
         r_start = await self.client.post(
             "/api/mcp/tunnel/start",

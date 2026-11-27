@@ -567,6 +567,109 @@ class TestM43ManualTransportApiAndIpc(AioHTTPTestCase):
         self.assertEqual(quota_res["status"], "RELAY_QUOTA_EXCEEDED")
         self.assertIn("USB, Hotspot, or Wi-Fi LAN", quota_res["error"])
 
+    async def test_sync_session_router_transfer_uses_mark_completed_and_mark_failed(self) -> None:
+        from unittest.mock import AsyncMock
+        from snow.core.ipc import SnowIpcServer
+        from snow.transfer.manager import TransferState
+
+        ok_file = Path(self.tmpdir.name) / "sync_ok.bin"
+        ok_file.write_bytes(b"SYNC_OK_PAYLOAD")
+        fail_file = Path(self.tmpdir.name) / "sync_fail.bin"
+        fail_file.write_bytes(b"SYNC_FAIL_PAYLOAD")
+
+        tm = TransferManager()
+        mark_completed_orig = tm.mark_completed
+        mark_failed_orig = tm.mark_failed
+        called = {"completed": [], "failed": []}
+
+        def _track_completed(tid: str) -> bool:
+            called["completed"].append(tid)
+            return mark_completed_orig(tid)
+
+        def _track_failed(tid: str, err: str) -> bool:
+            called["failed"].append((tid, err))
+            return mark_failed_orig(tid, err)
+
+        tm.mark_completed = _track_completed
+        tm.mark_failed = _track_failed
+
+        class _SyncRouterStub:
+            def __init__(self) -> None:
+                self.pin_calls = []
+                self.unpin_calls = []
+                self._route_mock = AsyncMock(
+                    side_effect=[
+                        {
+                            "success": True,
+                            "status": "SUCCESS",
+                            "transport_type": "wifi_lan",
+                            "transport_badge": "Wi-Fi • Zero Data",
+                            "data": {"saved_path": "/SAF/sync_ok.bin"},
+                        },
+                        {
+                            "success": False,
+                            "status": "PERMISSION_DENIED",
+                            "error": "Target denied file write",
+                        },
+                    ]
+                )
+
+            def pin_transfer_route(self, transfer_id, device_id, transport, host="", port=8766):
+                self.pin_calls.append((transfer_id, device_id, transport))
+
+            def clear_pinned_transfer_route(self, transfer_id):
+                self.unpin_calls.append(transfer_id)
+
+            def get_device_transport_state(self, device_id):
+                return {
+                    "active_transport": "wifi_lan",
+                    "transport_badge": "Wi-Fi • Zero Data",
+                    "routes": [{"transport": "wifi_lan", "host": "192.168.1.25"}],
+                }
+
+            async def route_request(self, action, target, data, timeout=15.0):
+                return await self._route_mock(action=action, target=target, data=data, timeout=timeout)
+
+        fake_router = _SyncRouterStub()
+        tmp_dir = Path(self.tmpdir.name)
+        fake_cs = SimpleNamespace(
+            session_router=fake_router,
+            db_manager=self.db,
+            config=SimpleNamespace(
+                max_transfer_size=16 * 1024 * 1024 * 1024,
+                max_relay_transfer_bytes=100 * 1024 * 1024,
+                transfer_port=8766,
+            ),
+            windows_files=SimpleNamespace(resolve_safe_path=lambda p, **_kw: (Path(p), None)),
+            transfer_manager=tm,
+            storage_manager=SimpleNamespace(resolve_destination_path=lambda name: tmp_dir / name),
+            session_manager=MagicMock(),
+            connection_manager=MagicMock(),
+            ws_server=MagicMock(),
+            http_transfer_server=SimpleNamespace(bound_port=8766),
+        )
+
+        ipc = SnowIpcServer.__new__(SnowIpcServer)
+        ipc.core_server = fake_cs
+        ipc.node_registry = self.registry
+        ipc.session_router = fake_router
+
+        res_ok = await ipc._handle_android_file_send({"device_id": "phone-api-1", "file_path": str(ok_file)})
+        self.assertTrue(res_ok["success"])
+        self.assertEqual(len(called["completed"]), 1)
+        ok_rec = tm.get_transfer(res_ok["transfer_id"])
+        self.assertEqual(ok_rec.status, TransferState.COMPLETED)
+        # Transitioning terminal state a second time must be rejected once-only
+        self.assertFalse(tm.mark_completed(res_ok["transfer_id"]))
+
+        res_fail = await ipc._handle_android_file_send({"device_id": "phone-api-1", "file_path": str(fail_file)})
+        self.assertFalse(res_fail["success"])
+        self.assertEqual(res_fail["status"], "PERMISSION_DENIED")
+        self.assertEqual(len(called["failed"]), 1)
+        fail_rec = tm.get_transfer(res_fail["transfer_id"])
+        self.assertEqual(fail_rec.status, TransferState.FAILED)
+        self.assertFalse(tm.mark_failed(res_fail["transfer_id"], "second"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -101,11 +101,22 @@ class RelayClient @JvmOverloads constructor(
     private val _reachabilityState = MutableStateFlow(ReachabilityState.UNREACHABLE_OFFLINE)
     val reachabilityState: StateFlow<ReachabilityState> = _reachabilityState.asStateFlow()
 
+    private val _tunnelEstablished = MutableStateFlow(false)
+    val tunnelEstablished: StateFlow<Boolean> = _tunnelEstablished.asStateFlow()
+
+    @Volatile
+    var lastErrorMessage: String? = null
+        private set
+
     var requestDispatcher: (suspend (action: String, data: Map<String, Any?>?) -> Pair<Map<String, Any?>?, SnowError?>)? = null
     var mediaFrameHandler: ((sourceId: String, meta: Map<String, Any?>, jpegBytes: ByteArray) -> Unit)? = null
     var onTunnelEstablished: (() -> Unit)? = null
     var onTunnelFailed: ((String) -> Unit)? = null
+    var webSocketFactory: ((Request, WebSocketListener) -> WebSocket)? = null
     private val pendingRequests = ConcurrentHashMap<String, (SnowMessage) -> Unit>()
+
+    fun isSessionAndTunnelVerified(): Boolean =
+        _reachabilityState.value == ReachabilityState.ONLINE_RELAYED && _tunnelEstablished.value
 
     @Volatile
     private var shouldReconnect = false
@@ -201,12 +212,14 @@ class RelayClient @JvmOverloads constructor(
     }
 
     fun connect() {
-        if (_reachabilityState.value == ReachabilityState.ONLINE_RELAYED) {
+        if (_reachabilityState.value == ReachabilityState.ONLINE_RELAYED && _tunnelEstablished.value) {
             return
         }
 
         shouldReconnect = true
         reconnectJob?.cancel()
+        _tunnelEstablished.value = false
+        lastErrorMessage = null
 
         try {
             webSocket?.close(1000, "Reconnecting")
@@ -229,10 +242,15 @@ class RelayClient @JvmOverloads constructor(
                 .url(relayUrl)
                 .build()
 
-            webSocket = okHttpClient.newWebSocket(req, RelayWebSocketListener())
+            val listener = RelayWebSocketListener()
+            webSocket = webSocketFactory?.invoke(req, listener) ?: okHttpClient.newWebSocket(req, listener)
         } catch (e: Exception) {
-            SafeLog.e(TAG, "Failed to initiate relay connection: ${e.message}", e)
+            val msg = e.message?.takeIf { it.isNotBlank() } ?: "Failed to initiate relay connection"
+            lastErrorMessage = msg
+            SafeLog.e(TAG, "Failed to initiate relay connection: $msg", e)
+            _tunnelEstablished.value = false
             _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
+            onTunnelFailed?.invoke(msg)
             scheduleReconnect()
         }
     }
@@ -240,6 +258,7 @@ class RelayClient @JvmOverloads constructor(
     fun disconnect() {
         shouldReconnect = false
         reconnectJob?.cancel()
+        _tunnelEstablished.value = false
         _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
         try {
             webSocket?.close(1000, "Normal disconnect")
@@ -366,8 +385,12 @@ class RelayClient @JvmOverloads constructor(
                                 }
                             }
                         } else {
-                            SafeLog.w(TAG, "Relay hello authentication failed: ${data.optString("error")}")
+                            val err = data.optString("error").ifBlank { "Relay hello authentication failed" }
+                            lastErrorMessage = err
+                            SafeLog.w(TAG, "Relay hello authentication failed: $err")
+                            _tunnelEstablished.value = false
                             _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
+                            onTunnelFailed?.invoke(err)
                             disconnect()
                         }
                     }
@@ -380,7 +403,14 @@ class RelayClient @JvmOverloads constructor(
                         }
                     }
                     "relay_error" -> {
-                        SafeLog.w(TAG, "Relay reported error: ${data.optString("message")} (${data.optString("error_code")})")
+                        val errCode = data.optString("error_code")
+                        val msg = data.optString("message").ifBlank { errCode.ifBlank { "Relay error" } }
+                        lastErrorMessage = msg
+                        SafeLog.w(TAG, "Relay reported error: $msg ($errCode)")
+                        if (!_tunnelEstablished.value || errCode in setOf("AUTH_FAILED", "PEER_OFFLINE", "PEER_NOT_FOUND", "TARGET_OFFLINE", "FORBIDDEN", "UNAUTHORIZED")) {
+                            _tunnelEstablished.value = false
+                            onTunnelFailed?.invoke(msg)
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -389,15 +419,23 @@ class RelayClient @JvmOverloads constructor(
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            SafeLog.w(TAG, "Relay WebSocket failure: ${t.message}")
+            val msg = t.message?.takeIf { it.isNotBlank() } ?: "Relay WebSocket failure"
+            lastErrorMessage = msg
+            SafeLog.w(TAG, "Relay WebSocket failure: $msg")
+            _tunnelEstablished.value = false
             _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
+            onTunnelFailed?.invoke(msg)
             scheduleReconnect()
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             SafeLog.i(TAG, "Relay WebSocket closed: code=$code, reason=$reason")
+            _tunnelEstablished.value = false
             _reachabilityState.value = ReachabilityState.UNREACHABLE_OFFLINE
             if (code != 1000) {
+                val msg = reason.ifBlank { "Relay WebSocket closed unexpectedly (code=$code)" }
+                lastErrorMessage = msg
+                onTunnelFailed?.invoke(msg)
                 scheduleReconnect()
             }
         }
@@ -423,12 +461,17 @@ class RelayClient @JvmOverloads constructor(
                         sendRelayFrame(ws, source, outBytes)
                     }
                 }
+                if (tun.handshakeDone && !_tunnelEstablished.value) {
+                    _tunnelEstablished.value = true
+                    onTunnelEstablished?.invoke()
+                }
             }
             return
         }
 
         val tun = tunnel ?: return
         try {
+            val wasDone = tun.handshakeDone
             tun.feedNetworkData(rawBytes)
 
             if (!tun.handshakeDone) {
@@ -437,9 +480,13 @@ class RelayClient @JvmOverloads constructor(
                     sendRelayFrame(ws, source, outBytes)
                 }
                 if (done) {
+                    _tunnelEstablished.value = true
                     SafeLog.i(TAG, "E2E TLS 1.3 inner tunnel established with peer [$source]")
                     onTunnelEstablished?.invoke()
                 }
+            } else if (!wasDone) {
+                _tunnelEstablished.value = true
+                onTunnelEstablished?.invoke()
             }
 
             if (tun.handshakeDone) {

@@ -45,13 +45,13 @@ class TestStage6BWS5McpCatalogAndTools(unittest.IsolatedAsyncioTestCase):
     async def test_54_tool_catalog_exact_parity_and_annotations(self) -> None:
         ok, errs = validate_registry()
         self.assertTrue(ok, f"validate_registry errors: {errs}")
-        self.assertEqual(len(CAPABILITY_REGISTRY), 54)
-        self.assertEqual(len(ALL_TOOL_NAMES), 54)
-        self.assertEqual(len(list_capabilities()), 54)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 60)
+        self.assertEqual(len(ALL_TOOL_NAMES), 60)
+        self.assertEqual(len(list_capabilities()), 60)
 
         srv = create_snow_mcp_server()
         srv_tools = await srv.list_tools()
-        self.assertEqual(len(srv_tools), 54)
+        self.assertEqual(len(srv_tools), 60)
         names = {t.name for t in srv_tools}
         self.assertEqual(names, set(CAPABILITY_REGISTRY.keys()))
 

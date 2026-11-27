@@ -2182,3 +2182,125 @@ class SnowMcpBridge:
                 "grant_token": str(grant_token or "").strip(),
             },
         )
+
+    @staticmethod
+    def _validate_android_saf_relative_path(raw_path: Any, *, allow_empty: bool = False) -> Optional[str]:
+        if raw_path is None:
+            return "" if allow_empty else "Relative 'path' must be a non-empty string."
+        if not isinstance(raw_path, str):
+            return "'path' must be a string."
+        trimmed = raw_path.strip()
+        if not trimmed:
+            return "" if allow_empty else "Relative 'path' must be non-empty."
+        if trimmed.startswith("/") or "\\" in trimmed or "\x00" in trimmed or any(ord(c) < 32 for c in trimmed):
+            return "PATH_TRAVERSAL_DETECTED: Absolute paths, backslashes, and control characters are forbidden."
+        lower = trimmed.lower()
+        if any(seq in lower for seq in ("%2e", "%2f", "%5c", "%25", "%00")):
+            return "PATH_TRAVERSAL_DETECTED: Encoded traversal or separator sequences are forbidden."
+        parts = trimmed.split("/")
+        if any(p in ("", ".", "..") for p in parts):
+            return "PATH_TRAVERSAL_DETECTED: Traversal segments (., .., empty) are forbidden."
+        return None
+
+    async def android_file_read(self, path: str, device_id: str = "") -> dict[str, Any]:
+        """Read UTF-8 text from Android's persisted SAF folder with strict relative path validation."""
+        err = self._validate_android_saf_relative_path(path, allow_empty=False)
+        if err:
+            status = "PATH_TRAVERSAL_DETECTED" if "PATH_TRAVERSAL_DETECTED" in err else "INVALID_ARGUMENT"
+            return {"success": False, "status": status, "error": err}
+        params: dict[str, Any] = {"path": path.strip()}
+        if device_id and str(device_id).strip():
+            params["target"] = str(device_id).strip()
+            params["device_id"] = str(device_id).strip()
+        return await self._execute_local_or_ipc("android_file_read", params)
+
+    async def android_file_write(
+        self,
+        path: str,
+        content: str,
+        overwrite: bool = False,
+        approval_id: str = "",
+        device_id: str = "",
+    ) -> dict[str, Any]:
+        """Write UTF-8 text to Android's persisted SAF folder (approval-gated for AI callers)."""
+        err = self._validate_android_saf_relative_path(path, allow_empty=False)
+        if err:
+            status = "PATH_TRAVERSAL_DETECTED" if "PATH_TRAVERSAL_DETECTED" in err else "INVALID_ARGUMENT"
+            return {"success": False, "status": status, "error": err}
+        if not isinstance(content, str):
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "'content' must be a string."}
+        if not isinstance(overwrite, bool):
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "'overwrite' must be a boolean."}
+        encoded = content.encode("utf-8")
+        if len(encoded) > 256 * 1024:
+            return {
+                "success": False,
+                "status": "FILE_TOO_LARGE",
+                "error": f"Content exceeds 256 KiB UTF-8 byte limit ({len(encoded)} bytes).",
+            }
+        params: dict[str, Any] = {
+            "path": path.strip(),
+            "content": content,
+            "overwrite": overwrite,
+        }
+        if approval_id and str(approval_id).strip():
+            params["approval_id"] = str(approval_id).strip()
+        if device_id and str(device_id).strip():
+            params["target"] = str(device_id).strip()
+            params["device_id"] = str(device_id).strip()
+        return await self._execute_local_or_ipc("android_file_write", params)
+
+    async def android_file_search(
+        self,
+        query: str,
+        subpath: str = "",
+        max_results: int = 25,
+        max_depth: int = 3,
+        device_id: str = "",
+    ) -> dict[str, Any]:
+        """Search filenames inside Android's persisted SAF folder."""
+        if not isinstance(query, str) or not query.strip() or len(query.strip()) > 128:
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "'query' must be a non-empty string (<= 128 chars)."}
+        if subpath:
+            err = self._validate_android_saf_relative_path(subpath, allow_empty=True)
+            if err:
+                return {"success": False, "status": "PATH_TRAVERSAL_DETECTED", "error": err}
+        try:
+            bounded_results = max(1, min(50, int(max_results)))
+            bounded_depth = max(1, min(5, int(max_depth)))
+        except (TypeError, ValueError):
+            return {"success": False, "status": "INVALID_ARGUMENT", "error": "'max_results' and 'max_depth' must be integers."}
+        params: dict[str, Any] = {
+            "query": query.strip(),
+            "subpath": subpath.strip() if isinstance(subpath, str) else "",
+            "max_results": bounded_results,
+            "max_depth": bounded_depth,
+        }
+        if device_id and str(device_id).strip():
+            params["target"] = str(device_id).strip()
+            params["device_id"] = str(device_id).strip()
+        return await self._execute_local_or_ipc("android_file_search", params)
+
+    async def android_device_info(self, device_id: str = "") -> dict[str, Any]:
+        """Query read-only Android device info and active M4.3 transport state."""
+        params: dict[str, Any] = {}
+        if device_id and str(device_id).strip():
+            params["target"] = str(device_id).strip()
+            params["device_id"] = str(device_id).strip()
+        return await self._execute_local_or_ipc("android_device_info", params)
+
+    async def android_audio_status(self, device_id: str = "") -> dict[str, Any]:
+        """Query read-only Android stream volumes, ringer mode, and DND status."""
+        params: dict[str, Any] = {}
+        if device_id and str(device_id).strip():
+            params["target"] = str(device_id).strip()
+            params["device_id"] = str(device_id).strip()
+        return await self._execute_local_or_ipc("android_audio_status", params)
+
+    async def android_clipboard_get(self, device_id: str = "") -> dict[str, Any]:
+        """Read Android clipboard text strictly when SNOW is in the visible foreground."""
+        params: dict[str, Any] = {}
+        if device_id and str(device_id).strip():
+            params["target"] = str(device_id).strip()
+            params["device_id"] = str(device_id).strip()
+        return await self._execute_local_or_ipc("android_clipboard_get", params)

@@ -311,7 +311,7 @@ class TestPhase23RemoteMcpGateway(AioHTTPTestCase):
         self.assertEqual(resp.status, 200)
         data = await resp.json()
         tools = data["result"]["tools"]
-        self.assertEqual(len(tools), 54)
+        self.assertEqual(len(tools), 60)
 
         # Verify tool structure and annotations
         tool_names = {t["name"] for t in tools}
@@ -623,7 +623,7 @@ class TestFastMcpStdioCompatibility(unittest.TestCase):
     def test_stdio_server_creation_has_30_tools(self):
         server = create_snow_mcp_server()
         tools = server._tool_manager._tools
-        self.assertEqual(len(tools), 54)
+        self.assertEqual(len(tools), 60)
         self.assertIn("snow_windows_system_info", tools)
         self.assertIn("snow_activity_history", tools)
 

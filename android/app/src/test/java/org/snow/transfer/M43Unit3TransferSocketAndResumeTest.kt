@@ -193,4 +193,71 @@ class M43Unit3TransferSocketAndResumeTest {
             tempRoot.deleteRecursively()
         }
     }
+
+    @Test
+    fun uiTransferClientUsesOrchestratorAndFallbackProviders() = runBlocking {
+        val tempRoot = Files.createTempDirectory("m43_ui_transfer_test_").toFile()
+        val prefsMap = mutableMapOf<String, android.content.SharedPreferences>()
+        fun memPrefs(): android.content.SharedPreferences = object : android.content.SharedPreferences {
+            val map = mutableMapOf<String, Any?>()
+            override fun getAll(): MutableMap<String, *> = HashMap(map)
+            override fun getString(k: String?, d: String?) = map[k] as? String ?: d
+            override fun getStringSet(k: String?, d: MutableSet<String>?) = d
+            override fun getInt(k: String?, d: Int) = (map[k] as? Int) ?: d
+            override fun getLong(k: String?, d: Long) = (map[k] as? Long) ?: d
+            override fun getFloat(k: String?, d: Float) = (map[k] as? Float) ?: d
+            override fun getBoolean(k: String?, d: Boolean) = (map[k] as? Boolean) ?: d
+            override fun contains(k: String?) = map.containsKey(k)
+            override fun edit() = object : android.content.SharedPreferences.Editor {
+                val p = mutableMapOf<String, Any?>(); val r = mutableSetOf<String>(); var c = false
+                override fun putString(k: String?, v: String?) = apply { if (k != null) p[k] = v }
+                override fun putStringSet(k: String?, v: MutableSet<String>?) = apply {}
+                override fun putInt(k: String?, v: Int) = apply { if (k != null) p[k] = v }
+                override fun putLong(k: String?, v: Long) = apply { if (k != null) p[k] = v }
+                override fun putFloat(k: String?, v: Float) = apply { if (k != null) p[k] = v }
+                override fun putBoolean(k: String?, v: Boolean) = apply { if (k != null) p[k] = v }
+                override fun remove(k: String?) = apply { if (k != null) r.add(k) }
+                override fun clear() = apply { c = true }
+                override fun commit(): Boolean {
+                    if (c) map.clear(); r.forEach { map.remove(it) }
+                    p.forEach { (k, v) -> if (v == null) map.remove(k) else map[k] = v }
+                    return true
+                }
+                override fun apply() { commit() }
+            }
+            override fun registerOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+            override fun unregisterOnSharedPreferenceChangeListener(l: android.content.SharedPreferences.OnSharedPreferenceChangeListener?) {}
+        }
+        val ctx = object : ContextWrapper(null) {
+            override fun getApplicationContext(): Context = this
+            override fun getFilesDir(): File = tempRoot
+            override fun getCacheDir(): File = tempRoot
+            override fun getPackageName(): String = "org.snow"
+            override fun getSharedPreferences(name: String?, mode: Int) = prefsMap.getOrPut(name ?: "def") { memPrefs() }
+        }
+        val instField = org.snow.ui.SnowUiRepository::class.java.getDeclaredField("instance").apply { isAccessible = true }
+        instField.set(null, null)
+        try {
+            val repo = org.snow.ui.SnowUiRepository.getInstance(ctx)
+            val uiClient = repo.createConfiguredTransferClient { "pc-ui-1" }
+            assertTrue(uiClient.transportOrchestrator === repo.activeTransportOrchestrator())
+            assertTrue(uiClient.usbMappingVerifiedProvider != null)
+            assertTrue(uiClient.fallbackTargetProvider != null)
+
+            // Verify orchestrator fallback ordering works via UI repository resolver (USB fails -> picks Hotspot over Wi-Fi)
+            val orch = repo.activeTransportOrchestrator()
+            orch.markVerified("pc-ui-1", TransportRoute.USB, host = "127.0.0.1", transferPort = 8766, isActive = true)
+            orch.markVerified("pc-ui-1", TransportRoute.HOTSPOT, host = "192.168.43.1", transferPort = 9766)
+            orch.markVerified("pc-ui-1", TransportRoute.WIFI_LAN, host = "192.168.1.50", transferPort = 8766)
+
+            val nextTarget = uiClient.fallbackTargetProvider!!.invoke("127.0.0.1", TransportRoute.USB)
+            assertEquals("192.168.43.1" to 9766, nextTarget)
+
+            // Verify route pin releases cleanly even after failed transfer attempt
+            assertFalse(orch.hasActivePinnedTransfer("pc-ui-1"))
+        } finally {
+            instField.set(null, null)
+            tempRoot.deleteRecursively()
+        }
+    }
 }

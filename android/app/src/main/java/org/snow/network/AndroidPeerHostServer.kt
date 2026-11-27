@@ -91,7 +91,8 @@ class AndroidPeerHostServer(
     private val hostNetworkIdProvider: (() -> String?)? = null,
     private val pinDetailedVerifier: ((String) -> PinVerificationResult)? = null,
     private val onNetworkNegotiated: ((NetworkNegotiationOutcome) -> Unit)? = null,
-    private val mergeDecisionHandler: ((txId: String, decision: String, actingDeviceId: String) -> NetworkMergeCommandResult)? = null
+    private val mergeDecisionHandler: ((txId: String, decision: String, actingDeviceId: String) -> NetworkMergeCommandResult)? = null,
+    private val perDeviceProfileProvider: ((String) -> String?)? = null
 ) {
     companion object {
         private const val TAG = "AndroidPeerHostServer"
@@ -107,6 +108,7 @@ class AndroidPeerHostServer(
     private val isRunning = AtomicBoolean(false)
     private var wsServer: WebSocketServer? = null
     private val serverScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val pendingOutgoingRequests = ConcurrentHashMap<String, (org.snow.protocol.SnowMessage) -> Unit>()
     @Volatile
     private var dynamicHostNetworkId: String? = hostNetworkId?.trim()?.uppercase()?.takeIf {
         AndroidPeerHostManager.isValidCanonicalNetworkId(it)
@@ -230,6 +232,53 @@ class AndroidPeerHostServer(
 
     fun getActiveConnectionCount(): Int = wsServer?.connections?.size ?: 0
 
+    fun listAuthenticatedPeerDeviceIds(): List<String> {
+        val conns = wsServer?.connections ?: return emptyList()
+        return conns.mapNotNull { conn ->
+            if (!conn.isOpen) return@mapNotNull null
+            val sess = conn.getAttachment<PeerSession>() ?: return@mapNotNull null
+            if (sess.isAuthenticated) sess.peerDeviceId?.takeIf { it.isNotBlank() } else null
+        }.distinct()
+    }
+
+    suspend fun sendRequestToPeer(
+        targetDeviceId: String,
+        action: String,
+        data: Map<String, Any?> = emptyMap(),
+        timeoutMs: Long = 20_000L
+    ): Pair<Map<String, Any?>?, String?> {
+        val cleanTarget = targetDeviceId.trim()
+        val conn = wsServer?.connections?.firstOrNull { ws ->
+            if (!ws.isOpen) return@firstOrNull false
+            val sess = ws.getAttachment<PeerSession>() ?: return@firstOrNull false
+            sess.isAuthenticated && sess.peerDeviceId.equals(cleanTarget, ignoreCase = true)
+        } ?: return null to "DEVICE_OFFLINE: Peer '$cleanTarget' is not connected to Android Peer Host."
+
+        val msg = SnowMessage.createRequest(action = action, data = data)
+        val deferred = kotlinx.coroutines.CompletableDeferred<SnowMessage>()
+        pendingOutgoingRequests[msg.id] = { reply ->
+            deferred.complete(reply)
+        }
+        try {
+            conn.send(JsonSerialization.toJson(msg))
+        } catch (e: Exception) {
+            pendingOutgoingRequests.remove(msg.id)
+            return null to "PEER_SEND_FAILED: ${e.message ?: "Socket send failed"}"
+        }
+        val reply = kotlinx.coroutines.withTimeoutOrNull(timeoutMs) { deferred.await() }
+        if (reply == null) {
+            pendingOutgoingRequests.remove(msg.id)
+            return null to "TIMEOUT: Peer '$cleanTarget' timed out handling '$action'."
+        }
+        return if (reply.isSuccess) {
+            (reply.payload ?: emptyMap()) to null
+        } else {
+            val errTxt = reply.error?.let { "${it.code}: ${it.message}" }
+                ?: (reply.payload?.get("error")?.toString() ?: "Peer rejected '$action'")
+            null to errTxt
+        }
+    }
+
     private fun handleIncomingMessage(conn: WebSocket, rawMessage: String) {
         if (rawMessage.length > MAX_FRAME_SIZE) {
             val err = SnowMessage.createError(
@@ -257,6 +306,14 @@ class AndroidPeerHostServer(
         if (message.type == MessageType.HEARTBEAT) {
             val ack = SnowMessage.createHeartbeatAck(correlationId = message.id)
             conn.send(JsonSerialization.toJson(ack))
+            return
+        }
+
+        if (message.type == MessageType.RESPONSE || message.type == MessageType.ERROR) {
+            val corrId = message.correlationId
+            if (!corrId.isNullOrBlank()) {
+                pendingOutgoingRequests.remove(corrId)?.invoke(message)
+            }
             return
         }
 
@@ -665,8 +722,112 @@ class AndroidPeerHostServer(
                 return
             }
 
+            if (action == "mesh_list_peers") {
+                val peerItems = listAuthenticatedPeerDeviceIds().map { pid ->
+                    mapOf(
+                        "device_id" to pid,
+                        "is_online" to true,
+                        "network_id" to (currentHostNetworkId() ?: "")
+                    )
+                }
+                val resp = SnowMessage.createResponse(
+                    correlationId = message.id,
+                    payload = mapOf(
+                        "status" to "success",
+                        "action" to "mesh_list_peers",
+                        "data" to mapOf(
+                            "host_device_id" to localDeviceId,
+                            "host_snow_id" to (hostSnowId ?: ""),
+                            "peers" to peerItems,
+                            "count" to peerItems.size
+                        )
+                    )
+                )
+                conn.send(JsonSerialization.toJson(resp))
+                return
+            }
+
+            if (action == "peer_relay_request") {
+                val targetId = (data["target_device_id"] as? String)?.trim().orEmpty()
+                val relayAction = (data["action"] as? String)?.trim().orEmpty()
+                @Suppress("UNCHECKED_CAST")
+                val rawRelayData = (data["data"] as? Map<String, Any?>)?.toMutableMap() ?: mutableMapOf()
+                val visitedNodes = (data["visited_nodes"] as? List<*>)?.mapNotNull { it?.toString() }?.toMutableList() ?: mutableListOf()
+                val hopLimit = ((data["hop_limit"] as? Number)?.toInt() ?: 2).coerceAtMost(2)
+                if (targetId.isEmpty() || relayAction.isEmpty()) {
+                    conn.send(JsonSerialization.toJson(SnowMessage.createError(ErrorCode.INVALID_PAYLOAD, "Peer relay requires target_device_id and action.", message.id)))
+                    return
+                }
+                if (localDeviceId in visitedNodes || hopLimit <= 0 || visitedNodes.size >= 2) {
+                    conn.send(JsonSerialization.toJson(SnowMessage.createError(ErrorCode.INTERNAL_ERROR, "Relay loop or hop limit exceeded.", message.id)))
+                    return
+                }
+                // Enforce caller origin binding and strip privilege/origin spoofing fields
+                for (spoofKey in listOf("principal", "trust_tier", "execution_principal", "origin_device_id", "origin_snow_id", "oauth_client_id")) {
+                    rawRelayData.remove(spoofKey)
+                }
+                rawRelayData["origin_device_id"] = session.peerDeviceId ?: "unknown"
+                val reqNetId = (data["network_id"] as? String)?.trim()?.uppercase()
+                val hostNet = currentHostNetworkId()
+                if (!reqNetId.isNullOrBlank() && reqNetId != hostNet) {
+                    conn.send(JsonSerialization.toJson(SnowMessage.createError(ErrorCode.UNAUTHORIZED, "Cross-network peer routing denied.", message.id)))
+                    return
+                }
+
+                val isLocalTarget = targetId.equals(localDeviceId, ignoreCase = true) ||
+                    (!hostSnowId.isNullOrBlank() && targetId.equals(hostSnowId, ignoreCase = true))
+
+                (parentScope ?: serverScope).launch(Dispatchers.IO) {
+                    if (isLocalTarget) {
+                        val callerId = session.peerDeviceId
+                        val profile = callerId?.let { perDeviceProfileProvider?.invoke(it) }
+                        if (!profile.isNullOrBlank()) {
+                            val saved = dispatcher.activePermissionProfile
+                            val allowed = try {
+                                val prev = saved
+                                if (prev == profile) {
+                                    dispatcher.isActionAllowedByProfile(relayAction)
+                                } else {
+                                    isActionAllowedUnderTier(profile, relayAction)
+                                }
+                            } catch (_: Exception) { false }
+                            if (!allowed) {
+                                conn.send(JsonSerialization.toJson(SnowMessage.createError(ErrorCode.UNAUTHORIZED, "PERMISSION_DENIED by target profile '$profile'.", message.id)))
+                                return@launch
+                            }
+                        }
+                        val peerHost = conn.remoteSocketAddress?.address?.hostAddress ?: "127.0.0.1"
+                        val (resMap, err) = dispatcher.dispatch(relayAction, rawRelayData, peerHost, defaultMediaPort)
+                        if (err != null) {
+                            conn.send(JsonSerialization.toJson(SnowMessage.createError(err.code, err.message, message.id)))
+                        } else {
+                            conn.send(JsonSerialization.toJson(SnowMessage.createResponse(message.id, mapOf("status" to "success", "action" to "peer_relay_request", "data" to resMap, "relayed_by" to localDeviceId, "target_device_id" to localDeviceId))))
+                        }
+                    } else {
+                        val (fwdRes, fwdErr) = sendRequestToPeer(targetId, relayAction, rawRelayData)
+                        if (fwdErr != null || fwdRes == null) {
+                            val code = if (fwdErr?.contains("UNAUTHORIZED") == true || fwdErr?.contains("PERMISSION_DENIED") == true) {
+                                ErrorCode.UNAUTHORIZED
+                            } else {
+                                ErrorCode.DEVICE_NOT_FOUND
+                            }
+                            conn.send(JsonSerialization.toJson(SnowMessage.createError(code, fwdErr ?: "Target device '$targetId' offline.", message.id)))
+                        } else {
+                            conn.send(JsonSerialization.toJson(SnowMessage.createResponse(message.id, mapOf("status" to "success", "action" to "peer_relay_request", "data" to fwdRes, "relayed_by" to localDeviceId, "target_device_id" to targetId))))
+                        }
+                    }
+                }
+                return
+            }
+
             (parentScope ?: serverScope).launch(Dispatchers.IO) {
                 val peerHost = conn.remoteSocketAddress?.address?.hostAddress ?: "127.0.0.1"
+                val callerId = session.peerDeviceId
+                val peerProfile = callerId?.let { perDeviceProfileProvider?.invoke(it) }
+                if (!peerProfile.isNullOrBlank() && !isActionAllowedUnderTier(peerProfile, action)) {
+                    conn.send(JsonSerialization.toJson(SnowMessage.createError(ErrorCode.UNAUTHORIZED, "PERMISSION_DENIED: Action '$action' blocked by profile '$peerProfile'.", message.id)))
+                    return@launch
+                }
                 SafeLog.i(TAG, "Dispatching capability: action=$action peer=${session.peerDeviceId}")
 
                 val (resultPayload, error) = try {
@@ -696,5 +857,14 @@ class AndroidPeerHostServer(
                 }
             }
         }
+    }
+
+    private fun isActionAllowedUnderTier(profile: String, action: String): Boolean {
+        val temp = AndroidCapabilityDispatcher(
+            context = dispatcher.contextProviderForProfileCheck(),
+            transferClientProvider = { null }
+        )
+        temp.activePermissionProfile = profile
+        return temp.isActionAllowedByProfile(action)
     }
 }

@@ -644,13 +644,13 @@ class TestStage6AExpandedMcpTools(unittest.TestCase):
     def test_48_tool_exact_parity_across_registry_all_tools_and_server(self) -> None:
         ok, errs = validate_registry()
         self.assertTrue(ok, f"validate_registry failed: {errs}")
-        self.assertEqual(len(CAPABILITY_REGISTRY), 54)
-        self.assertEqual(len(ALL_TOOL_NAMES), 54)
-        self.assertEqual(len(list_capabilities()), 54)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 60)
+        self.assertEqual(len(ALL_TOOL_NAMES), 60)
+        self.assertEqual(len(list_capabilities()), 60)
 
         srv = create_snow_mcp_server()
         srv_tools = asyncio.run(srv.list_tools())
-        self.assertEqual(len(srv_tools), 54)
+        self.assertEqual(len(srv_tools), 60)
         srv_names = {t.name for t in srv_tools}
         self.assertEqual(srv_names, set(CAPABILITY_REGISTRY.keys()))
 

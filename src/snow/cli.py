@@ -822,10 +822,10 @@ def run_doctor(
         registry_tools = set(CAPABILITY_REGISTRY.keys())
         missing_tools = registry_tools - server_tools
         unexpected_tools = server_tools - registry_tools
-        parity_ok = (server_tools == registry_tools and tool_count == 54 and not missing_tools and not unexpected_tools)
+        parity_ok = (server_tools == registry_tools and tool_count == 60 and not missing_tools and not unexpected_tools)
         if is_valid and parity_ok:
             status = "OK"
-            msg = f"{tool_count} capabilities dynamically registered with verified metadata ({len(capabilities)} catalog entries, 54 MCP tools verified)"
+            msg = f"{tool_count} capabilities dynamically registered with verified metadata ({len(capabilities)} catalog entries, 60 MCP tools verified)"
             remed = None
         else:
             status = "FAILED"
@@ -834,8 +834,8 @@ def run_doctor(
                 issues.append(f"Missing tools in server: {', '.join(sorted(missing_tools))}")
             if unexpected_tools:
                 issues.append(f"Unexpected tools in server: {', '.join(sorted(unexpected_tools))}")
-            if tool_count != 54:
-                issues.append(f"Expected 54 tools, got {tool_count}")
+            if tool_count != 60:
+                issues.append(f"Expected 60 tools, got {tool_count}")
             msg = f"Registry consistency issues: {'; '.join(issues)}"
             remed = "Audit snow.mcp.registry capability definitions and metadata."
     except Exception as exc:
@@ -1131,7 +1131,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("core", help="Run SNOW Desktop Core server in the foreground")
 
     # MCP Stdio Server (Phase 3 standalone execution)
-    subparsers.add_parser("mcp", help="Run local FastMCP stdio server (54 static tools)")
+    subparsers.add_parser("mcp", help="Run local FastMCP stdio server (60 static tools)")
 
     # Convenient top-level aliases
     start_parser = subparsers.add_parser("start", help="Alias for daemon start")

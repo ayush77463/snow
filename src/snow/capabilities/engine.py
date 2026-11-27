@@ -104,6 +104,19 @@ ENGINE_ACTION_MAP: dict[str, str] = {
     "android_clipboard_push": "android.clipboard.set",
     "snow_android_clipboard_push": "android.clipboard.set",
     "clipboard_push": "android.clipboard.set",
+    "android_clipboard_get": "android.clipboard.get",
+    "snow_android_clipboard_get": "android.clipboard.get",
+    "clipboard_pull": "android.clipboard.get",
+    "android_file_read": "android.files.transfer",
+    "snow_android_file_read": "android.files.transfer",
+    "android_file_write": "android.files.transfer",
+    "snow_android_file_write": "android.files.transfer",
+    "android_file_search": "android.files.transfer",
+    "snow_android_file_search": "android.files.transfer",
+    "android_device_info": "android.telemetry.get",
+    "snow_android_device_info": "android.telemetry.get",
+    "android_audio_status": "android.telemetry.get",
+    "snow_android_audio_status": "android.telemetry.get",
     # Shared Clipboard Ring Buffer (Phase 26B)
     "clipboard_buffer_list": CAPABILITY_DESKTOP_CLIPBOARD_READ,
     "clipboard_buffer_add": CAPABILITY_DESKTOP_CLIPBOARD_WRITE,
@@ -1580,6 +1593,12 @@ class CapabilityEngine:
             "android_clipboard_push", "snow_android_clipboard_push", "clipboard_push",
             "android_whatsapp_send", "snow_android_whatsapp_send", "whatsapp_send",
             "android_dnd_toggle", "snow_android_dnd_toggle", "dnd_toggle",
+            "android_file_read", "snow_android_file_read",
+            "android_file_write", "snow_android_file_write",
+            "android_file_search", "snow_android_file_search",
+            "android_device_info", "snow_android_device_info",
+            "android_audio_status", "snow_android_audio_status",
+            "android_clipboard_get", "snow_android_clipboard_get", "clipboard_pull",
         }
         if action in CROSS_DEVICE_ACTIONS:
             router = getattr(self, "session_router", None)

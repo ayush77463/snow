@@ -164,8 +164,8 @@ def validate_registry() -> tuple[bool, list[str]]:
         if not isinstance(meta.tier, str) or not meta.tier.strip():
             errors.append(f"Capability '{name}': tier must be non-empty string.")
 
-    if len(_CAPABILITY_REGISTRY) != 54:
-        errors.append(f"Expected exactly 54 registered capabilities (48 Stage 6A baseline + 6 V5.2 Stage 6B additions), found {len(_CAPABILITY_REGISTRY)}.")
+    if len(_CAPABILITY_REGISTRY) != 60:
+        errors.append(f"Expected exactly 60 registered capabilities (54 V5.2 Stage 6B baseline + 6 M4.4 Android tools), found {len(_CAPABILITY_REGISTRY)}.")
 
     return (len(errors) == 0, errors)
 
@@ -731,6 +731,69 @@ _INITIAL_CAPABILITIES: list[CapabilityMetadata] = [
         requires_approval=True,
         os_classification="cross_platform",
         description="Execute an authorized capability on an explicit federated peer device within active 5-tier grant boundaries.",
+    ),
+    # =========================================================================
+    # M4.4 Stage 5 Additions (55..60 -> 60 Total Tools)
+    # =========================================================================
+    CapabilityMetadata(
+        name="snow_android_file_read",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Read a UTF-8 text file (up to 256 KiB) inside Android's persisted SAF folder with strict relative path checks.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_file_write",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=False,
+        destructive_hint=True,
+        requires_approval=True,
+        os_classification="android",
+        description="Write a UTF-8 text file (up to 256 KiB) inside Android's persisted SAF folder (requires owner approval).",
+    ),
+    CapabilityMetadata(
+        name="snow_android_file_search",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Search filenames inside Android's persisted SAF folder with bounded depth and result count.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_device_info",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Read Android device model, OS version, memory, storage summary, lock state, and live M4.3 transport state.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_audio_status",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Read Android stream volumes, ringer mode, and Do Not Disturb status without modifying settings.",
+    ),
+    CapabilityMetadata(
+        name="snow_android_clipboard_get",
+        category=ToolCategory.CROSS_DEVICE,
+        tier=ToolCategory.CROSS_DEVICE.value,
+        read_only_hint=True,
+        destructive_hint=False,
+        requires_approval=False,
+        os_classification="android",
+        description="Read text from the paired Android clipboard strictly when SNOW is active in the visible foreground.",
     ),
 ]
 

@@ -647,6 +647,36 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     // Persistent storage helpers
     val identity: DeviceIdentity by lazy { DeviceIdentity.getOrCreate(appContext) }
     val canonicalSnowId: String by lazy { deriveCanonicalSnowId(identity.deviceId) }
+    internal var deviceKeyProviderOverrideForTest: org.snow.security.SecretKeyProvider? = null
+    val deviceKeyManager: org.snow.security.DeviceKeyManager by lazy {
+        val kp = deviceKeyProviderOverrideForTest
+            ?: org.snow.security.AndroidKeyStoreKeyProvider(org.snow.security.DeviceKeyManager.DEFAULT_KEYSTORE_ALIAS)
+        org.snow.security.DeviceKeyManager(appContext, keyProvider = kp)
+    }
+    private val _permanentDeviceSnowId = MutableStateFlow("")
+    val permanentDeviceSnowId: StateFlow<String> = _permanentDeviceSnowId.asStateFlow()
+    private val _permanentDeviceMcpUrl = MutableStateFlow("")
+    val permanentDeviceMcpUrl: StateFlow<String> = _permanentDeviceMcpUrl.asStateFlow()
+    private val _identityError = MutableStateFlow<String?>(null)
+    val identityError: StateFlow<String?> = _identityError.asStateFlow()
+
+    private val _androidRemoteMcpEnabled = MutableStateFlow(
+        appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .getBoolean(org.snow.mcp.AndroidRemoteMcpController.PREF_KEY_ANDROID_REMOTE_MCP_ENABLED, true)
+    )
+    val androidRemoteMcpEnabled: StateFlow<Boolean> = _androidRemoteMcpEnabled.asStateFlow()
+
+    private val _androidMcpTunnelState = MutableStateFlow(
+        org.snow.mcp.RelayMcpForwarderState(enabled = _androidRemoteMcpEnabled.value, connected = false)
+    )
+    val androidMcpTunnelState: StateFlow<org.snow.mcp.RelayMcpForwarderState> = _androidMcpTunnelState.asStateFlow()
+
+    private val _authorizedOAuthClients = MutableStateFlow<List<org.snow.mcp.AuthorizedOAuthClientSummary>>(emptyList())
+    val authorizedOAuthClients: StateFlow<List<org.snow.mcp.AuthorizedOAuthClientSummary>> = _authorizedOAuthClients.asStateFlow()
+
+    @Volatile
+    private var lastCorePendingApprovals: List<PendingApprovalItem> = emptyList()
+    private var androidMcpSyncJob: kotlinx.coroutines.Job? = null
     val tokenStorage: SharedPreferencesTokenStorage by lazy { SharedPreferencesTokenStorage(appContext) }
     val certPinStorage: EncryptedCertPinStorage by lazy { EncryptedCertPinStorage(appContext) }
     internal var tokenStorageOverrideForTest: org.snow.security.TokenStorage? = null
@@ -696,9 +726,82 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     private val localTransportOrchestrator = org.snow.network.TransportOrchestrator()
     private val _transportSnapshots = MutableStateFlow<Map<String, org.snow.network.DeviceTransportSnapshot>>(emptyMap())
     val transportSnapshots: StateFlow<Map<String, org.snow.network.DeviceTransportSnapshot>> = _transportSnapshots.asStateFlow()
+    private val _lastTransportError = MutableStateFlow<String?>(null)
+    val lastTransportError: StateFlow<String?> = _lastTransportError.asStateFlow()
+
+    @Volatile
+    internal var relayActivationVerifierForTest: (suspend (endpoint: String, deviceId: String) -> Pair<Boolean, String>)? = null
 
     fun activeTransportOrchestrator(): org.snow.network.TransportOrchestrator =
         serviceRef?.transportOrchestrator ?: localTransportOrchestrator
+
+    fun resolveTransferFallbackTarget(
+        failedHost: String,
+        failedRoute: org.snow.network.TransportRoute,
+        targetDeviceId: String? = null
+    ): Pair<String, Int>? {
+        val svc = serviceRef
+        if (svc != null) {
+            return svc.buildTransferFallbackTargets(failedHost, failedRoute, targetDeviceId)
+        }
+        val peerId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() } ?: failedHost
+        val orch = activeTransportOrchestrator()
+        orch.selectTransferFallbackTarget(peerId, failedHost, failedRoute)?.let { return it }
+        val mode = orch.getMode(peerId)
+        if (mode.isSingleRouteOverride() && mode.targetRouteOrNull() == failedRoute) {
+            return null
+        }
+        val dev = _savedDevices.value.firstOrNull { it.deviceId.equals(peerId, ignoreCase = true) } ?: return null
+        val fallbackPort = dev.transferPort.takeIf { it in 1..65535 } ?: 8766
+        val altHost = (listOf(dev.host) + dev.recentEndpoints.map { it.host })
+            .map { it.trim() }
+            .firstOrNull { h ->
+                h.isNotBlank() &&
+                    !h.equals(failedHost.trim(), ignoreCase = true) &&
+                    !h.equals("relay", ignoreCase = true) &&
+                    (failedRoute != org.snow.network.TransportRoute.USB || !org.snow.network.TransportClassifier.isLoopbackHost(h))
+            }
+        return altHost?.let { it to fallbackPort }
+    }
+
+    internal fun createConfiguredTransferClient(
+        targetDeviceIdProviderOverride: (() -> String?)? = null
+    ): FileTransferClient {
+        val clientRef = serviceRef?.client
+        val devIdProvider: () -> String? = targetDeviceIdProviderOverride ?: {
+            val c = serviceRef?.client
+            c?.activeTargetDeviceId()
+                ?: (_authState.value as? AuthState.Authenticated)?.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+        }
+        return FileTransferClient(
+            context = appContext,
+            deviceId = identity.deviceId,
+            certPinStorage = activeCertPinStorage,
+            tokenStorage = activeTokenStorage,
+            useTls = true,
+            targetDeviceIdProvider = devIdProvider
+        ).apply {
+            transportOrchestrator = activeTransportOrchestrator()
+            usbMappingVerifiedProvider = {
+                val c = clientRef ?: serviceRef?.client
+                c != null &&
+                    org.snow.network.TransportClassifier.isLoopbackHost(c.currentTargetHost) &&
+                    c.connectionState.value == ConnectionState.CONNECTED
+            }
+            fallbackTargetProvider = { failedHost, failedRoute ->
+                resolveTransferFallbackTarget(failedHost, failedRoute, devIdProvider.invoke())
+            }
+        }
+    }
+
+    internal fun resolveOrCreateTransferClient(requireConnectedAuth: Boolean = true): FileTransferClient? {
+        _fileTransferClient?.let { return it }
+        serviceRef?.transferClient?.let { return it }
+        if (requireConnectedAuth && !(_authState.value is AuthState.Authenticated && _connectionState.value == ConnectionState.CONNECTED)) {
+            return null
+        }
+        return createConfiguredTransferClient().also { _fileTransferClient = it }
+    }
 
     private val _activeTransfer = MutableStateFlow<ActiveTransferInfo?>(null)
     val activeTransfer: StateFlow<ActiveTransferInfo?> = _activeTransfer.asStateFlow()
@@ -954,6 +1057,103 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
     }
 
+    fun getPermanentDeviceKeyIdentity(): org.snow.security.DeviceKeyIdentity =
+        deviceKeyManager.getOrCreate()
+
+    fun refreshPermanentIdentityState() {
+        try {
+            val dk = deviceKeyManager.getOrCreate()
+            _permanentDeviceSnowId.value = dk.snowId
+            val hubBase = getDefaultHubUrl(allowDevLoopback = false).trimEnd('/')
+            _permanentDeviceMcpUrl.value = org.snow.security.DeviceKeyManager.formatPermanentMcpUrl(hubBase, dk.snowId)
+            _identityError.value = null
+        } catch (e: org.snow.security.DeviceKeyCorruptException) {
+            _identityError.value = e.message ?: "Device cryptographic identity is corrupted; explicit recovery required."
+        } catch (e: Throwable) {
+            _identityError.value = e.message ?: "Unable to initialize permanent device identity."
+        }
+    }
+
+    fun getPermanentDeviceMcpUrl(): String {
+        val cached = _permanentDeviceMcpUrl.value
+        if (cached.isNotBlank()) return cached
+        return try {
+            val dk = deviceKeyManager.getOrCreate()
+            val url = org.snow.security.DeviceKeyManager.formatPermanentMcpUrl(getDefaultHubUrl(allowDevLoopback = false), dk.snowId)
+            _permanentDeviceSnowId.value = dk.snowId
+            _permanentDeviceMcpUrl.value = url
+            url
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    fun exportDeviceRecoveryKeyWithConsent(confirmed: Boolean): Pair<Boolean, String> {
+        if (!confirmed) {
+            return false to "Explicit owner confirmation is required to reveal your device recovery key."
+        }
+        return try {
+            val dk = deviceKeyManager.getOrCreate()
+            val keyStr = org.snow.security.DeviceKeyManager.exportRecoveryKey(dk)
+            appendLog("INFO", TAG, "Owner exported device recovery key reference for [${dk.snowId}]")
+            true to keyStr
+        } catch (e: Exception) {
+            false to (e.message ?: "Unable to export device recovery key.")
+        }
+    }
+
+    fun exportEncryptedIdentityBackupToSaf(uri: android.net.Uri, passphrase: String): Pair<Boolean, String> {
+        return try {
+            val dk = deviceKeyManager.getOrCreate()
+            val jsonPayload = org.snow.security.DeviceKeyManager.exportEncryptedBackup(dk, passphrase)
+            val stream = appContext.contentResolver.openOutputStream(uri)
+                ?: return false to "Could not open selected SAF destination for writing."
+            stream.use { out ->
+                out.write((jsonPayload + "\n").toByteArray(Charsets.UTF_8))
+                out.flush()
+            }
+            appendLog("INFO", TAG, "Saved AES-GCM encrypted identity backup for [${dk.snowId}] via SAF")
+            true to "Encrypted backup saved (${dk.snowId})."
+        } catch (e: Exception) {
+            false to (e.message ?: "Failed saving encrypted backup.")
+        }
+    }
+
+    fun restoreDeviceIdentityFromRecovery(
+        recoveryOrBackupInput: String,
+        passphrase: String? = null,
+        confirmReplace: Boolean = true
+    ): Pair<Boolean, String> {
+        if (!confirmReplace) {
+            return false to "Explicit confirmation is required to restore identity and wipe prior trust."
+        }
+        return try {
+            val trimmed = recoveryOrBackupInput.trim()
+            val restored = if (trimmed.startsWith("{")) {
+                deviceKeyManager.restoreFromEncryptedBackup(trimmed, passphrase.orEmpty())
+            } else {
+                deviceKeyManager.restoreFromRecoveryKey(trimmed)
+            }
+            // Disengage any active sessions & clear in-memory trust without re-pairing automatically
+            disconnectAll()
+            _savedDevices.value = emptyList()
+            _adoptedNetworkId.value = null
+            _pendingNetworkDecision.value = null
+            _permanentDeviceSnowId.value = restored.snowId
+            val url = org.snow.security.DeviceKeyManager.formatPermanentMcpUrl(
+                getDefaultHubUrl(allowDevLoopback = false),
+                restored.snowId
+            )
+            _permanentDeviceMcpUrl.value = url
+            _identityError.value = null
+            serviceRef?.androidRemoteMcpController?.onDeviceIdentityRecovered()
+            appendLog("WARN", TAG, "Device identity restored as [${restored.snowId}]; prior peer trust & OAuth sessions wiped.")
+            true to "Restored identity ${restored.snowId}. Re-pair peers and re-approve AI clients explicitly."
+        } catch (e: Exception) {
+            false to (e.message ?: "Recovery failed.")
+        }
+    }
+
     fun getRemoteAiLinkDiagnostics(): Pair<String?, String> {
         val netId = _adoptedNetworkId.value?.trim()?.takeIf { it.isNotBlank() }
         if (netId != null) {
@@ -985,6 +1185,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         pairingFlow.localNetworkIdProvider = { getEffectiveNetworkId() }
         loadSavedDevices()
         refreshPhoneTelemetry()
+        refreshPermanentIdentityState()
         _permissionProfileState.value = activePermissionProfile
     }
 
@@ -995,6 +1196,14 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         serviceRef = service
         observeClientFlows(service.client)
         observeDiscoveryFlow(service.discoveryManager)
+        androidMcpSyncJob?.cancel()
+        androidMcpSyncJob = repoScope.launch {
+            val ctrl = service.androidRemoteMcpController
+            launch { ctrl.enabled.collect { _androidRemoteMcpEnabled.value = it } }
+            launch { ctrl.tunnelState.collect { _androidMcpTunnelState.value = it } }
+            launch { ctrl.authorizedClients.collect { _authorizedOAuthClients.value = it } }
+        }
+        syncMergedPendingApprovals()
 
         screenShareJob?.cancel()
         screenShareJob = repoScope.launch {
@@ -1085,17 +1294,10 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                         _connectedEndpoint.value = "$host:$port"
                     }
                     // Initialize dedicated FileTransferClient tied to this authenticated session
-                    _fileTransferClient = FileTransferClient(
-                        context = appContext,
-                        deviceId = identity.deviceId,
-                        certPinStorage = activeCertPinStorage,
-                        tokenStorage = activeTokenStorage,
-                        useTls = true,
-                        targetDeviceIdProvider = {
-                            client.activeTargetDeviceId()
-                                ?: auth.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
-                        }
-                    )
+                    _fileTransferClient = createConfiguredTransferClient {
+                        client.activeTargetDeviceId()
+                            ?: auth.peerDeviceId?.trim()?.takeIf { it.isNotBlank() }
+                    }
                     val existingDev = _savedDevices.value.find {
                         (!auth.peerDeviceId.isNullOrBlank() && it.deviceId.equals(auth.peerDeviceId, ignoreCase = true)) ||
                             (!auth.peerSnowId.isNullOrBlank() && it.snowId.equals(auth.peerSnowId, ignoreCase = true))
@@ -2511,7 +2713,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         val isAuthConn = isSessionTrulyConnected(_uiConnectionState.value, _authState.value)
         val authDevId = (_authState.value as? AuthState.Authenticated)?.peerDeviceId
         val nextMap = _transportSnapshots.value.toMutableMap()
-        val relayOn = isRemoteRelayEnabled() && (serviceRef?.relayClient != null || activeEp.contains("relay") || activeEp.contains("tunnel"))
+        val relayVerifiedLive = serviceRef?.relayClient?.isSessionAndTunnelVerified() == true ||
+            (isAuthConn && (activeEp.contains("relay") || activeEp.contains("tunnel")))
+        val relayOn = isRemoteRelayEnabled() && relayVerifiedLive
 
         for (dev in devList) {
             val discPeer = _discoveredPeers.value.firstOrNull { it.deviceId.equals(dev.deviceId, ignoreCase = true) }
@@ -2532,6 +2736,54 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         _transportSnapshots.value = nextMap
     }
 
+    private suspend fun activateAndVerifyRemoteRelay(
+        deviceId: String,
+        mode: org.snow.network.TransportMode,
+        orch: org.snow.network.TransportOrchestrator,
+        reasonLabel: String
+    ): Pair<Boolean, String> {
+        val endpoint = getEffectiveRelayEndpointForHub()
+        val validScheme = endpoint.startsWith("wss://") || endpoint.startsWith("ws://")
+        if (endpoint.isBlank() || !validScheme) {
+            val reason = "Remote relay endpoint is not configured or invalid."
+            orch.markUnavailable(deviceId, org.snow.network.TransportRoute.REMOTE_RELAY, reason)
+            _lastTransportError.value = reason
+            refreshTransportSnapshot(deviceId)
+            return false to reason
+        }
+        val verifier = relayActivationVerifierForTest
+        val (verified, reason) = if (verifier != null) {
+            verifier.invoke(endpoint, deviceId)
+        } else {
+            val svc = serviceRef
+            if (svc == null) {
+                false to "Connection service is offline; cannot verify Remote Relay."
+            } else {
+                svc.startRelayAndVerify(endpoint = endpoint, targetDeviceId = deviceId)
+            }
+        }
+        if (!verified) {
+            val err = reason.ifBlank { "Remote relay authentication or handshake failed." }
+            orch.markUnavailable(deviceId, org.snow.network.TransportRoute.REMOTE_RELAY, err)
+            _lastTransportError.value = err
+            appendLog("WARN", TAG, "Remote Relay activation failed for $deviceId: $err")
+            refreshTransportSnapshot(deviceId)
+            return false to err
+        }
+        _lastTransportError.value = null
+        val parsedUri = runCatching { java.net.URI(endpoint) }.getOrNull()
+        val relayHost = parsedUri?.host?.takeIf { it.isNotBlank() } ?: "relay"
+        val relayPort = parsedUri?.port?.takeIf { it in 1..65535 } ?: 443
+        orch.markVerified(deviceId, org.snow.network.TransportRoute.REMOTE_RELAY, host = relayHost, port = relayPort, isActive = true)
+        val (modeOk, modeMsg) = orch.setMode(deviceId, mode, reasonLabel)
+        if (!modeOk) {
+            _lastTransportError.value = modeMsg
+            refreshTransportSnapshot(deviceId)
+            return false to modeMsg
+        }
+        return true to "Remote relay authenticated and active"
+    }
+
     suspend fun switchDeviceTransport(deviceId: String, requestedMode: String): Pair<Boolean, String> {
         val mode = org.snow.network.TransportMode.normalize(requestedMode)
             ?: return false to "Unsupported transport mode '$requestedMode'."
@@ -2542,6 +2794,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         refreshTransportSnapshot(deviceId)
         val svc = serviceRef
         val wsClient = svc?.client
+        _lastTransportError.value = null
 
         if (mode.isSingleRouteOverride()) {
             val targetRoute = mode.targetRouteOrNull()!!
@@ -2551,15 +2804,15 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             }
             try {
                 if (targetRoute == org.snow.network.TransportRoute.REMOTE_RELAY) {
-                    val endpoint = getEffectiveRelayEndpointForHub()
-                    if (!isRemoteRelayEnabled() && endpoint.isBlank()) {
-                        return false to "Remote relay endpoint is not configured."
+                    val (ok, msg) = activateAndVerifyRemoteRelay(
+                        deviceId = deviceId,
+                        mode = mode,
+                        orch = orch,
+                        reasonLabel = "Manual switch to Remote"
+                    )
+                    if (!ok) {
+                        return false to msg
                     }
-                    if (svc != null && wsClient != null) {
-                        svc.startRelay(endpoint)
-                    }
-                    orch.markVerified(deviceId, org.snow.network.TransportRoute.REMOTE_RELAY, host = "relay", port = 443, isActive = true)
-                    orch.setMode(deviceId, mode, "Manual switch to Remote")
                 } else {
                     val candHost = when (targetRoute) {
                         org.snow.network.TransportRoute.USB -> "127.0.0.1"
@@ -2590,10 +2843,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     if (candHost.isBlank()) {
                         val reason = "No verified ${targetRoute.shortLabel} endpoint known."
                         orch.markUnavailable(deviceId, targetRoute, reason)
+                        _lastTransportError.value = reason
                         return false to reason
                     }
                     if (wsClient == null) {
-                        return false to "Connection service is offline; cannot verify ${targetRoute.shortLabel}."
+                        val reason = "Connection service is offline; cannot verify ${targetRoute.shortLabel}."
+                        _lastTransportError.value = reason
+                        return false to reason
                     }
                     val probeRes = wsClient.probeAndPromoteEndpoint(
                         newHost = candHost,
@@ -2605,6 +2861,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                     if (!probeRes.promoted) {
                         val reason = probeRes.error ?: "Verification failed for ${targetRoute.shortLabel}."
                         orch.markUnavailable(deviceId, targetRoute, reason)
+                        _lastTransportError.value = reason
                         return false to reason
                     }
                     orch.markVerified(deviceId, targetRoute, host = candHost, port = dev.port, isActive = true)
@@ -2613,18 +2870,34 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             } finally {
                 orch.setSwitching(deviceId, false)
             }
+        } else if (mode == org.snow.network.TransportMode.REMOTE_ONLY) {
+            orch.setSwitching(deviceId, true, "Verifying Remote • Uses Data")
+            _transportSnapshots.value = _transportSnapshots.value.toMutableMap().apply {
+                this[deviceId] = orch.snapshotFor(deviceId)
+            }
+            try {
+                val (ok, msg) = activateAndVerifyRemoteRelay(
+                    deviceId = deviceId,
+                    mode = mode,
+                    orch = orch,
+                    reasonLabel = "Mode updated to remote_only"
+                )
+                if (!ok) {
+                    return false to msg
+                }
+                updateRemoteRelayConfig(true, getEffectiveRelayEndpointForHub())
+            } finally {
+                orch.setSwitching(deviceId, false)
+            }
         } else {
             val (ok, msg) = orch.setMode(deviceId, mode, "Mode updated to ${mode.wireName}")
             if (!ok) {
+                _lastTransportError.value = msg
                 refreshTransportSnapshot(deviceId)
                 return false to msg
             }
             if (mode == org.snow.network.TransportMode.LOCAL_ONLY) {
                 svc?.stopRelay()
-            } else if (mode == org.snow.network.TransportMode.REMOTE_ONLY) {
-                val endpoint = getEffectiveRelayEndpointForHub()
-                updateRemoteRelayConfig(true, endpoint)
-                svc?.startRelay(endpoint)
             } else if (mode == org.snow.network.TransportMode.AUTO && svc != null) {
                 svc.promoteLocalRouteFromDiscoveryIfAvailable()
             }
@@ -3407,15 +3680,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     ) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (isConnectedAndAuthenticated()) {
-            FileTransferClient(
-                context = appContext,
-                deviceId = identity.deviceId,
-                certPinStorage = certPinStorage,
-                tokenStorage = tokenStorage,
-                useTls = true
-            ).also { _fileTransferClient = it }
-        } else null
+        val transferClient = if (isConnectedAndAuthenticated()) resolveOrCreateTransferClient(requireConnectedAuth = false) else (_fileTransferClient ?: serviceRef?.transferClient)
 
         if (client == null || !isConnectedAndAuthenticated() || transferClient == null) {
             onComplete?.invoke(false, "Desktop not connected or transfer client not ready.")
@@ -3570,15 +3835,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun pushLatestRecentScreenshotIfAvailable(onComplete: (Boolean, String?) -> Unit) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (isConnectedAndAuthenticated()) {
-            FileTransferClient(
-                context = appContext,
-                deviceId = identity.deviceId,
-                certPinStorage = certPinStorage,
-                tokenStorage = tokenStorage,
-                useTls = true
-            ).also { _fileTransferClient = it }
-        } else null
+        val transferClient = if (isConnectedAndAuthenticated()) resolveOrCreateTransferClient(requireConnectedAuth = false) else (_fileTransferClient ?: serviceRef?.transferClient)
 
         if (client == null || !isConnectedAndAuthenticated() || transferClient == null) {
             onComplete(false, "Desktop not connected or transfer client not ready.")
@@ -3907,15 +4164,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun uploadCameraPhoto(onComplete: (Boolean, String?) -> Unit) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (isConnectedAndAuthenticated()) {
-            FileTransferClient(
-                context = appContext,
-                deviceId = identity.deviceId,
-                certPinStorage = certPinStorage,
-                tokenStorage = tokenStorage,
-                useTls = true
-            ).also { _fileTransferClient = it }
-        } else null
+        val transferClient = if (isConnectedAndAuthenticated()) resolveOrCreateTransferClient(requireConnectedAuth = false) else (_fileTransferClient ?: serviceRef?.transferClient)
 
         if (client == null || !isConnectedAndAuthenticated() || transferClient == null) {
             val err = "Desktop not connected or transfer client not ready."
@@ -4422,15 +4671,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun pushCurrentClipboard(userInitiated: Boolean = false, onComplete: (Boolean, String?) -> Unit) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (_authState.value is AuthState.Authenticated && _connectionState.value == ConnectionState.CONNECTED) {
-            FileTransferClient(
-                context = appContext,
-                deviceId = identity.deviceId,
-                certPinStorage = certPinStorage,
-                tokenStorage = tokenStorage,
-                useTls = true
-            ).also { _fileTransferClient = it }
-        } else null
+        val transferClient = resolveOrCreateTransferClient(requireConnectedAuth = true)
 
         if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
             onComplete(false, "Desktop not connected.")
@@ -4635,15 +4876,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun pullClipboard(onComplete: (Boolean, String?) -> Unit) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (_authState.value is AuthState.Authenticated && _connectionState.value == ConnectionState.CONNECTED) {
-            FileTransferClient(
-                context = appContext,
-                deviceId = identity.deviceId,
-                certPinStorage = certPinStorage,
-                tokenStorage = tokenStorage,
-                useTls = true
-            ).also { _fileTransferClient = it }
-        } else null
+        val transferClient = resolveOrCreateTransferClient(requireConnectedAuth = true)
 
         if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
             onComplete(false, "Desktop not connected.")
@@ -5272,15 +5505,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     fun startFileDownload(item: PcFileItem, onComplete: (Boolean, String?) -> Unit) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (_authState.value is AuthState.Authenticated && _connectionState.value == ConnectionState.CONNECTED) {
-            FileTransferClient(
-                context = appContext,
-                deviceId = identity.deviceId,
-                certPinStorage = certPinStorage,
-                tokenStorage = tokenStorage,
-                useTls = true
-            ).also { _fileTransferClient = it }
-        } else null
+        val transferClient = resolveOrCreateTransferClient(requireConnectedAuth = true)
 
         if (client == null || transferClient == null || targetHost.isBlank() || _connectionState.value != ConnectionState.CONNECTED) {
             onComplete(false, "Desktop or file transfer client not ready.")
@@ -5437,15 +5662,7 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     ) {
         val client = serviceRef?.client
         val targetHost = client?.currentTargetHost?.takeIf { it.isNotBlank() } ?: connectedHost
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: if (_authState.value is AuthState.Authenticated && _connectionState.value == ConnectionState.CONNECTED) {
-            FileTransferClient(
-                context = appContext,
-                deviceId = identity.deviceId,
-                certPinStorage = certPinStorage,
-                tokenStorage = tokenStorage,
-                useTls = true
-            ).also { _fileTransferClient = it }
-        } else null
+        val transferClient = resolveOrCreateTransferClient(requireConnectedAuth = true)
 
         if (transferClient == null || targetHost.isBlank() || _connectionState.value != ConnectionState.CONNECTED) {
             onComplete(false, "Desktop or file transfer client not ready.")
@@ -5577,13 +5794,41 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         refreshPendingApprovals(force = true)
     }
 
+    fun setAndroidRemoteMcpEnabled(enabled: Boolean) {
+        appContext.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(org.snow.mcp.AndroidRemoteMcpController.PREF_KEY_ANDROID_REMOTE_MCP_ENABLED, enabled)
+            .apply()
+        _androidRemoteMcpEnabled.value = enabled
+        serviceRef?.androidRemoteMcpController?.setEnabled(enabled)
+    }
+
+    fun revokeAuthorizedOAuthClient(clientId: String): Boolean {
+        val ok = serviceRef?.androidRemoteMcpController?.revokeAuthorizedClient(clientId) ?: false
+        syncMergedPendingApprovals()
+        return ok
+    }
+
+    fun syncMergedPendingApprovals(remoteItems: List<PendingApprovalItem>? = null) {
+        if (remoteItems != null) {
+            lastCorePendingApprovals = remoteItems
+        } else if (_authState.value !is AuthState.Authenticated) {
+            lastCorePendingApprovals = emptyList()
+        }
+        val localItems = serviceRef?.androidRemoteMcpController?.listLocalApprovalItems().orEmpty()
+        val combined = (localItems + lastCorePendingApprovals).distinctBy { it.requestId }
+        _pendingApprovals.value = combined
+        _pendingApprovalsCount.value = combined.size
+    }
+
     fun refreshPendingApprovals(
         force: Boolean = false,
         callback: ((Result<List<PendingApprovalItem>>) -> Unit)? = null
     ) {
         val client = serviceRef?.client
         if (client == null || _connectionState.value != ConnectionState.CONNECTED || _authState.value !is AuthState.Authenticated) {
-            callback?.invoke(Result.failure(IllegalStateException("Not connected to SNOW Desktop Core.")))
+            syncMergedPendingApprovals(emptyList())
+            callback?.invoke(Result.success(_pendingApprovals.value))
             return
         }
         if (!approvalsFetchInFlight.compareAndSet(false, true)) {
@@ -5615,11 +5860,11 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                             )
                         }
                         if (approvalsEpoch.get() == epoch && _authState.value is AuthState.Authenticated) {
-                            _pendingApprovals.value = items
-                            _pendingApprovalsCount.value = items.size
+                            syncMergedPendingApprovals(items)
                         }
-                        callback?.invoke(Result.success(items))
+                        callback?.invoke(Result.success(_pendingApprovals.value))
                     } else {
+                        syncMergedPendingApprovals()
                         val err = resp.error?.message ?: (resp.payload?.get("error") as? String) ?: "Failed fetching approvals"
                         callback?.invoke(Result.failure(RuntimeException(err)))
                     }
@@ -5641,20 +5886,30 @@ class SnowUiRepository private constructor(private val appContext: Context) {
     }
 
     fun resolveApproval(requestId: String, decision: String, callback: (Result<String>) -> Unit) {
+        val cleanDecision = decision.trim().uppercase()
+        val localResult = serviceRef?.androidRemoteMcpController?.tryResolveLocalApproval(requestId, cleanDecision)
+        if (localResult != null) {
+            if (localResult) {
+                syncMergedPendingApprovals()
+                callback(Result.success(cleanDecision))
+            } else {
+                callback(Result.failure(IllegalStateException("Approval request expired or already resolved.")))
+            }
+            return
+        }
+
         val client = serviceRef?.client
         if (client == null || _connectionState.value != ConnectionState.CONNECTED) {
             callback(Result.failure(IllegalStateException("Not connected to SNOW Desktop Core.")))
             return
         }
 
-        val cleanDecision = decision.trim().uppercase()
         val data = mapOf("request_id" to requestId, "decision" to cleanDecision)
         client.sendRequest("approval_resolve", data) { resp ->
             repoScope.launch {
                 if (resp.isSuccess) {
-                    val remaining = _pendingApprovals.value.filter { it.requestId != requestId }
-                    _pendingApprovals.value = remaining
-                    _pendingApprovalsCount.value = remaining.size
+                    val remaining = lastCorePendingApprovals.filter { it.requestId != requestId }
+                    syncMergedPendingApprovals(remaining)
                     refreshPendingApprovals(force = true)
                     val msg = resp.payload?.get("message") as? String ?: cleanDecision
                     callback(Result.success(msg))
@@ -6031,13 +6286,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     fun checkAppUpdate(onResult: (FileTransferClient.AppUpdateInfo?) -> Unit) {
         val host = resolveActiveConnectedHost()
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: FileTransferClient(
-            context = appContext,
-            deviceId = "android-client",
-            certPinStorage = certPinStorage,
-            tokenStorage = tokenStorage,
-            useTls = true
-        )
+        val transferClient = resolveOrCreateTransferClient(requireConnectedAuth = false)
+            ?: createConfiguredTransferClient()
         if (host.isNullOrBlank()) {
             appendLog("WARN", TAG, "Cannot check app update: no active desktop endpoint resolved")
             onResult(null)
@@ -6074,13 +6324,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         onComplete: (Boolean, String?) -> Unit
     ) {
         val host = resolveActiveConnectedHost()
-        val transferClient = _fileTransferClient ?: serviceRef?.transferClient ?: FileTransferClient(
-            context = appContext,
-            deviceId = "android-client",
-            certPinStorage = certPinStorage,
-            tokenStorage = tokenStorage,
-            useTls = true
-        )
+        val transferClient = resolveOrCreateTransferClient(requireConnectedAuth = false)
+            ?: createConfiguredTransferClient()
         if (host.isNullOrBlank()) {
             onComplete(false, "No active desktop endpoint resolved.")
             return

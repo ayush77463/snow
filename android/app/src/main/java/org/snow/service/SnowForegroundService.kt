@@ -121,7 +121,51 @@ class SnowForegroundService : Service() {
                 org.snow.network.TransportClassifier.isLoopbackHost(client.currentTargetHost) &&
                     client.connectionState.value == ConnectionState.CONNECTED
             }
+            fallbackTargetProvider = { failedHost, failedRoute ->
+                buildTransferFallbackTargets(failedHost, failedRoute, client.activeTargetDeviceId())
+            }
         }
+    }
+
+    fun buildTransferFallbackTargets(
+        failedHost: String,
+        failedRoute: org.snow.network.TransportRoute,
+        targetDeviceId: String? = null
+    ): Pair<String, Int>? {
+        val peerId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            ?: client.activeTargetDeviceId()
+            ?: failedHost
+        transportOrchestrator.selectTransferFallbackTarget(
+            deviceId = peerId,
+            failedHost = failedHost,
+            failedRoute = failedRoute
+        )?.let { return it }
+
+        val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
+        val mode = transportOrchestrator.getMode(peerId)
+        if (mode.isSingleRouteOverride() && mode.targetRouteOrNull() == failedRoute) {
+            return null
+        }
+        val matchedSaved = repo.savedDevices.value.firstOrNull { it.deviceId.equals(peerId, ignoreCase = true) }
+        val fallbackTransferPort = matchedSaved?.transferPort?.takeIf { it in 1..65535 } ?: 8766
+        val epPrefs = getSharedPreferences(PREFS_ENDPOINT, Context.MODE_PRIVATE)
+        if (failedRoute == org.snow.network.TransportRoute.USB) {
+            val nonLoopback = resolveUsbFallbackTarget(
+                lastWifiHost = epPrefs.getString(PREF_LAST_WIFI_HOST, null),
+                lastWifiPort = fallbackTransferPort,
+                savedHost = epPrefs.getString(PREF_SAVED_HOST, null),
+                savedPort = fallbackTransferPort
+            )
+            if (nonLoopback != null) {
+                return nonLoopback.first to fallbackTransferPort
+            }
+        }
+        val cleanSaved = matchedSaved?.host?.trim()?.takeIf {
+            it.isNotBlank() &&
+                !it.equals(failedHost.trim(), ignoreCase = true) &&
+                !it.equals("relay", ignoreCase = true)
+        }
+        return cleanSaved?.let { it to fallbackTransferPort }
     }
 
     val capabilityDispatcher: AndroidCapabilityDispatcher by lazy {
@@ -180,10 +224,16 @@ class SnowForegroundService : Service() {
         }
     }
 
-    fun startRelay(endpoint: String) {
+    private fun createConfiguredRelayClient(
+        endpoint: String,
+        targetDeviceId: String? = null
+    ): Pair<org.snow.network.RelayClient?, String?> {
         val effectiveEndpoint = resolveEffectiveRelayEndpoint(endpoint)
-        if (effectiveEndpoint.isBlank()) return
-        stopRelay()
+        if (effectiveEndpoint.isBlank() ||
+            (!effectiveEndpoint.startsWith("wss://") && !effectiveEndpoint.startsWith("ws://"))
+        ) {
+            return null to "Remote relay endpoint is not configured or invalid."
+        }
         val deviceId = org.snow.security.DeviceIdentity.getOrCreate(applicationContext).deviceId
         val certPinStorage = EncryptedCertPinStorage(applicationContext)
         val relaySecurityPrefs = getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE)
@@ -198,7 +248,7 @@ class SnowForegroundService : Service() {
         )
         if (authMaterial == null) {
             SafeLog.i("SnowForegroundService", "Remote relay standby: awaiting Render Hub rendezvous or Desktop relay credentials.")
-            return
+            return null to "No usable relay credentials available (awaiting Render Hub session or pairing credentials)."
         }
         val prefs = getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
         val savedNetId = relaySecurityPrefs.getString(PREF_RELAY_NETWORK_ID, null)
@@ -207,11 +257,14 @@ class SnowForegroundService : Service() {
         val groupId = prefs.getString("remote_relay_group_id", null)
             ?: savedNetId.takeIf { it.isNotBlank() }
             ?: "default_group"
-        val targetPeerId = prefs.getString("remote_relay_target_peer", null) ?: "desktop-core"
+        val configuredTargetPeer = prefs.getString("remote_relay_target_peer", null)?.trim()
+        val targetPeerId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+            ?: configuredTargetPeer?.takeIf { it.isNotBlank() }
+            ?: "desktop-core"
         val expectedFingerprint = resolveRelayTargetFingerprint(certPinStorage, targetPeerId)
         if (expectedFingerprint.isNullOrBlank()) {
             SafeLog.w("SnowForegroundService", "Refusing startRelay without pinned TLS certificate fingerprint for peer $targetPeerId.")
-            return
+            return null to "No pinned TLS certificate fingerprint for target device '$targetPeerId'."
         }
         val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
         val matchedSaved = repo.savedDevices.value.find { it.deviceId.equals(targetPeerId, ignoreCase = true) }
@@ -227,16 +280,16 @@ class SnowForegroundService : Service() {
         } catch (e: Exception) {
             if (!isClientMode) {
                 SafeLog.e("SnowForegroundService", "Refusing startRelay server role without valid TLS keyManagers: ${e.message}")
-                return
+                return null to "Missing local TLS key material for relay handshake: ${e.message}"
             }
             null
         }
         if (!isClientMode && (localKeyManagers == null || localKeyManagers.isEmpty())) {
             SafeLog.e("SnowForegroundService", "Refusing startRelay server role: keyManagers empty.")
-            return
+            return null to "Empty TLS key managers for relay server role."
         }
 
-        relayClient = org.snow.network.RelayClient(
+        val configured = org.snow.network.RelayClient(
             relayUrl = effectiveEndpoint,
             deviceId = deviceId,
             groupId = groupId,
@@ -264,7 +317,79 @@ class SnowForegroundService : Service() {
                     .onIncomingRelayScreenFrame(sourceId, meta, jpegBytes)
             }
         }
-        relayClient?.connect()
+        return configured to null
+    }
+
+    fun startRelay(endpoint: String) {
+        stopRelay()
+        val (configured, _) = createConfiguredRelayClient(endpoint)
+        if (configured == null) return
+        relayClient = configured
+        configured.connect()
+    }
+
+    /**
+     * Start Remote Relay and await real authenticated hub registration (`ONLINE_RELAYED`) plus E2E TLS handshake.
+     * Fails closed on missing credentials, missing fingerprint, auth rejection, closed socket, or timeout.
+     */
+    suspend fun startRelayAndVerify(
+        endpoint: String,
+        targetDeviceId: String? = null,
+        timeoutMs: Long = 8_000L
+    ): Pair<Boolean, String> {
+        stopRelay()
+        val (configured, prepErr) = createConfiguredRelayClient(endpoint, targetDeviceId)
+        if (configured == null) {
+            return false to (prepErr ?: "Remote relay could not be initialized.")
+        }
+
+        val resultDeferred = kotlinx.coroutines.CompletableDeferred<Pair<Boolean, String>>()
+        val expectedTarget = configured.targetPeerId
+
+        fun evaluateReady() {
+            if (configured.reachabilityState.value == org.snow.network.ReachabilityState.ONLINE_RELAYED &&
+                configured.tunnelEstablished.value
+            ) {
+                val targetMatches = targetDeviceId.isNullOrBlank() ||
+                    configured.targetPeerId.equals(expectedTarget, ignoreCase = true)
+                if (targetMatches && !resultDeferred.isCompleted) {
+                    resultDeferred.complete(true to "Remote relay authenticated and verified.")
+                } else if (!targetMatches && !resultDeferred.isCompleted) {
+                    resultDeferred.complete(false to "Relay target identity mismatch.")
+                }
+            }
+        }
+
+        configured.onTunnelEstablished = { evaluateReady() }
+        configured.onTunnelFailed = { err ->
+            if (!resultDeferred.isCompleted) {
+                resultDeferred.complete(false to err.ifBlank { "Remote relay authentication failed." })
+            }
+        }
+
+        relayClient = configured
+        val observerJob = serviceScope.launch {
+            configured.tunnelEstablished.collectLatest { established ->
+                if (established) {
+                    evaluateReady()
+                }
+            }
+        }
+
+        return try {
+            configured.connect()
+            evaluateReady()
+            val outcome = kotlinx.coroutines.withTimeoutOrNull(timeoutMs.coerceAtLeast(250L)) {
+                resultDeferred.await()
+            } ?: (false to (configured.lastErrorMessage?.takeIf { it.isNotBlank() }
+                ?: "Timed out waiting for authenticated Remote Relay handshake."))
+            if (!outcome.first) {
+                stopRelay()
+            }
+            outcome
+        } finally {
+            observerJob.cancel()
+        }
     }
 
     fun stopRelay() {
@@ -328,7 +453,11 @@ class SnowForegroundService : Service() {
         peerHostManager.setHostModeSettingEnabled(true)
         val identity = DeviceIdentity.getOrCreate(applicationContext)
         val repo = SnowUiRepository.getInstance(applicationContext)
-        val snowId = SnowUiRepository.deriveCanonicalSnowId(identity.deviceId)
+        val snowId = try {
+            repo.getPermanentDeviceKeyIdentity().snowId
+        } catch (_: Exception) {
+            SnowUiRepository.deriveCanonicalSnowId(identity.deviceId)
+        }
         val tokenStorage = SharedPreferencesTokenStorage(
             applicationContext,
             prefName = SharedPreferencesTokenStorage.PEER_HOST_PREFS_NAME
@@ -407,6 +536,185 @@ class SnowForegroundService : Service() {
                 defaultTransferPort = 8766
             )
         }
+        androidRemoteMcpController.startIfEnabled()
+    }
+
+    val androidRemoteMcpController: org.snow.mcp.AndroidRemoteMcpController by lazy {
+        val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
+        org.snow.mcp.AndroidRemoteMcpController(
+            appContext = applicationContext,
+            capabilityDispatcher = capabilityDispatcher,
+            settingsPrefsName = org.snow.ui.SnowUiRepository.PREFS_SETTINGS,
+            deviceKeyProvider = { repo.getPermanentDeviceKeyIdentity() },
+            hubHttpUrlProvider = { repo.getDefaultHubUrl(allowDevLoopback = false) },
+            networkIdProvider = { repo.getEffectiveNetworkId() },
+            peerDirectoryProvider = { buildMcpPeerDirectory(repo) },
+            peerActionForwarder = { targetId, action, params, _ ->
+                executePeerActionForward(repo, targetId, action, params)
+            },
+            onLocalApprovalsUpdated = {
+                repo.syncMergedPendingApprovals()
+            }
+        )
+    }
+
+    private fun buildMcpPeerDirectory(repo: org.snow.ui.SnowUiRepository): List<org.snow.mcp.McpPeerDescriptor> {
+        val saved = repo.savedDevices.value
+        val authHostPeers = peerHostManager.listAuthenticatedPeers().toSet()
+        val clientAuth = client.authState.value as? AuthState.Authenticated
+        val activeClientPeer = if (client.connectionState.value == ConnectionState.CONNECTED && clientAuth != null) {
+            clientAuth.peerDeviceId?.takeIf { it.isNotBlank() } ?: client.activeTargetDeviceId()
+        } else {
+            null
+        }
+        val activeRelay = relayClient?.takeIf { it.isSessionAndTunnelVerified() }
+        val descriptors = linkedMapOf<String, org.snow.mcp.McpPeerDescriptor>()
+
+        for (dev in saved) {
+            val matchedClient = activeClientPeer != null && (
+                dev.deviceId.equals(activeClientPeer, ignoreCase = true) ||
+                    dev.host.equals(client.currentTargetHost, ignoreCase = true)
+                )
+            val matchedHostPeer = authHostPeers.any { it.equals(dev.deviceId, ignoreCase = true) }
+            val matchedRelay = activeRelay != null && activeRelay.targetPeerId.equals(dev.deviceId, ignoreCase = true)
+            val isOnline = matchedClient || matchedHostPeer || matchedRelay
+            val transport = when {
+                matchedClient -> org.snow.network.TransportClassifier.classifyRoute(host = client.currentTargetHost).wireName
+                matchedHostPeer -> "peer_host"
+                matchedRelay -> "remote_relay"
+                else -> "offline"
+            }
+            descriptors[dev.deviceId] = org.snow.mcp.McpPeerDescriptor(
+                deviceId = dev.deviceId,
+                snowId = dev.snowId ?: "",
+                deviceName = dev.deviceName,
+                deviceType = dev.deviceType,
+                networkId = dev.networkId ?: "",
+                isOnline = isOnline,
+                transport = transport,
+                isFederated = dev.relationship.equals("federated", ignoreCase = true)
+            )
+        }
+        for (pid in authHostPeers) {
+            if (!descriptors.containsKey(pid)) {
+                descriptors[pid] = org.snow.mcp.McpPeerDescriptor(
+                    deviceId = pid,
+                    deviceName = pid,
+                    deviceType = "android",
+                    networkId = repo.getEffectiveNetworkId() ?: "",
+                    isOnline = true,
+                    transport = "peer_host"
+                )
+            }
+        }
+        return descriptors.values.toList()
+    }
+
+    private suspend fun executePeerActionForward(
+        repo: org.snow.ui.SnowUiRepository,
+        targetId: String,
+        action: String,
+        params: Map<String, Any?>
+    ): Pair<Map<String, Any?>?, String?> {
+        val matchedSaved = repo.savedDevices.value.firstOrNull {
+            it.deviceId.equals(targetId, ignoreCase = true) ||
+                (!it.snowId.isNullOrBlank() && it.snowId.equals(targetId, ignoreCase = true))
+        }
+        val resolvedId = matchedSaved?.deviceId ?: targetId
+        val localNet = repo.getEffectiveNetworkId()?.trim()?.uppercase().orEmpty()
+        val targetNet = matchedSaved?.networkId?.trim()?.uppercase().orEmpty()
+        if (localNet.isNotEmpty() && targetNet.isNotEmpty() && localNet != targetNet &&
+            matchedSaved?.relationship?.equals("federated", ignoreCase = true) != true
+        ) {
+            return null to "PERMISSION_DENIED: Cross-network execution blocked between '$localNet' and '$targetNet'."
+        }
+
+        // 1. Direct authenticated incoming peer on Android Peer Host
+        if (peerHostManager.listAuthenticatedPeers().any { it.equals(resolvedId, ignoreCase = true) }) {
+            return peerHostManager.sendRequestToPeer(resolvedId, action, params)
+        }
+
+        // 2. Direct authenticated WebSocket client session to PC or Peer Host
+        val clientAuth = client.authState.value as? AuthState.Authenticated
+        if (client.connectionState.value == ConnectionState.CONNECTED && clientAuth != null) {
+            val peerId = clientAuth.peerDeviceId ?: client.activeTargetDeviceId()
+            val isDirectTarget = peerId?.equals(resolvedId, ignoreCase = true) == true ||
+                (matchedSaved != null && matchedSaved.host.equals(client.currentTargetHost, ignoreCase = true))
+            val deferred = kotlinx.coroutines.CompletableDeferred<Pair<Map<String, Any?>?, String?>>()
+            if (isDirectTarget) {
+                client.sendRequest(action = action, data = params) { msg ->
+                    deferred.complete(unwrapPeerReply(msg, unwrapRelayEnvelope = false))
+                }
+            } else {
+                client.sendRequest(
+                    action = "peer_relay_request",
+                    data = mapOf(
+                        "target_device_id" to resolvedId,
+                        "action" to action,
+                        "data" to params,
+                        "hop_limit" to 2
+                    )
+                ) { msg ->
+                    deferred.complete(unwrapPeerReply(msg, unwrapRelayEnvelope = true))
+                }
+            }
+            return kotlinx.coroutines.withTimeoutOrNull(22_000L) { deferred.await() }
+                ?: (null to "TIMEOUT: Peer '$resolvedId' timed out executing '$action'.")
+        }
+
+        // 3. Verified end-to-end encrypted Remote Relay tunnel
+        val rc = relayClient
+        if (rc != null && rc.isSessionAndTunnelVerified()) {
+            val isDirectTarget = rc.targetPeerId.equals(resolvedId, ignoreCase = true)
+            val deferred = kotlinx.coroutines.CompletableDeferred<Pair<Map<String, Any?>?, String?>>()
+            val sendOk = if (isDirectTarget) {
+                rc.sendRequest(action = action, data = params) { msg ->
+                    deferred.complete(unwrapPeerReply(msg, unwrapRelayEnvelope = false))
+                }
+            } else {
+                rc.sendRequest(
+                    action = "peer_relay_request",
+                    data = mapOf(
+                        "target_device_id" to resolvedId,
+                        "action" to action,
+                        "data" to params,
+                        "hop_limit" to 2
+                    )
+                ) { msg ->
+                    deferred.complete(unwrapPeerReply(msg, unwrapRelayEnvelope = true))
+                }
+            }
+            if (!sendOk) {
+                return null to "DEVICE_OFFLINE: Failed dispatching via remote relay tunnel."
+            }
+            return kotlinx.coroutines.withTimeoutOrNull(22_000L) { deferred.await() }
+                ?: (null to "TIMEOUT: Remote peer '$resolvedId' timed out executing '$action'.")
+        }
+
+        return null to "DEVICE_OFFLINE: Target device '$resolvedId' is unreachable on all transports."
+    }
+
+    private fun unwrapPeerReply(
+        msg: org.snow.protocol.SnowMessage,
+        unwrapRelayEnvelope: Boolean
+    ): Pair<Map<String, Any?>?, String?> {
+        if (!msg.isSuccess) {
+            val errTxt = msg.error?.let { "${it.code}: ${it.message}" }
+                ?: (msg.payload?.get("error")?.toString() ?: "Peer returned error.")
+            return null to errTxt
+        }
+        val payload = msg.payload ?: emptyMap()
+        if (!unwrapRelayEnvelope) {
+            return payload to null
+        }
+        val status = (payload["status"] as? String)?.lowercase().orEmpty()
+        if (status != "success" && status.isNotEmpty()) {
+            val err = (payload["error"] as? String) ?: status.uppercase()
+            return null to "$status: $err"
+        }
+        @Suppress("UNCHECKED_CAST")
+        val inner = payload["data"] as? Map<String, Any?> ?: payload
+        return inner to null
     }
 
     /**
@@ -1282,6 +1590,7 @@ class SnowForegroundService : Service() {
         super.onDestroy()
         unregisterNetworkCallback()
         liveScreenHandler.stopStreaming()
+        androidRemoteMcpController.stop()
         org.snow.ui.SnowUiRepository.getInstance(applicationContext).unbindService()
         discoveryManager.stopPeerHostBeacon()
         peerHostManager.disableHostMode()
@@ -1455,6 +1764,9 @@ class SnowForegroundService : Service() {
 
         @Volatile
         private var activeInstance: SnowForegroundService? = null
+
+        @JvmStatic
+        fun getActiveInstance(): SnowForegroundService? = activeInstance
 
         @JvmStatic
         fun setDisconnectedByUser(context: Context, disconnected: Boolean) {

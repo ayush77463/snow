@@ -615,6 +615,51 @@ class TransportOrchestrator(
     }
 
     /**
+     * Select the highest-priority fallback HTTP transfer target `(host, transferPort)` for [deviceId]
+     * when [failedRoute] at [failedHost] fails, honoring single-route manual pins fail-closed.
+     */
+    fun selectTransferFallbackTarget(
+        deviceId: String,
+        failedHost: String,
+        failedRoute: TransportRoute,
+        failedPort: Int = -1
+    ): Pair<String, Int>? {
+        val clean = deviceId.trim()
+        if (clean.isEmpty()) return null
+        synchronized(lockFor(clean)) {
+            val mode = getMode(clean)
+            if (mode.isSingleRouteOverride() && mode.targetRouteOrNull() == failedRoute) {
+                return null
+            }
+            val now = clockMs()
+            val cmap = ensureCandidateMap(clean)
+            val candidate = TransportRoute.values()
+                .filter { it != failedRoute && it != TransportRoute.REMOTE_RELAY }
+                .filter { r ->
+                    when (mode) {
+                        TransportMode.AUTO, TransportMode.LOCAL_ONLY -> true
+                        TransportMode.REMOTE_ONLY, TransportMode.REMOTE_RELAY -> false
+                        TransportMode.USB -> r == TransportRoute.USB
+                        TransportMode.HOTSPOT -> r == TransportRoute.HOTSPOT
+                        TransportMode.WIFI_LAN -> r == TransportRoute.WIFI_LAN
+                    }
+                }
+                .mapNotNull { cmap[it] }
+                .firstOrNull { cand ->
+                    val validHost = cand.host.trim()
+                    validHost.isNotEmpty() &&
+                        !validHost.equals("relay", ignoreCase = true) &&
+                        !(validHost == failedHost.trim() && (failedPort <= 0 || cand.transferPort == failedPort)) &&
+                        !cand.inCooldown(now) &&
+                        cand.state != RouteState.UNAVAILABLE
+                }
+            return candidate?.let { cand ->
+                cand.host.trim() to (if (cand.transferPort in 1..65535) cand.transferPort else 8766)
+            }
+        }
+    }
+
+    /**
      * Evaluate whether a higher-priority route candidate should be probed/promoted right now.
      * Respects mode pins, sticky active multi-GB transfer pins, TTLs, and cooldowns.
      */

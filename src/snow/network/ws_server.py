@@ -1813,10 +1813,10 @@ class SnowWebSocketServer:
         except Exception:
             pass
 
-        target_device_id = data.get("target_device_id")
-        relay_action = data.get("action")
+        target_device_id = str(data.get("target_device_id") or "").strip()
+        relay_action = str(data.get("action") or "").strip()
         relay_data = data.get("data") or {}
-        hop_limit = data.get("hop_limit", 3)
+        hop_limit = data.get("hop_limit", 2)
         visited_nodes = list(data.get("visited_nodes", []))
 
         if not target_device_id or not relay_action:
@@ -1827,6 +1827,29 @@ class SnowWebSocketServer:
             )
             await client.websocket.send(error_response.to_json())
             return
+
+        # Resolve canonical snow_id aliases (SNW-XXXX-XXXX) to exact device_id when known
+        local_id = self.device_identity.device_id
+        from snow.security.identity import generate_snow_id
+        local_snow_id = ""
+        if getattr(self, "db_manager", None) is not None and hasattr(self.db_manager, "get_setting"):
+            local_snow_id = str(self.db_manager.get_setting("device_snow_id") or "").strip().upper()
+        if not local_snow_id:
+            local_snow_id = str(getattr(self.device_identity, "snow_id", "") or "").strip().upper() or generate_snow_id(seed=local_id).upper()
+
+        if target_device_id.upper() == local_snow_id and local_snow_id:
+            target_device_id = local_id
+        elif target_device_id != local_id and getattr(self, "db_manager", None) is not None:
+            target_upper = target_device_id.upper()
+            for rec in self.db_manager.list_paired_devices():
+                rec_snow = (
+                    str(getattr(rec, "snow_id", "") or "").strip().upper()
+                    or str(self.db_manager.get_setting(f"device_snow_id:{rec.device_id}") or "").strip().upper()
+                    or generate_snow_id(seed=rec.device_id).upper()
+                )
+                if rec.device_id == target_device_id or (rec_snow and rec_snow == target_upper):
+                    target_device_id = rec.device_id
+                    break
 
         # Payload size boundary check (64KB boundary limit)
         raw_payload_len = len(json.dumps(relay_data)) if relay_data else 0
@@ -1839,16 +1862,21 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
-        # Strip caller-supplied authority overrides
+        # Strip caller-supplied authority & origin spoofing overrides; server binds authenticated origin
         if isinstance(relay_data, dict):
             relay_data = dict(relay_data)
-            relay_data.pop("principal", None)
-            relay_data.pop("trust_tier", None)
-            relay_data.pop("execution_principal", None)
+            for spoof_key in (
+                "principal",
+                "trust_tier",
+                "execution_principal",
+                "origin_device_id",
+                "origin_snow_id",
+                "oauth_client_id",
+            ):
+                relay_data.pop(spoof_key, None)
+            relay_data["origin_device_id"] = caller_device_id
 
-        local_id = self.device_identity.device_id
-
-        # Loop prevention: check if this host is already in visited nodes
+        # Loop & transitive-hop prevention: check if this host is already in visited nodes
         if local_id in visited_nodes:
             logger.warning(
                 "Routing loop detected in peer relay! Host [%s] already in visited nodes: %s",
@@ -1863,13 +1891,13 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
-        # Hop limit enforcement
+        # Hop limit enforcement (bounded <= 2, prevents transitive A->B->C chaining across relays)
         try:
-            hop_limit = int(hop_limit)
+            hop_limit = min(int(hop_limit), 2)
         except (ValueError, TypeError):
-            hop_limit = 3
+            hop_limit = 2
 
-        if hop_limit <= 0:
+        if hop_limit <= 0 or len(visited_nodes) >= 2:
             logger.warning("Hop limit exceeded in peer relay to [%s]", target_device_id)
             error_response = SnowMessage.create_error(
                 code=ErrorCode.INTERNAL_ERROR,
@@ -1878,6 +1906,27 @@ class SnowWebSocketServer:
             )
             await client.websocket.send(error_response.to_json())
             return
+
+        # Network boundary isolation check: cross-network hops require explicit federation
+        if getattr(self, "db_manager", None) is not None:
+            try:
+                caller_rec = self.db_manager.get_paired_device(caller_device_id)
+                caller_net = str(getattr(caller_rec, "network_id", "") or "").strip().upper() if caller_rec else ""
+                if target_device_id == local_id:
+                    target_net = str(self.db_manager.get_setting("network_id") or "").strip().upper()
+                else:
+                    target_rec = self.db_manager.get_paired_device(target_device_id)
+                    target_net = str(getattr(target_rec, "network_id", "") or "").strip().upper() if target_rec else ""
+                if caller_net and target_net and caller_net != target_net:
+                    error_response = SnowMessage.create_error(
+                        code=ErrorCode.UNAUTHORIZED,
+                        message=f"Cross-network peer relay denied between '{caller_net}' and '{target_net}'.",
+                        correlation_id=message.id,
+                    )
+                    await client.websocket.send(error_response.to_json())
+                    return
+            except Exception as net_exc:
+                logger.warning("Peer relay network boundary validation error: %s", net_exc)
 
         visited_nodes.append(local_id)
         next_hop_limit = hop_limit - 1

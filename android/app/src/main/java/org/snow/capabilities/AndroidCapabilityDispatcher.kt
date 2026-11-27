@@ -36,21 +36,31 @@ class AndroidCapabilityDispatcher(
     val linkShareHandler = LinkShareHandler(context)
     val screenCaptureHandler = ScreenCaptureHandler(context, transferClientProvider)
     val cameraCaptureHandler = CameraCaptureHandler(context, transferClientProvider)
+    val systemStatusHandler = SystemStatusHandler(context)
 
     var activePermissionProfile: String = "full_control"
 
+    internal fun contextProviderForProfileCheck(): Context = context
+
     fun isActionAllowedByProfile(action: String): Boolean {
         val norm = activePermissionProfile.trim().lowercase()
-        val telemetry = setOf("battery_status", "android_battery", "android_battery_status")
+        val telemetry = setOf(
+            "battery_status", "android_battery", "android_battery_status", "snow_android_battery",
+            "android_device_info", "snow_android_device_info",
+            "android_audio_status", "snow_android_audio_status"
+        )
         val clipboard = setOf(
             "clipboard_pull", "clipboard_push", "android_clipboard_pull",
-            "android_clipboard_push", "android_clipboard_get", "android_clipboard_set",
-            "clipboard_buffer_updated", "clipboard_buffer_list", "clipboard_ack"
+            "android_clipboard_push", "android_clipboard_get", "snow_android_clipboard_get",
+            "android_clipboard_set", "clipboard_buffer_updated", "clipboard_buffer_list", "clipboard_ack"
         )
         val files = setOf(
             "file_list", "android_file_list", "file_send_request",
             "file_receive_request", "android_file_receive", "ring_phone", "android_ring",
-            "transfer_cancel", "file_transfer_cancel"
+            "transfer_cancel", "file_transfer_cancel",
+            "android_file_read", "snow_android_file_read",
+            "android_file_write", "snow_android_file_write",
+            "android_file_search", "snow_android_file_search"
         )
         return when (norm) {
             "not_allowed" -> false
@@ -168,7 +178,7 @@ class AndroidCapabilityDispatcher(
                     }
                 }
             }
-            "clipboard_pull" -> {
+            "clipboard_pull", "android_clipboard_get", "snow_android_clipboard_get" -> {
                 if (!ClipboardHandler.isAppInForeground) {
                     return mapOf(
                         "success" to false,
@@ -282,7 +292,7 @@ class AndroidCapabilityDispatcher(
                     transferClient = transferClientProvider()
                 )
             }
-            "clipboard_pull" -> {
+            "clipboard_pull", "android_clipboard_get", "snow_android_clipboard_get" -> {
                 val res = clipboardHandler.pullClipboard()
                 if (res["status"] == "success" || res["success"] == true) {
                     Pair(res, null)
@@ -293,6 +303,49 @@ class AndroidCapabilityDispatcher(
                         else -> ErrorCode.INVALID_PAYLOAD
                     }
                     val msg = res["message"] as? String ?: errType
+                    Pair(null, SnowError(code = code, message = "$errType: $msg"))
+                }
+            }
+            "android_device_info", "snow_android_device_info" -> {
+                Pair(systemStatusHandler.getDeviceInfo(), null)
+            }
+            "android_audio_status", "snow_android_audio_status" -> {
+                Pair(systemStatusHandler.getAudioStatus(), null)
+            }
+            "android_file_read", "snow_android_file_read" -> {
+                val res = fileHandler.readSafTextFile(data)
+                if (res["status"] == "success") Pair(res, null) else {
+                    val errType = res["status"] as? String ?: "ERROR"
+                    val msg = res["error"] as? String ?: errType
+                    val code = when (errType) {
+                        "PATH_TRAVERSAL_DETECTED", "SAF_PERMISSION_REVOKED" -> ErrorCode.UNAUTHORIZED
+                        "FILE_NOT_FOUND" -> ErrorCode.FILE_NOT_FOUND
+                        else -> ErrorCode.INVALID_PAYLOAD
+                    }
+                    Pair(null, SnowError(code = code, message = "$errType: $msg"))
+                }
+            }
+            "android_file_write", "snow_android_file_write" -> {
+                val res = fileHandler.writeSafTextFile(data)
+                if (res["status"] == "success") Pair(res, null) else {
+                    val errType = res["status"] as? String ?: "ERROR"
+                    val msg = res["error"] as? String ?: errType
+                    val code = when (errType) {
+                        "PATH_TRAVERSAL_DETECTED", "SAF_PERMISSION_REVOKED" -> ErrorCode.UNAUTHORIZED
+                        else -> ErrorCode.INVALID_PAYLOAD
+                    }
+                    Pair(null, SnowError(code = code, message = "$errType: $msg"))
+                }
+            }
+            "android_file_search", "snow_android_file_search" -> {
+                val res = fileHandler.searchSafFileNames(data)
+                if (res["status"] == "success") Pair(res, null) else {
+                    val errType = res["status"] as? String ?: "ERROR"
+                    val msg = res["error"] as? String ?: errType
+                    val code = when (errType) {
+                        "PATH_TRAVERSAL_DETECTED", "SAF_PERMISSION_REVOKED" -> ErrorCode.UNAUTHORIZED
+                        else -> ErrorCode.INVALID_PAYLOAD
+                    }
                     Pair(null, SnowError(code = code, message = "$errType: $msg"))
                 }
             }

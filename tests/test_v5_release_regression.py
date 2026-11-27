@@ -96,13 +96,13 @@ class TestV5Phase7McpFourNewTools(unittest.IsolatedAsyncioTestCase):
     async def test_42_tool_catalog_and_annotations_parity(self) -> None:
         is_valid, errs = validate_registry()
         self.assertTrue(is_valid, f"Registry validation failed: {errs}")
-        self.assertEqual(len(CAPABILITY_REGISTRY), 54)
-        self.assertEqual(len(ALL_TOOL_NAMES), 54)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 60)
+        self.assertEqual(len(ALL_TOOL_NAMES), 60)
 
         server = create_snow_mcp_server()
         tools = await server.list_tools()
         tool_names = {t.name for t in tools}
-        self.assertEqual(len(tools), 54)
+        self.assertEqual(len(tools), 60)
         for new_tool in (
             "snow_mesh_health_summary",
             "snow_windows_active_window",
@@ -357,7 +357,7 @@ class TestV5Phase3And6WebEndpoints(unittest.IsolatedAsyncioTestCase):
     def test_web_ui_structure_invariants_preserved(self) -> None:
         html_path = Path(__file__).resolve().parents[1] / "src" / "snow" / "web" / "static" / "index.html"
         html = html_path.read_text("utf-8")
-        self.assertIn("FastMCP 54 Tools", html)
+        self.assertIn("FastMCP 60 Tools", html)
         self.assertNotIn("activity-timeline-container", html)
         self.assertIn('id="section-clipboard"', html)
         self.assertIn('id="btn-stop-screen-stream"', html)

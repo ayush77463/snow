@@ -80,12 +80,12 @@ class TestStage6CWS4VersionAndFrozenInvariants(unittest.TestCase):
 
         ok, errors = validate_registry()
         self.assertTrue(ok, f"Registry validation failed: {errors}")
-        self.assertEqual(len(CAPABILITY_REGISTRY), 54)
-        self.assertEqual(len(ALL_TOOL_NAMES), 54)
+        self.assertEqual(len(CAPABILITY_REGISTRY), 60)
+        self.assertEqual(len(ALL_TOOL_NAMES), 60)
 
         srv = create_snow_mcp_server()
         srv_tools = asyncio.run(srv.list_tools())
-        self.assertEqual(len(srv_tools), 54)
+        self.assertEqual(len(srv_tools), 60)
         self.assertEqual({t.name for t in srv_tools}, set(CAPABILITY_REGISTRY.keys()))
 
     def test_ui_files_have_zero_emojis_and_zero_external_cdns(self) -> None:

@@ -87,6 +87,21 @@ def derive_network_id_from_pubkey(pubkey: str | bytes) -> str:
     return f"SNW-NET-{digest_prefix}"
 
 
+def derive_device_snow_id_from_pubkey(pubkey: str | bytes) -> str:
+    """Derive canonical permanent per-device SNOW ID from a raw 32-byte Ed25519 public key.
+
+    Formula: "SNW-" + SHA256(raw_32_byte_ed25519_public_key).hexdigest()[:8].upper()
+    formatted canonically as SNW-XXXX-XXXX.
+
+    Security Note: An 8-hex-character (32-bit) digest prefix provides a concise address,
+    NOT full 256-bit collision resistance. Render Hub and peers MUST verify public key
+    ownership and reject any conflicting registration for an existing snow_id.
+    """
+    raw = decode_ed25519_pubkey(pubkey)
+    digest_prefix = hashlib.sha256(raw).hexdigest()[:8].upper()
+    return f"SNW-{digest_prefix[:4]}-{digest_prefix[4:]}"
+
+
 def canonical_hub_challenge_message(
     challenge_id: str,
     network_id: str,
@@ -100,6 +115,37 @@ def canonical_hub_challenge_message(
     clean_nonce = str(nonce or "").strip()
     clean_dev = str(device_id or "").strip()
     return f"snow-hub-v1|{clean_cid}|{clean_nid}|{clean_nonce}|{int(expires_at)}|{clean_dev}".encode("utf-8")
+
+
+def canonical_device_hub_challenge_message(
+    *,
+    challenge_id: str,
+    nonce: str,
+    expires_at: int,
+    snow_id: str,
+    public_key_b64: str,
+    device_id: str,
+    network_id: str = "",
+    audience: str = "render-hub-tunnel",
+) -> bytes:
+    """Canonical domain-separated challenge payload signed by a device's permanent Ed25519 key."""
+    canonical_pub = encode_ed25519_pubkey(decode_ed25519_pubkey(public_key_b64))
+    clean_snow_id = str(snow_id or "").strip().upper()
+    fields = [
+        "snow-device-hub-v1",
+        str(challenge_id or "").strip(),
+        str(nonce or "").strip(),
+        str(int(expires_at)),
+        clean_snow_id,
+        canonical_pub,
+        str(device_id or "").strip(),
+        str(network_id or "").strip().upper(),
+        str(audience or "render-hub-tunnel").strip(),
+    ]
+    for f in fields:
+        if "|" in f or "\n" in f or "\r" in f or "\x00" in f:
+            raise ValueError("Challenge message field contains prohibited control or delimiter characters.")
+    return "|".join(fields).encode("utf-8")
 
 
 def verify_ed25519_signature(pubkey: str | bytes, message: bytes, signature_b64: str) -> bool:

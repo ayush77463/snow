@@ -2323,6 +2323,11 @@ SENSITIVE_KEY_PATTERNS = {
     "body",
     "cert_fingerprint",
     "auth_token_hash",
+    "recovery",
+    "private_key",
+    "seed",
+    "code_verifier",
+    "authorization_code",
 }
 
 
@@ -2344,3 +2349,68 @@ def redact_sensitive_data(val: Any) -> Any:
     elif isinstance(val, list):
         return [redact_sensitive_data(item) for item in val]
     return val
+
+
+def _clear_table_safely(conn: sqlite3.Connection, table_name: str) -> int:
+    try:
+        cur = conn.execute(f"DELETE FROM {table_name};")
+        return int(cur.rowcount or 0)
+    except Exception:
+        return 0
+
+
+def _append_recovery_audit_event(conn: sqlite3.Connection, details: dict[str, Any]) -> None:
+    try:
+        conn.execute(
+            """
+            INSERT INTO activity_history (
+                event_id, timestamp, event_type, capability, principal,
+                target_device, outcome, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                f"act_{uuid.uuid4().hex}",
+                current_utc_timestamp(),
+                "identity_recovery_trust_reset",
+                "device_identity",
+                "OWNER_MANUAL",
+                "local",
+                "SUCCESS",
+                json.dumps(redact_sensitive_data(details)),
+            ),
+        )
+    except Exception:
+        pass
+
+
+def _attach_clear_trust_method() -> None:
+    def clear_trust_on_device_recovery(self) -> dict[str, int]:
+        """Wipe all peer pairing credentials, TLS pins, network privileges, and OAuth sessions.
+
+        Enforces M4.4 Section 5.3 trust separation: recovering an Ed25519 keypair restores
+        ONLY the device's cryptographic identity and permanent URL—NEVER prior peer trust,
+        pairing tokens, network ownership/privileges, or active OAuth client sessions.
+        """
+        counts: dict[str, int] = {}
+        with self._lock, self._get_connection() as conn:
+            for tbl in (
+                "paired_devices",
+                "oauth_tokens",
+                "oauth_auth_codes",
+                "oauth_clients",
+                "federation_grants",
+                "federation_invitations",
+                "network_merge_proposals",
+                "network_identity",
+                "networks",
+                "network_endpoints",
+            ):
+                counts[tbl] = _clear_table_safely(conn, tbl)
+            _append_recovery_audit_event(conn, {"tables_cleared": counts})
+        logger.warning("Cleared all prior peer trust and OAuth sessions after device identity recovery.")
+        return counts
+
+    DatabaseManager.clear_trust_on_device_recovery = clear_trust_on_device_recovery
+
+
+_attach_clear_trust_method()
