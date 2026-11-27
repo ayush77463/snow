@@ -395,11 +395,12 @@ class TestMcpHostingStage3B(unittest.IsolatedAsyncioTestCase):
         html_text = html_path.read_text(encoding="utf-8")
         js_text = js_path.read_text(encoding="utf-8")
 
-        # 1. Antigravity button and siblings in index.html
+        # 1. Antigravity, Claude, ChatGPT, Gemini buttons in index.html (Cursor removed in M4.5)
         self.assertIn('id="btn-setup-antigravity"', html_text)
         self.assertIn('id="btn-setup-claude"', html_text)
-        self.assertIn('id="btn-setup-cursor"', html_text)
+        self.assertIn('id="btn-setup-chatgpt"', html_text)
         self.assertIn('id="btn-setup-gemini"', html_text)
+        self.assertNotIn('id="btn-setup-cursor"', html_text)
 
         # 2. Host setup in app.js includes antigravity
         self.assertIn('"antigravity"', js_text)

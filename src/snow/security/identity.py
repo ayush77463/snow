@@ -1010,3 +1010,32 @@ def restore_device_key_identity(
     )
     logger.info("Restored permanent Ed25519 device identity [%s] and cleared prior peer/OAuth trust.", verified_identity.snow_id)
     return verified_identity, archived_path
+
+
+def resolve_canonical_device_snow_id(
+    data_dir: Optional[Union[str, Path]] = None,
+    fallback_identity: Optional[DeviceIdentity] = None,
+) -> Tuple[str, Optional[str]]:
+    """Return `(canonical_device_snow_id, legacy_uuid_snow_id_alias)`.
+
+    Uses the permanent Ed25519 `DeviceKeyIdentity.snow_id` (`SNW-XXXX-XXXX`) as
+    the canonical device identifier while returning the legacy UUID-derived
+    `DeviceIdentity.snow_id` (only when distinct) as a compatibility alias for
+    historic peer/route lookups.
+    """
+    legacy_ident = fallback_identity
+    if legacy_ident is None:
+        try:
+            legacy_ident = load_or_create_device_identity(data_dir=data_dir)
+        except Exception:
+            legacy_ident = None
+    legacy_snow = str(getattr(legacy_ident, "snow_id", "") or "").strip().upper() or None
+    try:
+        dev_key = load_or_create_device_key_identity(data_dir=data_dir)
+        canonical = dev_key.snow_id.upper()
+        alias = legacy_snow if (legacy_snow and legacy_snow != canonical) else None
+        return canonical, alias
+    except DeviceIdentityError:
+        if legacy_snow:
+            return legacy_snow, None
+        raise

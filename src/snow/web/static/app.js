@@ -841,7 +841,7 @@
                                 <span class="text-sm font-semibold text-primary leading-tight truncate">${escapeHtml(dev.device_name || "Device")}</span>
                                 <span class="text-xs text-muted flex items-center gap-1">
                                     <span class="status-dot ${dotClass}" style="width:6px;height:6px;"></span>
-                                    <span>${isConn ? transport : "Offline"}${batPart} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}</span>
+                                    <span>${isConn ? transport : "Offline"}${batPart} • ${escapeHtml(dev.snow_id || "Pending ID")}</span>
                                 </span>
                             </div>
                         </div>
@@ -2123,89 +2123,67 @@
             };
         }
 
+        document.getElementById("btn-copy-pairing-snow-id")?.addEventListener("click", () => {
+            const val = document.getElementById("pairing-snow-id")?.textContent?.trim() || canonicalSnowId;
+            if (val && val !== "--") {
+                navigator.clipboard?.writeText(val).catch(() => {});
+                showNotificationToast(`Copied My SNOW ID: ${val}`, "success");
+            }
+        });
+        document.getElementById("btn-pairing-refresh-live-qr")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Refreshing...", async () => {
+                if (lastPairingSnapshotHasActivePin) {
+                    await refreshPairingState();
+                } else {
+                    const res = await apiRequest("/api/pair/qr", "POST", { trust_tier: "owner", include_pin: false });
+                    if (res && res.success) applyPairingState(res, false);
+                    else await refreshPairingState();
+                }
+                showNotificationToast("Refreshed live pairing QR.", "info");
+            });
+        });
         document.getElementById("btn-pairing-refresh-qr")?.addEventListener("click", async (e) => {
             await withButtonLoading(e.currentTarget, "Generating...", async () => {
                 const ok = await loadPairingQR();
-                if (ok) showNotificationToast("Generated 60s pairing QR & PIN.", "info");
+                if (ok) showNotificationToast("Generated 60s 6-digit pairing PIN.", "info");
             });
         });
         document.getElementById("btn-modal-generate-pin")?.addEventListener("click", async (e) => {
             await withButtonLoading(e.currentTarget, "Generating...", async () => {
                 const ok = await loadPairingQR();
-                if (ok) showNotificationToast("Generated 60s pairing QR & PIN.", "info");
+                if (ok) showNotificationToast("Generated 60s 6-digit pairing PIN.", "info");
             });
         });
         document.getElementById("btn-pairing-cancel-pin")?.addEventListener("click", async (e) => {
             await withButtonLoading(e.currentTarget, "Cancelling...", cancelPairingPin);
         });
+        document.getElementById("btn-modal-cancel-pin")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Cancelling...", cancelPairingPin);
+        });
 
         const btnPairConnect = document.getElementById("btn-pairing-connect");
         const inputPair = document.getElementById("pairing-input");
+        const inputPairPin = document.getElementById("pairing-pin-input");
         if (btnPairConnect && inputPair) {
             btnPairConnect.onclick = async () => {
                 await withButtonLoading(btnPairConnect, "Connecting...", async () => {
-                    await handleUnifiedConnectInput(inputPair.value.trim());
+                    await handleUnifiedConnectInput(inputPair.value.trim(), inputPairPin ? inputPairPin.value.trim() : "");
                 });
             };
         }
 
-        // Federation Controls
-        document.getElementById("btn-federation-gen-invite")?.addEventListener("click", async (e) => {
-            await withButtonLoading(e.currentTarget, "Generating...", async () => {
-                const permTier = document.getElementById("federation-invite-tier")?.value || "files_and_clipboard";
-                const res = await apiRequest("/api/federation/invite", "POST", {
-                    ttl_seconds: 600,
-                    permission_tier: permTier,
-                });
-                const displayInvite = document.getElementById("federation-invite-display");
-                const code = res?.code || res?.invite_code;
-                if (res && res.success && code && displayInvite) {
-                    displayInvite.textContent = code;
-                    displayInvite.classList.remove("d-none");
-                    showNotificationToast(`Generated 9-digit code: ${code}`, "success");
-                } else {
-                    showNotificationToast(res?.error || "Could not generate federation invite", "error");
-                }
-            });
+        document.getElementById("btn-validate-qr-json")?.addEventListener("click", async () => {
+            const rawQr = document.getElementById("pairing-qr-json-input")?.value.trim() || "";
+            await validateQrJsonInput(rawQr, "pairing-qr-json-preview");
         });
-
-        document.getElementById("btn-federation-join")?.addEventListener("click", async (e) => {
-            const inp = document.getElementById("federation-input-code");
-            const code = inp ? inp.value.trim() : "";
-            if (!code) {
-                showNotificationToast("Enter a 9-digit federation invite code.", "warning");
-                return;
-            }
-            await withButtonLoading(e.currentTarget, "Joining...", async () => {
-                const res = await apiRequest("/api/federation/accept", "POST", { code });
-                if (res && res.success) {
-                    showNotificationToast("Joined federated network!", "success");
+        document.getElementById("btn-accept-qr-json")?.addEventListener("click", async (e) => {
+            const rawQr = document.getElementById("pairing-qr-json-input")?.value.trim() || "";
+            await withButtonLoading(e.currentTarget, "Connecting...", async () => {
+                const ok = await acceptQrJsonInput(rawQr, "pairing-qr-json-preview");
+                if (ok) {
+                    const inp = document.getElementById("pairing-qr-json-input");
                     if (inp) inp.value = "";
-                    refreshAllData();
-                } else {
-                    showNotificationToast(res?.error || "Failed joining federation", "error");
                 }
-            });
-        });
-
-        // Kill Switch Modal
-        const killModal = document.getElementById("killswitch-modal");
-        document.getElementById("btn-federation-kill-switch")?.addEventListener("click", () => {
-            killModal?.classList.remove("d-none");
-        });
-        document.getElementById("btn-killswitch-cancel")?.addEventListener("click", () => {
-            killModal?.classList.add("d-none");
-        });
-        document.getElementById("btn-killswitch-confirm")?.addEventListener("click", async (e) => {
-            await withButtonLoading(e.currentTarget, "Revoking...", async () => {
-                const res = await apiRequest("/api/federation/kill-switch", "POST", { reason: "Emergency Kill Switch via Web Dashboard" });
-                if (res && res.success) {
-                    showNotificationToast("Emergency Kill Switch activated: All federation grants severed.", "warning");
-                } else {
-                    showNotificationToast(res?.error || "Failed activating kill switch.", "error");
-                }
-                killModal?.classList.add("d-none");
-                refreshAllData();
             });
         });
 
@@ -2272,55 +2250,156 @@
         });
     }
 
-    async function handleUnifiedConnectInput(rawVal) {
+    function openMergeDecisionModal(conflictData) {
+        const modal = document.getElementById("network-merge-decision-modal");
+        const summaryEl = document.getElementById("network-merge-modal-summary");
+        if (!modal || !conflictData?.merge_tx_id) return;
+        const txId = String(conflictData.merge_tx_id);
+        const srcNet = String(conflictData.source_network_id || "Your Network");
+        const dstNet = String(conflictData.target_network_id || "Peer Network");
+        if (summaryEl) {
+            summaryEl.textContent = `Separate SNOW networks detected (${srcNet} vs ${dstNet}). Merge requires mutual owner confirmation. Keeping separate isolates external peer trust cleanly.`;
+        }
+        const closeModal = () => modal.classList.add("d-none");
+        const btnKeep = document.getElementById("btn-modal-keep-separate");
+        const btnMerge = document.getElementById("btn-modal-merge-networks");
+        if (btnKeep) {
+            btnKeep.onclick = async () => {
+                const res = await apiRequest("/api/network/merge/keep-separate", "POST", { tx_id: txId });
+                closeModal();
+                if (res && res.success) {
+                    showNotificationToast("Kept networks separate (isolated external peer relationship).", "info");
+                    refreshAllData();
+                } else {
+                    showNotificationToast(res?.error || "Failed keeping networks separate", "error");
+                }
+            };
+        }
+        if (btnMerge) {
+            btnMerge.onclick = async () => {
+                const res = await apiRequest("/api/network/merge/approve", "POST", { tx_id: txId });
+                closeModal();
+                if (res && res.success) {
+                    showNotificationToast(
+                        res.committed ? "Networks merged cleanly." : "Merge approved; waiting on peer owner confirmation.",
+                        "success"
+                    );
+                    refreshAllData();
+                } else {
+                    showNotificationToast(res?.error || "Failed approving merge", "error");
+                }
+            };
+        }
+        modal.classList.remove("d-none");
+    }
+
+    async function validateQrJsonInput(rawJson, previewId) {
+        const previewEl = document.getElementById(previewId);
+        if (!rawJson) {
+            if (previewEl) {
+                previewEl.textContent = "Paste QR v2 JSON payload first.";
+                previewEl.className = "text-xs text-rose";
+            }
+            return null;
+        }
+        const res = await apiRequest("/api/pair/qr/validate", "POST", { qr_json: rawJson });
+        if (res && res.success) {
+            const msg = `Valid QR v2 • Peer: ${res.snow_id}${res.network_id ? ` • Network: ${res.network_id}` : ""}${res.device_name ? ` (${res.device_name})` : ""}`;
+            if (previewEl) {
+                previewEl.textContent = msg;
+                previewEl.className = "text-xs text-emerald";
+            }
+            return res;
+        }
+        if (previewEl) {
+            previewEl.textContent = res?.error || "Invalid QR v2 JSON payload.";
+            previewEl.className = "text-xs text-rose";
+        }
+        return null;
+    }
+
+    async function acceptQrJsonInput(rawJson, previewId) {
+        const previewEl = document.getElementById(previewId);
+        if (!rawJson) {
+            showNotificationToast("Paste QR v2 JSON payload first.", "warning");
+            return false;
+        }
+        const res = await apiRequest("/api/pair/qr/accept", "POST", { qr_json: rawJson });
+        if (res && res.success) {
+            if (previewEl) {
+                previewEl.textContent = `Paired with ${res.snow_id || "peer"}.`;
+                previewEl.className = "text-xs text-emerald";
+            }
+            showNotificationToast(`Paired cleanly with ${res.snow_id || "peer"}!`, "success");
+            const conflictData = res.network_conflict ? res : (res.data?.network_conflict ? res.data : null);
+            if (conflictData && conflictData.merge_tx_id) {
+                openMergeDecisionModal(conflictData);
+            }
+            await refreshAllData();
+            return true;
+        }
+        const errMsg = res?.error || "Could not connect using pasted QR JSON.";
+        if (previewEl) {
+            previewEl.textContent = errMsg;
+            previewEl.className = "text-xs text-rose";
+        }
+        showNotificationToast(errMsg, "error");
+        return false;
+    }
+
+    async function handleUnifiedConnectInput(rawVal, optionalPin = "") {
         if (!rawVal) {
-            showNotificationToast("Enter a peer SNOW ID (SNW-...) or IP address.", "warning");
+            showNotificationToast("Enter a peer SNOW ID (SNW-...), Network ID, or IP address.", "warning");
             return;
         }
-        const digitsOnly = rawVal.replace(/\D/g, "");
-        if (digitsOnly.length === 9 && /^[\d-\s]+$/.test(rawVal)) {
-            showNotificationToast("Accepting cross-network federation code...", "info");
-            const res = await apiRequest("/api/federation/accept", "POST", { code: rawVal });
-            if (res && res.success) {
-                showNotificationToast("Federation established!", "success");
-                refreshAllData();
-            } else {
-                showNotificationToast(res?.error || "Federation acceptance failed", "error");
-            }
+        const trimmed = rawVal.trim();
+        if (trimmed.startsWith("{")) {
+            await acceptQrJsonInput(trimmed, "pairing-qr-json-preview");
             return;
         }
 
-        const cleanId = rawVal.trim().toUpperCase();
+        const cleanId = trimmed.toUpperCase();
         if (/^SNW-(NET-[A-F0-9]{8}|[A-Z0-9]{4}-[A-Z0-9]{4})$/i.test(cleanId)) {
-            showNotificationToast(`Resolving SNOW ID ${cleanId}...`, "info");
+            showNotificationToast(`Resolving ${cleanId}...`, "info");
             const dirRes = await apiRequest(`/api/directory/resolve/${encodeURIComponent(cleanId)}`);
             if (!dirRes || !dirRes.found) {
                 showNotificationToast(dirRes?.error || `No online peer found for ${cleanId}.`, "error");
                 return;
             }
-            if (dirRes.host) {
-                const connRes = await apiRequest("/api/devices/connect-peer", "POST", { snow_id: cleanId });
-                if (connRes && connRes.success) {
-                    showNotificationToast(`Connected to ${cleanId}!`, "success");
-                    refreshAllData();
-                } else {
-                    showNotificationToast(connRes?.error || `Found ${cleanId} via ${dirRes.source || "directory"}, pairing confirmation may be required.`, "info");
+            const connRes = await apiRequest("/api/devices/connect-peer", "POST", {
+                snow_id: cleanId,
+                pin: optionalPin,
+            });
+            if (connRes && connRes.success) {
+                showNotificationToast(`Connected to ${cleanId}!`, "success");
+                const conflictData = connRes.data?.network_conflict ? connRes.data : (connRes.network_conflict ? connRes : null);
+                if (conflictData && conflictData.merge_tx_id) {
+                    openMergeDecisionModal(conflictData);
                 }
-                return;
+                refreshAllData();
+            } else {
+                showNotificationToast(connRes?.error || `Found ${cleanId} via ${dirRes.source || "directory"}, pairing confirmation may be required.`, "info");
             }
-            showNotificationToast(`Resolved ${cleanId} via cloud hub directory!`, "success");
             return;
         }
 
-        const parsed = parseHostAndPort(rawVal);
+        const parsed = parseHostAndPort(trimmed);
         if (!parsed) return;
         showNotificationToast(`Connecting to ${parsed.host}:${parsed.port}...`, "info");
-        const res = await apiRequest("/api/devices/connect-peer", "POST", { host: parsed.host, port: parsed.port });
+        const res = await apiRequest("/api/devices/connect-peer", "POST", {
+            host: parsed.host,
+            port: parsed.port,
+            pin: optionalPin,
+        });
         if (res && res.success) {
             showNotificationToast("Connected to peer device!", "success");
+            const conflictData = res.data?.network_conflict ? res.data : (res.network_conflict ? res : null);
+            if (conflictData && conflictData.merge_tx_id) {
+                openMergeDecisionModal(conflictData);
+            }
             refreshAllData();
         } else {
-            showNotificationToast(res?.error || "Connection failed (check Advanced Diagnostics if manual PIN needed)", "error");
+            showNotificationToast(res?.error || "Connection failed (check Advanced Diagnostics or QR JSON paste)", "error");
         }
     }
 
@@ -2429,7 +2508,7 @@
                         <div class="island-icon-box">${iconSvg}</div>
                         <div class="flex flex-col min-w-0">
                             <span class="text-sm font-bold text-primary truncate">${escapeHtml(dev.device_name || "Device")}</span>
-                            <span class="text-xs text-muted">${isConn ? `Connected • ${escapeHtml(activeBadge)}` : "Disconnected"}${batVal != null ? ` • ${batVal}%` : ""} • ${escapeHtml((dev.snow_id || dev.device_id).slice(0, 13).replace(/-$/, ""))}${isExternalNet ? " • External Network" : ""}</span>
+                            <span class="text-xs text-muted">${isConn ? `Connected • ${escapeHtml(activeBadge)}` : "Disconnected"}${batVal != null ? ` • ${batVal}%` : ""} • ${escapeHtml(dev.snow_id || "Pending ID")}${isExternalNet ? " • External Network" : ""}</span>
                         </div>
                     </div>
                     <div class="flex items-center gap-1">
@@ -2567,11 +2646,9 @@
         }
 
         refreshPairingState();
-        loadRelayTunnelStatus();
-        loadFederationGrants();
     }
 
-    function renderIdlePairingState(label = "No active PIN", countdownText = "--") {
+    function renderIdlePairingState(label = "No active PIN", countdownText = "--", preserveQr = true) {
         lastPairingSnapshotHasActivePin = false;
         if (qrCountdownTimer) {
             clearInterval(qrCountdownTimer);
@@ -2582,74 +2659,78 @@
         const pinEl = document.getElementById("pairing-pin-display");
         const modalPinEl = document.getElementById("modal-pairing-pin");
         const countdownEl = document.getElementById("pairing-countdown-display");
+        const modalCountdownEl = document.getElementById("modal-countdown-display");
         const cancelBtn = document.getElementById("btn-pairing-cancel-pin");
+        const modalCancelBtn = document.getElementById("btn-modal-cancel-pin");
+        const progWrap = document.getElementById("pairing-countdown-progress-wrap");
+        const progFill = document.getElementById("pairing-countdown-progress");
+        const modalProgWrap = document.getElementById("modal-pin-progress-wrap");
+        const modalProgFill = document.getElementById("modal-pin-progress");
 
-        const idleMsg = `<span class="text-xs text-muted text-center">Click Generate Pairing QR &amp; PIN when ready</span>`;
-        if (qrBox) {
-            qrBox.classList.remove("qr-active");
-            qrBox.innerHTML = idleMsg;
-        }
-        if (modalQrBox) {
-            modalQrBox.classList.remove("qr-active");
-            modalQrBox.innerHTML = idleMsg;
+        if (!preserveQr) {
+            const idleMsg = `<span class="text-xs text-muted text-center">Preparing live QR...</span>`;
+            if (qrBox) {
+                qrBox.classList.remove("qr-active");
+                qrBox.innerHTML = idleMsg;
+            }
+            if (modalQrBox) {
+                modalQrBox.classList.remove("qr-active");
+                modalQrBox.innerHTML = idleMsg;
+            }
         }
         if (pinEl) pinEl.textContent = label;
         if (modalPinEl) modalPinEl.textContent = label;
         if (countdownEl) countdownEl.textContent = countdownText;
+        if (modalCountdownEl) modalCountdownEl.textContent = countdownText;
         cancelBtn?.classList.add("d-none");
+        modalCancelBtn?.classList.add("d-none");
+        progWrap?.classList.add("d-none");
+        modalProgWrap?.classList.add("d-none");
+        if (progFill) progFill.style.width = "0%";
+        if (modalProgFill) modalProgFill.style.width = "0%";
     }
 
     function applyPairingState(res, isActiveGeneration = false) {
         const qrBox = document.getElementById("pairing-qr-box");
         const modalQrBox = document.getElementById("modal-qr-container");
         const snowIdEl = document.getElementById("pairing-snow-id");
+        const modalSnowEl = document.getElementById("modal-snow-id");
+        const netIdEl = document.getElementById("pairing-network-id");
         const modalNetEl = document.getElementById("modal-network-id");
-        const fpEl = document.getElementById("pairing-device-fp");
         const pinEl = document.getElementById("pairing-pin-display");
         const modalPinEl = document.getElementById("modal-pairing-pin");
         const countdownEl = document.getElementById("pairing-countdown-display");
+        const modalCountdownEl = document.getElementById("modal-countdown-display");
         const cancelBtn = document.getElementById("btn-pairing-cancel-pin");
+        const modalCancelBtn = document.getElementById("btn-modal-cancel-pin");
+        const progWrap = document.getElementById("pairing-countdown-progress-wrap");
+        const progFill = document.getElementById("pairing-countdown-progress");
+        const modalProgWrap = document.getElementById("modal-pin-progress-wrap");
+        const modalProgFill = document.getElementById("modal-pin-progress");
 
         const dataObj = res?.data || res || {};
         const effectiveSnowId = dataObj?.snow_id || canonicalSnowId;
+        const effectiveNetId = dataObj?.network_id || activeMeshNetworkId || "Standalone";
         if (snowIdEl) snowIdEl.textContent = effectiveSnowId;
-        if (modalNetEl) modalNetEl.textContent = effectiveSnowId;
+        if (modalSnowEl) modalSnowEl.textContent = effectiveSnowId;
+        if (netIdEl) netIdEl.textContent = effectiveNetId;
+        if (modalNetEl) modalNetEl.textContent = effectiveNetId;
 
         const fpVal = res?.data?.fp || res?.fp || res?.data?.cert_fingerprint || res?.cert_fingerprint || "";
-        if (fpEl) {
-            if (fpVal) {
-                fpEl.textContent = `${fpVal.slice(0, 16)}...`;
-                fpEl.title = fpVal;
-            } else {
-                fpEl.textContent = "--";
-                fpEl.removeAttribute("title");
-            }
-        }
-
-        const pinVal = res?.data?.pin || res?.pin || "";
-        const hasActivePin = Boolean(
-            pinVal && (isActiveGeneration || dataObj?.has_active_pin === true)
-        );
-
-        if (!hasActivePin) {
-            if (res && res.success === false && qrBox) {
+        const svgMarkup = res?.svg || res?.qr_svg || res?.data?.svg;
+        if (res && res.success === false && !svgMarkup) {
+            if (qrBox) {
                 qrBox.classList.remove("qr-active");
                 qrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
-                if (modalQrBox) {
-                    modalQrBox.classList.remove("qr-active");
-                    modalQrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
-                }
-                if (pinEl) pinEl.textContent = "Unavailable";
-                if (countdownEl) countdownEl.textContent = "--";
-                cancelBtn?.classList.add("d-none");
-                return;
             }
-            renderIdlePairingState("No active PIN", "--");
+            if (modalQrBox) {
+                modalQrBox.classList.remove("qr-active");
+                modalQrBox.innerHTML = `<span class="text-xs text-muted text-center">Core Offline</span>`;
+            }
+            renderIdlePairingState("Unavailable", "--", true);
             return;
         }
 
-        lastPairingSnapshotHasActivePin = true;
-        const svgMarkup = res?.svg || res?.qr_svg || res?.data?.svg;
         if (svgMarkup) {
             if (qrBox) {
                 qrBox.classList.add("qr-active");
@@ -2659,28 +2740,50 @@
                 modalQrBox.classList.add("qr-active");
                 modalQrBox.innerHTML = svgMarkup;
             }
-        } else {
+        } else if (fpVal) {
             qrBox?.classList.remove("qr-active");
             modalQrBox?.classList.remove("qr-active");
         }
 
+        const pinVal = res?.data?.pin || res?.pin || "";
+        const hasActivePin = Boolean(
+            pinVal && (isActiveGeneration || dataObj?.has_active_pin === true)
+        );
+
+        if (!hasActivePin) {
+            renderIdlePairingState("No active PIN", "--", true);
+            return;
+        }
+
+        lastPairingSnapshotHasActivePin = true;
         const fmtPin = pinVal.length === 6 ? `${pinVal.slice(0, 3)} ${pinVal.slice(3)}` : pinVal;
         if (pinEl) pinEl.textContent = fmtPin;
         if (modalPinEl) modalPinEl.textContent = fmtPin;
         cancelBtn?.classList.remove("d-none");
+        modalCancelBtn?.classList.remove("d-none");
+        progWrap?.classList.remove("d-none");
+        modalProgWrap?.classList.remove("d-none");
 
         let remaining = Number.isFinite(Number(dataObj?.remaining_seconds))
             ? Math.max(1, Math.round(Number(dataObj.remaining_seconds)))
             : 60;
-        if (countdownEl) countdownEl.textContent = `${remaining}s`;
+        const setProgressWidth = (sec) => {
+            const pct = Math.max(0, Math.min(100, (sec / 60) * 100));
+            if (progFill) progFill.style.width = `${pct.toFixed(1)}%`;
+            if (modalProgFill) modalProgFill.style.width = `${pct.toFixed(1)}%`;
+            if (countdownEl) countdownEl.textContent = `${Math.max(0, sec)}s`;
+            if (modalCountdownEl) modalCountdownEl.textContent = `${Math.max(0, sec)}s`;
+        };
+        setProgressWidth(remaining);
         if (qrCountdownTimer) clearInterval(qrCountdownTimer);
         qrCountdownTimer = setInterval(() => {
             remaining--;
-            if (countdownEl) countdownEl.textContent = `${Math.max(0, remaining)}s`;
+            setProgressWidth(remaining);
             if (remaining <= 0) {
                 clearInterval(qrCountdownTimer);
                 qrCountdownTimer = null;
-                renderIdlePairingState("Expired", "0s");
+                renderIdlePairingState("No active PIN", "--", true);
+                refreshPairingState().catch(() => {});
             }
         }, 1000);
     }
@@ -2692,17 +2795,22 @@
 
     async function cancelPairingPin() {
         const res = await apiRequest("/api/pair/cancel", "POST", {});
-        renderIdlePairingState("No active PIN", "--");
+        renderIdlePairingState("No active PIN", "--", true);
         if (res && res.success) {
             showNotificationToast("Pairing PIN cancelled.", "info");
         }
+        await refreshPairingState();
     }
 
     async function loadPairingQR() {
         const snowIdEl = document.getElementById("pairing-snow-id");
+        const modalSnowEl = document.getElementById("modal-snow-id");
+        const netIdEl = document.getElementById("pairing-network-id");
         const modalNetEl = document.getElementById("modal-network-id");
         if (snowIdEl) snowIdEl.textContent = canonicalSnowId;
-        if (modalNetEl) modalNetEl.textContent = canonicalSnowId;
+        if (modalSnowEl) modalSnowEl.textContent = canonicalSnowId;
+        if (netIdEl) netIdEl.textContent = activeMeshNetworkId || "Standalone";
+        if (modalNetEl) modalNetEl.textContent = activeMeshNetworkId || "Standalone";
 
         const res = await apiRequest("/api/pair/qr", "POST", { trust_tier: "owner" });
         const svgMarkup = res?.svg || res?.qr_svg || res?.data?.svg;
@@ -2713,7 +2821,7 @@
             return true;
         }
         applyPairingState(res, false);
-        showNotificationToast(res?.error || "Failed generating pairing QR & PIN", "error");
+        showNotificationToast(res?.error || "Failed generating pairing PIN & QR", "error");
         return false;
     }
 
@@ -3780,6 +3888,17 @@
     // 10. View 5: AI & Settings
     // =========================================================================
 
+    function clearRevealedRecoveryKey() {
+        const revealBox = document.getElementById("recovery-key-reveal-box");
+        const secretOut = document.getElementById("recovery-key-secret-output");
+        const copyBtn = document.getElementById("btn-recovery-copy-manual");
+        const revealBtn = document.getElementById("btn-recovery-reveal-confirm");
+        if (secretOut) secretOut.textContent = "";
+        revealBox?.classList.add("d-none");
+        copyBtn?.classList.add("d-none");
+        revealBtn?.classList.remove("d-none");
+    }
+
     function initAiSettingsView() {
         document.getElementById("btn-mcp-test-local")?.addEventListener("click", async (e) => {
             await withButtonLoading(e.currentTarget, "Testing...", async () => {
@@ -3797,7 +3916,6 @@
             { id: "btn-setup-chatgpt", host: "chatgpt" },
             { id: "btn-setup-gemini", host: "gemini" },
             { id: "btn-setup-antigravity", host: "antigravity" },
-            { id: "btn-setup-cursor", host: "cursor" },
         ];
         hostMappings.forEach(({ id, host }) => {
             document.getElementById(id)?.addEventListener("click", async (e) => {
@@ -3813,33 +3931,35 @@
             });
         });
 
-        // Remote AI Link Start / Stop / Copy Link / Show QR
-        document.getElementById("btn-mcp-tunnel-start")?.addEventListener("click", async (e) => {
-            await withButtonLoading(e.currentTarget, "Starting...", async () => {
-                const provider = document.getElementById("mcp-tunnel-provider")?.value || "render";
-                const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || undefined;
-                const payload = { provider };
-                if (domain) payload.custom_url = domain;
-                const res = await apiRequest("/api/mcp/tunnel/start", "POST", payload, { timeoutMs: 15000 });
-                if (res && res.success) {
-                    showNotificationToast("Remote AI Link online!", "success");
+        // Top-Level Remote AI Link Toggle (ON by default)
+        const chkMcpTunnel = document.getElementById("chk-mcp-tunnel-toggle");
+        chkMcpTunnel?.addEventListener("change", async () => {
+            chkMcpTunnel.disabled = true;
+            try {
+                if (chkMcpTunnel.checked) {
+                    const provider = document.getElementById("mcp-tunnel-provider")?.value || "render";
+                    const domain = document.getElementById("mcp-tunnel-permanent-input")?.value.trim() || undefined;
+                    const payload = { provider };
+                    if (domain) payload.custom_url = domain;
+                    const res = await apiRequest("/api/mcp/tunnel/start", "POST", payload, { timeoutMs: 15000 });
+                    if (res && res.success) {
+                        showNotificationToast("Remote AI Link active!", "success");
+                    } else {
+                        showNotificationToast(res?.error || "Remote AI Link waiting on Render Hub", "warning");
+                    }
                 } else {
-                    showNotificationToast(res?.error || "Failed starting Remote AI Link", "error");
+                    const res = await apiRequest("/api/mcp/tunnel/stop", "POST", {});
+                    if (res && res.success) {
+                        showNotificationToast("Remote AI Link turned off.", "info");
+                    } else {
+                        chkMcpTunnel.checked = true;
+                        showNotificationToast(res?.error || "Failed stopping Remote AI Link", "error");
+                    }
                 }
                 await loadAiTunnelStatus();
-            });
-        });
-
-        document.getElementById("btn-mcp-tunnel-stop")?.addEventListener("click", async (e) => {
-            await withButtonLoading(e.currentTarget, "Stopping...", async () => {
-                const res = await apiRequest("/api/mcp/tunnel/stop", "POST", {});
-                if (res && res.success) {
-                    showNotificationToast("Remote AI Link stopped.", "info");
-                } else {
-                    showNotificationToast(res?.error || "Failed stopping Remote AI Link", "error");
-                }
-                await loadAiTunnelStatus();
-            });
+            } finally {
+                chkMcpTunnel.disabled = false;
+            }
         });
 
         document.getElementById("btn-mcp-copy-url")?.addEventListener("click", () => {
@@ -3847,10 +3967,34 @@
             const activeUrl = inp ? inp.value.trim() : "";
             if (activeUrl) {
                 navigator.clipboard?.writeText(activeUrl).catch(() => {});
-                showNotificationToast("Copied active Remote AI Link!", "success");
+                showNotificationToast("Copied Remote AI Link!", "success");
             } else {
-                showNotificationToast("Start Remote AI Link first.", "warning");
+                showNotificationToast("Remote AI Link URL is not ready yet.", "warning");
             }
+        });
+
+        document.getElementById("btn-refresh-oauth-clients")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Refreshing...", loadAuthorizedOAuthClients);
+        });
+
+        // Recovery Modals Openers
+        document.getElementById("btn-recovery-open-export")?.addEventListener("click", () => {
+            clearRevealedRecoveryKey();
+            document.getElementById("recovery-key-modal")?.classList.remove("d-none");
+        });
+        document.getElementById("btn-recovery-open-backup")?.addEventListener("click", () => {
+            const passInp = document.getElementById("recovery-backup-passphrase");
+            if (passInp) passInp.value = "";
+            document.getElementById("recovery-backup-modal")?.classList.remove("d-none");
+        });
+        document.getElementById("btn-recovery-open-restore")?.addEventListener("click", () => {
+            const inp = document.getElementById("recovery-restore-input");
+            const pass = document.getElementById("recovery-restore-passphrase");
+            const chk = document.getElementById("chk-recovery-restore-confirm");
+            if (inp) inp.value = "";
+            if (pass) pass.value = "";
+            if (chk) chk.checked = false;
+            document.getElementById("recovery-restore-modal")?.classList.remove("d-none");
         });
 
         document.getElementById("btn-mcp-tunnel-save")?.addEventListener("click", async (e) => {
@@ -3914,7 +4058,7 @@
             await withButtonLoading(e.currentTarget, "Loading...", async () => {
                 const res = await apiRequest("/api/mcp/tunnel/qr");
                 const container = document.getElementById("mcp-qr-svg-container");
-                if (res && res.success && res.active && res.svg && qrModal) {
+                if (res && res.success && res.svg && qrModal) {
                     if (container) {
                         container.classList.add("qr-active");
                         container.innerHTML = res.svg;
@@ -3926,7 +4070,7 @@
                         container.classList.remove("qr-active");
                         container.innerHTML = `<span class="text-xs text-muted text-center">No active QR</span>`;
                     }
-                    showNotificationToast("Start Remote AI Link to display active QR.", "warning");
+                    showNotificationToast(res?.error || "Remote AI Link QR unavailable.", "warning");
                 }
             });
         });
@@ -3952,13 +4096,6 @@
             if (val && val !== "--") {
                 navigator.clipboard?.writeText(val).catch(() => {});
                 showNotificationToast("Copied My Network ID!", "success");
-            }
-        });
-        document.getElementById("btn-copy-diag-ai-url")?.addEventListener("click", () => {
-            const val = document.getElementById("diag-remote-ai-url")?.textContent?.trim() || "";
-            if (val && val !== "--") {
-                navigator.clipboard?.writeText(val).catch(() => {});
-                showNotificationToast("Copied Remote AI Link URL!", "success");
             }
         });
 
@@ -4066,8 +4203,48 @@
             loadAiTunnelStatus(),
             loadRelayTunnelStatus(),
             loadApprovals(),
-            loadActivityTimeline(),
+            loadAuthorizedOAuthClients(),
         ]);
+    }
+
+    async function loadAuthorizedOAuthClients() {
+        const container = document.getElementById("oauth-clients-list-container");
+        const emptyState = document.getElementById("oauth-clients-empty-state");
+        const badge = document.getElementById("oauth-clients-count-badge");
+        const res = await apiRequest("/api/mcp/oauth/clients");
+        const clients = (res && res.success && Array.isArray(res.clients)) ? res.clients : [];
+
+        if (badge) badge.textContent = String(clients.length);
+        if (!container) return;
+        container.innerHTML = "";
+        if (clients.length === 0) {
+            emptyState?.classList.remove("d-none");
+            return;
+        }
+        emptyState?.classList.add("d-none");
+
+        clients.forEach(c => {
+            const row = document.createElement("div");
+            row.className = "notif-card";
+            const cid = String(c.client_id || "");
+            const cname = String(c.client_name || cid || "AI Client");
+            const scopeStr = String(c.scope || "snow:mcp");
+            const tokCnt = Number(c.active_token_count || 0);
+            row.innerHTML = `
+                <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs font-bold text-primary truncate">${escapeHtml(cname)}</span>
+                    <span class="chip chip-sm ${tokCnt > 0 ? "chip-emerald" : "chip-neutral"}">${tokCnt} active token${tokCnt === 1 ? "" : "s"}</span>
+                </div>
+                <span class="text-xs text-muted mono truncate">${escapeHtml(scopeStr)} • ${escapeHtml(cid)}</span>
+                <div class="flex justify-end mt-1">
+                    <button class="btn btn-xs btn-danger btn-radius-md btn-revoke-oauth-client" type="button">Revoke</button>
+                </div>
+            `;
+            row.querySelector(".btn-revoke-oauth-client").onclick = () => {
+                openOAuthRevokeConfirmModal(cid, cname);
+            };
+            container.appendChild(row);
+        });
     }
 
     async function loadAiHostStatus() {
@@ -4084,14 +4261,14 @@
     }
 
     async function loadAiTunnelStatus() {
-        const [statusRes, cfgRes, hubRes] = await Promise.all([
+        const [statusRes, cfgRes, hubRes, devIdRes] = await Promise.all([
             apiRequest("/api/mcp/tunnel/status"),
             apiRequest("/api/mcp/tunnel/config"),
             apiRequest("/api/settings/hub"),
+            apiRequest("/api/identity/device"),
         ]);
         const statusBadge = document.getElementById("mcp-tunnel-status");
-        const btnStart = document.getElementById("btn-mcp-tunnel-start");
-        const btnStop = document.getElementById("btn-mcp-tunnel-stop");
+        const chkTunnel = document.getElementById("chk-mcp-tunnel-toggle");
         const btnCopy = document.getElementById("btn-mcp-copy-url");
         const btnShowQr = document.getElementById("btn-mcp-tunnel-show-qr");
         const urlInput = document.getElementById("mcp-tunnel-url-display");
@@ -4104,16 +4281,21 @@
         const selectedProvider = cfg.provider || "render";
         if (providerSel) providerSel.value = selectedProvider;
         if (netBadge && hubRes?.network_id) netBadge.textContent = hubRes.network_id;
+        if (devIdRes?.snow_id) canonicalSnowId = devIdRes.snow_id;
         const diagSnowEl = document.getElementById("diag-my-snow-id");
         const diagNetEl = document.getElementById("diag-my-network-id");
-        const diagAiEl = document.getElementById("diag-remote-ai-url");
         if (diagSnowEl) diagSnowEl.textContent = canonicalSnowId || "--";
-        if (diagNetEl) diagNetEl.textContent = activeMeshNetworkId || (activeMeshNetworkFormed ? "--" : "Standalone");
-        const activeEndpointPreview = (statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url))
+        if (diagNetEl) diagNetEl.textContent = activeMeshNetworkId || "Standalone";
+
+        const configuredRenderRoute = statusRes?.configured_render_url || devIdRes?.permanent_mcp_url || "";
+        const isPrefEnabled = statusRes?.enabled !== false;
+        const isActive = Boolean(statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url));
+        const activeEndpointPreview = (isActive && (statusRes.mcp_endpoint || statusRes.public_url))
             ? (statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`)
-            : "";
-        if (diagAiEl) {
-            diagAiEl.textContent = activeEndpointPreview || statusRes?.configured_render_url || hubRes?.permanent_mcp_url || "--";
+            : configuredRenderRoute;
+
+        if (chkTunnel && document.activeElement !== chkTunnel) {
+            chkTunnel.checked = isPrefEnabled;
         }
         if (permUrlInput && document.activeElement !== permUrlInput) {
             permUrlInput.value = cfg.default_hub_url || cfg.mcp_public_url || cfg.public_url || "";
@@ -4129,52 +4311,29 @@
             }
         }
 
-        const configuredRenderRoute = statusRes?.configured_render_url || hubRes?.permanent_mcp_url || "";
-        const isPrefEnabled = statusRes?.enabled !== false;
-        const isActive = Boolean(statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url));
-
         if (isActive) {
-            const activeEndpoint = statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`;
             if (statusBadge) {
                 statusBadge.textContent = "Active • 60 Tools Ready";
                 statusBadge.className = "chip chip-emerald";
             }
-            if (btnStart) btnStart.disabled = true;
-            if (btnStop) btnStop.disabled = false;
-            if (btnCopy) btnCopy.disabled = false;
-            if (btnShowQr) btnShowQr.disabled = false;
-            if (urlInput) {
-                urlInput.value = activeEndpoint;
-                urlInput.placeholder = configuredRenderRoute || activeEndpoint;
-            }
         } else if (isPrefEnabled) {
-            const transientErr = statusRes?.last_error ? "Enabled • Reconnecting to Render Hub" : "Starting Remote AI Link...";
             if (statusBadge) {
-                statusBadge.textContent = transientErr;
+                statusBadge.textContent = statusRes?.last_error ? "Reconnecting" : "Starting...";
                 statusBadge.className = "chip chip-amber";
-            }
-            if (btnStart) btnStart.disabled = false;
-            if (btnStop) btnStop.disabled = false;
-            if (btnCopy) btnCopy.disabled = !configuredRenderRoute;
-            if (btnShowQr) btnShowQr.disabled = true;
-            if (urlInput) {
-                urlInput.value = "";
-                urlInput.placeholder = configuredRenderRoute || "Connecting Remote AI Link to Render Hub...";
             }
         } else {
             if (statusBadge) {
-                statusBadge.textContent = "Stopped";
+                statusBadge.textContent = "Off";
                 statusBadge.className = "chip chip-neutral";
             }
-            if (btnStart) btnStart.disabled = false;
-            if (btnStop) btnStop.disabled = true;
-            if (btnCopy) btnCopy.disabled = true;
-            if (btnShowQr) btnShowQr.disabled = true;
-            if (urlInput) {
-                urlInput.value = "";
-                urlInput.placeholder = configuredRenderRoute || "Start Remote AI Link to activate your Render Hub endpoint";
-            }
         }
+
+        if (urlInput) {
+            urlInput.value = activeEndpointPreview || "";
+            urlInput.placeholder = configuredRenderRoute || "https://snow-relay.onrender.com/u/SNW-.../mcp";
+        }
+        if (btnCopy) btnCopy.disabled = !activeEndpointPreview;
+        if (btnShowQr) btnShowQr.disabled = !activeEndpointPreview;
     }
 
     async function loadApprovals() {
@@ -4403,7 +4562,12 @@
                 document.getElementById("notif-reply-modal")?.classList.add("d-none");
                 document.getElementById("share-link-modal")?.classList.add("d-none");
                 document.getElementById("mcp-qr-modal")?.classList.add("d-none");
-                document.getElementById("killswitch-modal")?.classList.add("d-none");
+                document.getElementById("oauth-revoke-modal")?.classList.add("d-none");
+                document.getElementById("network-merge-decision-modal")?.classList.add("d-none");
+                document.getElementById("recovery-key-modal")?.classList.add("d-none");
+                document.getElementById("recovery-backup-modal")?.classList.add("d-none");
+                document.getElementById("recovery-restore-modal")?.classList.add("d-none");
+                clearRevealedRecoveryKey();
                 document.getElementById("device-island-container")?.classList.add("d-none");
             }
         });
@@ -4446,21 +4610,58 @@
     // 12. Global Modals (Connect, Peer Host, Share/Add Note, Media, Reply)
     // =========================================================================
 
+    let pendingOAuthRevokeClient = null;
+
+    function openOAuthRevokeConfirmModal(clientId, clientName) {
+        pendingOAuthRevokeClient = { clientId, clientName };
+        const modal = document.getElementById("oauth-revoke-modal");
+        const msgEl = document.getElementById("oauth-revoke-message");
+        if (msgEl) {
+            msgEl.textContent = `Revoking ${clientName} (${clientId}) immediately invalidates all issued access tokens, refresh tokens, and token families.`;
+        }
+        modal?.classList.remove("d-none");
+    }
+
     function initModals() {
         const connectModal = document.getElementById("connect-modal");
         document.getElementById("btn-close-connect-modal")?.addEventListener("click", () => connectModal?.classList.add("d-none"));
 
+        document.getElementById("btn-copy-modal-snowid")?.addEventListener("click", () => {
+            const val = document.getElementById("modal-snow-id")?.textContent || canonicalSnowId;
+            if (val && val !== "--") {
+                navigator.clipboard?.writeText(val).catch(() => {});
+                showNotificationToast(`Copied My SNOW ID: ${val}`, "success");
+            }
+        });
+
         document.getElementById("btn-copy-modal-netid")?.addEventListener("click", () => {
-            const val = document.getElementById("modal-network-id")?.textContent || canonicalSnowId;
+            const val = document.getElementById("modal-network-id")?.textContent || activeMeshNetworkId || "Standalone";
             navigator.clipboard?.writeText(val).catch(() => {});
             showNotificationToast(`Copied ${val}`, "success");
         });
 
         document.getElementById("btn-modal-connect-submit")?.addEventListener("click", async () => {
             const val = document.getElementById("modal-connect-input")?.value.trim();
+            const pin = document.getElementById("modal-connect-pin-input")?.value.trim() || "";
             if (!val) return;
             connectModal?.classList.add("d-none");
-            await handleUnifiedConnectInput(val);
+            await handleUnifiedConnectInput(val, pin);
+        });
+
+        document.getElementById("btn-modal-validate-qr")?.addEventListener("click", async () => {
+            const rawQr = document.getElementById("modal-qr-json-input")?.value.trim() || "";
+            await validateQrJsonInput(rawQr, "modal-qr-json-preview");
+        });
+        document.getElementById("btn-modal-accept-qr")?.addEventListener("click", async (e) => {
+            const rawQr = document.getElementById("modal-qr-json-input")?.value.trim() || "";
+            await withButtonLoading(e.currentTarget, "Connecting...", async () => {
+                const ok = await acceptQrJsonInput(rawQr, "modal-qr-json-preview");
+                if (ok) {
+                    const inp = document.getElementById("modal-qr-json-input");
+                    if (inp) inp.value = "";
+                    connectModal?.classList.add("d-none");
+                }
+            });
         });
 
         document.getElementById("btn-connect-peer-submit")?.addEventListener("click", async () => {
@@ -4482,10 +4683,159 @@
             if (res && res.success) {
                 showNotificationToast("Connected to peer host!", "success");
                 connectModal?.classList.add("d-none");
+                if (res.data?.network_conflict && res.data?.merge_tx_id) {
+                    openMergeDecisionModal(res.data);
+                }
                 refreshAllData();
             } else {
                 showNotificationToast(res?.error || "Peer host connection failed", "error");
             }
+        });
+
+        document.getElementById("btn-close-merge-modal")?.addEventListener("click", () => {
+            document.getElementById("network-merge-decision-modal")?.classList.add("d-none");
+        });
+
+        // OAuth Client Revoke Modal
+        const closeOAuthRevoke = () => {
+            pendingOAuthRevokeClient = null;
+            document.getElementById("oauth-revoke-modal")?.classList.add("d-none");
+        };
+        document.getElementById("btn-close-oauth-revoke")?.addEventListener("click", closeOAuthRevoke);
+        document.getElementById("btn-oauth-revoke-cancel")?.addEventListener("click", closeOAuthRevoke);
+        document.getElementById("btn-oauth-revoke-confirm")?.addEventListener("click", async (e) => {
+            if (!pendingOAuthRevokeClient?.clientId) return;
+            const target = pendingOAuthRevokeClient;
+            await withButtonLoading(e.currentTarget, "Revoking...", async () => {
+                const res = await apiRequest("/api/mcp/oauth/clients/revoke", "POST", {
+                    client_id: target.clientId,
+                    confirm: true,
+                });
+                closeOAuthRevoke();
+                if (res && res.success) {
+                    showNotificationToast(`Revoked OAuth client ${target.clientName}.`, "warning");
+                    await loadAuthorizedOAuthClients();
+                    await loadAiTunnelStatus();
+                } else {
+                    showNotificationToast(res?.error || "Failed revoking OAuth client", "error");
+                }
+            });
+        });
+
+        // Cryptographic Identity Recovery Modals (Never auto-copy or store secret key)
+        const closeRecoveryKeyModal = () => {
+            clearRevealedRecoveryKey();
+            document.getElementById("recovery-key-modal")?.classList.add("d-none");
+        };
+        document.getElementById("btn-close-recovery-key-modal")?.addEventListener("click", closeRecoveryKeyModal);
+        document.getElementById("btn-recovery-close-key")?.addEventListener("click", closeRecoveryKeyModal);
+        document.getElementById("btn-recovery-reveal-confirm")?.addEventListener("click", async (e) => {
+            await withButtonLoading(e.currentTarget, "Exporting...", async () => {
+                const res = await apiRequest("/api/identity/recovery/export", "POST", { confirm: true });
+                if (res && res.success && res.recovery_key) {
+                    const revealBox = document.getElementById("recovery-key-reveal-box");
+                    const out = document.getElementById("recovery-key-secret-output");
+                    const copyBtn = document.getElementById("btn-recovery-copy-manual");
+                    if (out) out.textContent = res.recovery_key;
+                    revealBox?.classList.remove("d-none");
+                    copyBtn?.classList.remove("d-none");
+                    document.getElementById("btn-recovery-reveal-confirm")?.classList.add("d-none");
+                } else {
+                    showNotificationToast(res?.error || "Recovery key export failed.", "error");
+                }
+            });
+        });
+        document.getElementById("btn-recovery-copy-manual")?.addEventListener("click", () => {
+            const keyVal = document.getElementById("recovery-key-secret-output")?.textContent?.trim() || "";
+            if (keyVal) {
+                navigator.clipboard?.writeText(keyVal).catch(() => {});
+                showNotificationToast("Copied recovery key to clipboard. Store offline immediately.", "warning");
+            }
+        });
+        window.addEventListener("beforeunload", clearRevealedRecoveryKey);
+        document.addEventListener("visibilitychange", () => {
+            if (document.hidden) clearRevealedRecoveryKey();
+        });
+
+        const closeBackupModal = () => {
+            const passInp = document.getElementById("recovery-backup-passphrase");
+            if (passInp) passInp.value = "";
+            document.getElementById("recovery-backup-modal")?.classList.add("d-none");
+        };
+        document.getElementById("btn-close-recovery-backup-modal")?.addEventListener("click", closeBackupModal);
+        document.getElementById("btn-recovery-backup-cancel")?.addEventListener("click", closeBackupModal);
+        document.getElementById("btn-recovery-backup-download")?.addEventListener("click", async (e) => {
+            const passInp = document.getElementById("recovery-backup-passphrase");
+            const passphrase = passInp ? passInp.value : "";
+            if (!passphrase || passphrase.length < 10) {
+                showNotificationToast("Passphrase must be at least 10 characters.", "warning");
+                return;
+            }
+            await withButtonLoading(e.currentTarget, "Encrypting...", async () => {
+                const res = await apiRequest("/api/identity/recovery/export", "POST", {
+                    confirm: true,
+                    passphrase,
+                });
+                if (res && res.success && res.encrypted_backup_json) {
+                    const blob = new Blob([res.encrypted_backup_json + "\n"], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${res.snow_id || canonicalSnowId || "snow-device"}-backup.snowkey.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    closeBackupModal();
+                    showNotificationToast(`Downloaded encrypted backup for ${res.snow_id || canonicalSnowId}.`, "success");
+                } else {
+                    showNotificationToast(res?.error || "Encrypted backup export failed.", "error");
+                }
+            });
+        });
+
+        const closeRestoreModal = () => {
+            const inp = document.getElementById("recovery-restore-input");
+            const pass = document.getElementById("recovery-restore-passphrase");
+            const chk = document.getElementById("chk-recovery-restore-confirm");
+            if (inp) inp.value = "";
+            if (pass) pass.value = "";
+            if (chk) chk.checked = false;
+            document.getElementById("recovery-restore-modal")?.classList.add("d-none");
+        };
+        document.getElementById("btn-close-recovery-restore-modal")?.addEventListener("click", closeRestoreModal);
+        document.getElementById("btn-recovery-restore-cancel")?.addEventListener("click", closeRestoreModal);
+        document.getElementById("btn-recovery-restore-submit")?.addEventListener("click", async (e) => {
+            const rawIn = document.getElementById("recovery-restore-input")?.value.trim() || "";
+            const pass = document.getElementById("recovery-restore-passphrase")?.value || "";
+            const confirmed = Boolean(document.getElementById("chk-recovery-restore-confirm")?.checked);
+            if (!confirmed) {
+                showNotificationToast("Confirm trust reset checkbox before restoring identity.", "warning");
+                return;
+            }
+            if (!rawIn) {
+                showNotificationToast("Paste a SNW-REC-V1 recovery key or encrypted backup JSON.", "warning");
+                return;
+            }
+            await withButtonLoading(e.currentTarget, "Restoring...", async () => {
+                const payload = rawIn.startsWith("{")
+                    ? { backup_json: rawIn, passphrase: pass, confirm: true }
+                    : { recovery_key: rawIn, confirm: true };
+                const res = await apiRequest("/api/identity/recovery/restore", "POST", payload);
+                if (res && res.success) {
+                    closeRestoreModal();
+                    if (res.snow_id) canonicalSnowId = res.snow_id;
+                    showNotificationToast(
+                        `Restored identity ${res.snow_id}. Prior trust wiped (${res.gateway_takeover || "OK"}).`,
+                        "success"
+                    );
+                    await refreshAllData();
+                    await loadAiTunnelStatus();
+                    await loadAuthorizedOAuthClients();
+                } else {
+                    showNotificationToast(res?.error || "Identity restore failed.", "error");
+                }
+            });
         });
 
         document.getElementById("btn-close-media-preview")?.addEventListener("click", closeMediaPreview);
@@ -4506,6 +4856,12 @@
                 if (mediaModal && !mediaModal.classList.contains("d-none")) {
                     closeMediaPreview();
                 }
+                closeRecoveryKeyModal();
+                closeBackupModal();
+                closeRestoreModal();
+                closeOAuthRevoke();
+                document.getElementById("network-merge-decision-modal")?.classList.add("d-none");
+                document.getElementById("connect-modal")?.classList.add("d-none");
             }
         });
 

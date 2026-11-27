@@ -508,7 +508,8 @@ class TestDashboardScreenEndpoints(AioHTTPTestCase):
         self.assertNotIn('id="workflow-steps-details"', content)
         self.assertNotIn('id="workflow-steps-list"', content)
         self.assertIn('<details class="advanced-accordion">', content)
-        self.assertIn("Technical Ports &amp; Loopback Architecture", content)
+        self.assertIn("Advanced Settings", content)
+        self.assertIn(":8765 Control WSS", content)
 
 
 class TestPhase26AMultiProcessIntegration(AioHTTPTestCase):

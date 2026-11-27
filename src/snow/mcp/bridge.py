@@ -1436,6 +1436,13 @@ class SnowMcpBridge:
         port: int = 8765,
         pin: str = "",
         expected_fingerprint: str = "",
+        handshake_token: str = "",
+        network_id: Optional[str] = None,
+        client_network_id: Optional[str] = None,
+        network_decision: Optional[str] = None,
+        merge_tx_id: Optional[str] = None,
+        client_merge_approved: bool = False,
+        surviving_network_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Federate with another SNOW Desktop Core peer on the LAN."""
         if await self.daemon_manager.is_ipc_ready(timeout=0.1):
@@ -1446,6 +1453,13 @@ class SnowMcpBridge:
                     "port": port,
                     "pin": pin,
                     "expected_fingerprint": expected_fingerprint,
+                    "handshake_token": handshake_token,
+                    "network_id": network_id,
+                    "client_network_id": client_network_id,
+                    "network_decision": network_decision,
+                    "merge_tx_id": merge_tx_id,
+                    "client_merge_approved": client_merge_approved,
+                    "surviving_network_id": surviving_network_id,
                 },
                 timeout=15.0,
             )
@@ -1460,7 +1474,17 @@ class SnowMcpBridge:
             expected_fingerprint=expected_fingerprint or None,
             use_tls=True,
         )
-        res = await client.connect(pin=pin, timeout=10.0)
+        res = await client.connect(
+            pin=pin,
+            timeout=10.0,
+            handshake_token=handshake_token,
+            network_id=network_id,
+            client_network_id=client_network_id,
+            network_decision=network_decision,
+            merge_tx_id=merge_tx_id,
+            client_merge_approved=client_merge_approved,
+            surviving_network_id=surviving_network_id,
+        )
         if res.success and res.remote_device_id:
             remote_id = res.remote_device_id
             remote_name = res.remote_device_name or "Connected Peer"
@@ -1480,6 +1504,8 @@ class SnowMcpBridge:
                             last_known_host=host,
                             last_known_port=port,
                             capabilities_json=json.dumps(res.manifest or {}),
+                            network_id=getattr(res, "network_id", None),
+                            relationship=getattr(res, "relationship", "member") or "member",
                         )
                     else:
                         db_mgr.update_device_endpoint(remote_id, host, port)
@@ -1507,6 +1533,14 @@ class SnowMcpBridge:
                     "remote_device_name": res.remote_device_name,
                     "session_id": res.session_id,
                     "cert_fingerprint": res.cert_fingerprint,
+                    "remote_snow_id": getattr(res, "remote_snow_id", None),
+                    "network_id": getattr(res, "network_id", None),
+                    "network_action": getattr(res, "network_action", None),
+                    "network_conflict": bool(getattr(res, "network_conflict", False)),
+                    "relationship": getattr(res, "relationship", "member"),
+                    "merge_tx_id": getattr(res, "merge_tx_id", None),
+                    "host_network_id": getattr(res, "host_network_id", None),
+                    "client_network_id": getattr(res, "client_network_id", None),
                 },
             }
         else:

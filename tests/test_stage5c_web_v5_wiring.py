@@ -348,7 +348,10 @@ class TestStage5CFiveViewAndModalCoverage(unittest.TestCase):
         self.assertIn('id="poweroff-modal"', self.html)
         self.assertIn('id="media-preview-modal"', self.html)
         self.assertIn('id="notif-reply-modal"', self.html)
-        self.assertIn('id="killswitch-modal"', self.html)
+        self.assertIn('id="oauth-revoke-modal"', self.html)
+        self.assertIn('id="network-merge-decision-modal"', self.html)
+        self.assertIn('id="recovery-key-modal"', self.html)
+        self.assertNotIn('id="killswitch-modal"', self.html)
         self.assertIn('id="mcp-qr-modal"', self.html)
 
     def test_empty_states_present(self):

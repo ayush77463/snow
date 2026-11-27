@@ -1828,28 +1828,38 @@ class SnowWebSocketServer:
             await client.websocket.send(error_response.to_json())
             return
 
-        # Resolve canonical snow_id aliases (SNW-XXXX-XXXX) to exact device_id when known
+        # Resolve canonical snow_id aliases (SNW-XXXX-XXXX) including legacy UUID-seeded aliases
         local_id = self.device_identity.device_id
-        from snow.security.identity import generate_snow_id
-        local_snow_id = ""
+        from snow.security.identity import generate_snow_id, resolve_canonical_device_snow_id
+        local_snow_id, local_legacy_snow = resolve_canonical_device_snow_id(
+            fallback_identity=self.device_identity,
+        )
+        local_aliases = {local_snow_id}
+        if local_legacy_snow:
+            local_aliases.add(local_legacy_snow)
         if getattr(self, "db_manager", None) is not None and hasattr(self.db_manager, "get_setting"):
-            local_snow_id = str(self.db_manager.get_setting("device_snow_id") or "").strip().upper()
-        if not local_snow_id:
-            local_snow_id = str(getattr(self.device_identity, "snow_id", "") or "").strip().upper() or generate_snow_id(seed=local_id).upper()
+            db_local_snow = str(self.db_manager.get_setting("device_snow_id") or "").strip().upper()
+            if db_local_snow:
+                local_aliases.add(db_local_snow)
 
-        if target_device_id.upper() == local_snow_id and local_snow_id:
+        if target_device_id.upper() in local_aliases:
             target_device_id = local_id
         elif target_device_id != local_id and getattr(self, "db_manager", None) is not None:
-            target_upper = target_device_id.upper()
-            for rec in self.db_manager.list_paired_devices():
-                rec_snow = (
-                    str(getattr(rec, "snow_id", "") or "").strip().upper()
-                    or str(self.db_manager.get_setting(f"device_snow_id:{rec.device_id}") or "").strip().upper()
-                    or generate_snow_id(seed=rec.device_id).upper()
-                )
-                if rec.device_id == target_device_id or (rec_snow and rec_snow == target_upper):
-                    target_device_id = rec.device_id
-                    break
+            if hasattr(self.db_manager, "find_paired_device_by_identifier"):
+                matched_rec = self.db_manager.find_paired_device_by_identifier(target_device_id)
+                if matched_rec is not None:
+                    target_device_id = matched_rec.device_id
+            else:
+                target_upper = target_device_id.upper()
+                for rec in self.db_manager.list_paired_devices():
+                    rec_snow = (
+                        str(getattr(rec, "snow_id", "") or "").strip().upper()
+                        or str(self.db_manager.get_setting(f"device_snow_id:{rec.device_id}") or "").strip().upper()
+                        or generate_snow_id(seed=rec.device_id).upper()
+                    )
+                    if rec.device_id == target_device_id or (rec_snow and rec_snow == target_upper):
+                        target_device_id = rec.device_id
+                        break
 
         # Payload size boundary check (64KB boundary limit)
         raw_payload_len = len(json.dumps(relay_data)) if relay_data else 0
@@ -2508,10 +2518,13 @@ class SnowWebSocketServer:
         )
         host_network_id = active_net.get("network_id") if active_net else None
 
+        from snow.security.identity import resolve_canonical_device_snow_id
+        host_canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=self.device_identity)
+
         auth_data = {
             "device_id": device_id,
             "server_device_id": self.device_identity.device_id,
-            "snow_id": self.device_identity.snow_id,
+            "snow_id": host_canonical_snow,
             "device_name": self.device_identity.device_name,
             "session_id": session.session_id,
             "trust_tier": device_record.trust_tier,
@@ -2791,6 +2804,16 @@ class SnowWebSocketServer:
                     network_id=paired_net_id,
                     relationship=paired_rel,
                 )
+                try:
+                    from snow.security.identity import generate_snow_id, is_valid_snow_id
+                    client_canonical_snow = str(data.get("snow_id") or "").strip().upper()
+                    legacy_client_snow = generate_snow_id(seed=client_device_id).upper()
+                    if is_valid_snow_id(client_canonical_snow):
+                        self.db_manager.set_setting(f"device_snow_id:{client_device_id}", client_canonical_snow)
+                        if legacy_client_snow != client_canonical_snow:
+                            self.db_manager.set_setting(f"device_legacy_snow_id:{client_device_id}", legacy_client_snow)
+                except Exception:
+                    pass
                 if resp_network_id and getattr(self, "federation_manager", None):
                     self.federation_manager.local_network_id = resp_network_id
                 self.db_manager.log_audit_event(
@@ -2833,12 +2856,14 @@ class SnowWebSocketServer:
                     timer.cancel()
 
                 from snow.network.node import build_windows_manifest
+                from snow.security.identity import resolve_canonical_device_snow_id
                 pair_profile = self._resolve_authoritative_permission_profile(client_device_id)
+                host_canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=self.device_identity)
 
                 pair_data = {
                     "device_id": self.device_identity.device_id,
                     "server_device_id": self.device_identity.device_id,
-                    "snow_id": self.device_identity.snow_id,
+                    "snow_id": host_canonical_snow,
                     "device_name": self.device_identity.device_name,
                     "session_id": result.session_id,
                     "auth_token": auth_token,

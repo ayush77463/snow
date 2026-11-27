@@ -318,6 +318,7 @@ class OAuthServer:
         redirect_uris: Optional[list[str]] = None,
         scope: str = "snow:mcp",
         is_confidential: bool = False,
+        owner_snow_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Perform Dynamic Client Registration (RFC 7591) with SQLite persistence."""
         client_id = f"snow_client_{secrets.token_hex(12)}"
@@ -325,6 +326,13 @@ class OAuthServer:
         client_secret_hash = hash_token(client_secret) if client_secret else None
         now = time.time()
         uris = redirect_uris or ["http://localhost", "http://127.0.0.1", "urn:ietf:wg:oauth:2.0:oob"]
+        resolved_owner = (owner_snow_id or "").strip().upper() or None
+        if not resolved_owner:
+            try:
+                from snow.security.identity import resolve_canonical_device_snow_id
+                resolved_owner, _ = resolve_canonical_device_snow_id()
+            except Exception:
+                resolved_owner = None
 
         self.db_manager.save_oauth_client(
             client_id=client_id,
@@ -334,6 +342,7 @@ class OAuthServer:
             client_secret_hash=client_secret_hash,
             is_confidential=is_confidential,
             created_at=now,
+            owner_snow_id=resolved_owner,
         )
         logger.info("Registered dynamic OAuth client: %s (%s)", client_name, client_id)
 
@@ -556,6 +565,22 @@ class OAuthServer:
             return False
         tok_hash = hash_token(token)
         return self.db_manager.revoke_oauth_token(tok_hash)
+
+    def list_clients(self, owner_snow_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """List registered OAuth 2.1 AI clients bound to this device identity."""
+        return self.db_manager.list_oauth_clients(owner_snow_id=owner_snow_id)
+
+    def revoke_client(self, client_id: str, owner_snow_id: Optional[str] = None) -> dict[str, Any]:
+        """Revoke a specific OAuth client and invalidate all of its tokens and families."""
+        self._cimd_cache.pop(client_id, None)
+        return self.db_manager.revoke_oauth_client(client_id, owner_snow_id=owner_snow_id)
+
+    def revoke_all_on_recovery(self) -> dict[str, int]:
+        """Wipe all OAuth clients, tokens, auth codes, and cached CIMD state during identity recovery."""
+        self._cimd_cache.clear()
+        summary = self.db_manager.revoke_all_oauth_sessions()
+        logger.warning("Revoked all OAuth clients and token families on device identity recovery: %s", summary)
+        return summary
 
     def validate_access_token(self, access_token: str) -> Optional[TokenRecord]:
         """Validate bearer access token, checking revocation and expiration."""

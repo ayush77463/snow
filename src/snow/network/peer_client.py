@@ -45,6 +45,7 @@ class PeerConnectionResult:
     merge_tx_id: Optional[str] = None
     host_network_id: Optional[str] = None
     client_network_id: Optional[str] = None
+    remote_snow_id: Optional[str] = None
 
 
 class SnowPeerClient:
@@ -176,8 +177,11 @@ class SnowPeerClient:
         # Perform authentication or pairing handshake
         try:
             if pin or handshake_token:
+                from snow.security.identity import resolve_canonical_device_snow_id
+                client_canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=self.identity)
                 pair_payload: dict[str, Any] = {
                     "device_id": self.identity.device_id,
+                    "snow_id": client_canonical_snow,
                     "device_name": self.identity.device_name,
                     "platform": "windows",
                     "device_type": "windows",
@@ -242,6 +246,7 @@ class SnowPeerClient:
                     merge_tx_id=data.get("merge_tx_id"),
                     host_network_id=data.get("host_network_id"),
                     client_network_id=data.get("client_network_id"),
+                    remote_snow_id=data.get("snow_id"),
                 )
 
             elif auth_token:

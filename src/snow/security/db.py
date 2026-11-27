@@ -459,9 +459,15 @@ class DatabaseManager:
                     redirect_uris_json TEXT NOT NULL DEFAULT '[]',
                     scope TEXT NOT NULL DEFAULT 'snow:mcp',
                     is_confidential INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL
+                    created_at REAL NOT NULL,
+                    owner_snow_id TEXT
                 );
             """)
+            oauth_client_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(oauth_clients);").fetchall()
+            }
+            if oauth_client_cols and "owner_snow_id" not in oauth_client_cols:
+                conn.execute("ALTER TABLE oauth_clients ADD COLUMN owner_snow_id TEXT;")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS oauth_auth_codes (
                     code_hash TEXT PRIMARY KEY,
@@ -1804,20 +1810,22 @@ class DatabaseManager:
         client_secret_hash: Optional[str] = None,
         is_confidential: bool = False,
         created_at: Optional[float] = None,
+        owner_snow_id: Optional[str] = None,
     ) -> None:
         """Persist or update an OAuth 2.1 client registration record."""
         now = created_at if created_at is not None else time.time()
         redirect_json = json.dumps(redirect_uris)
         conf_int = 1 if is_confidential else 0
+        clean_owner = str(owner_snow_id).strip().upper() if owner_snow_id else None
         with self._get_connection() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO oauth_clients (
                     client_id, client_name, client_secret_hash,
-                    redirect_uris_json, scope, is_confidential, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                    redirect_uris_json, scope, is_confidential, created_at, owner_snow_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
                 """,
-                (client_id, client_name, client_secret_hash, redirect_json, scope, conf_int, now),
+                (client_id, client_name, client_secret_hash, redirect_json, scope, conf_int, now, clean_owner),
             )
 
     def get_oauth_client(self, client_id: str) -> Optional[dict[str, Any]]:
@@ -1842,7 +1850,163 @@ class DatabaseManager:
                 "scope": row["scope"],
                 "is_confidential": bool(row["is_confidential"]),
                 "created_at": float(row["created_at"]),
+                "owner_snow_id": row["owner_snow_id"] if "owner_snow_id" in row.keys() else None,
             }
+
+    def list_oauth_clients(self, owner_snow_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """List registered OAuth clients with active token metadata, optionally scoped by owner SNOW ID."""
+        now = time.time()
+        clean_owner = str(owner_snow_id or "").strip().upper() or None
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    c.client_id,
+                    c.client_name,
+                    c.redirect_uris_json,
+                    c.scope,
+                    c.is_confidential,
+                    c.created_at,
+                    c.owner_snow_id,
+                    COALESCE(SUM(CASE WHEN t.revoked = 0 AND t.refresh_expires_at > ? THEN 1 ELSE 0 END), 0) AS active_token_count,
+                    MAX(CASE WHEN t.revoked = 0 AND t.refresh_expires_at > ? THEN t.created_at ELSE NULL END) AS last_token_at,
+                    MAX(CASE WHEN t.revoked = 0 AND t.expires_at > ? THEN t.expires_at ELSE NULL END) AS access_expires_at
+                FROM oauth_clients c
+                LEFT JOIN oauth_tokens t ON c.client_id = t.client_id
+                GROUP BY c.client_id
+                ORDER BY c.created_at DESC;
+                """,
+                (now, now, now),
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            row_owner = str(row["owner_snow_id"] or "").strip().upper() or None
+            if clean_owner and row_owner and row_owner != clean_owner:
+                continue
+            try:
+                redirect_uris = json.loads(row["redirect_uris_json"] or "[]")
+            except Exception:
+                redirect_uris = []
+            results.append({
+                "client_id": row["client_id"],
+                "client_name": row["client_name"],
+                "redirect_uris": redirect_uris,
+                "scope": row["scope"],
+                "is_confidential": bool(row["is_confidential"]),
+                "created_at": float(row["created_at"]),
+                "owner_snow_id": row_owner or clean_owner,
+                "active_token_count": int(row["active_token_count"] or 0),
+                "last_token_at": float(row["last_token_at"]) if row["last_token_at"] is not None else None,
+                "access_expires_at": float(row["access_expires_at"]) if row["access_expires_at"] is not None else None,
+            })
+        return results
+
+    def revoke_oauth_client(
+        self,
+        client_id: str,
+        owner_snow_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Revoke all tokens, auth codes, and registration state for an OAuth client."""
+        clean_id = (client_id or "").strip()
+        if not clean_id:
+            raise ValueError("client_id is required.")
+        clean_owner = str(owner_snow_id or "").strip().upper() or None
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT client_id, client_name, owner_snow_id FROM oauth_clients WHERE client_id = ?;",
+                (clean_id,),
+            ).fetchone()
+            if row is not None:
+                row_owner = str(row["owner_snow_id"] or "").strip().upper() or None
+                if clean_owner and row_owner and row_owner != clean_owner:
+                    raise PermissionError(
+                        f"OAuth client '{clean_id}' is bound to device '{row_owner}', not '{clean_owner}'."
+                    )
+
+            tok_cur = conn.execute(
+                "UPDATE oauth_tokens SET revoked = 1 WHERE client_id = ?;",
+                (clean_id,),
+            )
+            code_cur = conn.execute(
+                "DELETE FROM oauth_auth_codes WHERE client_id = ?;",
+                (clean_id,),
+            )
+            client_cur = conn.execute(
+                "DELETE FROM oauth_clients WHERE client_id = ?;",
+                (clean_id,),
+            )
+            found = (row is not None) or (tok_cur.rowcount > 0) or (code_cur.rowcount > 0)
+            summary = {
+                "found": bool(found),
+                "client_id": clean_id,
+                "client_name": row["client_name"] if row is not None else clean_id,
+                "tokens_revoked": int(tok_cur.rowcount or 0),
+                "codes_deleted": int(code_cur.rowcount or 0),
+                "client_deleted": int(client_cur.rowcount or 0),
+            }
+            if found:
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO activity_history (
+                            event_id, timestamp, event_type, capability, principal,
+                            target_device, outcome, details_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            f"act_{uuid.uuid4().hex}",
+                            current_utc_timestamp(),
+                            "oauth_client_revoked",
+                            "oauth_security",
+                            "OWNER_MANUAL",
+                            clean_id,
+                            "SUCCESS",
+                            json.dumps({
+                                "client_id": clean_id,
+                                "tokens_revoked": summary["tokens_revoked"],
+                                "codes_deleted": summary["codes_deleted"],
+                            }),
+                        ),
+                    )
+                except Exception:
+                    pass
+            return summary
+
+    def revoke_all_oauth_sessions(self) -> dict[str, int]:
+        """Revoke all OAuth clients, tokens, auth codes, and pending approval prompts."""
+        with self._lock, self._get_connection() as conn:
+            tok_cur = conn.execute("DELETE FROM oauth_tokens;")
+            code_cur = conn.execute("DELETE FROM oauth_auth_codes;")
+            client_cur = conn.execute("DELETE FROM oauth_clients;")
+            pend_cur = conn.execute(
+                "DELETE FROM app_settings WHERE key LIKE 'oauth_req:%' OR key LIKE 'oauth_dec:%';"
+            )
+            return {
+                "oauth_tokens": int(tok_cur.rowcount or 0),
+                "oauth_auth_codes": int(code_cur.rowcount or 0),
+                "oauth_clients": int(client_cur.rowcount or 0),
+                "pending_settings": int(pend_cur.rowcount or 0),
+            }
+
+    def find_paired_device_by_identifier(self, identifier: str) -> Optional[PairedDeviceRecord]:
+        """Resolve a paired device by UUID, stored snow_id, stored device_snow_id/legacy alias, or deterministic fallback."""
+        clean = (identifier or "").strip()
+        if not clean:
+            return None
+        clean_upper = clean.upper()
+        from snow.security.identity import generate_snow_id
+
+        for rec in self.list_paired_devices():
+            if rec.device_id == clean or str(rec.device_id).upper() == clean_upper:
+                return rec
+            rec_snow = str(getattr(rec, "snow_id", "") or "").strip().upper()
+            stored_snow = str(self.get_setting(f"device_snow_id:{rec.device_id}") or "").strip().upper()
+            stored_legacy = str(self.get_setting(f"device_legacy_snow_id:{rec.device_id}") or "").strip().upper()
+            det_snow = generate_snow_id(seed=rec.device_id).upper()
+            if clean_upper in {rec_snow, stored_snow, stored_legacy, det_snow} - {""}:
+                return rec
+        return None
 
     def save_oauth_auth_code(
         self,

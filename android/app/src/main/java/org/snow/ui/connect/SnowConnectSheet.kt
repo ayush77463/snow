@@ -31,6 +31,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -92,12 +93,12 @@ fun SnowConnectSheet(
     val colors = LocalSnowColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var inputQuery by remember { mutableStateOf("") }
-    var showMyQr by remember { mutableStateOf(false) }
+    var manualVerifyPin by remember { mutableStateOf("") }
     val clipboardManager = LocalClipboardManager.current
     var copiedFeedback by remember { mutableStateOf(false) }
 
-    LaunchedEffect(showMyQr) {
-        if (showMyQr) {
+    LaunchedEffect(visible) {
+        if (visible) {
             onPreparePairingQr()
         }
     }
@@ -202,10 +203,38 @@ fun SnowConnectSheet(
                             value = inputQuery,
                             onValueChange = { inputQuery = it },
                             modifier = Modifier.fillMaxWidth(),
+                            label = { Text("SNOW ID or Network ID") },
                             placeholder = {
                                 Text(
-                                    text = "SNW-XXXX-XXXX or SNW-XXXX-XXXX 123456",
+                                    text = "SNW-XXXX-XXXX or SNW-NET-XXXXXXXX",
                                     style = SnowTypography.bodyMedium,
+                                    color = colors.textMuted
+                                )
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = colors.accentBlue,
+                                unfocusedBorderColor = colors.border,
+                                focusedTextColor = colors.textPrimary,
+                                unfocusedTextColor = colors.textPrimary,
+                                cursorColor = colors.accentCyan
+                            ),
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp)
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        OutlinedTextField(
+                            value = manualVerifyPin,
+                            onValueChange = { raw ->
+                                manualVerifyPin = raw.filter { it.isDigit() }.take(6)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("6-Digit Verify PIN (optional if saved)") },
+                            placeholder = {
+                                Text(
+                                    text = "123456",
+                                    style = SnowTypography.monospaceSmall,
                                     color = colors.textMuted
                                 )
                             },
@@ -234,8 +263,15 @@ fun SnowConnectSheet(
                         SnowTonalButton(
                             text = if (isConnecting) "Connecting..." else "Connect",
                             onClick = {
-                                if (inputQuery.isNotBlank()) {
-                                    onConnectInput(inputQuery.trim())
+                                val target = inputQuery.trim()
+                                val cleanPin = manualVerifyPin.trim()
+                                if (target.isNotEmpty()) {
+                                    val combined = if (cleanPin.length == 6 && !target.contains(" ")) {
+                                        "$target $cleanPin"
+                                    } else {
+                                        target
+                                    }
+                                    onConnectInput(combined)
                                 }
                             },
                             enabled = inputQuery.isNotBlank() && !isConnecting,
@@ -247,7 +283,8 @@ fun SnowConnectSheet(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Action 3 & 4: My Identity and QR
+            // Action 3 & 4: Canonical Identity + Always-Visible Live Zero-PIN Pairing QR
+            val canonicalId = mySnowId.trim().uppercase()
             SnowCard(
                 modifier = Modifier.fillMaxWidth(),
                 cornerRadius = 18.dp
@@ -266,7 +303,7 @@ fun SnowConnectSheet(
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = mySnowId.ifBlank { myDeviceId },
+                                text = canonicalId.ifBlank { "Generating..." },
                                 style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
                                 color = colors.textPrimary
                             )
@@ -275,11 +312,36 @@ fun SnowConnectSheet(
                         SnowTonalButton(
                             text = if (copiedFeedback) "Copied!" else "Copy",
                             icon = Icons.Default.ContentCopy,
+                            enabled = canonicalId.isNotBlank(),
                             onClick = {
-                                clipboardManager.setText(AnnotatedString(mySnowId.ifBlank { myDeviceId }))
-                                copiedFeedback = true
+                                if (canonicalId.isNotBlank()) {
+                                    clipboardManager.setText(AnnotatedString(canonicalId))
+                                    copiedFeedback = true
+                                }
                             }
                         )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "MY NETWORK ID",
+                                style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp),
+                                color = colors.textMuted
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = myNetworkId?.takeIf { it.isNotBlank() } ?: "Standalone",
+                                style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = if (!myNetworkId.isNullOrBlank()) colors.accentCyan else colors.textSecondary
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -287,9 +349,7 @@ fun SnowConnectSheet(
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { showMyQr = !showMyQr },
+                        modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
@@ -302,134 +362,145 @@ fun SnowConnectSheet(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = if (showMyQr) "Hide Pairing QR" else "Show My Pairing QR",
+                                text = "Live Zero-PIN Pairing QR",
                                 style = SnowTypography.labelMedium,
                                 color = colors.textPrimary
                             )
                         }
-                        Icon(
-                            imageVector = if (showMyQr) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                            contentDescription = null,
-                            tint = colors.textMuted,
-                            modifier = Modifier.size(18.dp)
+                        SnowOutlinedButton(
+                            text = "Refresh QR",
+                            onClick = onPreparePairingQr
                         )
                     }
 
-                    if (showMyQr) {
-                        Spacer(modifier = Modifier.height(14.dp))
-                        if (isPreparingPairingQr) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 24.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(26.dp),
-                                        color = colors.accentCyan,
-                                        strokeWidth = 2.5.dp
-                                    )
-                                    Spacer(modifier = Modifier.height(8.dp))
-                                    Text(
-                                        text = "Starting direct pairing host...",
-                                        style = SnowTypography.bodySmall,
-                                        color = colors.textSecondary
-                                    )
-                                }
-                            }
-                        } else if (!pairingQrJson.isNullOrBlank()) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(Color.White)
-                                    .padding(16.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                val qrBitmap = remember(pairingQrJson) {
-                                    generateQrCode(pairingQrJson)
-                                }
-                                if (qrBitmap != null) {
-                                    Image(
-                                        bitmap = qrBitmap.asImageBitmap(),
-                                        contentDescription = "SNOW Protocol Pairing QR Code",
-                                        modifier = Modifier.size(200.dp)
-                                    )
-                                } else {
-                                    Text(
-                                        text = "Unable to encode pairing QR",
-                                        style = SnowTypography.bodySmall,
-                                        color = Color.Black
-                                    )
-                                }
-                            }
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                    if (isPreparingPairingQr) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 24.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(26.dp),
+                                    color = colors.accentCyan,
+                                    strokeWidth = 2.5.dp
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "Preparing live QR v2...",
+                                    style = SnowTypography.bodySmall,
+                                    color = colors.textSecondary
+                                )
+                            }
+                        }
+                    } else if (!pairingQrJson.isNullOrBlank()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.White)
+                                .padding(16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val qrBitmap = remember(pairingQrJson) {
+                                generateQrCode(pairingQrJson)
+                            }
+                            if (qrBitmap != null) {
+                                Image(
+                                    bitmap = qrBitmap.asImageBitmap(),
+                                    contentDescription = "SNOW Protocol Pairing QR Code",
+                                    modifier = Modifier.size(200.dp)
+                                )
+                            } else {
+                                Text(
+                                    text = "Unable to encode pairing QR",
+                                    style = SnowTypography.bodySmall,
+                                    color = Color.Black
+                                )
+                            }
+                        }
 
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                val pinRaw = peerHostState.pairingPin ?: ""
-                                val formattedPin = if (pinRaw.length == 6) "${pinRaw.take(3)} ${pinRaw.drop(3)}" else pinRaw.ifBlank { "--- ---" }
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "PAIRING PIN: $formattedPin",
-                                        style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
-                                        color = colors.accentCyan
-                                    )
-                                val ttlText = if (peerHostState.pinExpiresInSeconds > 0L) {
-                                    "Expires in ${peerHostState.pinExpiresInSeconds}s • ${peerHostState.ipAddress}"
-                                } else {
-                                    "Host ${peerHostState.ipAddress}"
-                                }
-                                Text(
-                                    text = ttlText,
-                                    style = SnowTypography.labelSmall,
-                                    color = colors.textMuted
-                                )
-                                Text(
-                                    text = myNetworkId?.takeIf { it.isNotBlank() }?.let { "Network: $it" }
-                                        ?: "Standalone (not in a shared network yet)",
-                                    style = SnowTypography.labelSmall,
-                                    color = colors.textMuted
-                                )
-                                }
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    SnowTonalButton(
-                                        text = "New PIN",
-                                        icon = Icons.Default.Refresh,
-                                        onClick = onRegeneratePairingPin
-                                    )
-                                    if (!peerHostState.pairingPin.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        val activePin = peerHostState.pairingPin?.takeIf {
+                            it.isNotBlank() && peerHostState.pinExpiresInSeconds > 0L
+                        }
+                        if (activePin != null) {
+                            val formattedPin = if (activePin.length == 6) {
+                                "${activePin.take(3)} ${activePin.drop(3)}"
+                            } else {
+                                activePin
+                            }
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "PIN: $formattedPin",
+                                            style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = colors.accentCyan
+                                        )
+                                        Text(
+                                            text = "Expires in ${peerHostState.pinExpiresInSeconds}s • ${peerHostState.ipAddress}",
+                                            style = SnowTypography.labelSmall,
+                                            color = colors.textMuted
+                                        )
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        SnowTonalButton(
+                                            text = "New PIN",
+                                            icon = Icons.Default.Refresh,
+                                            onClick = onRegeneratePairingPin
+                                        )
                                         SnowOutlinedButton(
                                             text = "Cancel",
                                             onClick = onCancelPairingPin
                                         )
                                     }
                                 }
+                                Spacer(modifier = Modifier.height(6.dp))
+                                LinearProgressIndicator(
+                                    progress = (peerHostState.pinExpiresInSeconds.coerceIn(0L, 60L) / 60f),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(4.dp)
+                                        .clip(RoundedCornerShape(9999.dp)),
+                                    color = colors.accentCyan,
+                                    trackColor = colors.surfaceElevated
+                                )
                             }
                         } else {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 12.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Text(
-                                    text = pairingQrError ?: "Unable to generate pairing QR.",
-                                    style = SnowTypography.bodySmall,
-                                    color = colors.textSecondary
-                                )
-                                Spacer(modifier = Modifier.height(10.dp))
-                                SnowTonalButton(
-                                    text = "Retry QR",
-                                    icon = Icons.Default.Refresh,
-                                    onClick = onPreparePairingQr
-                                )
-                            }
+                            SnowTonalButton(
+                                text = "Generate 6-Digit PIN",
+                                icon = Icons.Default.Refresh,
+                                onClick = onRegeneratePairingPin,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = pairingQrError ?: "Connect to Wi-Fi or hotspot to share live QR.",
+                                style = SnowTypography.bodySmall,
+                                color = colors.textSecondary
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            SnowTonalButton(
+                                text = "Retry QR",
+                                icon = Icons.Default.Refresh,
+                                onClick = onPreparePairingQr
+                            )
                         }
                     }
                 }

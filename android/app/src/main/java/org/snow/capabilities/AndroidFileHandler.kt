@@ -691,8 +691,8 @@ class AndroidFileHandler @JvmOverloads constructor(
         if (treeUri == null || safManager == null) {
             return mapOf(
                 "status" to "SAF_FOLDER_NOT_CONFIGURED",
-                "error" to "No SAF destination folder has been configured by the user.",
-                "remediation_hint" to "Open SNOW Files tab on the phone and pick a destination folder.",
+                "error" to "No Transfer Folder has been configured by the user.",
+                "remediation_hint" to "Open SNOW Settings or Files tab on the phone and choose a Transfer Folder.",
                 "storage_mode" to "saf_tree",
                 "items" to emptyList<Any>()
             )
@@ -703,7 +703,7 @@ class AndroidFileHandler @JvmOverloads constructor(
         } catch (e: Exception) {
             return mapOf(
                 "status" to "error",
-                "error" to "Failed resolving SAF tree URI: ${e.message}",
+                "error" to "Failed resolving Transfer Folder URI: ${e.message}",
                 "storage_mode" to "saf_tree",
                 "items" to emptyList<Any>()
             )
@@ -712,7 +712,7 @@ class AndroidFileHandler @JvmOverloads constructor(
         if (rootDoc == null || !rootDoc.exists() || !rootDoc.canRead()) {
             return mapOf(
                 "status" to "SAF_PERMISSION_REVOKED",
-                "error" to "Persisted SAF tree permission has expired or been revoked.",
+                "error" to "Persisted Transfer Folder permission has expired or been revoked.",
                 "storage_mode" to "saf_tree",
                 "items" to emptyList<Any>()
             )
@@ -761,7 +761,7 @@ class AndroidFileHandler @JvmOverloads constructor(
         return mapOf(
             "status" to "success",
             "storage_mode" to "saf_tree",
-            "folder_name" to (targetDoc.name ?: safManager?.getDestinationDisplayName() ?: "SAF Folder"),
+            "folder_name" to (targetDoc.name ?: safManager?.getDestinationDisplayName() ?: "Transfer Folder"),
             "subpath" to (subpath ?: ""),
             "count" to items.size,
             "items" to items
@@ -849,7 +849,7 @@ class AndroidFileHandler @JvmOverloads constructor(
             if (root == null || !root.exists || !root.canRead || (requireWrite && !root.canWrite)) {
                 return null to mapOf(
                     "status" to "SAF_PERMISSION_REVOKED",
-                    "error" to "Configured SAF directory is missing read/write permission.",
+                    "error" to "Configured Transfer Folder is missing read/write permission.",
                     "storage_mode" to "saf_tree"
                 )
             }
@@ -867,8 +867,8 @@ class AndroidFileHandler @JvmOverloads constructor(
             null
         } ?: return null to mapOf(
             "status" to "SAF_FOLDER_NOT_CONFIGURED",
-            "error" to "No SAF destination folder has been configured by the user.",
-            "remediation_hint" to "Open SNOW Files tab on Android and select a SAF destination folder.",
+            "error" to "No Transfer Folder has been configured by the user.",
+            "remediation_hint" to "Open SNOW Settings or Files tab on Android and choose a Transfer Folder.",
             "storage_mode" to "saf_tree"
         )
 
@@ -880,8 +880,8 @@ class AndroidFileHandler @JvmOverloads constructor(
         if (rootDoc == null || !rootDoc.exists() || !rootDoc.canRead() || (requireWrite && !rootDoc.canWrite())) {
             return null to mapOf(
                 "status" to "SAF_PERMISSION_REVOKED",
-                "error" to "Persisted SAF folder permission expired or was revoked.",
-                "remediation_hint" to "Re-select the SAF folder in SNOW Android Files tab.",
+                "error" to "Persisted Transfer Folder permission expired or was revoked.",
+                "remediation_hint" to "Re-select the Transfer Folder in SNOW Android Settings or Files tab.",
                 "storage_mode" to "saf_tree"
             )
         }
@@ -892,14 +892,14 @@ class AndroidFileHandler @JvmOverloads constructor(
         if (rawPath == null) {
             return if (allowEmpty) emptyList<String>() to null else null to mapOf(
                 "status" to "INVALID_PATH",
-                "error" to "A valid relative SAF path is required."
+                "error" to "A valid relative folder path is required."
             )
         }
         val trimmed = rawPath.trim()
         if (trimmed.isEmpty()) {
             return if (allowEmpty) emptyList<String>() to null else null to mapOf(
                 "status" to "INVALID_PATH",
-                "error" to "Relative SAF path must be non-empty."
+                "error" to "Relative folder path must be non-empty."
             )
         }
         if (trimmed.startsWith("/") || trimmed.contains('\\') || trimmed.contains('\u0000') || trimmed.any { it.code < 32 }) {
@@ -933,28 +933,28 @@ class AndroidFileHandler @JvmOverloads constructor(
         }
         val (rootDoc, safErr) = resolveSafRootForM44(requireWrite = false)
         if (safErr != null || rootDoc == null) {
-            return safErr ?: mapOf("status" to "SAF_FOLDER_NOT_CONFIGURED", "error" to "SAF folder not configured.")
+            return safErr ?: mapOf("status" to "SAF_FOLDER_NOT_CONFIGURED", "error" to "Transfer Folder not configured.")
         }
 
         var current: SafNode = rootDoc
         for (i in 0 until segments.size - 1) {
             val child = current.findChild(segments[i])
             if (child == null || !child.exists || !child.isDirectory) {
-                return mapOf("status" to "FILE_NOT_FOUND", "error" to "Directory '${segments[i]}' not found in SAF folder.")
+                return mapOf("status" to "FILE_NOT_FOUND", "error" to "Directory '${segments[i]}' not found in Transfer Folder.")
             }
             current = child
         }
         val target = current.findChild(segments.last())
         if (target == null || !target.exists || !target.isFile) {
-            return mapOf("status" to "FILE_NOT_FOUND", "error" to "File '${segments.joinToString("/")}' not found in SAF folder.")
+            return mapOf("status" to "FILE_NOT_FOUND", "error" to "File '${segments.joinToString("/")}' not found in Transfer Folder.")
         }
 
         val maxBytes = 256 * 1024 // 256 KiB cap
         val inputStream = try {
             target.openInputStream()
         } catch (e: Exception) {
-            return mapOf("status" to "READ_FAILED", "error" to "Failed opening SAF file stream: ${e.message}")
-        } ?: return mapOf("status" to "READ_FAILED", "error" to "Unable to open input stream for SAF file.")
+            return mapOf("status" to "READ_FAILED", "error" to "Failed opening file stream: ${e.message}")
+        } ?: return mapOf("status" to "READ_FAILED", "error" to "Unable to open input stream for Transfer Folder file.")
 
         val rawBytes = try {
             inputStream.use { stream ->
@@ -1083,7 +1083,7 @@ class AndroidFileHandler @JvmOverloads constructor(
                 "storage_mode" to "saf_tree"
             )
         } catch (e: Exception) {
-            mapOf("status" to "WRITE_FAILED", "error" to "SAF write failed: ${e.message}")
+            mapOf("status" to "WRITE_FAILED", "error" to "Transfer Folder write failed: ${e.message}")
         }
     }
 
@@ -1105,14 +1105,14 @@ class AndroidFileHandler @JvmOverloads constructor(
 
         val (rootDoc, safErr) = resolveSafRootForM44(requireWrite = false)
         if (safErr != null || rootDoc == null) {
-            return safErr ?: mapOf("status" to "SAF_FOLDER_NOT_CONFIGURED", "error" to "SAF folder not configured.")
+            return safErr ?: mapOf("status" to "SAF_FOLDER_NOT_CONFIGURED", "error" to "Transfer Folder not configured.")
         }
 
         var startDoc: SafNode = rootDoc
         for (seg in subSegments) {
             val child = startDoc.findChild(seg)
             if (child == null || !child.exists || !child.isDirectory) {
-                return mapOf("status" to "DIRECTORY_NOT_FOUND", "error" to "Subdirectory '$seg' not found in SAF folder.")
+                return mapOf("status" to "DIRECTORY_NOT_FOUND", "error" to "Subdirectory '$seg' not found in Transfer Folder.")
             }
             startDoc = child
         }

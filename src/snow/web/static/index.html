@@ -469,7 +469,7 @@
                             </div>
                         </div>
 
-                        <!-- Right Column: Connect & Pair + Cross-Network Federation -->
+                        <!-- Right Column: Connect & Pair -->
                         <div class="flex flex-col gap-4">
                             <div class="card">
                                 <div class="card-header-row">
@@ -483,35 +483,60 @@
                                     </div>
                                 </div>
 
-                                <!-- Tab 1: Pairing QR & Code -->
+                                <!-- Tab 1: Live Zero-PIN QR v2 & Guided Pairing -->
                                 <div id="pair-pane-qr" class="flex flex-col gap-3">
-                                    <div class="flex gap-4 items-center">
-                                        <div id="pairing-qr-box" class="qr-surface" style="width: 136px; height: 136px; flex-shrink: 0;">
-                                            <span class="text-xs text-muted text-center">Click Generate Pairing QR &amp; PIN when ready</span>
+                                    <div class="flex gap-4 items-center pairing-qr-split">
+                                        <div id="pairing-qr-box" class="qr-surface" style="width: 140px; height: 140px; flex-shrink: 0;">
+                                            <span class="text-xs text-muted text-center">Preparing live QR...</span>
                                         </div>
                                         <div class="flex flex-col gap-2 flex-1 min-w-0">
                                             <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
-                                                <span class="text-xs text-muted" style="display: block;">SNOW ID</span>
-                                                <span id="pairing-snow-id" class="text-sm font-bold text-cyan mono truncate">--</span>
+                                                <span class="text-xs text-muted" style="display: block;">My SNOW ID</span>
+                                                <div class="flex items-center justify-between gap-2">
+                                                    <span id="pairing-snow-id" class="text-sm font-bold text-cyan mono truncate">--</span>
+                                                    <button id="btn-copy-pairing-snow-id" class="btn btn-xs btn-tonal btn-radius-md" type="button">Copy</button>
+                                                </div>
                                             </div>
                                             <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
-                                                <span class="text-xs text-muted" style="display: block;">UNIFIED PAIRING PIN</span>
+                                                <span class="text-xs text-muted" style="display: block;">My Network ID</span>
+                                                <span id="pairing-network-id" class="text-xs font-bold text-primary mono truncate" style="display: block;">Standalone</span>
+                                            </div>
+                                            <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
+                                                <span class="text-xs text-muted" style="display: block;">6-DIGIT PAIRING PIN</span>
                                                 <div class="flex items-center justify-between gap-2">
                                                     <span id="pairing-pin-display" class="text-sm font-bold text-primary mono">No active PIN</span>
                                                     <span id="pairing-countdown-display" class="text-xs text-muted mono">--</span>
                                                 </div>
+                                                <div id="pairing-countdown-progress-wrap" class="pin-progress-track mt-1 d-none">
+                                                    <div id="pairing-countdown-progress" class="pin-progress-fill" style="width: 100%;"></div>
+                                                </div>
                                             </div>
                                         </div>
                                     </div>
-                                    <div class="text-xs text-muted truncate">Fingerprint: <span id="pairing-device-fp" class="mono">--</span></div>
-                                    <div class="flex gap-2">
-                                        <input type="text" id="pairing-input" class="form-input" placeholder="Enter SNOW ID (SNW-...) or peer IP">
+                                    <div class="flex gap-2 flex-wrap">
+                                        <button id="btn-pairing-refresh-qr" class="btn btn-xs btn-tonal btn-radius-md flex-1">Generate 6-Digit PIN</button>
+                                        <button id="btn-pairing-cancel-pin" class="btn btn-xs btn-danger btn-radius-md d-none" style="flex-shrink: 0;">Cancel PIN</button>
+                                        <button id="btn-pairing-refresh-live-qr" class="btn btn-xs btn-ghost btn-radius-md" type="button" title="Refresh live QR">Refresh QR</button>
+                                    </div>
+                                    <div class="flex gap-2 flex-wrap">
+                                        <input type="text" id="pairing-input" class="form-input flex-1" style="min-width: 170px;" placeholder="Peer SNOW ID (SNW-...) or Network ID">
+                                        <input type="text" id="pairing-pin-input" class="form-input mono" style="max-width: 145px;" maxlength="6" placeholder="6-digit PIN (opt)">
                                         <button id="btn-pairing-connect" class="btn btn-primary btn-sm btn-radius-md">Connect</button>
                                     </div>
-                                    <div class="flex gap-2">
-                                        <button id="btn-pairing-refresh-qr" class="btn btn-xs btn-tonal btn-radius-md w-full">Generate Pairing QR &amp; PIN</button>
-                                        <button id="btn-pairing-cancel-pin" class="btn btn-xs btn-tonal btn-radius-md d-none" style="flex-shrink: 0;">Cancel PIN</button>
-                                    </div>
+                                    <details id="paste-qr-json-accordion" class="peer-connect-accordion">
+                                        <summary>
+                                            <span>Paste QR v2 JSON</span>
+                                            <span class="text-xs text-cyan">Validate &amp; Pair</span>
+                                        </summary>
+                                        <div class="flex flex-col gap-2 mt-2">
+                                            <textarea id="pairing-qr-json-input" class="form-input text-xs mono" rows="3" placeholder='{"v":2,"snow_id":"SNW-...","handshake_token":"..."}'></textarea>
+                                            <div id="pairing-qr-json-preview" class="text-xs text-muted d-none"></div>
+                                            <div class="flex gap-2">
+                                                <button id="btn-validate-qr-json" class="btn btn-xs btn-tonal btn-radius-md" type="button">Validate QR</button>
+                                                <button id="btn-accept-qr-json" class="btn btn-xs btn-primary btn-radius-md flex-1" type="button">Connect via QR</button>
+                                            </div>
+                                        </div>
+                                    </details>
                                 </div>
 
                                 <!-- Tab 2: Install APK -->
@@ -539,41 +564,6 @@
                                     <span class="chip chip-sm chip-amber">Owner Consent</span>
                                 </div>
                                 <div id="network-merge-proposals-container" class="flex flex-col gap-2"></div>
-                            </div>
-
-                            <!-- Cross-Network Federation directly underneath Connect & Pair -->
-                            <div id="cross-network-federation-card" class="card flex flex-col gap-3">
-                                <div class="card-header-row" style="margin-bottom: 4px;">
-                                    <div class="flex items-center gap-2">
-                                        <h3 class="card-title">Cross-Network Federation</h3>
-                                        <span class="chip chip-sm chip-cyan">Anti-transitive</span>
-                                    </div>
-                                    <div class="flex items-center gap-2">
-                                        <select id="federation-invite-tier" class="form-input text-xs" style="width: auto; padding: 4px 8px;" title="Default Tier for New Network Invite">
-                                            <option value="files_and_clipboard" selected>Files &amp; Clipboard</option>
-                                            <option value="full_control">Full Control</option>
-                                            <option value="files_only">Files Only</option>
-                                            <option value="clipboard_only">Clipboard Only</option>
-                                        </select>
-                                        <button id="btn-federation-kill-switch" class="btn btn-xs btn-danger btn-radius-md">Kill Switch</button>
-                                    </div>
-                                </div>
-                                <p class="text-xs text-muted">9-digit mutual invites with explicit capability and TTL scoping. Zero privilege inheritance.</p>
-                                <div class="flex items-center gap-2 flex-wrap">
-                                    <button id="btn-federation-gen-invite" class="btn btn-sm btn-tonal btn-radius-md">Generate 9-Digit Code</button>
-                                    <span id="federation-invite-display" class="chip chip-emerald mono d-none">--- --- ---</span>
-                                </div>
-                                <div class="form-group">
-                                    <label class="form-label">Join Peer Network with 9-Digit Code</label>
-                                    <div class="flex gap-2">
-                                        <input type="text" id="federation-input-code" class="form-input mono" placeholder="XXX-XXX-XXX">
-                                        <button id="btn-federation-join" class="btn btn-sm btn-primary btn-radius-md">Join</button>
-                                    </div>
-                                </div>
-                                <div class="flex flex-col gap-2">
-                                    <span class="text-xs font-semibold text-secondary">Active Grants</span>
-                                    <div id="federation-grants-container" class="flex flex-col gap-2"></div>
-                                </div>
                             </div>
                         </div>
                     </div>
@@ -750,68 +740,55 @@
                         <div class="ai-assistant-grid">
                             <!-- Claude -->
                             <div class="ai-card">
-                                <div class="flex items-center justify-between">
+                                <div class="flex items-center justify-between gap-2">
                                     <span class="font-semibold text-primary">Claude Desktop</span>
                                     <span id="badge-status-claude" class="chip chip-sm chip-neutral">Ready</span>
                                 </div>
-                                <p class="text-xs text-muted">Native stdio integration via claude_desktop_config.json</p>
-                                <button id="btn-setup-claude" class="btn btn-xs btn-tonal">Configure</button>
+                                <button id="btn-setup-claude" class="btn btn-xs btn-tonal btn-radius-md w-full">Configure</button>
                             </div>
                             <!-- ChatGPT -->
                             <div class="ai-card">
-                                <div class="flex items-center justify-between">
+                                <div class="flex items-center justify-between gap-2">
                                     <span class="font-semibold text-primary">ChatGPT</span>
                                     <span id="badge-status-chatgpt" class="chip chip-sm chip-neutral">Ready</span>
                                 </div>
-                                <p class="text-xs text-muted">Connects via OAuth 2.1 Streamable HTTP gateway</p>
-                                <button id="btn-setup-chatgpt" class="btn btn-xs btn-tonal">Configure</button>
+                                <button id="btn-setup-chatgpt" class="btn btn-xs btn-tonal btn-radius-md w-full">Configure</button>
                             </div>
                             <!-- Gemini & Antigravity -->
                             <div class="ai-card">
-                                <div class="flex items-center justify-between">
+                                <div class="flex items-center justify-between gap-2">
                                     <span class="font-semibold text-primary">Gemini &amp; Antigravity</span>
                                     <span id="badge-status-gemini" class="chip chip-sm chip-neutral">Ready</span>
                                 </div>
-                                <p class="text-xs text-muted">MCP stdio bridge in Gemini CLI and Antigravity IDE</p>
                                 <div class="flex gap-2">
-                                    <button id="btn-setup-gemini" class="btn btn-xs btn-tonal w-full">Configure Gemini</button>
-                                    <button id="btn-setup-antigravity" class="btn btn-xs btn-primary w-full">Setup Antigravity</button>
+                                    <button id="btn-setup-gemini" class="btn btn-xs btn-tonal btn-radius-md w-full">Configure Gemini</button>
+                                    <button id="btn-setup-antigravity" class="btn btn-xs btn-primary btn-radius-md w-full">Setup Antigravity</button>
                                 </div>
-                            </div>
-                            <!-- Cursor -->
-                            <div class="ai-card">
-                                <div class="flex items-center justify-between">
-                                    <span class="font-semibold text-primary">Cursor IDE</span>
-                                    <span id="badge-status-cursor" class="chip chip-sm chip-neutral">Ready</span>
-                                </div>
-                                <p class="text-xs text-muted">Configures ~/.cursor/mcp.json stdio bridge</p>
-                                <button id="btn-setup-cursor" class="btn btn-xs btn-tonal">Configure</button>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Remote AI Link Card (Render Hub Default) -->
+                    <!-- Top-Level Remote AI Link Card -->
                     <div id="remote-ai-link-card" class="card flex flex-col gap-3">
-                        <div class="card-header-row" style="margin-bottom: 4px;">
+                        <div class="card-header-row" style="margin-bottom: 0;">
                             <div class="flex items-center gap-2">
                                 <h3 class="card-title">Remote AI Link</h3>
-                                <span id="mcp-tunnel-status" class="chip chip-neutral">Offline</span>
+                                <span id="mcp-tunnel-status" class="chip chip-neutral">Starting...</span>
                             </div>
-                            <div class="flex items-center gap-2">
-                                <button id="btn-mcp-tunnel-start" class="btn btn-sm btn-primary btn-radius-md">Start</button>
-                                <button id="btn-mcp-tunnel-stop" class="btn btn-sm btn-danger btn-radius-md" disabled>Stop</button>
-                            </div>
+                            <label class="snow-switch" aria-label="Toggle Remote AI Link">
+                                <input type="checkbox" id="chk-mcp-tunnel-toggle" checked title="Toggle Remote AI Link">
+                                <span class="snow-switch-slider"></span>
+                            </label>
                         </div>
-                        <p class="text-xs text-muted">Authenticated permanent Render Hub route for remote MCP assistants with OAuth 2.1 human-in-the-loop approval.</p>
                         <div class="flex gap-2 flex-wrap">
-                            <input type="text" id="mcp-tunnel-url-display" class="form-input text-xs mono" style="flex: 1; min-width: 240px;" readonly value="" placeholder="Start Remote AI Link to activate your Render Hub endpoint">
-                            <button id="btn-mcp-copy-url" class="btn btn-sm btn-tonal btn-radius-md" disabled>Copy Link</button>
-                            <button id="btn-mcp-tunnel-show-qr" class="btn btn-sm btn-tonal btn-radius-md" disabled>Show QR</button>
+                            <input type="text" id="mcp-tunnel-url-display" class="form-input text-xs mono" style="flex: 1; min-width: 220px;" readonly value="" placeholder="https://snow-relay.onrender.com/u/SNW-.../mcp">
+                            <button id="btn-mcp-copy-url" class="btn btn-sm btn-tonal btn-radius-md">Copy Link</button>
+                            <button id="btn-mcp-tunnel-show-qr" class="btn btn-sm btn-tonal btn-radius-md">Show QR</button>
                         </div>
                     </div>
 
                     <div class="ai-settings-layout">
-                        <!-- Left Column: Appearance + Remote Access + Advanced & Diagnostics -->
+                        <!-- Left Column: Appearance + Remote Access + Collapsed Advanced Settings -->
                         <div class="flex flex-col gap-4">
                             <!-- Appearance Theme Selector -->
                             <div class="card">
@@ -838,12 +815,9 @@
                             <!-- Remote Access Card (Moved from Devices) -->
                             <div id="remote-access-settings-card" class="card flex flex-col gap-2">
                                 <div class="card-header-row" style="margin-bottom: 0;">
-                                    <div class="flex flex-col gap-1">
-                                        <div class="flex items-center gap-2">
-                                            <h3 class="card-title">Remote Access</h3>
-                                            <span id="relay-tunnel-badge" class="chip chip-sm chip-neutral">Offline</span>
-                                        </div>
-                                        <span class="text-xs text-muted">Handled automatically</span>
+                                    <div class="flex items-center gap-2">
+                                        <h3 class="card-title">Remote Access</h3>
+                                        <span id="relay-tunnel-badge" class="chip chip-sm chip-neutral">Offline</span>
                                     </div>
                                     <label class="snow-switch" aria-label="Toggle Remote Access">
                                         <input type="checkbox" id="chk-relay-tunnel-toggle" title="Toggle Remote Access">
@@ -853,67 +827,71 @@
                                 <span id="relay-tunnel-detail" class="text-xs text-muted">Off-network relay is inactive until enabled and verified.</span>
                             </div>
 
-                            <!-- Advanced & Diagnostics -->
+                            <!-- Collapsed Advanced Settings Card -->
                             <div id="advanced-diagnostics-card" class="card flex flex-col gap-3">
-                                <div class="card-header-row" style="margin-bottom: 4px;">
-                                    <h3 class="card-title">Advanced &amp; Diagnostics</h3>
-                                    <span id="diag-version" class="chip chip-sm chip-cyan mono">SNOW v7.0.0</span>
-                                </div>
-                                <div class="flex items-center gap-2 flex-wrap">
-                                    <button id="btn-diag-update-check" class="btn btn-xs btn-tonal btn-radius-md">Check Updates</button>
-                                    <button id="btn-diag-update-apply" class="btn btn-xs btn-primary btn-radius-md d-none">Apply Update</button>
-                                    <button id="btn-diag-reset-override" class="btn btn-xs btn-danger btn-radius-md" style="margin-left: auto;">Reset to Bundled UI</button>
-                                </div>
-                                <div id="update-status-banner" class="text-xs text-muted d-none"></div>
-
-                                <div class="flex flex-col gap-2 p-2" style="background-color: var(--snow-bg-nested); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <div class="flex flex-col min-w-0">
-                                            <span class="text-xs text-muted">My SNOW ID</span>
-                                            <strong id="diag-my-snow-id" class="text-xs mono text-primary truncate">--</strong>
-                                        </div>
-                                        <button id="btn-copy-diag-snow-id" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
-                                    </div>
-                                    <div class="flex items-center justify-between gap-2">
-                                        <div class="flex flex-col min-w-0">
-                                            <span class="text-xs text-muted">My Network ID</span>
-                                            <strong id="diag-my-network-id" class="text-xs mono text-cyan truncate">--</strong>
-                                        </div>
-                                        <button id="btn-copy-diag-network-id" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
-                                    </div>
-                                    <div class="flex items-center justify-between gap-2">
-                                        <div class="flex flex-col min-w-0">
-                                            <span class="text-xs text-muted">Remote AI Link (MCP URL)</span>
-                                            <strong id="diag-remote-ai-url" class="text-xs mono text-primary truncate">--</strong>
-                                        </div>
-                                        <button id="btn-copy-diag-ai-url" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
-                                    </div>
-                                </div>
-
-                                <div class="flex flex-col gap-2 p-2" style="background-color: var(--snow-bg-nested); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <span class="text-xs text-muted font-medium">Core IPC Secret (Owner Only)</span>
-                                        <span class="text-xs text-muted">Cleared automatically when hidden</span>
-                                    </div>
-                                    <div class="flex items-center gap-2">
-                                        <input type="password" id="diag-ipc-secret-value" class="form-input text-xs mono" value="••••••••••••••••" readonly aria-label="Core IPC Secret">
-                                        <button id="btn-ipc-secret-toggle" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Reveal</button>
-                                        <button id="btn-ipc-secret-copy" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
-                                    </div>
-                                </div>
-
-                                <!-- Collapsed Accordion for Technical Ports & Optional Self-Hosted / Custom Overrides -->
                                 <details class="advanced-accordion">
-                                    <summary>
-                                        <span>Technical Ports &amp; Loopback Architecture</span>
-                                        <span class="chip chip-sm chip-neutral">Advanced</span>
+                                    <summary id="advanced-settings-accordion-summary">
+                                        <div class="flex items-center gap-2">
+                                            <span class="font-semibold text-primary">Advanced Settings</span>
+                                            <span id="diag-version" class="chip chip-sm chip-cyan mono">SNOW v7.0.0</span>
+                                        </div>
+                                        <span class="text-xs text-cyan">Show / Hide</span>
                                     </summary>
-                                    <div class="flex flex-col gap-3 mt-2 text-xs text-muted">
-                                        <div>Web Dashboard Binding: <strong id="diag-port" class="mono text-primary">127.0.0.1:8769</strong> &bull; Network ID: <strong id="diag-network-key-id" class="mono text-cyan">--</strong></div>
+
+                                    <div class="flex flex-col gap-3 mt-3">
+                                        <div class="flex flex-col gap-2 p-2" style="background-color: var(--snow-bg-nested); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
+                                            <div class="flex items-center justify-between gap-2">
+                                                <div class="flex flex-col min-w-0">
+                                                    <span class="text-xs text-muted">My SNOW ID</span>
+                                                    <strong id="diag-my-snow-id" class="text-xs mono text-primary truncate">--</strong>
+                                                </div>
+                                                <button id="btn-copy-diag-snow-id" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
+                                            </div>
+                                            <div class="flex items-center justify-between gap-2">
+                                                <div class="flex flex-col min-w-0">
+                                                    <span class="text-xs text-muted">My Network ID</span>
+                                                    <strong id="diag-my-network-id" class="text-xs mono text-cyan truncate">Standalone</strong>
+                                                </div>
+                                                <button id="btn-copy-diag-network-id" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
+                                            </div>
+                                        </div>
+
+                                        <!-- Cryptographic Device Identity Recovery Controls -->
+                                        <div class="flex flex-col gap-2 p-2" style="background-color: var(--snow-bg-nested); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
+                                            <span class="text-xs text-muted font-medium">Cryptographic Identity Recovery</span>
+                                            <div class="flex items-center gap-2 flex-wrap">
+                                                <button id="btn-recovery-open-export" class="btn btn-xs btn-tonal btn-radius-md" type="button">Export Recovery Key</button>
+                                                <button id="btn-recovery-open-backup" class="btn btn-xs btn-tonal btn-radius-md" type="button">Encrypted Backup</button>
+                                                <button id="btn-recovery-open-restore" class="btn btn-xs btn-danger btn-radius-md" type="button">Restore Identity</button>
+                                            </div>
+                                        </div>
+
+                                        <div class="flex flex-col gap-2 p-2" style="background-color: var(--snow-bg-nested); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
+                                            <div class="flex items-center justify-between gap-2">
+                                                <span class="text-xs text-muted font-medium">Core IPC Secret (Owner Only)</span>
+                                                <span class="text-xs text-muted">Cleared automatically when hidden</span>
+                                            </div>
+                                            <div class="flex items-center gap-2">
+                                                <input type="password" id="diag-ipc-secret-value" class="form-input text-xs mono" value="••••••••••••••••" readonly aria-label="Core IPC Secret">
+                                                <button id="btn-ipc-secret-toggle" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Reveal</button>
+                                                <button id="btn-ipc-secret-copy" class="btn btn-xs btn-tonal btn-radius-md" style="flex-shrink: 0;">Copy</button>
+                                            </div>
+                                        </div>
+
+                                        <div class="flex items-center gap-2 flex-wrap">
+                                            <button id="btn-diag-update-check" class="btn btn-xs btn-tonal btn-radius-md">Check Updates</button>
+                                            <button id="btn-diag-update-apply" class="btn btn-xs btn-primary btn-radius-md d-none">Apply Update</button>
+                                            <button id="btn-diag-reset-override" class="btn btn-xs btn-danger btn-radius-md" style="margin-left: auto;">Reset to Bundled UI</button>
+                                        </div>
+                                        <div id="update-status-banner" class="text-xs text-muted d-none"></div>
+
+                                        <div class="text-xs text-muted">
+                                            Web Dashboard Binding: <strong id="diag-port" class="mono text-primary">127.0.0.1:8769</strong> &bull; Hub Identity: <strong id="diag-network-key-id" class="mono text-cyan">--</strong>
+                                        </div>
                                         <div class="flex gap-1 flex-wrap mono">
                                             <span class="chip chip-sm chip-cyan">:8765 Control WSS</span>
                                             <span class="chip chip-sm chip-emerald">:8766 Transfer HTTPS</span>
-                                            <span class="chip chip-sm chip-neutral">:8767 Core IPC (Local) / Peer Host (Mobile)</span>
+                                            <span class="chip chip-sm chip-neutral">:8767 Core IPC / Peer Host</span>
                                             <span class="chip chip-sm chip-neutral">:8768 Discovery UDP</span>
                                             <span class="chip chip-sm chip-neutral">:8769 Web UI</span>
                                             <span class="chip chip-sm chip-neutral">:8770 Relay</span>
@@ -922,7 +900,7 @@
 
                                         <details id="mcp-permanent-accordion" class="peer-connect-accordion">
                                             <summary>
-                                                <span>Optional Self-Hosted Hub / Custom Tunnel Provider</span>
+                                                <span>Default Hub / Custom Tunnel Override</span>
                                                 <span class="text-xs text-cyan">Opt-in Override</span>
                                             </summary>
                                             <div class="flex flex-col gap-3 mt-2">
@@ -959,7 +937,7 @@
                             </div>
                         </div>
 
-                        <!-- Right Column: Pending Approvals -->
+                        <!-- Right Column: Pending Approvals + Authorized AI Clients -->
                         <div class="flex flex-col gap-4 approvals-activity-card">
                             <div class="card">
                                 <div class="card-header-row">
@@ -970,6 +948,20 @@
                                 <div id="approvals-empty-state" class="empty-state" style="padding: 24px 16px;">
                                     <svg class="svg-icon svg-icon-md text-muted" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
                                     <span class="text-sm">No pending security or OAuth approvals</span>
+                                </div>
+                            </div>
+
+                            <div id="oauth-authorized-clients-card" class="card flex flex-col gap-3">
+                                <div class="card-header-row" style="margin-bottom: 2px;">
+                                    <div class="flex items-center gap-2">
+                                        <h3 class="card-title">Authorized AI Clients</h3>
+                                        <span id="oauth-clients-count-badge" class="chip chip-sm chip-neutral mono">0</span>
+                                    </div>
+                                    <button id="btn-refresh-oauth-clients" class="btn btn-xs btn-tonal btn-radius-md" type="button">Refresh</button>
+                                </div>
+                                <div id="oauth-clients-list-container" class="flex flex-col gap-2"></div>
+                                <div id="oauth-clients-empty-state" class="empty-state" style="padding: 18px 12px;">
+                                    <span class="text-xs">No OAuth 2.1 AI clients authorized yet</span>
                                 </div>
                             </div>
                         </div>
@@ -992,36 +984,66 @@
                     <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                 </button>
             </div>
-            <p class="text-xs text-muted">Scan QR v2 with SNOW Mobile (zero-PIN handshake) or another PC, or connect using a peer SNOW ID.</p>
-            <div class="flex gap-4 items-center">
+            <p class="text-xs text-muted">Scan live zero-PIN QR v2 with SNOW Mobile or another PC, paste a QR v2 JSON payload, or enter a SNOW ID.</p>
+            <div class="flex gap-4 items-center pairing-qr-split">
                 <div id="modal-qr-container" class="qr-surface" style="width: 140px; height: 140px; flex-shrink: 0;">
-                    <span class="text-xs text-muted text-center">No active QR</span>
+                    <span class="text-xs text-muted text-center">Preparing live QR...</span>
                 </div>
                 <div class="flex flex-col gap-2 flex-1 min-w-0">
                     <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
-                        <span class="text-xs text-muted" style="display: block;">Network / SNOW ID</span>
+                        <span class="text-xs text-muted" style="display: block;">My SNOW ID</span>
                         <div class="flex items-center justify-between gap-2">
-                            <span id="modal-network-id" class="text-xs font-bold text-cyan mono truncate">Standalone</span>
-                            <button id="btn-copy-modal-netid" class="btn btn-xs btn-tonal btn-radius-md">Copy</button>
+                            <span id="modal-snow-id" class="text-xs font-bold text-cyan mono truncate">--</span>
+                            <button id="btn-copy-modal-snowid" class="btn btn-xs btn-tonal btn-radius-md" type="button">Copy</button>
+                        </div>
+                    </div>
+                    <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
+                        <span class="text-xs text-muted" style="display: block;">My Network ID</span>
+                        <div class="flex items-center justify-between gap-2">
+                            <span id="modal-network-id" class="text-xs font-bold text-primary mono truncate">Standalone</span>
+                            <button id="btn-copy-modal-netid" class="btn btn-xs btn-tonal btn-radius-md" type="button">Copy</button>
                         </div>
                     </div>
                     <div class="p-2" style="background: var(--snow-bg-elevated); border-radius: var(--snow-radius-sm); border: 1px solid var(--snow-border);">
                         <span class="text-xs text-muted" style="display: block;">Unified 6-Digit PIN</span>
                         <div class="flex items-center justify-between gap-2">
                             <span id="modal-pairing-pin" class="text-xs font-bold text-primary mono">No active PIN</span>
-                            <button id="btn-modal-generate-pin" class="btn btn-xs btn-tonal btn-radius-md">Generate Pairing QR &amp; PIN</button>
+                            <span id="modal-countdown-display" class="text-xs text-muted mono">--</span>
                         </div>
+                        <div id="modal-pin-progress-wrap" class="pin-progress-track mt-1 d-none">
+                            <div id="modal-pin-progress" class="pin-progress-fill" style="width: 100%;"></div>
+                        </div>
+                    </div>
+                    <div class="flex gap-2">
+                        <button id="btn-modal-generate-pin" class="btn btn-xs btn-tonal btn-radius-md flex-1">Generate 6-Digit PIN</button>
+                        <button id="btn-modal-cancel-pin" class="btn btn-xs btn-danger btn-radius-md d-none" type="button">Cancel</button>
                     </div>
                 </div>
             </div>
 
             <div class="form-group">
-                <label class="form-label">Peer SNOW ID or IP:Port</label>
-                <div class="flex gap-2">
-                    <input type="text" id="modal-connect-input" class="form-input mono" placeholder="e.g. SNW-A1B2-C3D4 or 192.168.1.50:8767">
-                    <button id="btn-modal-connect-submit" class="btn btn-primary btn-sm">Connect</button>
+                <label class="form-label">SNOW ID / Network ID &amp; Optional PIN</label>
+                <div class="flex gap-2 flex-wrap">
+                    <input type="text" id="modal-connect-input" class="form-input mono flex-1" style="min-width: 170px;" placeholder="e.g. SNW-A1B2-C3D4 or 192.168.1.50:8767">
+                    <input type="text" id="modal-connect-pin-input" class="form-input mono" style="max-width: 135px;" maxlength="6" placeholder="6-digit PIN (opt)">
+                    <button id="btn-modal-connect-submit" class="btn btn-primary btn-sm btn-radius-md">Connect</button>
                 </div>
             </div>
+
+            <details class="peer-connect-accordion" id="modal-paste-qr-accordion">
+                <summary>
+                    <span>Paste QR v2 JSON</span>
+                    <span class="text-xs text-cyan">Validate &amp; Pair</span>
+                </summary>
+                <div class="flex flex-col gap-2 mt-2">
+                    <textarea id="modal-qr-json-input" class="form-input text-xs mono" rows="2" placeholder='{"v":2,"snow_id":"SNW-...","handshake_token":"..."}'></textarea>
+                    <div id="modal-qr-json-preview" class="text-xs text-muted d-none"></div>
+                    <div class="flex gap-2">
+                        <button id="btn-modal-validate-qr" class="btn btn-xs btn-tonal btn-radius-md" type="button">Validate</button>
+                        <button id="btn-modal-accept-qr" class="btn btn-xs btn-primary btn-radius-md flex-1" type="button">Connect via QR</button>
+                    </div>
+                </div>
+            </details>
 
             <details class="peer-connect-accordion" id="connect-advanced-accordion">
                 <summary>
@@ -1192,17 +1214,99 @@
         </div>
     </div>
 
-    <!-- Kill Switch Confirmation Modal -->
-    <div id="killswitch-modal" class="modal-overlay d-none">
+    <!-- OAuth Client Revoke Confirmation Modal -->
+    <div id="oauth-revoke-modal" class="modal-overlay d-none" role="dialog" aria-modal="true" aria-labelledby="oauth-revoke-title">
         <div class="modal-card">
-            <div class="flex items-center gap-2 text-rose">
-                <svg class="svg-icon svg-icon-lg" viewBox="0 0 24 24"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" x2="12" y1="9" y2="13"></line><line x1="12" x2="12.01" y1="17" y2="17"></line></svg>
-                <h3 class="card-title">Trigger Emergency Kill Switch?</h3>
+            <div class="modal-header-row">
+                <h3 id="oauth-revoke-title" class="card-title text-rose">Revoke Authorized AI Client?</h3>
+                <button id="btn-close-oauth-revoke" class="icon-btn" style="width: 28px; height: 28px;" title="Close">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
             </div>
-            <p class="text-sm text-muted">This will immediately revoke all active cross-network federation grants, severing all federated peer connections permanently.</p>
-            <div class="flex justify-between gap-3 mt-3">
-                <button id="btn-killswitch-cancel" class="btn btn-tonal w-full">Cancel</button>
-                <button id="btn-killswitch-confirm" class="btn btn-danger w-full">Revoke All Grants</button>
+            <p id="oauth-revoke-message" class="text-xs text-muted">Revoking this OAuth client immediately invalidates all issued access tokens, refresh tokens, and token families.</p>
+            <div class="flex gap-2 mt-2">
+                <button id="btn-oauth-revoke-cancel" class="btn btn-tonal btn-sm w-full" type="button">Cancel</button>
+                <button id="btn-oauth-revoke-confirm" class="btn btn-danger btn-sm w-full" type="button">Revoke Access</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Separate Networks Merge / Keep Separate Modal -->
+    <div id="network-merge-decision-modal" class="modal-overlay d-none" role="dialog" aria-modal="true" aria-labelledby="network-merge-modal-title">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3 id="network-merge-modal-title" class="card-title">Separate SNOW Networks Detected</h3>
+                <button id="btn-close-merge-modal" class="icon-btn" style="width: 28px; height: 28px;" title="Close">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+            <p id="network-merge-modal-summary" class="text-xs text-muted"></p>
+            <div class="flex gap-2 mt-2">
+                <button id="btn-modal-keep-separate" class="btn btn-tonal btn-sm w-full" type="button">Keep Separate</button>
+                <button id="btn-modal-merge-networks" class="btn btn-primary btn-sm w-full" type="button">Merge Networks</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Device Recovery Key Modal (Strict Security Warning & Zero Persistence) -->
+    <div id="recovery-key-modal" class="modal-overlay d-none" role="dialog" aria-modal="true" aria-labelledby="recovery-key-modal-title">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3 id="recovery-key-modal-title" class="card-title">Export Device Recovery Key</h3>
+                <button id="btn-close-recovery-key-modal" class="icon-btn" style="width: 28px; height: 28px;" title="Close">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+            <p class="text-xs text-rose">CRITICAL WARNING: Anyone possessing your SNW-REC-V1 recovery key can sign challenges and impersonate this device on SNOW. It is never auto-copied or stored in the browser.</p>
+            <div id="recovery-key-reveal-box" class="p-3 d-none" style="background: var(--snow-bg-elevated); border: 1px solid var(--snow-border); border-radius: var(--snow-radius-md);">
+                <span class="text-xs text-muted" style="display: block;">Recovery Key (shown once)</span>
+                <code id="recovery-key-secret-output" class="text-xs mono text-cyan" style="word-break: break-all;"></code>
+            </div>
+            <div class="flex gap-2">
+                <button id="btn-recovery-reveal-confirm" class="btn btn-danger btn-sm flex-1" type="button">I Understand — Reveal Key</button>
+                <button id="btn-recovery-copy-manual" class="btn btn-tonal btn-sm d-none" type="button">Copy Manually</button>
+                <button id="btn-recovery-close-key" class="btn btn-tonal btn-sm" type="button">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Encrypted Backup Modal -->
+    <div id="recovery-backup-modal" class="modal-overlay d-none" role="dialog" aria-modal="true" aria-labelledby="recovery-backup-modal-title">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3 id="recovery-backup-modal-title" class="card-title">Save Encrypted Identity Backup</h3>
+                <button id="btn-close-recovery-backup-modal" class="icon-btn" style="width: 28px; height: 28px;" title="Close">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+            <p class="text-xs text-muted">Encrypt your permanent Ed25519 identity with PBKDF2-SHA256 (310,000 iterations) + AES-256-GCM. Passphrase must be at least 10 characters.</p>
+            <input type="password" id="recovery-backup-passphrase" class="form-input text-xs" autocomplete="new-password" placeholder="Passphrase (minimum 10 characters)">
+            <div class="flex gap-2">
+                <button id="btn-recovery-backup-cancel" class="btn btn-tonal btn-sm w-full" type="button">Cancel</button>
+                <button id="btn-recovery-backup-download" class="btn btn-primary btn-sm w-full" type="button">Download Encrypted Backup</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Restore Device Identity Modal -->
+    <div id="recovery-restore-modal" class="modal-overlay d-none" role="dialog" aria-modal="true" aria-labelledby="recovery-restore-modal-title">
+        <div class="modal-card">
+            <div class="modal-header-row">
+                <h3 id="recovery-restore-modal-title" class="card-title text-rose">Restore Device Identity</h3>
+                <button id="btn-close-recovery-restore-modal" class="icon-btn" style="width: 28px; height: 28px;" title="Close">
+                    <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+            <p class="text-xs text-muted">Restoring recovers ONLY your cryptographic keypair and permanent URL. All prior paired devices, TLS trust, and active OAuth sessions are wiped immediately.</p>
+            <textarea id="recovery-restore-input" class="form-input text-xs mono" rows="3" placeholder="Paste SNW-REC-V1-... recovery key or encrypted backup JSON"></textarea>
+            <input type="password" id="recovery-restore-passphrase" class="form-input text-xs" autocomplete="off" placeholder="Passphrase (required if restoring encrypted backup JSON)">
+            <label class="flex items-center gap-2 text-xs text-secondary cursor-pointer">
+                <input type="checkbox" id="chk-recovery-restore-confirm">
+                <span>I confirm wiping prior peer trust, pairing credentials, and OAuth tokens.</span>
+            </label>
+            <div class="flex gap-2">
+                <button id="btn-recovery-restore-cancel" class="btn btn-tonal btn-sm w-full" type="button">Cancel</button>
+                <button id="btn-recovery-restore-submit" class="btn btn-danger btn-sm w-full" type="button">Restore &amp; Reset Trust</button>
             </div>
         </div>
     </div>

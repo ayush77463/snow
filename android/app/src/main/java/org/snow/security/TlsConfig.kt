@@ -274,7 +274,10 @@ class EncryptedCertPinStorage(
                 editor.remove(k)
             }
         }
-        editor.commit()
+        val committed = editor.commit()
+        if (!committed) {
+            throw IllegalStateException("Failed committing cleared encrypted certificate pins in snow_security.")
+        }
     }
 
     /**

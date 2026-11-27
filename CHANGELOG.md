@@ -4,9 +4,32 @@ All notable changes to the SNOW platform are documented in this file.
 
 ---
 
-## [7.0.0] — Pre-Release Candidate (Milestones 1, 2, and 3A)
+## [7.0.0] — Pre-Release Candidate (Milestones 1 through 4.5)
 
 > Local pre-release build prepared for physical owner verification (Lenovo V15 + Realme P4 + Render Hub) prior to final `v7.0.0` release tagging.
+
+### Milestone 4.5 — Final UI/UX Parity, OAuth/Recovery Management & M4.4 Audit Fixes
+- **Canonical Identity & Recovery Takeover:** Unified permanent Ed25519 `SNW-XXXX-XXXX` identity across Core IPC, Web UI, Relay, and Android with legacy UUID-seeded alias resolution; wired `EncryptedCertPinStorage.clearAllPinnedFingerprints()` into `DeviceKeyManager.clearPeerTrustAndOAuthOnRecovery()` with explicit failure propagation (`DeviceRecoveryTrustResetException`); fixed Web recovery gateway reference (`_mcp_gateway_instance`) to trigger `recovery_takeover=True` Render Hub reconnection when active/enabled.
+- **Cryptographic Identity Recovery & OAuth Client Revocation:** Added Web UI & backend endpoints for `SNW-REC-V1` key reveal (no auto-copy, cleared on modal close/hide/unload), passphrase-encrypted backup download/restore with explicit trust-reset confirmation, and OAuth 2.1 client listing & single-click revocation (`GET /api/mcp/oauth/clients`, `POST /api/mcp/oauth/clients/revoke`).
+- **Streamlined Pairing & AI/Settings UX Parity:** Displayed live zero-PIN QR v2 immediately on Windows & Android with optional 6-digit countdown PIN and pasteable QR v2 JSON validation (`/api/pair/qr/validate`, `/api/pair/qr/accept`); removed prominent Cross-Network Federation cards while preserving Merge vs Keep Separate conflict dialogs; consolidated AI & Settings to a 3-card AI grid (Claude Desktop, ChatGPT Desktop, Gemini & Antigravity), top-level Remote AI Link toggle + URL + Copy + Show QR, top-level Authorized AI Clients, and collapsed Advanced Settings; replaced user-facing `"SAF"` wording across Android UI with `"Transfer Folder"`.
+
+### Milestone 4.4 — Permanent Device Identity, Per-Device Remote MCP & Native Android MCP (`f2fba90`)
+- **Permanent Per-Device Ed25519 Identity:** Introduced `identity.py` and Android `DeviceKeyManager` deriving stable per-device `SNW-XXXX-XXXX` identifiers, recovery key export/restore, and authenticated Render Hub device challenge signatures.
+- **Native Standalone Android MCP & OAuth 2.1:** Added `AndroidMcpResponder`, `AndroidOAuthManager`, `AndroidRemoteMcpController`, and `AndroidMcpRelayForwarder` so phones host independent `/u/<SNW-...>/mcp` endpoints directly through the Render Hub without requiring an online Windows PC.
+- **60-Tool Catalog & Network-Wide Routing:** Added `snow_android_file_read`, `snow_android_file_write`, `snow_android_file_search`, `snow_android_device_info`, `snow_android_audio_status`, and `snow_android_clipboard_get`, bringing the FastMCP catalog to `60` tools.
+
+### Milestone 4.3 — Intelligent Transport Orchestration (`a11647f`)
+- **Priority Transport Model:** Standardized priority `USB -> Hotspot -> Wi-Fi LAN -> Remote Relay` across Python `TransportType`/`SessionRouter` and Android `TransportOrchestrator`, with make-before-break connection switching, bidirectional USB ADB tunneling, and verified active transfer-socket classification.
+
+### Milestone 4.2 — Universal Pairing, Network Formation & Peer Streaming (`5b7d8d7`)
+- **SQLite Schema v8 & Mutual Network Merge:** Upgraded schema to version 8 (`network_merge_transactions`), implemented QR v2 PIN/rendezvous negotiation, Mutual Network Merge vs Keep Separate conflict resolution, M4.1 carry-forward fixes, and Android-to-Android peer streaming/hosting.
+
+### Milestone 4.1 — Reliability, Lifecycle & 16 GiB Large-Transfer Hardening (`50a0000`)
+- **Core/Tray Single-Instance Lifecycle & Polling Stability:** Hardened Windows daemon PID/lock ownership, tray event-loop reuse, and Web UI visibility-aware polling backoff (verified in headless Chromium CDP).
+- **Streaming Transfers & Clipboard Integrity:** Expanded resumable SHA-256 HTTPS transfers up to `16 GiB` (`MAX_SUPPORTED_TRANSFER_SIZE`), added WebSocket connection generation fencing (`M41Unit3WebSocketGenerationTest`), canonical image digest deduplication, and SAF permission recovery.
+
+### Milestone 3B — Multi-Device Trust, Web UI & Play Protect Stabilization (`6f42a2e`)
+- Stabilized multi-device trust isolation, remote relay tunnel controls, Google Play Protect metadata posture, and pre-M4 regression coverage.
 
 ### Milestone 1 — Pairing, Security, Revocation & Android Trust (`d46579c`)
 - **Authoritative QR Pairing & Token/PIN Separation:** Separated short-lived pairing PIN entry from long-lived token authentication and enforced canonical identity matching.

@@ -362,7 +362,7 @@ private fun FilesToolView(
                     Spacer(modifier = Modifier.width(8.dp))
                     Column {
                         Text(
-                            text = "SAF Destination",
+                            text = "Save Files To",
                             style = SnowTypography.labelSmall.copy(fontSize = 10.sp),
                             color = colors.textMuted
                         )

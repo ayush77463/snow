@@ -35,7 +35,7 @@ class TestMilestone3AWebUiStructure(unittest.TestCase):
             ["Home", "Clipboard", "Files & Apps", "Devices", "AI & Settings"],
         )
 
-    def test_02_devices_layout_federation_and_remote_access_relocated(self) -> None:
+    def test_02_devices_layout_and_remote_access_relocated(self) -> None:
         devices_sec = re.search(
             r'<section id="section-devices"[\s\S]*?</section>',
             self.html,
@@ -43,27 +43,28 @@ class TestMilestone3AWebUiStructure(unittest.TestCase):
         self.assertIsNotNone(devices_sec)
         devices_html = devices_sec.group(0)
 
-        # Remote Access must be moved OUT of Devices view
+        # Remote Access and Cross-Network Federation must NOT appear in Devices view
         self.assertNotIn('id="chk-relay-tunnel-toggle"', devices_html)
         self.assertNotIn('id="relay-tunnel-badge"', devices_html)
+        self.assertNotIn('id="cross-network-federation-card"', self.html)
 
-        # Cross-Network Federation must live in the right column under Connect & Pair
+        # Connect & Pair lives alongside device list & network summary
         connect_pos = devices_html.find('id="pair-pane-qr"')
-        fed_pos = devices_html.find('id="cross-network-federation-card"')
         dev_list_pos = devices_html.find('id="devices-list-container"')
         net_info_pos = devices_html.find('id="devices-network-info-card"')
         self.assertGreater(dev_list_pos, 0)
         self.assertGreater(net_info_pos, dev_list_pos)
         self.assertGreater(connect_pos, net_info_pos)
-        self.assertGreater(fed_pos, connect_pos)
+        self.assertIn('id="paste-qr-json-accordion"', devices_html)
+        self.assertNotIn("Fingerprint:", devices_html)
 
-        # Remote Access card lives in AI & Settings with "Handled automatically"
+        # Remote Access lives in AI & Settings without "Handled automatically"
         settings_sec = re.search(r'<section id="section-settings"[\s\S]*?</section>', self.html)
         self.assertIsNotNone(settings_sec)
         settings_html = settings_sec.group(0)
         self.assertIn('id="remote-access-settings-card"', settings_html)
         self.assertIn('id="chk-relay-tunnel-toggle"', settings_html)
-        self.assertIn("Handled automatically", settings_html)
+        self.assertNotIn("Handled automatically", settings_html)
 
     def test_03_qr_placeholders_themed_and_modal_button_consistent(self) -> None:
         for box_id in ("pairing-qr-box", "modal-qr-container", "apk-qr-box", "mcp-qr-svg-container"):
@@ -73,7 +74,8 @@ class TestMilestone3AWebUiStructure(unittest.TestCase):
             self.assertIn("qr-surface", attrs)
             self.assertNotIn("#FFF", attrs.upper())
 
-        self.assertIn("Generate Pairing QR &amp; PIN", self.html)
+        self.assertIn("Generate 6-Digit PIN", self.html)
+        self.assertNotIn("Generate Pairing QR &amp; PIN", self.html)
         self.assertNotIn(">Generate PIN<", self.html)
         for btn_id in (
             "btn-usb-unlock-permissions",
@@ -106,21 +108,31 @@ class TestMilestone3AWebUiStructure(unittest.TestCase):
     def test_06_ai_settings_render_hub_default_and_no_hardcoded_id(self) -> None:
         self.assertNotIn("SNW-NET-XXXXXXXX", self.html)
         self.assertNotIn("SNW-NET-XXXXXXXX", self.js)
+        self.assertNotIn("btn-setup-cursor", self.html)
         remote_card = re.search(r'<div id="remote-ai-link-card"[\s\S]*?<div class="ai-settings-layout">', self.html)
         self.assertIsNotNone(remote_card)
         card_html = remote_card.group(0)
-        self.assertIn('id="btn-mcp-tunnel-start"', card_html)
-        self.assertIn('id="btn-mcp-tunnel-stop"', card_html)
+        self.assertIn('id="chk-mcp-tunnel-toggle"', card_html)
         self.assertIn('id="btn-mcp-copy-url"', card_html)
         self.assertIn('id="btn-mcp-tunnel-show-qr"', card_html)
-        # Permanent URL accordion is moved inside collapsed Advanced & Diagnostics, not primary card
+        self.assertNotIn('id="btn-mcp-tunnel-start"', card_html)
+        self.assertNotIn('id="btn-mcp-tunnel-stop"', card_html)
+        # Permanent URL override accordion & diagnostics live inside collapsed details.advanced-accordion
         self.assertNotIn('id="mcp-permanent-accordion"', card_html)
-        adv_card = re.search(r'<div id="advanced-diagnostics-card"[\s\S]*?<div class="flex flex-col gap-4 approvals-activity-card">', self.html)
+        adv_card = re.search(
+            r'<div id="advanced-diagnostics-card"[\s\S]*?<div class="flex flex-col gap-4 approvals-activity-card">',
+            self.html,
+        )
         self.assertIsNotNone(adv_card)
-        self.assertIn('id="mcp-permanent-accordion"', adv_card.group(0))
-        # Redundant setting-default-hub-url duplicate box removed
+        adv_html = adv_card.group(0)
+        self.assertIn('<details class="advanced-accordion">', adv_html)
+        self.assertNotIn('class="advanced-accordion" open', adv_html)
+        self.assertIn('id="mcp-permanent-accordion"', adv_html)
+        self.assertIn('id="oauth-authorized-clients-card"', self.html)
+        # Redundant setting-default-hub-url and diagnostic copy duplicate removed
         self.assertNotIn('id="setting-default-hub-url"', self.html)
         self.assertNotIn('id="diag-hub-permanent-mcp"', self.html)
+        self.assertNotIn('id="btn-copy-diag-ai-url"', self.html)
 
 
 class TestMilestone3AWebServerRenderAndClipboardEndpoints(AioHTTPTestCase):

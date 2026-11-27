@@ -646,7 +646,20 @@ class SnowUiRepository private constructor(private val appContext: Context) {
 
     // Persistent storage helpers
     val identity: DeviceIdentity by lazy { DeviceIdentity.getOrCreate(appContext) }
-    val canonicalSnowId: String by lazy { deriveCanonicalSnowId(identity.deviceId) }
+    val canonicalSnowId: String
+        get() {
+            val livePerm = _permanentDeviceSnowId.value.trim().uppercase()
+            if (org.snow.security.DeviceKeyIdentity.SNOW_ID_REGEX.matches(livePerm)) {
+                return livePerm
+            }
+            return try {
+                val dk = deviceKeyManager.getOrCreate()
+                _permanentDeviceSnowId.value = dk.snowId
+                dk.snowId
+            } catch (_: Throwable) {
+                deriveCanonicalSnowId(identity.deviceId)
+            }
+        }
     internal var deviceKeyProviderOverrideForTest: org.snow.security.SecretKeyProvider? = null
     val deviceKeyManager: org.snow.security.DeviceKeyManager by lazy {
         val kp = deviceKeyProviderOverrideForTest
@@ -1107,12 +1120,12 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             val dk = deviceKeyManager.getOrCreate()
             val jsonPayload = org.snow.security.DeviceKeyManager.exportEncryptedBackup(dk, passphrase)
             val stream = appContext.contentResolver.openOutputStream(uri)
-                ?: return false to "Could not open selected SAF destination for writing."
+                ?: return false to "Could not open selected Transfer Folder for writing."
             stream.use { out ->
                 out.write((jsonPayload + "\n").toByteArray(Charsets.UTF_8))
                 out.flush()
             }
-            appendLog("INFO", TAG, "Saved AES-GCM encrypted identity backup for [${dk.snowId}] via SAF")
+            appendLog("INFO", TAG, "Saved AES-GCM encrypted identity backup for [${dk.snowId}] to Transfer Folder")
             true to "Encrypted backup saved (${dk.snowId})."
         } catch (e: Exception) {
             false to (e.message ?: "Failed saving encrypted backup.")
@@ -1129,10 +1142,16 @@ class SnowUiRepository private constructor(private val appContext: Context) {
         }
         return try {
             val trimmed = recoveryOrBackupInput.trim()
-            val restored = if (trimmed.startsWith("{")) {
-                deviceKeyManager.restoreFromEncryptedBackup(trimmed, passphrase.orEmpty())
-            } else {
-                deviceKeyManager.restoreFromRecoveryKey(trimmed)
+            var partialResetError: String? = null
+            val restored = try {
+                if (trimmed.startsWith("{")) {
+                    deviceKeyManager.restoreFromEncryptedBackup(trimmed, passphrase.orEmpty())
+                } else {
+                    deviceKeyManager.restoreFromRecoveryKey(trimmed)
+                }
+            } catch (resetErr: org.snow.security.DeviceRecoveryTrustResetException) {
+                partialResetError = resetErr.message ?: "Post-recovery trust cleanup failed."
+                deviceKeyManager.getOrCreate()
             }
             // Disengage any active sessions & clear in-memory trust without re-pairing automatically
             disconnectAll()
@@ -1147,8 +1166,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             _permanentDeviceMcpUrl.value = url
             _identityError.value = null
             serviceRef?.androidRemoteMcpController?.onDeviceIdentityRecovered()
-            appendLog("WARN", TAG, "Device identity restored as [${restored.snowId}]; prior peer trust & OAuth sessions wiped.")
-            true to "Restored identity ${restored.snowId}. Re-pair peers and re-approve AI clients explicitly."
+            if (partialResetError != null) {
+                appendLog("ERROR", TAG, "Restored [${restored.snowId}], but trust reset reported errors: $partialResetError")
+                false to partialResetError
+            } else {
+                appendLog("WARN", TAG, "Device identity restored as [${restored.snowId}]; prior peer trust & OAuth sessions wiped.")
+                true to "Restored identity ${restored.snowId}. Re-pair peers and re-approve AI clients explicitly."
+            }
         } catch (e: Exception) {
             false to (e.message ?: "Recovery failed.")
         }
@@ -5026,9 +5050,9 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                             if (result.isSuccess) {
                                 val saved = result.getOrNull().orEmpty()
                                 val msg = when {
-                                    saved.isEmpty() -> "Saved to SAF folder"
-                                    saved.size == 1 -> "Saved ${saved[0]} to SAF folder"
-                                    else -> "Saved ${saved.size} files to SAF folder (${saved.take(3).joinToString(", ")})"
+                                    saved.isEmpty() -> "Saved to Transfer Folder"
+                                    saved.size == 1 -> "Saved ${saved[0]} to Transfer Folder"
+                                    else -> "Saved ${saved.size} files to Transfer Folder (${saved.take(3).joinToString(", ")})"
                                 }
                                 onComplete(true, msg)
                             } else {
@@ -5984,7 +6008,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             }
     }
 
-    fun generatePeerHostQrJson(): String? {
+    @JvmOverloads
+    fun generatePeerHostQrJson(includePin: Boolean = false): String? {
         val service = serviceRef ?: return null
         val hubUrl = try { getDefaultHubUrl() } catch (_: Exception) { null }
         return service.peerHostManager.generatePairingQrJson(
@@ -5992,11 +6017,13 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             snowId = canonicalSnowId,
             networkId = getEffectiveNetworkId(),
             version = 2,
-            hubUrl = hubUrl
+            hubUrl = hubUrl,
+            includePin = includePin
         )
     }
 
-    fun preparePeerHostPairingQr(onReady: (qrJson: String?, error: String?) -> Unit) {
+    @JvmOverloads
+    fun preparePeerHostPairingQr(includePin: Boolean = false, onReady: (qrJson: String?, error: String?) -> Unit) {
         val service = serviceRef
         if (service == null) {
             onReady(null, "Background service starting; retry in a moment.")
@@ -6009,7 +6036,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
             snowId = canonicalSnowId,
             networkId = getEffectiveNetworkId(),
             version = 2,
-            hubUrl = hubUrl
+            hubUrl = hubUrl,
+            includePin = includePin
         )
         if (!existing.isNullOrBlank()) {
             onReady(existing, null)
@@ -6023,7 +6051,8 @@ class SnowUiRepository private constructor(private val appContext: Context) {
                 snowId = canonicalSnowId,
                 networkId = getEffectiveNetworkId(),
                 version = 2,
-                hubUrl = hubUrl
+                hubUrl = hubUrl,
+                includePin = includePin
             )
             repoScope.launch(Dispatchers.Main) {
                 if (!generated.isNullOrBlank()) {

@@ -332,6 +332,7 @@ class _TunnelInstance:
         custom_url: Optional[str] = None,
         timeout: float = 12.0,
         token: Optional[str] = None,
+        recovery_takeover: bool = False,
     ) -> dict[str, Any]:
         """Start a public tunnel exposing this instance's verified port."""
         target_port = port if port is not None else self.target_port
@@ -358,7 +359,8 @@ class _TunnelInstance:
             provider_lower = provider.strip().lower()
             existing_status = self.get_status()
             if (
-                existing_status.get("active")
+                not recovery_takeover
+                and existing_status.get("active")
                 and self._provider == provider_lower
                 and not custom_url
             ):
@@ -773,6 +775,7 @@ class _TunnelInstance:
                     network_id=net_ident.network_id if net_ident else "",
                     device_name=dev_ident.device_name,
                     auto_reconnect=True,
+                    recovery_takeover=recovery_takeover,
                 )
                 ok, err = await device_forwarder.start(timeout=timeout)
                 if not ok:
@@ -796,6 +799,7 @@ class _TunnelInstance:
                         device_id=f"{dev_ident.device_id}:net",
                         device_name=dev_ident.device_name,
                         auto_reconnect=True,
+                        recovery_takeover=recovery_takeover,
                     )
                     net_ok, net_err = await legacy_net_fwd.start(timeout=timeout)
                     if net_ok:
@@ -912,6 +916,7 @@ class TunnelManager:
         custom_url: Optional[str] = None,
         timeout: float = 12.0,
         token: Optional[str] = None,
+        recovery_takeover: bool = False,
     ) -> dict[str, Any]:
         """Start a public tunnel exposing Remote MCP Gateway (port 8771).
 
@@ -926,7 +931,14 @@ class TunnelManager:
             logger.error(err)
             return {"success": False, "status": "PORT_RESTRICTED", "error": err}
 
-        return await self._mcp_tunnel.start(provider=provider, port=port, custom_url=custom_url, timeout=timeout, token=token)
+        return await self._mcp_tunnel.start(
+            provider=provider,
+            port=port,
+            custom_url=custom_url,
+            timeout=timeout,
+            token=token,
+            recovery_takeover=recovery_takeover,
+        )
 
     async def start_relay_tunnel(
         self,

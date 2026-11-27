@@ -437,6 +437,9 @@ class AndroidPeerHostManager(
 
     /**
      * Generate QR pairing payload (v1 or v2) including all ranked local candidate IPs.
+     *
+     * When [includePin] is false and version == 2, generates a live zero-PIN QR payload
+     * backed by a single-use cryptographic handshake token (only including any already-active PIN).
      */
     @Synchronized
     @JvmOverloads
@@ -446,7 +449,8 @@ class AndroidPeerHostManager(
         networkId: String? = null,
         version: Int = 1,
         hubUrl: String? = null,
-        rdvId: String? = null
+        rdvId: String? = null,
+        includePin: Boolean = true
     ): String? {
         val state = _hostState.value
         val cleanFp = state.certFingerprint.replace(":", "").replace(" ", "").trim().uppercase()
@@ -466,7 +470,11 @@ class AndroidPeerHostManager(
         val effectiveNetId = networkId?.trim()?.uppercase()?.takeIf { isValidCanonicalNetworkId(it) }
             ?: configuredNetworkId?.trim()?.uppercase()?.takeIf { isValidCanonicalNetworkId(it) }
             ?: state.networkId?.trim()?.uppercase()?.takeIf { isValidCanonicalNetworkId(it) }
-        val activePin = getCurrentEphemeralPinInfo()?.first ?: generatePairingPin()
+        val activePin = if (includePin || version == 1) {
+            getCurrentEphemeralPinInfo()?.first ?: generatePairingPin()
+        } else {
+            getCurrentEphemeralPinInfo()?.first.orEmpty()
+        }
         if (activePin.isBlank() && version == 1) return null
         val activeHandshakeToken = getCurrentHandshakeTokenInfo()?.first ?: generateHandshakeToken(effectiveNetId)
         val effectiveSnowId = snowId?.trim()?.uppercase()?.takeIf { it.isNotBlank() } ?: configuredSnowId

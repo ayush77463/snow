@@ -152,9 +152,9 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) {
             val success = repository.safFolderManager.persistFolderUri(uri)
             if (success) {
-                Toast.makeText(this, "Download destination set to: ${repository.safFolderManager.getDestinationDisplayName()}", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Transfer Folder set to: ${repository.safFolderManager.getDestinationDisplayName()}", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "Failed to persist SAF folder permission", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Failed to persist folder permission", Toast.LENGTH_LONG).show()
             }
         }
     }

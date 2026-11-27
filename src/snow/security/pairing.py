@@ -100,6 +100,7 @@ class PairingManager:
         self._session_id: Optional[str] = None
         # Single-use QR handshake tokens: sha256(token) -> metadata
         self._handshake_tokens: dict[str, dict[str, Any]] = {}
+        self._live_qr_handshake: Optional[dict[str, str]] = None
 
     @property
     def is_locked(self) -> bool:
@@ -332,11 +333,48 @@ class PairingManager:
         with self._lock:
             return self._handshake_tokens.pop(digest, None) is not None
 
+    def get_or_issue_live_qr_handshake_token(
+        self,
+        host_device_id: str,
+        network_id: str = "",
+        trust_tier: str = "owner",
+        ttl_seconds: float = 60.0,
+    ) -> str:
+        """Return currently active unconsumed live QR handshake token, or mint a fresh one."""
+        clean_host = (host_device_id or "").strip()
+        clean_net = (network_id or "").strip().upper()
+        now = self.time_provider()
+        with self._lock:
+            cur = getattr(self, "_live_qr_handshake", None)
+            if isinstance(cur, dict):
+                tok_digest = cur.get("digest")
+                meta = self._handshake_tokens.get(tok_digest) if tok_digest else None
+                if (
+                    meta is not None
+                    and not meta.get("used")
+                    and str(meta.get("host_device_id", "")) == clean_host
+                    and str(meta.get("network_id", "")).strip().upper() == clean_net
+                    and (float(meta.get("expires_at", 0.0)) - now) > 10.0
+                ):
+                    return str(cur["token"])
+            tok = self.issue_handshake_token(
+                host_device_id=clean_host,
+                network_id=clean_net,
+                trust_tier=trust_tier,
+                ttl_seconds=ttl_seconds,
+            )
+            self._live_qr_handshake = {
+                "token": tok,
+                "digest": hashlib.sha256(tok.encode("utf-8")).hexdigest(),
+            }
+            return tok
+
     def revoke_all_handshake_tokens(self) -> int:
         """Invalidate every currently active QR handshake token safely."""
         with self._lock:
             revoked = len(self._handshake_tokens)
             self._handshake_tokens.clear()
+            self._live_qr_handshake = None
         if revoked:
             logger.info("Revoked %d active QR handshake token(s).", revoked)
         return revoked

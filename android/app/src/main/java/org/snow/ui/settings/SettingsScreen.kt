@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -11,6 +12,7 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatDelegate
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -41,6 +43,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.LockReset
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.SettingsBrightness
 import androidx.compose.material.icons.filled.Sync
@@ -67,7 +70,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -163,6 +169,8 @@ fun SettingsScreen(
     var recoveryFeedback by remember { mutableStateOf<String?>(null) }
     var relayInput by remember { mutableStateOf(relayEndpoint) }
     var manualConnectInput by remember { mutableStateOf("") }
+    var showRemoteMcpQrDialog by remember { mutableStateOf(false) }
+    var pendingRevokeOAuthClient by remember { mutableStateOf<org.snow.mcp.AuthorizedOAuthClientSummary?>(null) }
 
     val encryptedBackupSafLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
@@ -270,6 +278,141 @@ fun SettingsScreen(
             }
         }
 
+        // Top-Level Remote AI Link Card (M4.5)
+        item {
+            val activeMcpUrl = permanentDeviceMcpUrl.ifBlank {
+                remoteAiLinkUrl.orEmpty()
+            }
+            SnowSectionHeader(title = "Remote AI Link")
+            SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Remote AI Link",
+                            style = SnowTypography.titleSmall,
+                            color = colors.textPrimary
+                        )
+                        val statusBadgeType = when {
+                            !androidRemoteMcpEnabled -> SnowBadgeType.STANDBY
+                            androidMcpConnected -> SnowBadgeType.CONNECTED
+                            else -> SnowBadgeType.STANDBY
+                        }
+                        val statusLabel = when {
+                            !androidRemoteMcpEnabled -> "OFF"
+                            androidMcpConnected -> "ACTIVE"
+                            !androidMcpError.isNullOrBlank() -> "OFFLINE"
+                            else -> "CONNECTING"
+                        }
+                        SnowStatusBadge(text = statusLabel, type = statusBadgeType)
+                    }
+
+                    SettingsSwitchRow(
+                        title = "Enable Remote AI Link",
+                        checked = androidRemoteMcpEnabled,
+                        onCheckedChange = onToggleAndroidRemoteMcp
+                    )
+
+                    if (androidRemoteMcpEnabled && !androidMcpError.isNullOrBlank() && !androidMcpConnected) {
+                        Text(
+                            text = androidMcpError,
+                            style = SnowTypography.bodySmall,
+                            color = colors.textSecondary
+                        )
+                    }
+
+                    if (!identityError.isNullOrBlank()) {
+                        Text(
+                            text = identityError,
+                            style = SnowTypography.bodySmall,
+                            color = Color(0xFFEF4444)
+                        )
+                    }
+
+                    Divider(color = colors.borderSubtle)
+
+                    Column {
+                        Text(
+                            text = "Permanent Endpoint URL",
+                            style = SnowTypography.labelSmall,
+                            color = colors.textMuted
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = activeMcpUrl.ifBlank { "Generating permanent URL..." },
+                            style = SnowTypography.monospaceSmall,
+                            color = if (activeMcpUrl.isNotBlank()) colors.accentCyan else colors.textSecondary
+                        )
+                    }
+
+                    if (activeMcpUrl.isNotBlank()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            SnowTonalButton(
+                                text = "Copy Link",
+                                icon = Icons.Default.ContentCopy,
+                                onClick = { clipboardManager.setText(AnnotatedString(activeMcpUrl)) },
+                                modifier = Modifier.weight(1f)
+                            )
+                            SnowOutlinedButton(
+                                text = "Show QR",
+                                icon = Icons.Default.QrCode,
+                                onClick = { showRemoteMcpQrDialog = true },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    Divider(color = colors.borderSubtle)
+
+                    Text(
+                        text = "Authorized AI Clients (${authorizedOAuthClients.size})",
+                        style = SnowTypography.labelSmall,
+                        color = colors.textMuted
+                    )
+                    if (authorizedOAuthClients.isEmpty()) {
+                        Text(
+                            text = "No AI assistants authorized yet.",
+                            style = SnowTypography.bodySmall,
+                            color = colors.textSecondary
+                        )
+                    } else {
+                        authorizedOAuthClients.forEach { oauthClient ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = oauthClient.clientName,
+                                        style = SnowTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                                        color = colors.textPrimary
+                                    )
+                                    Text(
+                                        text = "${oauthClient.scopes.joinToString(" ")} • ${oauthClient.clientId}",
+                                        style = SnowTypography.monospaceSmall,
+                                        color = colors.textMuted
+                                    )
+                                }
+                                SnowOutlinedButton(
+                                    text = "Revoke",
+                                    onClick = { pendingRevokeOAuthClient = oauthClient }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Always-On Remote Access & Sync Switches
         item {
             SnowSectionHeader(title = "Sync & Background Services")
@@ -333,7 +476,7 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.Notifications,
                         title = "Notification Sync & Listener",
-                        subtitle = "App launching from background & folder transfers use Android Notifications & SAF folders.",
+                        subtitle = "App launching from background & file transfers use Android Notifications & Transfer Folder.",
                         statusText = if (isNotificationAccessGranted) "GRANTED" else "SETUP",
                         isGranted = isNotificationAccessGranted,
                         onClick = { showNotificationGuide = true }
@@ -343,7 +486,7 @@ fun SettingsScreen(
 
                     PermissionRowItem(
                         icon = Icons.Default.FolderOpen,
-                        title = "Transfer Folder (SAF)",
+                        title = "Transfer Folder",
                         subtitle = if (permSnapshot.safFolderConfigured) {
                             "Active folder: ${permSnapshot.safFolderName}"
                         } else {
@@ -434,7 +577,7 @@ fun SettingsScreen(
             }
         }
 
-        // Collapsible Advanced Diagnostics & Reset
+        // Collapsible Advanced Settings & Recovery
         item {
             Row(
                 modifier = Modifier
@@ -445,7 +588,7 @@ fun SettingsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                SnowSectionHeader(title = "Security & Advanced Diagnostics")
+                SnowSectionHeader(title = "Advanced Settings")
                 Text(
                     text = if (showAdvancedDiagnostics) "Hide ▲" else "Show ▼",
                     style = SnowTypography.labelSmall.copy(fontWeight = FontWeight.Bold),
@@ -454,6 +597,7 @@ fun SettingsScreen(
             }
 
             if (showAdvancedDiagnostics) {
+                val canonicalSnowDisplay = permanentDeviceSnowId.ifBlank { mySnowId }.trim().uppercase()
                 Spacer(modifier = Modifier.height(8.dp))
                 SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
                     Column {
@@ -465,7 +609,7 @@ fun SettingsScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(text = "My SNOW ID", style = SnowTypography.labelSmall, color = colors.textMuted)
                                 Text(
-                                    text = permanentDeviceSnowId.ifBlank { mySnowId.ifBlank { myDeviceId } },
+                                    text = canonicalSnowDisplay.ifBlank { "Generating..." },
                                     style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
                                     color = colors.textPrimary
                                 )
@@ -473,90 +617,38 @@ fun SettingsScreen(
                             SnowTonalButton(
                                 text = "Copy",
                                 icon = Icons.Default.ContentCopy,
+                                enabled = canonicalSnowDisplay.isNotBlank(),
                                 onClick = {
-                                    clipboardManager.setText(AnnotatedString(permanentDeviceSnowId.ifBlank { mySnowId.ifBlank { myDeviceId } }))
+                                    if (canonicalSnowDisplay.isNotBlank()) {
+                                        clipboardManager.setText(AnnotatedString(canonicalSnowDisplay))
+                                    }
                                 }
-                            )
-                        }
-
-                        if (permanentDeviceMcpUrl.isNotBlank()) {
-                            Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(text = "Permanent Android MCP URL", style = SnowTypography.labelSmall, color = colors.textMuted)
-                                    Text(
-                                        text = permanentDeviceMcpUrl,
-                                        style = SnowTypography.monospaceSmall,
-                                        color = colors.accentCyan
-                                    )
-                                }
-                                SnowTonalButton(
-                                    text = "Copy",
-                                    icon = Icons.Default.ContentCopy,
-                                    onClick = { clipboardManager.setText(AnnotatedString(permanentDeviceMcpUrl)) }
-                                )
-                            }
-                        }
-
-                        if (!identityError.isNullOrBlank()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = identityError,
-                                style = SnowTypography.bodySmall,
-                                color = Color(0xFFEF4444)
                             )
                         }
 
                         Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
-                        SettingsSwitchRow(
-                            title = "Standalone Android MCP Endpoint",
-                            subtitle = when {
-                                !androidRemoteMcpEnabled -> "Disabled by owner — remote AI clients cannot connect"
-                                androidMcpConnected -> "Connected directly to Render Hub (/u/$permanentDeviceSnowId/mcp)"
-                                !androidMcpError.isNullOrBlank() -> "Reconnecting: $androidMcpError"
-                                else -> "Enabled by default — connecting standalone without Windows PC"
-                            },
-                            checked = androidRemoteMcpEnabled,
-                            onCheckedChange = onToggleAndroidRemoteMcp
-                        )
 
-                        if (authorizedOAuthClients.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(
-                                text = "Authorized AI Clients (${authorizedOAuthClients.size})",
-                                style = SnowTypography.labelSmall,
-                                color = colors.textMuted
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            authorizedOAuthClients.forEach { oauthClient ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = oauthClient.clientName,
-                                            style = SnowTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-                                            color = colors.textPrimary
-                                        )
-                                        Text(
-                                            text = "${oauthClient.scopes.joinToString(" ")} • ${oauthClient.clientId}",
-                                            style = SnowTypography.monospaceSmall,
-                                            color = colors.textMuted
-                                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(text = "My Network ID", style = SnowTypography.labelSmall, color = colors.textMuted)
+                                Text(
+                                    text = myNetworkId.ifBlank { "Standalone" },
+                                    style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = if (myNetworkId.isNotBlank()) colors.accentCyan else colors.textSecondary
+                                )
+                            }
+                            if (myNetworkId.isNotBlank()) {
+                                SnowTonalButton(
+                                    text = "Copy",
+                                    icon = Icons.Default.ContentCopy,
+                                    onClick = {
+                                        clipboardManager.setText(AnnotatedString(myNetworkId))
                                     }
-                                    SnowOutlinedButton(
-                                        text = "Revoke",
-                                        onClick = { onRevokeOAuthClient(oauthClient.clientId) }
-                                    )
-                                }
+                                )
                             }
                         }
 
@@ -596,58 +688,6 @@ fun SettingsScreen(
                                 style = SnowTypography.bodySmall,
                                 color = colors.accentCyan
                             )
-                        }
-
-                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(text = "My Network ID", style = SnowTypography.labelSmall, color = colors.textMuted)
-                                Text(
-                                    text = myNetworkId.ifBlank { "Not linked to a PC host yet" },
-                                    style = SnowTypography.monospaceSmall.copy(fontWeight = FontWeight.Bold),
-                                    color = if (myNetworkId.isNotBlank()) colors.accentCyan else colors.textSecondary
-                                )
-                            }
-                            if (myNetworkId.isNotBlank()) {
-                                SnowTonalButton(
-                                    text = "Copy",
-                                    icon = Icons.Default.ContentCopy,
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(myNetworkId))
-                                    }
-                                )
-                            }
-                        }
-
-                        Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(text = "Remote AI Link (MCP URL)", style = SnowTypography.labelSmall, color = colors.textMuted)
-                                Text(
-                                    text = remoteAiLinkUrl ?: remoteAiLinkStatus,
-                                    style = SnowTypography.monospaceSmall,
-                                    color = if (!remoteAiLinkUrl.isNullOrBlank()) colors.textPrimary else colors.textSecondary
-                                )
-                            }
-                            if (!remoteAiLinkUrl.isNullOrBlank()) {
-                                SnowTonalButton(
-                                    text = "Copy",
-                                    icon = Icons.Default.ContentCopy,
-                                    onClick = {
-                                        clipboardManager.setText(AnnotatedString(remoteAiLinkUrl))
-                                    }
-                                )
-                            }
                         }
 
                         Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 12.dp))
@@ -886,7 +926,7 @@ fun SettingsScreen(
             text = {
                 Column {
                     Text(
-                        text = "Choose a strong passphrase (minimum 10 characters) to encrypt your device identity via PBKDF2-SHA256 + AES-256-GCM before saving via SAF.",
+                        text = "Choose a strong passphrase (minimum 10 characters) to encrypt your device identity via PBKDF2-SHA256 + AES-256-GCM before saving to your chosen folder.",
                         style = SnowTypography.bodySmall,
                         color = colors.textSecondary
                     )
@@ -902,7 +942,7 @@ fun SettingsScreen(
             },
             confirmButton = {
                 SnowTonalButton(
-                    text = "Choose Location (SAF)",
+                    text = "Choose Folder",
                     onClick = {
                         val snowTag = permanentDeviceSnowId.ifBlank { "snow-device" }
                         showEncryptedBackupDialog = false
@@ -975,6 +1015,102 @@ fun SettingsScreen(
                         restoreInput = ""
                         restorePassphrase = ""
                     }
+                )
+            },
+            containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+        )
+    }
+
+    val revokeTarget = pendingRevokeOAuthClient
+    if (revokeTarget != null) {
+        AlertDialog(
+            onDismissRequest = { pendingRevokeOAuthClient = null },
+            title = { Text("Revoke AI Client Access?", style = SnowTypography.titleMedium, color = colors.textPrimary) },
+            text = {
+                Text(
+                    text = "Revoking ${revokeTarget.clientName} (${revokeTarget.clientId}) will immediately invalidate all of its OAuth access and refresh tokens.",
+                    style = SnowTypography.bodySmall,
+                    color = colors.textSecondary
+                )
+            },
+            confirmButton = {
+                SnowTonalButton(
+                    text = "Revoke Access",
+                    onClick = {
+                        onRevokeOAuthClient(revokeTarget.clientId)
+                        pendingRevokeOAuthClient = null
+                    }
+                )
+            },
+            dismissButton = {
+                SnowOutlinedButton(
+                    text = "Cancel",
+                    onClick = { pendingRevokeOAuthClient = null }
+                )
+            },
+            containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White
+        )
+    }
+
+    if (showRemoteMcpQrDialog) {
+        val qrTargetUrl = permanentDeviceMcpUrl.ifBlank { remoteAiLinkUrl.orEmpty() }
+        val qrBmp = remember(qrTargetUrl) {
+            if (qrTargetUrl.isBlank()) null else try {
+                val matrix = QRCodeWriter().encode(qrTargetUrl, BarcodeFormat.QR_CODE, 512, 512)
+                Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.RGB_565).apply {
+                    for (x in 0 until matrix.width) {
+                        for (y in 0 until matrix.height) {
+                            setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { showRemoteMcpQrDialog = false },
+            title = { Text("Remote AI Link QR", style = SnowTypography.titleMedium, color = colors.textPrimary) },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                    if (qrBmp != null) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.White)
+                                .padding(12.dp)
+                        ) {
+                            Image(
+                                bitmap = qrBmp.asImageBitmap(),
+                                contentDescription = "Remote AI Link QR",
+                                modifier = Modifier.size(200.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(10.dp))
+                    }
+                    Text(
+                        text = qrTargetUrl,
+                        style = SnowTypography.monospaceSmall,
+                        color = colors.accentCyan
+                    )
+                }
+            },
+            confirmButton = {
+                SnowTonalButton(
+                    text = "Copy Link",
+                    icon = Icons.Default.ContentCopy,
+                    onClick = {
+                        if (qrTargetUrl.isNotBlank()) {
+                            clipboardManager.setText(AnnotatedString(qrTargetUrl))
+                        }
+                        showRemoteMcpQrDialog = false
+                    }
+                )
+            },
+            dismissButton = {
+                SnowOutlinedButton(
+                    text = "Close",
+                    onClick = { showRemoteMcpQrDialog = false }
                 )
             },
             containerColor = if (colors.isDark) Color(0xFF1E1E1E) else Color.White

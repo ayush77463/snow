@@ -1041,6 +1041,13 @@ class SnowCoreServer:
         port: int = 8765,
         pin: str = "",
         expected_fingerprint: str = "",
+        handshake_token: str = "",
+        network_id: Optional[str] = None,
+        client_network_id: Optional[str] = None,
+        network_decision: Optional[str] = None,
+        merge_tx_id: Optional[str] = None,
+        client_merge_approved: bool = False,
+        surviving_network_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Establish outbound TLS/WSS peer connection, register in NodeRegistry and DB, and retain session."""
         from snow.network.peer_client import SnowPeerClient
@@ -1052,7 +1059,17 @@ class SnowCoreServer:
             expected_fingerprint=expected_fingerprint or None,
             use_tls=True,
         )
-        res = await client.connect(pin=pin, timeout=10.0)
+        res = await client.connect(
+            pin=pin,
+            timeout=10.0,
+            handshake_token=handshake_token,
+            network_id=network_id,
+            client_network_id=client_network_id,
+            network_decision=network_decision,
+            merge_tx_id=merge_tx_id,
+            client_merge_approved=client_merge_approved,
+            surviving_network_id=surviving_network_id,
+        )
         if not res.success or not res.remote_device_id:
             await client.close()
             return {
@@ -1139,6 +1156,13 @@ class SnowCoreServer:
                 "remote_device_name": remote_name,
                 "session_id": session_id,
                 "cert_fingerprint": cert_fp,
+                "network_id": getattr(res, "network_id", None),
+                "network_action": getattr(res, "network_action", None),
+                "network_conflict": bool(getattr(res, "network_conflict", False)),
+                "relationship": getattr(res, "relationship", "member"),
+                "merge_tx_id": getattr(res, "merge_tx_id", None),
+                "host_network_id": getattr(res, "host_network_id", None),
+                "client_network_id": getattr(res, "client_network_id", None),
             },
         }
 
@@ -1454,8 +1478,10 @@ class SnowCoreServer:
         from snow.security.identity import load_or_create_device_identity, load_or_create_network_key_identity
 
         try:
+            from snow.security.identity import resolve_canonical_device_snow_id
             net_ident = load_or_create_network_key_identity()
             dev_ident = load_or_create_device_identity()
+            canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
         except Exception as exc:
             return False, "", "", f"Failed loading Ed25519 identity: {exc}"
 
@@ -1468,7 +1494,7 @@ class SnowCoreServer:
                         "network_id": net_ident.network_id,
                         "public_key": net_ident.public_key_b64,
                         "device_id": dev_ident.device_id,
-                        "snow_id": dev_ident.snow_id,
+                        "snow_id": canonical_snow,
                     },
                 ) as ch_resp:
                     ch_data = await ch_resp.json(content_type=None)
@@ -1486,7 +1512,7 @@ class SnowCoreServer:
                         "public_key": net_ident.public_key_b64,
                         "signature": sig_b64,
                         "device_id": dev_ident.device_id,
-                        "snow_id": dev_ident.snow_id,
+                        "snow_id": canonical_snow,
                     },
                 ) as sess_resp:
                     sess_data = await sess_resp.json(content_type=None)
@@ -1552,12 +1578,13 @@ class SnowCoreServer:
                 if not ok_hub or not hub_token:
                     logger.warning("Skipping hub rendezvous open (%s): %s", hub_http_base, err_hub)
                     return None
+                from snow.security.identity import resolve_canonical_device_snow_id
                 ws_srv = getattr(self, "ws_server", None)
                 cert_info = getattr(ws_srv, "certificate_info", None)
                 fp = getattr(cert_info, "fingerprint_sha256", "") if cert_info else ""
                 dev_ident = getattr(self, "device_identity", None)
                 host_dev_id = str(getattr(dev_ident, "device_id", "") or "").strip()
-                host_snow_id = str(getattr(dev_ident, "snow_id", "") or "").strip().upper()
+                host_snow_id, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
                 body: dict[str, Any] = {
                     "mode": "pairing",
                     "host_device_id": host_dev_id,

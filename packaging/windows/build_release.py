@@ -289,8 +289,16 @@ def run_pipeline(
     except Exception:
         rel_ver = "7.0.0"
 
+    gradle_release_apk = repo_root / "android" / "app" / "build" / "outputs" / "apk" / "release" / "app-release.apk"
     staged_apk = output_dir / f"SNOW-Mobile-{rel_ver}.apk"
-    if not staged_apk.is_file():
+    if gradle_release_apk.is_file():
+        needs_sync = (not staged_apk.is_file()) or (
+            compute_file_sha256(gradle_release_apk) != compute_file_sha256(staged_apk)
+        )
+        if needs_sync:
+            shutil.copy2(gradle_release_apk, staged_apk)
+            print(f"[+] Synced signed release APK into {staged_apk}")
+    elif not staged_apk.is_file():
         candidates = sorted(output_dir.glob("SNOW-Mobile-*.apk"), reverse=True)
         staged_apk = candidates[0] if candidates else staged_apk
     if staged_apk.is_file():

@@ -173,7 +173,7 @@ class SafFolderManager(
             if (pickedDir == null || !pickedDir.canWrite()) {
                 return Result.failure(
                     IllegalStateException(
-                        "Configured SAF destination directory is inaccessible or write permission was revoked. Please select a valid folder in Settings."
+                        "Configured Transfer Folder is inaccessible or write permission was revoked. Please select a valid folder in Settings."
                     )
                 )
             }
@@ -182,7 +182,7 @@ class SafFolderManager(
             val uniqueName = generateUniqueSafName(pickedDir, fileName)
             val destDoc = pickedDir.createFile("application/octet-stream", uniqueName)
                 ?: return Result.failure(
-                    IllegalStateException("Failed to create destination file in SAF directory: $uniqueName")
+                    IllegalStateException("Failed to create destination file in Transfer Folder: $uniqueName")
                 )
 
             return try {
@@ -247,7 +247,7 @@ class SafFolderManager(
             if (pickedDir == null || !pickedDir.canWrite()) {
                 return Result.failure(
                     IllegalStateException(
-                        "Configured SAF destination directory is inaccessible or write permission was revoked. Please select a valid folder in Settings."
+                        "Configured Transfer Folder is inaccessible or write permission was revoked. Please select a valid folder in Settings."
                     )
                 )
             }
@@ -257,7 +257,7 @@ class SafFolderManager(
                 for ((tempFile, safeName) in entries) {
                     val uniqueName = generateUniqueSafName(pickedDir, safeName)
                     val destDoc = pickedDir.createFile("application/octet-stream", uniqueName)
-                        ?: throw IllegalStateException("Failed to create SAF destination file: $uniqueName")
+                        ?: throw IllegalStateException("Failed to create file in Transfer Folder: $uniqueName")
                     createdDocs.add(destDoc)
                     val outStream = context.contentResolver.openOutputStream(destDoc.uri)
                         ?: throw IllegalStateException("ContentResolver failed opening stream for $uniqueName")

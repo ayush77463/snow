@@ -664,6 +664,13 @@ class SnowIpcServer:
             port = payload.get("port", 8765)
             pin = payload.get("pin", "")
             expected_fingerprint = payload.get("expected_fingerprint", "")
+            handshake_token = payload.get("handshake_token", "")
+            network_id = payload.get("network_id")
+            client_network_id = payload.get("client_network_id")
+            network_decision = payload.get("network_decision")
+            merge_tx_id = payload.get("merge_tx_id")
+            client_merge_approved = bool(payload.get("client_merge_approved", False))
+            surviving_network_id = payload.get("surviving_network_id")
             if not host:
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -679,6 +686,13 @@ class SnowIpcServer:
                     port=port,
                     pin=pin,
                     expected_fingerprint=expected_fingerprint,
+                    handshake_token=handshake_token,
+                    network_id=network_id,
+                    client_network_id=client_network_id,
+                    network_decision=network_decision,
+                    merge_tx_id=merge_tx_id,
+                    client_merge_approved=client_merge_approved,
+                    surviving_network_id=surviving_network_id,
                 )
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -2199,7 +2213,7 @@ class SnowIpcServer:
                 }, now_authed
 
             from snow.core.network import get_active_ip_addresses
-            from snow.security.identity import generate_snow_id
+            from snow.security.identity import resolve_canonical_device_snow_id
             from snow.security.pairing import create_qr_pairing_payload
 
             local_ident = getattr(cs, "device_identity", None)
@@ -2231,7 +2245,7 @@ class SnowIpcServer:
                     active_ips=candidate_ips,
                 )
             fp = cert_info.fingerprint_sha256 if cert_info else ""
-            snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=host_device_id)
+            snow_id, legacy_snow_id = resolve_canonical_device_snow_id(fallback_identity=local_ident)
             from snow.core.config import resolve_default_hub_url
             from snow.network.network_model import SnowNetworkManager
             net_mgr = SnowNetworkManager(db_manager=getattr(cs, "db_manager", None))
@@ -2243,17 +2257,24 @@ class SnowIpcServer:
 
             pin_state = pm.get_active_pin_state(include_pin=True)
             qr_payload = None
-            if pin_state.get("has_active_pin") and pin_state.get("pin") and fp:
+            if fp and (candidate_ips or rdv_id):
                 try:
+                    live_handshake = pm.get_or_issue_live_qr_handshake_token(
+                        host_device_id=host_device_id,
+                        network_id=active_net_id or "",
+                        trust_tier=pin_state.get("trust_tier", "owner"),
+                        ttl_seconds=pm.pin_lifetime or 60.0,
+                    )
                     qr_payload = create_qr_pairing_payload(
                         node_id=host_device_id,
                         candidate_ips=candidate_ips,
                         port=port,
                         cert_fingerprint=fp,
-                        pin=pin_state["pin"],
+                        pin=pin_state["pin"] if (pin_state.get("has_active_pin") and pin_state.get("pin")) else None,
                         version=2,
                         trust_tier=pin_state.get("trust_tier", "owner"),
                         snow_id=snow_id,
+                        handshake_token=live_handshake,
                         network_id=active_net_id,
                         hub_url=hub_url,
                         device_type="windows",
@@ -2268,10 +2289,13 @@ class SnowIpcServer:
                 "port": port,
                 "node_id": host_device_id,
                 "snow_id": snow_id,
+                "network_id": active_net_id,
                 "fp": fp,
                 "cert_fingerprint": fp,
                 **pin_state,
             }
+            if legacy_snow_id:
+                state_data["legacy_snow_id"] = legacy_snow_id
             if qr_payload is not None:
                 state_data["qr_payload"] = qr_payload
 
@@ -2347,7 +2371,8 @@ class SnowIpcServer:
 
             payload_data = payload if isinstance(payload, dict) else {}
             trust_tier = payload_data.get("trust_tier", "owner")
-            pin = pm.generate_pin(display_to_stderr=False, trust_tier=trust_tier)
+            include_pin = bool(payload_data.get("include_pin", True)) and not bool(payload_data.get("zero_pin", False))
+            pin = pm.generate_pin(display_to_stderr=False, trust_tier=trust_tier) if include_pin else None
             from snow.core.network import get_active_ip_addresses
             candidate_ips = get_active_ip_addresses()
 
@@ -2371,7 +2396,7 @@ class SnowIpcServer:
             fp = cert_info.fingerprint_sha256 if cert_info else ""
             from snow.core.config import resolve_default_hub_url
             from snow.network.network_model import SnowNetworkManager
-            from snow.security.identity import generate_snow_id
+            from snow.security.identity import resolve_canonical_device_snow_id
             from snow.security.pairing import create_qr_pairing_payload
 
             net_mgr = SnowNetworkManager(db_manager=getattr(cs, "db_manager", None))
@@ -2379,19 +2404,28 @@ class SnowIpcServer:
             transfer_srv = getattr(cs, "http_transfer_server", None)
             transfer_port = getattr(transfer_srv, "bound_port", None) or getattr(cfg, "transfer_port", None) or 8766
             hub_url = resolve_default_hub_url(db_manager=getattr(cs, "db_manager", None)) or None
-            snow_id = getattr(local_ident, "snow_id", None) or generate_snow_id(seed=host_device_id)
-            handshake_token = pm.issue_handshake_token(
-                host_device_id=host_device_id,
-                network_id=active_net_id or "",
-                trust_tier=trust_tier,
-                ttl_seconds=pm.pin_lifetime or 60.0,
+            snow_id, _ = resolve_canonical_device_snow_id(fallback_identity=local_ident)
+            handshake_token = (
+                pm.issue_handshake_token(
+                    host_device_id=host_device_id,
+                    network_id=active_net_id or "",
+                    trust_tier=trust_tier,
+                    ttl_seconds=pm.pin_lifetime or 60.0,
+                )
+                if include_pin
+                else pm.get_or_issue_live_qr_handshake_token(
+                    host_device_id=host_device_id,
+                    network_id=active_net_id or "",
+                    trust_tier=trust_tier,
+                    ttl_seconds=pm.pin_lifetime or 60.0,
+                )
             )
 
             rdv_id: Optional[str] = None
             if hasattr(cs, "open_rendezvous_for_pairing"):
                 try:
                     rdv_res = cs.open_rendezvous_for_pairing(
-                        pin=pin,
+                        pin=pin or "",
                         handshake_token=handshake_token,
                         trust_tier=trust_tier,
                         ttl_seconds=pm.pin_lifetime or 60.0,

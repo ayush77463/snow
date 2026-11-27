@@ -740,6 +740,7 @@ fun SnowApp(
                         )
                     }
                     SnowTab.SETTINGS -> {
+                        val livePermanentSnowId by repository.permanentDeviceSnowId.collectAsState()
                         SettingsScreen(
                             currentThemeMode = themeMode,
                             onThemeModeChanged = { mode ->
@@ -800,10 +801,10 @@ fun SnowApp(
                                 autoConnectNearby = checked
                                 repository.setAutoReconnectEnabled(checked)
                             },
-                            mySnowId = repository.canonicalSnowId,
+                            mySnowId = repository.permanentDeviceSnowId.collectAsState().value.ifBlank { repository.canonicalSnowId },
                             myDeviceId = repository.identity.deviceId,
                             myNetworkId = adoptedNetworkId.orEmpty(),
-                            permanentDeviceSnowId = repository.permanentDeviceSnowId.collectAsState().value,
+                            permanentDeviceSnowId = repository.permanentDeviceSnowId.collectAsState().value.ifBlank { repository.canonicalSnowId },
                             permanentDeviceMcpUrl = repository.permanentDeviceMcpUrl.collectAsState().value,
                             identityError = repository.identityError.collectAsState().value,
                             onExportRecoveryKey = { confirmed -> repository.exportDeviceRecoveryKeyWithConsent(confirmed) },
@@ -989,7 +990,7 @@ fun SnowApp(
                             }
                         }
                     },
-                    mySnowId = repository.canonicalSnowId,
+                    mySnowId = repository.permanentDeviceSnowId.collectAsState().value.ifBlank { repository.canonicalSnowId },
                     myDeviceId = repository.identity.deviceId,
                     isConnecting = isConnectingByInput,
                     errorMessage = connectErrorMessage,
@@ -1000,7 +1001,7 @@ fun SnowApp(
                     onPreparePairingQr = {
                         isPreparingConnectQr = true
                         connectQrError = null
-                        repository.preparePeerHostPairingQr { qrJson, err ->
+                        repository.preparePeerHostPairingQr(includePin = false) { qrJson, err ->
                             isPreparingConnectQr = false
                             connectQrJson = qrJson
                             connectQrError = err
@@ -1008,11 +1009,11 @@ fun SnowApp(
                     },
                     onRegeneratePairingPin = {
                         repository.generatePeerHostPin()
-                        connectQrJson = repository.generatePeerHostQrJson()
+                        connectQrJson = repository.generatePeerHostQrJson(includePin = true)
                     },
                     onCancelPairingPin = {
                         repository.cancelPeerHostPairing()
-                        connectQrJson = null
+                        connectQrJson = repository.generatePeerHostQrJson(includePin = false)
                     },
                     myNetworkId = adoptedNetworkId
                 )

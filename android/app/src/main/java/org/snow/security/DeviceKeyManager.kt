@@ -16,6 +16,9 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
+class DeviceRecoveryTrustResetException(message: String, cause: Throwable? = null) :
+    IllegalStateException(message, cause)
+
 /**
  * Manages persistence, fail-closed integrity checking, checksummed recovery export/restore,
  * and strict post-recovery trust separation for Android's permanent Ed25519 [DeviceKeyIdentity].
@@ -34,7 +37,8 @@ class DeviceKeyManager(
     private val appContext: Context,
     keyProvider: SecretKeyProvider = AndroidKeyStoreKeyProvider(DEFAULT_KEYSTORE_ALIAS),
     private val prefs: SharedPreferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
-    private val keyStoreManager: KeyStoreManager = KeyStoreManager(keyProvider)
+    private val keyStoreManager: KeyStoreManager = KeyStoreManager(keyProvider),
+    private val certPinStorageFactory: (Context) -> CertPinStorage = { ctx -> EncryptedCertPinStorage(ctx) }
 ) {
     private val lock = Any()
 
@@ -422,39 +426,67 @@ class DeviceKeyManager(
 
     /**
      * Enforce post-recovery trust separation:
-     * Wipe pairing tokens, pinned TLS certs, saved peer trust records, relay sessions,
-     * adopted network membership, and Android OAuth tokens/clients/codes.
+     * Wipe pairing tokens, Keystore-encrypted pinned TLS certs (snow_security), saved peer trust
+     * records, relay sessions, adopted network membership, and Android OAuth tokens/clients/codes.
+     *
+     * Collects all wipe steps and throws [DeviceRecoveryTrustResetException] if any security store
+     * fails to clear cleanly rather than silently succeeding.
      */
     fun clearPeerTrustAndOAuthOnRecovery() {
-        try {
+        val failures = mutableListOf<String>()
+
+        fun recordStep(label: String, action: () -> Unit) {
+            try {
+                action()
+            } catch (e: Exception) {
+                SafeLog.e(TAG, "Post-recovery trust wipe failed at [$label]: ${e.message}", e)
+                failures.add("$label (${e.message ?: e.javaClass.simpleName})")
+            }
+        }
+
+        fun clearPrefsStrict(prefName: String) {
+            recordStep(prefName) {
+                val ok = appContext.getSharedPreferences(prefName, Context.MODE_PRIVATE)
+                    .edit()
+                    .clear()
+                    .commit()
+                if (!ok) throw IllegalStateException("SharedPreferences commit returned false")
+            }
+        }
+
+        recordStep("encrypted_cert_pins") {
+            certPinStorageFactory(appContext).clearAllPinnedFingerprints()
+        }
+        recordStep("token_storage_default") {
             SharedPreferencesTokenStorage(appContext).clearAllTokens()
-        } catch (_: Exception) {}
-        try {
-            SharedPreferencesTokenStorage(appContext, prefName = SharedPreferencesTokenStorage.PEER_HOST_PREFS_NAME).clearAllTokens()
-        } catch (_: Exception) {}
-        try {
-            appContext.getSharedPreferences("snow_cert_pins", Context.MODE_PRIVATE).edit().clear().commit()
-        } catch (_: Exception) {}
-        try {
-            appContext.getSharedPreferences("snow_cert_pins_v2", Context.MODE_PRIVATE).edit().clear().commit()
-        } catch (_: Exception) {}
-        try {
-            appContext.getSharedPreferences("snow_paired_devices_v2", Context.MODE_PRIVATE).edit().clear().commit()
-        } catch (_: Exception) {}
-        try {
-            appContext.getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE).edit().clear().commit()
-        } catch (_: Exception) {}
-        try {
-            appContext.getSharedPreferences("snow_android_oauth_prefs", Context.MODE_PRIVATE).edit().clear().commit()
-        } catch (_: Exception) {}
-        try {
-            appContext.getSharedPreferences("snow_android_oauth_secrets", Context.MODE_PRIVATE).edit().clear().commit()
-        } catch (_: Exception) {}
-        try {
-            appContext.getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE).edit()
+        }
+        recordStep("token_storage_peer_host") {
+            SharedPreferencesTokenStorage(
+                appContext,
+                prefName = SharedPreferencesTokenStorage.PEER_HOST_PREFS_NAME
+            ).clearAllTokens()
+        }
+
+        clearPrefsStrict("snow_cert_pins")
+        clearPrefsStrict("snow_cert_pins_v2")
+        clearPrefsStrict("snow_paired_devices_v2")
+        clearPrefsStrict("snow_relay_security")
+        clearPrefsStrict("snow_android_oauth_prefs")
+        clearPrefsStrict("snow_android_oauth_secrets")
+
+        recordStep(SnowUiRepository.PREFS_SETTINGS) {
+            val ok = appContext.getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+                .edit()
                 .remove(SnowUiRepository.PREF_KEY_ADOPTED_NETWORK_ID)
                 .remove("remote_relay_group_id")
                 .commit()
-        } catch (_: Exception) {}
+            if (!ok) throw IllegalStateException("SharedPreferences commit returned false")
+        }
+
+        if (failures.isNotEmpty()) {
+            throw DeviceRecoveryTrustResetException(
+                "Device identity restored, but post-recovery trust cleanup failed for: ${failures.joinToString("; ")}"
+            )
+        }
     }
 }

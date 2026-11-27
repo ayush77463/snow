@@ -218,8 +218,10 @@ class Milestone1Unit5TrustAndGuardTest {
         val repoSrc = resolveModuleFile("src/main/java/org/snow/ui/SnowUiRepository.kt").readText()
         assertTrue(repoSrc.contains("val availability = evaluateShareCodeEligibility(_connectionState.value, _authState.value)"))
 
+        // M4.5 removed CrossNetworkSharingCard / federation UI from DevicesScreen while keeping the repository guard intact
         val devicesSrc = resolveModuleFile("src/main/java/org/snow/ui/devices/DevicesScreen.kt").readText()
-        assertTrue(devicesSrc.contains("enabled = canShareCode"))
+        assertFalse(devicesSrc.contains("CrossNetworkSharingCard("))
+        assertFalse(devicesSrc.contains("enabled = canShareCode"))
     }
 
     @Test

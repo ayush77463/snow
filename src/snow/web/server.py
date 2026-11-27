@@ -879,15 +879,27 @@ class SnowWebServer:
             and (usb_stat.get("connected") or usb_stat.get("authorized_count", 0) > 0)
         )
 
-        from snow.security.identity import load_or_create_device_identity
+        from snow.security.identity import load_or_create_device_identity, resolve_canonical_device_snow_id
         identity = load_or_create_device_identity()
+        canonical_snow_id, _ = resolve_canonical_device_snow_id(fallback_identity=identity)
+        active_net_id = None
+        try:
+            cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+            db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
+            if db_mgr is not None and hasattr(db_mgr, "get_active_network"):
+                active_net = db_mgr.get_active_network()
+                if isinstance(active_net, dict) and active_net.get("network_id"):
+                    active_net_id = str(active_net["network_id"]).strip().upper()
+        except Exception:
+            active_net_id = None
 
         data = {
             "success": True,
             "daemon_online": daemon_online,
-            "snow_id": identity.snow_id,
+            "snow_id": canonical_snow_id,
             "device_id": identity.device_id,
             "device_name": identity.device_name,
+            "network_id": active_net_id,
             "ipc_endpoint": f"127.0.0.1:{self.bridge.port}",
             "wss_port": 8765,
             "lan_ips": lan_ips,
@@ -948,8 +960,18 @@ class SnowWebServer:
             devices = res["devices"]
 
         # Deduplicate local host node & normalize live phone telemetry and canonical snow_id
-        from snow.security.identity import generate_snow_id, load_or_create_device_identity
+        from snow.security.identity import (
+            generate_snow_id,
+            load_or_create_device_identity,
+            resolve_canonical_device_snow_id,
+        )
         local_ident = load_or_create_device_identity()
+        canonical_local_snow, legacy_local_snow = resolve_canonical_device_snow_id(fallback_identity=local_ident)
+        local_snow_aliases = {canonical_local_snow}
+        if legacy_local_snow:
+            local_snow_aliases.add(legacy_local_snow)
+        cap_eng_dev = getattr(getattr(self, "bridge", None), "capability_engine", None)
+        dev_db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng_dev, "db_manager", None)
         deduped: list[dict[str, Any]] = []
         discovered_peers: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -960,19 +982,28 @@ class SnowWebServer:
         for raw_dev in devices:
             dev = dict(raw_dev)
             dev_id = dev.get("device_id") or ""
+            dev_snow_raw = str(dev.get("snow_id") or "").strip().upper()
             is_local = bool(
                 dev.get("is_local")
                 or dev_id in ("local", "desktop-core", local_ident.device_id)
                 or dev.get("transport") == "local"
-                or (local_ident.snow_id and dev.get("snow_id") == local_ident.snow_id)
+                or (dev_snow_raw and dev_snow_raw in local_snow_aliases)
             )
             if is_local:
                 dev["is_local"] = True
-                dev["snow_id"] = local_ident.snow_id
+                dev["snow_id"] = canonical_local_snow
                 if seen_local:
                     continue
                 seen_local = True
             else:
+                if not dev_snow_raw and dev_id:
+                    stored_peer_snow = ""
+                    if dev_db_mgr is not None and hasattr(dev_db_mgr, "get_setting"):
+                        try:
+                            stored_peer_snow = str(dev_db_mgr.get_setting(f"device_snow_id:{dev_id}") or "").strip().upper()
+                        except Exception:
+                            stored_peer_snow = ""
+                    dev["snow_id"] = stored_peer_snow or generate_snow_id(seed=dev_id)
                 # Filter unpaired UDP discovery candidates & "Unknown Node" ghosts out of MY NETWORK DEVICES
                 is_explicitly_unpaired = (
                     dev.get("is_paired") is False
@@ -1182,7 +1213,7 @@ class SnowWebServer:
         return web.json_response(res)
 
     async def handle_api_devices_connect_peer(self, request: web.Request) -> web.Response:
-        """Federate or connect to another SNOW Core or Android Peer Host by host/port or SNOW ID."""
+        """Federate or connect to another SNOW Core or Android Peer Host by host/port, SNOW ID, or QR v2 JSON."""
         try:
             body = await request.json()
         except Exception:
@@ -1193,6 +1224,33 @@ class SnowWebServer:
         port_raw = body.get("port", 8765)
         pin = (body.get("pin") or "").strip()
         expected_fingerprint = (body.get("expected_fingerprint") or "").strip()
+        handshake_token = (body.get("handshake_token") or "").strip()
+        network_id = (body.get("network_id") or "").strip().upper() or None
+        client_network_id = (body.get("client_network_id") or "").strip().upper() or None
+        network_decision = (body.get("network_decision") or "").strip().lower() or None
+        merge_tx_id = (body.get("merge_tx_id") or "").strip() or None
+        client_merge_approved = bool(body.get("client_merge_approved", False))
+        surviving_network_id = (body.get("surviving_network_id") or "").strip().upper() or None
+
+        if body.get("qr_json") is not None:
+            from snow.security.pairing import validate_qr_pairing_payload
+            try:
+                validated_qr = validate_qr_pairing_payload(body.get("qr_json"), allow_usb_loopback=True)
+            except ValueError as qr_exc:
+                return web.json_response(
+                    {"success": False, "status": "INVALID_QR_PAYLOAD", "error": str(qr_exc)},
+                    status=400,
+                )
+            if not host and validated_qr.get("ips"):
+                host = str(validated_qr["ips"][0])
+            port_raw = validated_qr.get("port", port_raw)
+            expected_fingerprint = expected_fingerprint or str(validated_qr.get("fp") or "")
+            if not pin and validated_qr.get("pin"):
+                pin = str(validated_qr["pin"])
+            if not handshake_token and validated_qr.get("handshake_token"):
+                handshake_token = str(validated_qr["handshake_token"])
+            if network_id is None and validated_qr.get("network_id"):
+                network_id = str(validated_qr["network_id"]).strip().upper()
 
         if not host and snow_id_query:
             resolved_entry = await self._resolve_snow_id_directory(snow_id_query)
@@ -1232,12 +1290,31 @@ class SnowWebServer:
         except (ValueError, TypeError):
             return web.json_response({"success": False, "error": "Invalid port number."}, status=400)
 
+        # Resolve local network_id automatically when caller is already part of a mesh network
+        if client_network_id is None:
+            try:
+                cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+                db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
+                if db_mgr is not None and hasattr(db_mgr, "get_active_network"):
+                    active_net = db_mgr.get_active_network()
+                    if isinstance(active_net, dict) and active_net.get("network_id"):
+                        client_network_id = str(active_net["network_id"]).strip().upper()
+            except Exception:
+                pass
+
         # Call bridge to connect peer (Never log PINs or secret tokens)
         res = await self.bridge.mesh_connect_peer(
             host=host,
             port=port,
             pin=pin,
             expected_fingerprint=expected_fingerprint,
+            handshake_token=handshake_token,
+            network_id=network_id,
+            client_network_id=client_network_id,
+            network_decision=network_decision,
+            merge_tx_id=merge_tx_id,
+            client_merge_approved=client_merge_approved,
+            surviving_network_id=surviving_network_id,
         )
 
         # If successful, record endpoint in SnowNetworkManager
@@ -1253,6 +1330,151 @@ class SnowWebServer:
                     logger.debug("Failed recording connected peer endpoint: %s", ex)
 
         return web.json_response(res)
+
+    async def handle_api_pair_qr_validate(self, request: web.Request) -> web.Response:
+        """Validate a pasted QR v1/v2 JSON string and return safe connection preview metadata."""
+        from snow.security.pairing import validate_qr_pairing_payload
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        if not isinstance(body, dict) or body.get("qr_json") is None:
+            return web.json_response({"success": False, "status": "MISSING_QR_JSON", "error": "Field 'qr_json' is required."}, status=400)
+
+        try:
+            validated = validate_qr_pairing_payload(body.get("qr_json"), allow_usb_loopback=True)
+        except ValueError as exc:
+            return web.json_response(
+                {"success": False, "valid": False, "status": "INVALID_QR_PAYLOAD", "error": str(exc)},
+                status=400,
+            )
+
+        fp = str(validated.get("fp") or "")
+        return web.json_response({
+            "success": True,
+            "valid": True,
+            "status": "VALID_QR_PAYLOAD",
+            "summary": {
+                "v": validated.get("v"),
+                "snow_id": validated.get("snow_id"),
+                "network_id": validated.get("network_id"),
+                "ips": list(validated.get("ips") or []),
+                "port": validated.get("port"),
+                "fp": fp,
+                "fp_short": f"{fp[:8]}...{fp[-8:]}" if len(fp) >= 16 else fp,
+                "tier": validated.get("tier", "owner"),
+                "device_type": validated.get("device_type") or "unknown",
+                "rdv_id": validated.get("rdv_id"),
+                "has_pin": bool(validated.get("pin")),
+                "has_handshake_token": bool(validated.get("handshake_token")),
+                "exp": validated.get("exp"),
+            },
+        })
+
+    async def handle_api_pair_qr_accept(self, request: web.Request) -> web.Response:
+        """Validate and connect to a peer using a pasted QR v1/v2 JSON payload across ranked IPs."""
+        from snow.security.pairing import validate_qr_pairing_payload
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        if not isinstance(body, dict) or body.get("qr_json") is None:
+            return web.json_response({"success": False, "status": "MISSING_QR_JSON", "error": "Field 'qr_json' is required."}, status=400)
+
+        try:
+            validated = validate_qr_pairing_payload(body.get("qr_json"), allow_usb_loopback=True)
+        except ValueError as exc:
+            return web.json_response(
+                {"success": False, "status": "INVALID_QR_PAYLOAD", "error": str(exc)},
+                status=400,
+            )
+
+        candidate_hosts: list[str] = []
+        override_host = (body.get("host") or "").strip()
+        if override_host:
+            candidate_hosts.append(override_host)
+        for ip_addr in validated.get("ips") or []:
+            if ip_addr and ip_addr not in candidate_hosts:
+                candidate_hosts.append(str(ip_addr))
+
+        if not candidate_hosts:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "NO_DIRECT_LAN_ENDPOINT",
+                    "error": "QR payload has no reachable LAN candidate IPs; ensure relay rendezvous or enter peer IP.",
+                },
+                status=400,
+            )
+
+        port = int(body.get("port") or validated["port"])
+        pin = str(body.get("pin") or validated.get("pin") or "").strip()
+        handshake_token = str(validated.get("handshake_token") or "").strip()
+        expected_fp = str(validated.get("fp") or "").strip()
+        target_net_id = validated.get("network_id")
+        network_decision = (body.get("network_decision") or "").strip().lower() or None
+        merge_tx_id = (body.get("merge_tx_id") or "").strip() or None
+        client_merge_approved = bool(body.get("client_merge_approved", False))
+        surviving_network_id = (body.get("surviving_network_id") or "").strip().upper() or None
+
+        client_network_id = None
+        try:
+            cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+            db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
+            if db_mgr is not None and hasattr(db_mgr, "get_active_network"):
+                active_net = db_mgr.get_active_network()
+                if isinstance(active_net, dict) and active_net.get("network_id"):
+                    client_network_id = str(active_net["network_id"]).strip().upper()
+        except Exception:
+            client_network_id = None
+
+        last_res: dict[str, Any] = {"success": False, "status": "CONNECTION_FAILED", "error": "Unable to reach peer endpoints."}
+        chosen_host = candidate_hosts[0]
+        for cand_host in candidate_hosts:
+            last_res = await self.bridge.mesh_connect_peer(
+                host=cand_host,
+                port=port,
+                pin=pin,
+                expected_fingerprint=expected_fp,
+                handshake_token=handshake_token,
+                network_id=target_net_id,
+                client_network_id=client_network_id,
+                network_decision=network_decision,
+                merge_tx_id=merge_tx_id,
+                client_merge_approved=client_merge_approved,
+                surviving_network_id=surviving_network_id,
+            )
+            if last_res.get("success"):
+                chosen_host = cand_host
+                break
+
+        if last_res.get("success") and last_res.get("data"):
+            remote_dev_id = last_res["data"].get("remote_device_id")
+            if remote_dev_id:
+                try:
+                    from snow.network.network_model import SnowNetworkManager
+                    db_mgr = getattr(self, "db_manager", None) or self.bridge.capability_engine.db_manager
+                    net_mgr = SnowNetworkManager(db_manager=db_mgr)
+                    net_mgr.record_endpoint(device_id=remote_dev_id, host=chosen_host, port=port)
+                except Exception as ex:
+                    logger.debug("Failed recording QR-accepted peer endpoint: %s", ex)
+            return web.json_response({
+                **last_res,
+                "snow_id": validated.get("snow_id"),
+                "network_id": target_net_id,
+                "network_conflict": bool(
+                    last_res.get("network_conflict")
+                    or (isinstance(last_res.get("data"), dict) and last_res["data"].get("network_conflict"))
+                ),
+                "merge_tx_id": last_res.get("merge_tx_id")
+                or (last_res.get("data").get("merge_tx_id") if isinstance(last_res.get("data"), dict) else None),
+            })
+
+        err_status = str(last_res.get("status") or "ERROR")
+        http_code = 422 if err_status in ("FINGERPRINT_MISMATCH", "PAIRING_REJECTED") else 400
+        return web.json_response(last_res, status=http_code)
 
     async def handle_api_devices_connection_mode(self, request: web.Request) -> web.Response:
         """Update per-device transport/connection mode with verified route validation."""
@@ -1533,13 +1755,37 @@ class SnowWebServer:
         db_mgr = getattr(self, "db_manager", None) or getattr(
             getattr(getattr(self, "bridge", None), "capability_engine", None), "db_manager", None
         )
-        oauth_srv = getattr(getattr(self, "remote_gateway", None), "oauth_server", None)
+        gateway = getattr(self, "_mcp_gateway_instance", None) or getattr(self, "remote_gateway", None)
+        oauth_srv = getattr(gateway, "oauth_server", None)
 
         def _revoke_oauth() -> None:
             if oauth_srv is not None and hasattr(oauth_srv, "revoke_all_on_recovery"):
                 oauth_srv.revoke_all_on_recovery()
+            elif db_mgr is not None and hasattr(db_mgr, "revoke_all_oauth_sessions"):
+                db_mgr.revoke_all_oauth_sessions()
+            pending_dict = getattr(gateway, "_pending_authorizations", None)
+            if isinstance(pending_dict, dict):
+                pending_dict.clear()
+
+        from snow.mcp.tunnel import is_remote_ai_link_enabled
+        tm = getattr(self, "tunnel_manager", None)
+        gw_port = getattr(self, "gateway_port", 8771)
+        was_tunnel_active = False
+        if tm is not None and hasattr(tm, "get_status"):
+            try:
+                was_tunnel_active = bool(tm.get_status(port=gw_port).get("active"))
+            except Exception:
+                was_tunnel_active = False
 
         try:
+            if tm is not None and hasattr(tm, "stop_tunnel"):
+                try:
+                    await tm.stop_tunnel(port=gw_port)
+                except Exception as stop_exc:
+                    logger.debug("Non-fatal stop_tunnel prior to recovery restore: %s", stop_exc)
+            if gateway is not None and hasattr(gateway, "set_public_url"):
+                gateway.set_public_url(None)
+
             restored, _ = restore_device_key_identity(
                 recovery_input,
                 passphrase=passphrase if isinstance(passphrase, str) else None,
@@ -1547,19 +1793,45 @@ class SnowWebServer:
                 oauth_revoke_callback=_revoke_oauth,
                 confirm_replace=True,
             )
+
+            link_enabled = is_remote_ai_link_enabled()
+            gateway_takeover_status = "STOPPED_DISABLED"
+            gateway_active = False
+            takeover_error = None
+            if (link_enabled or was_tunnel_active) and tm is not None and hasattr(self, "ensure_remote_ai_link_running"):
+                try:
+                    takeover_res = await self.ensure_remote_ai_link_running(
+                        mark_enabled=False,
+                        recovery_takeover=True,
+                    )
+                    gateway_active = bool(takeover_res.get("success"))
+                    gateway_takeover_status = "TAKEN_OVER" if gateway_active else "DEFERRED_OFFLINE"
+                    if not gateway_active:
+                        takeover_error = str(takeover_res.get("error") or "Hub offline during recovery takeover.")
+                except Exception as tk_exc:
+                    gateway_takeover_status = "DEFERRED_OFFLINE"
+                    takeover_error = str(tk_exc)
+            elif tm is None:
+                gateway_takeover_status = "UNAVAILABLE"
+
             hub_url = resolve_default_hub_url(db_manager=db_mgr)
-            return web.json_response({
+            resp_payload: dict[str, Any] = {
                 "success": True,
                 "status": "IDENTITY_RESTORED",
                 "device_identity": restored.to_public_dict(),
                 "snow_id": restored.snow_id,
                 "permanent_mcp_url": f"{hub_url.rstrip('/')}/u/{restored.snow_id}/mcp" if hub_url else "",
                 "trust_reset": True,
+                "gateway_takeover": gateway_takeover_status,
+                "gateway_active": gateway_active,
                 "message": (
                     "Permanent cryptographic identity restored. Prior pairing credentials, peer trust, "
                     "and OAuth sessions were wiped; re-pair peers and re-approve AI clients explicitly."
                 ),
-            })
+            }
+            if takeover_error:
+                resp_payload["takeover_error"] = takeover_error
+            return web.json_response(resp_payload)
         except DeviceIdentityError as exc:
             return web.json_response({"success": False, "status": "INVALID_RECOVERY", "error": str(exc)}, status=400)
 
@@ -1759,9 +2031,11 @@ class SnowWebServer:
             return web.json_response({"success": False, "error": str(exc)}, status=500)
 
     async def handle_api_pair_qr(self, request: web.Request) -> web.Response:
-        """Generate temporary pairing PIN, QR code metadata, and vector SVG."""
+        """Generate temporary pairing PIN (optional), QR code metadata, and vector SVG."""
         trust_tier = "owner"
         require_legacy_ticket = False
+        include_pin = True
+        zero_pin = False
         if request.method == "POST":
             try:
                 body = await request.json()
@@ -1772,6 +2046,11 @@ class SnowWebServer:
                         or body.get("include_relay_ticket")
                         or body.get("legacy_relay_ticket")
                     )
+                    if "include_pin" in body:
+                        include_pin = bool(body.get("include_pin"))
+                    if body.get("zero_pin"):
+                        zero_pin = True
+                        include_pin = False
             except Exception:
                 pass
         elif request.method == "GET":
@@ -1785,8 +2064,17 @@ class SnowWebServer:
                 ).strip().lower()
                 in ("1", "true", "yes")
             )
+            if str(request.query.get("zero_pin") or "").strip().lower() in ("1", "true", "yes") or str(
+                request.query.get("include_pin") or ""
+            ).strip().lower() in ("0", "false", "no"):
+                zero_pin = True
+                include_pin = False
 
-        res = await self.bridge.call("generate_pairing_qr", {"trust_tier": trust_tier})
+        ipc_payload: dict[str, Any] = {"trust_tier": trust_tier}
+        if not include_pin or zero_pin:
+            ipc_payload["include_pin"] = False
+            ipc_payload["zero_pin"] = True
+        res = await self.bridge.call("generate_pairing_qr", ipc_payload)
         if not res.get("success"):
             return web.json_response({
                 "success": False,
@@ -3732,8 +4020,10 @@ class SnowWebServer:
         from snow.security.identity import load_or_create_device_identity, load_or_create_network_key_identity
 
         try:
+            from snow.security.identity import resolve_canonical_device_snow_id
             net_ident = load_or_create_network_key_identity()
             dev_ident = load_or_create_device_identity()
+            canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
         except Exception as exc:
             return False, "", "HUB_AUTH_FAILED", f"Failed loading local hub Ed25519 identity: {exc}"
 
@@ -3748,7 +4038,7 @@ class SnowWebServer:
                     "network_id": net_ident.network_id,
                     "public_key": net_ident.public_key_b64,
                     "device_id": dev_ident.device_id,
-                    "snow_id": dev_ident.snow_id,
+                    "snow_id": canonical_snow,
                 },
             ) as ch_resp:
                 try:
@@ -3777,7 +4067,7 @@ class SnowWebServer:
                     "public_key": net_ident.public_key_b64,
                     "signature": sig_b64,
                     "device_id": dev_ident.device_id,
-                    "snow_id": dev_ident.snow_id,
+                    "snow_id": canonical_snow,
                 },
             ) as sess_resp:
                 try:
@@ -3857,7 +4147,11 @@ class SnowWebServer:
         """Resolve a SNOW ID: validate -> local paired DB -> Core IPC LAN discovery -> authenticated Cloud Hub."""
         from snow.core.config import resolve_default_hub_url
         from snow.relay.auth import is_valid_network_id, is_valid_snow_id
-        from snow.security.identity import generate_snow_id, load_or_create_device_identity
+        from snow.security.identity import (
+            generate_snow_id,
+            load_or_create_device_identity,
+            resolve_canonical_device_snow_id,
+        )
 
         # 1. Validate & normalize requested SNOW ID
         clean_id = (snow_id or "").strip().upper()
@@ -3867,31 +4161,45 @@ class SnowWebServer:
         cap_engine = getattr(getattr(self, "bridge", None), "capability_engine", None)
         db_mgr = getattr(self, "db_manager", None) or getattr(cap_engine, "db_manager", None)
         local_ident = load_or_create_device_identity()
-        if local_ident.snow_id.upper() == clean_id:
+        canonical_local_snow, legacy_local_snow = resolve_canonical_device_snow_id(fallback_identity=local_ident)
+        if clean_id == canonical_local_snow or (legacy_local_snow and clean_id == legacy_local_snow):
             return {
                 "success": True,
                 "found": True,
                 "source": "local",
-                "snow_id": clean_id,
+                "snow_id": canonical_local_snow,
                 "device_id": local_ident.device_id,
                 "host": "127.0.0.1",
                 "port": 8765,
             }
 
-        # 2. Check existing local paired-device database first
+        # 2. Check existing local paired-device database first (including legacy aliases)
         paired_match: Optional[Any] = None
-        if db_mgr and hasattr(db_mgr, "list_paired_devices"):
+        if db_mgr and hasattr(db_mgr, "find_paired_device_by_identifier"):
+            paired_match = db_mgr.find_paired_device_by_identifier(clean_id)
+        elif db_mgr and hasattr(db_mgr, "list_paired_devices"):
             for p in db_mgr.list_paired_devices():
                 cand_snow = (getattr(p, "snow_id", None) or generate_snow_id(seed=p.device_id)).upper()
                 if cand_snow == clean_id or str(p.device_id).upper() == clean_id:
                     paired_match = p
                     break
         if paired_match is not None and str(paired_match.last_known_host or "").strip():
+            resolved_peer_snow = ""
+            if db_mgr is not None and hasattr(db_mgr, "get_setting"):
+                try:
+                    resolved_peer_snow = str(db_mgr.get_setting(f"device_snow_id:{paired_match.device_id}") or "").strip().upper()
+                except Exception:
+                    resolved_peer_snow = ""
+            resolved_peer_snow = (
+                resolved_peer_snow
+                or str(getattr(paired_match, "snow_id", "") or "").strip().upper()
+                or clean_id
+            )
             return {
                 "success": True,
                 "found": True,
                 "source": "paired_db",
-                "snow_id": clean_id,
+                "snow_id": resolved_peer_snow,
                 "device_id": paired_match.device_id,
                 "device_name": paired_match.device_name,
                 "host": str(paired_match.last_known_host).strip(),
@@ -4542,6 +4850,7 @@ class SnowWebServer:
         provider: Optional[str] = None,
         custom_url: Optional[str] = None,
         mark_enabled: bool = False,
+        recovery_takeover: bool = False,
     ) -> dict[str, Any]:
         """Idempotently start Remote MCP Gateway (:8771) and public Render/provider tunnel."""
         from snow.mcp.tunnel import load_tunnel_config, set_remote_ai_link_enabled
@@ -4580,10 +4889,11 @@ class SnowWebServer:
                         "error": self._remote_ai_link_last_error,
                     }
 
-        # 2. Deduplicate if tunnel is already active on matching provider and no custom override was requested
+        # 2. Deduplicate if tunnel is already active on matching provider and no custom override or recovery takeover was requested
         cur_status = self.tunnel_manager.get_status(port=self.gateway_port)
         if (
-            cur_status.get("active")
+            not recovery_takeover
+            and cur_status.get("active")
             and cur_status.get("provider") == resolved_provider
             and not custom_url
             and cur_status.get("public_url")
@@ -4605,6 +4915,7 @@ class SnowWebServer:
             provider=resolved_provider,
             port=self.gateway_port,
             custom_url=custom_url,
+            recovery_takeover=recovery_takeover,
         )
 
         # 4. Synchronize live public URL into RemoteMcpGateway instance
@@ -4990,6 +5301,108 @@ class SnowWebServer:
         res = self._mcp_gateway_instance.reject_authorization(req_id)
         return web.json_response(res)
 
+    async def _resolve_oauth_server_and_owner(self) -> tuple[Any, str]:
+        """Resolve local canonical device SNOW ID and backing OAuthServer instance."""
+        from snow.mcp.oauth import OAuthServer
+        from snow.security.identity import load_or_create_device_key_identity
+
+        cap_eng = getattr(getattr(self, "bridge", None), "capability_engine", None)
+        db_mgr = getattr(self, "db_manager", None) or getattr(cap_eng, "db_manager", None)
+        gateway = getattr(self, "_mcp_gateway_instance", None) or getattr(self, "remote_gateway", None)
+        oauth_srv = getattr(gateway, "oauth_server", None)
+        if oauth_srv is None and db_mgr is not None:
+            oauth_srv = OAuthServer(db_manager=db_mgr)
+        dev_key = load_or_create_device_key_identity()
+        return oauth_srv, dev_key.snow_id.upper()
+
+    async def handle_api_mcp_oauth_clients(self, request: web.Request) -> web.Response:
+        """List authorized OAuth 2.1 AI clients bound to this device identity."""
+        try:
+            oauth_srv, local_snow_id = await self._resolve_oauth_server_and_owner()
+        except Exception as exc:
+            return web.json_response({"success": False, "status": "IDENTITY_ERROR", "error": str(exc)}, status=409)
+
+        req_owner = (request.query.get("device_snow_id") or "").strip().upper()
+        if req_owner and req_owner != local_snow_id:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "FORBIDDEN",
+                    "error": f"Device identity mismatch: requested '{req_owner}' does not own this node ('{local_snow_id}').",
+                },
+                status=403,
+            )
+
+        clients = oauth_srv.list_clients(owner_snow_id=local_snow_id) if oauth_srv is not None else []
+        gateway = getattr(self, "_mcp_gateway_instance", None) or getattr(self, "remote_gateway", None)
+        return web.json_response({
+            "success": True,
+            "status": "SUCCESS",
+            "device_snow_id": local_snow_id,
+            "gateway_online": gateway is not None,
+            "clients": clients,
+            "count": len(clients),
+        })
+
+    async def handle_api_mcp_oauth_clients_revoke(self, request: web.Request) -> web.Response:
+        """Revoke an authorized OAuth 2.1 client and invalidate all its access/refresh tokens and families."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "CONFIRMATION_REQUIRED",
+                    "error": "Explicit owner confirmation (confirm=true) is required to revoke an AI client.",
+                },
+                status=400,
+            )
+
+        client_id = str(body.get("client_id") or "").strip()
+        if not client_id:
+            return web.json_response({"success": False, "status": "MISSING_CLIENT_ID", "error": "Field 'client_id' is required."}, status=400)
+
+        try:
+            oauth_srv, local_snow_id = await self._resolve_oauth_server_and_owner()
+        except Exception as exc:
+            return web.json_response({"success": False, "status": "IDENTITY_ERROR", "error": str(exc)}, status=409)
+
+        req_owner = str(body.get("device_snow_id") or "").strip().upper()
+        if req_owner and req_owner != local_snow_id:
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": "FORBIDDEN",
+                    "error": f"Device identity mismatch: '{req_owner}' is not authorized to revoke '{local_snow_id}' clients.",
+                },
+                status=403,
+            )
+
+        if oauth_srv is None:
+            return web.json_response({"success": False, "status": "OAUTH_UNAVAILABLE", "error": "OAuth store is unavailable."}, status=503)
+
+        try:
+            revoked = oauth_srv.revoke_client(client_id, owner_snow_id=local_snow_id)
+        except PermissionError as pex:
+            return web.json_response({"success": False, "status": "FORBIDDEN", "error": str(pex)}, status=403)
+        except ValueError as vex:
+            return web.json_response({"success": False, "status": "INVALID_CLIENT_ID", "error": str(vex)}, status=400)
+
+        if not revoked.get("found"):
+            return web.json_response(
+                {"success": False, "status": "CLIENT_NOT_FOUND", "error": f"OAuth client '{client_id}' was not found."},
+                status=404,
+            )
+
+        return web.json_response({
+            "success": True,
+            "status": "CLIENT_REVOKED",
+            "device_snow_id": local_snow_id,
+            **revoked,
+        })
+
     # =========================================================================
     # Additional Native Capability Endpoints (Phase 4 Stage 4B)
     # =========================================================================
@@ -5234,15 +5647,15 @@ class SnowWebServer:
         if not mcp_url:
             try:
                 from snow.core.config import resolve_default_hub_url
-                from snow.security.identity import load_or_create_network_key_identity
+                from snow.security.identity import load_or_create_device_key_identity
 
                 db_mgr = getattr(self, "db_manager", None) or getattr(
                     getattr(self.bridge, "capability_engine", None), "db_manager", None
                 )
                 hub_url = resolve_default_hub_url(db_manager=db_mgr)
-                key_ident = load_or_create_network_key_identity()
-                if hub_url and key_ident and getattr(key_ident, "network_id", ""):
-                    mcp_url = f"{hub_url.rstrip('/')}/u/{key_ident.network_id}/mcp"
+                dev_key = load_or_create_device_key_identity()
+                if hub_url and dev_key and getattr(dev_key, "snow_id", ""):
+                    mcp_url = f"{hub_url.rstrip('/')}/u/{dev_key.snow_id}/mcp"
             except Exception:
                 mcp_url = ""
         if not mcp_url:
@@ -5460,6 +5873,8 @@ class SnowWebServer:
         app.router.add_get("/api/pair/state", self.handle_api_pair_state)
         app.router.add_get("/api/pair/qr", self.handle_api_pair_qr)
         app.router.add_post("/api/pair/qr", self.handle_api_pair_qr)
+        app.router.add_post("/api/pair/qr/validate", self.handle_api_pair_qr_validate)
+        app.router.add_post("/api/pair/qr/accept", self.handle_api_pair_qr_accept)
         app.router.add_post("/api/pair/cancel", self.handle_api_pair_cancel)
         app.router.add_get("/api/files", self.handle_api_files)
         app.router.add_get("/api/files/destinations", self.handle_api_files_destinations)
@@ -5553,6 +5968,8 @@ class SnowWebServer:
         app.router.add_get("/api/mcp/oauth/pending", self.handle_api_mcp_oauth_pending)
         app.router.add_post("/api/mcp/oauth/approve", self.handle_api_mcp_oauth_approve)
         app.router.add_post("/api/mcp/oauth/reject", self.handle_api_mcp_oauth_reject)
+        app.router.add_get("/api/mcp/oauth/clients", self.handle_api_mcp_oauth_clients)
+        app.router.add_post("/api/mcp/oauth/clients/revoke", self.handle_api_mcp_oauth_clients_revoke)
 
         # Relay Tunnel Management (Phase 4 Stage 4A)
         app.router.add_post("/api/relay/tunnel/start", self.handle_api_relay_tunnel_start)
