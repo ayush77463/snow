@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -32,14 +33,15 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.LockReset
 import androidx.compose.material.icons.filled.Notifications
@@ -194,7 +196,6 @@ fun SettingsScreen(
 
     var permSnapshot by remember { mutableStateOf(refreshPermissionSnapshot()) }
     var isNotificationAccessGranted by remember { mutableStateOf(permSnapshot.notificationListenerGranted) }
-    val isServiceRunning by SnowForegroundService.isServiceRunningFlow.collectAsState()
 
     val safPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -278,11 +279,13 @@ fun SettingsScreen(
             }
         }
 
-        // Top-Level Remote AI Link Card (M4.5)
+        // Top-Level Remote AI Link Card (M4.6)
         item {
             val activeMcpUrl = permanentDeviceMcpUrl.ifBlank {
                 remoteAiLinkUrl.orEmpty()
             }
+            @Suppress("UNUSED_VARIABLE")
+            val ignoredMcpError = androidMcpError
             SnowSectionHeader(title = "Remote AI Link")
             SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -291,36 +294,38 @@ fun SettingsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "Remote AI Link",
-                            style = SnowTypography.titleSmall,
-                            color = colors.textPrimary
-                        )
-                        val statusBadgeType = when {
-                            !androidRemoteMcpEnabled -> SnowBadgeType.STANDBY
-                            androidMcpConnected -> SnowBadgeType.CONNECTED
-                            else -> SnowBadgeType.STANDBY
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Remote AI Link",
+                                style = SnowTypography.titleSmall,
+                                color = colors.textPrimary
+                            )
+                            val statusBadgeType = when {
+                                !androidRemoteMcpEnabled -> SnowBadgeType.STANDBY
+                                androidMcpConnected -> SnowBadgeType.CONNECTED
+                                else -> SnowBadgeType.STANDBY
+                            }
+                            val statusLabel = when {
+                                !androidRemoteMcpEnabled -> "OFF"
+                                androidMcpConnected -> "ACTIVE"
+                                else -> "OFFLINE"
+                            }
+                            SnowStatusBadge(text = statusLabel, type = statusBadgeType)
                         }
-                        val statusLabel = when {
-                            !androidRemoteMcpEnabled -> "OFF"
-                            androidMcpConnected -> "ACTIVE"
-                            !androidMcpError.isNullOrBlank() -> "OFFLINE"
-                            else -> "CONNECTING"
-                        }
-                        SnowStatusBadge(text = statusLabel, type = statusBadgeType)
-                    }
-
-                    SettingsSwitchRow(
-                        title = "Enable Remote AI Link",
-                        checked = androidRemoteMcpEnabled,
-                        onCheckedChange = onToggleAndroidRemoteMcp
-                    )
-
-                    if (androidRemoteMcpEnabled && !androidMcpError.isNullOrBlank() && !androidMcpConnected) {
-                        Text(
-                            text = androidMcpError,
-                            style = SnowTypography.bodySmall,
-                            color = colors.textSecondary
+                        Switch(
+                            checked = androidRemoteMcpEnabled,
+                            onCheckedChange = onToggleAndroidRemoteMcp,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = colors.accentBlue,
+                                uncheckedThumbColor = colors.textMuted,
+                                uncheckedTrackColor = colors.surfaceElevated
+                            ),
+                            modifier = Modifier.scale(0.85f)
                         )
                     }
 
@@ -451,35 +456,56 @@ fun SettingsScreen(
             }
         }
 
-        // Permissions & Setup Guide
+        // Permissions & Setup Guide (4 clean rows: Notification Sync, File Access, Transfer Folder, Background Run)
         item {
             SnowSectionHeader(title = "Permissions & System Setup")
             SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
                 Column {
                     PermissionRowItem(
                         icon = Icons.Default.Notifications,
-                        title = "Post Notifications",
-                        subtitle = if (permSnapshot.postNotificationsGranted) {
-                            "Foreground bridge status & background tap-to-open notifications ready."
-                        } else {
-                            "Required for persistent foreground bridge & tap-to-open app notifications."
-                        },
-                        statusText = if (permSnapshot.postNotificationsGranted) "GRANTED" else "REQUIRED",
-                        isGranted = permSnapshot.postNotificationsGranted,
+                        title = "Notification Sync",
+                        subtitle = null,
+                        statusText = if (isNotificationAccessGranted) "GRANTED" else "SETUP",
+                        isGranted = isNotificationAccessGranted,
                         onClick = {
-                            context.startActivity(createAppNotificationSettingsIntent(context.packageName))
+                            if (isNotificationAccessGranted) {
+                                context.startActivity(createNotificationListenerSettingsIntent())
+                            } else {
+                                showNotificationGuide = true
+                            }
                         }
                     )
 
                     Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
                     PermissionRowItem(
-                        icon = Icons.Default.Notifications,
-                        title = "Notification Sync & Listener",
-                        subtitle = "App launching from background & file transfers use Android Notifications & Transfer Folder.",
-                        statusText = if (isNotificationAccessGranted) "GRANTED" else "SETUP",
-                        isGranted = isNotificationAccessGranted,
-                        onClick = { showNotificationGuide = true }
+                        icon = Icons.Default.Folder,
+                        title = "File Access",
+                        subtitle = null,
+                        statusText = if (permSnapshot.allFilesAccessGranted) "GRANTED" else "SETUP",
+                        isGranted = permSnapshot.allFilesAccessGranted,
+                        onClick = {
+                            val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                createAllFilesAccessSettingsIntent(context.packageName)
+                            } else {
+                                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                    data = Uri.parse("package:${context.packageName}")
+                                }
+                            }
+                            try {
+                                context.startActivity(intent)
+                            } catch (_: Exception) {
+                                try {
+                                    context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                                } catch (_: Exception) {
+                                    context.startActivity(
+                                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                            data = Uri.parse("package:${context.packageName}")
+                                        }
+                                    )
+                                }
+                            }
+                        }
                     )
 
                     Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
@@ -487,11 +513,7 @@ fun SettingsScreen(
                     PermissionRowItem(
                         icon = Icons.Default.FolderOpen,
                         title = "Transfer Folder",
-                        subtitle = if (permSnapshot.safFolderConfigured) {
-                            "Active folder: ${permSnapshot.safFolderName}"
-                        } else {
-                            "Default: Downloads/SNOW (Tap to authorize a custom folder)"
-                        },
+                        subtitle = permSnapshot.safFolderName,
                         statusText = if (permSnapshot.safFolderConfigured) "CONFIGURED" else "DEFAULT",
                         isGranted = permSnapshot.safFolderConfigured,
                         onClick = {
@@ -501,15 +523,22 @@ fun SettingsScreen(
 
                     Divider(color = colors.borderSubtle, modifier = Modifier.padding(vertical = 10.dp))
 
-                    val liveBg = permSnapshot.copy(isForegroundServiceRunning = isServiceRunning || permSnapshot.isForegroundServiceRunning)
                     PermissionRowItem(
-                        icon = Icons.Default.BatteryChargingFull,
-                        title = "Background Activity & Service",
-                        subtitle = liveBg.backgroundSummaryText(),
-                        statusText = liveBg.backgroundBadgeText(),
-                        isGranted = liveBg.isBackgroundFullyHealthy(),
+                        icon = Icons.Default.Layers,
+                        title = "Background Run",
+                        subtitle = null,
+                        statusText = if (permSnapshot.overlayPermissionGranted) "GRANTED" else "SETUP",
+                        isGranted = permSnapshot.overlayPermissionGranted,
                         onClick = {
-                            org.snow.ui.SnowUiRepository.openBatteryOptimizationSettings(context)
+                            try {
+                                context.startActivity(createOverlayPermissionSettingsIntent(context.packageName))
+                            } catch (_: Exception) {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                        data = Uri.parse("package:${context.packageName}")
+                                    }
+                                )
+                            }
                         }
                     )
                 }
@@ -795,10 +824,15 @@ fun SettingsScreen(
                         color = colors.textSecondary
                     )
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text(text = "1. Restricted Settings: Open App Info -> Menu (3 dots) -> Allow restricted settings.", style = SnowTypography.bodySmall, color = colors.textPrimary)
-                    Text(text = "2. Notifications: Grant Notification permission and enable SNOW in Notification Listener settings.", style = SnowTypography.bodySmall, color = colors.textPrimary)
+                    Text(text = "1. Restricted Settings: Open App Info -> ⋮ -> Allow restricted settings.", style = SnowTypography.bodySmall, color = colors.textPrimary)
+                    Text(text = "2. Notification Sync: Grant Notification Listener access for SNOW.", style = SnowTypography.bodySmall, color = colors.textPrimary)
                     Text(text = "3. Battery Optimization: Set Battery usage to Unrestricted / Allow background activity.", style = SnowTypography.bodySmall, color = colors.textPrimary)
-                    Text(text = "4. Auto-Launch (ColorOS): Enable Allow auto-launch under App Info -> Battery usage.", style = SnowTypography.bodySmall, color = colors.textPrimary)
+                    Spacer(modifier = Modifier.height(10.dp))
+                    SnowOutlinedButton(
+                        text = "Battery Optimization Settings",
+                        onClick = { org.snow.ui.SnowUiRepository.openBatteryOptimizationSettings(context) },
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
             },
             confirmButton = {
@@ -1121,6 +1155,16 @@ fun SettingsScreen(
 fun createNotificationListenerSettingsIntent(): Intent =
     Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
 
+fun createAllFilesAccessSettingsIntent(packageName: String): Intent =
+    Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+        data = Uri.parse("package:$packageName")
+    }
+
+fun createOverlayPermissionSettingsIntent(packageName: String): Intent =
+    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
+        data = Uri.parse("package:$packageName")
+    }
+
 fun createAppNotificationSettingsIntent(packageName: String): Intent =
     Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
         putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
@@ -1130,13 +1174,20 @@ fun createBatteryOptimizationSettingsIntent(): Intent =
     Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
 
 data class SettingsPermissionSnapshot(
-    val postNotificationsGranted: Boolean,
     val notificationListenerGranted: Boolean,
+    val allFilesAccessGranted: Boolean,
     val safFolderConfigured: Boolean,
     val safFolderName: String,
-    val isBatteryUnrestricted: Boolean,
-    val isForegroundServiceRunning: Boolean
+    val overlayPermissionGranted: Boolean,
+    val postNotificationsGranted: Boolean = false,
+    val isBatteryUnrestricted: Boolean = false,
+    val isForegroundServiceRunning: Boolean = false
 ) {
+    fun notificationSyncBadgeText(): String = if (notificationListenerGranted) "GRANTED" else "SETUP"
+    fun fileAccessBadgeText(): String = if (allFilesAccessGranted) "GRANTED" else "SETUP"
+    fun transferFolderBadgeText(): String = if (safFolderConfigured) "CONFIGURED" else "DEFAULT"
+    fun backgroundRunBadgeText(): String = if (overlayPermissionGranted) "GRANTED" else "SETUP"
+
     fun backgroundBadgeText(): String = when {
         isBatteryUnrestricted && isForegroundServiceRunning -> "UNRESTRICTED"
         isBatteryUnrestricted || isForegroundServiceRunning -> "PARTIAL"
@@ -1158,26 +1209,28 @@ object SettingsPermissionInspector {
     fun inspect(
         context: Context,
         listenerGranted: Boolean? = null,
-        postNotificationsOverride: Boolean? = null,
+        allFilesAccessOverride: Boolean? = null,
         safConfiguredOverride: Boolean? = null,
         safFolderNameOverride: String? = null,
+        overlayPermissionOverride: Boolean? = null,
+        postNotificationsOverride: Boolean? = null,
         batteryUnrestrictedOverride: Boolean? = null,
         serviceRunningOverride: Boolean? = null
     ): SettingsPermissionSnapshot {
-        val postGranted = postNotificationsOverride ?: try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-            } else {
-                ActionNotificationHelper.canPostNotifications(context)
-            }
-        } catch (_: Throwable) {
-            false
-        }
-
         val listenerOk = listenerGranted ?: try {
             androidx.core.app.NotificationManagerCompat
                 .getEnabledListenerPackages(context)
                 .contains(context.packageName)
+        } catch (_: Throwable) {
+            false
+        }
+
+        val allFilesOk = allFilesAccessOverride ?: try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Environment.isExternalStorageManager()
+            } else {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+            }
         } catch (_: Throwable) {
             false
         }
@@ -1190,6 +1243,26 @@ object SettingsPermissionInspector {
         val safOk = safConfiguredOverride ?: (safManager?.hasValidPersistedFolderUri() == true)
         val safName = safFolderNameOverride ?: (safManager?.getDestinationDisplayName() ?: "Default: Downloads/SNOW")
 
+        val overlayOk = overlayPermissionOverride ?: try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                Settings.canDrawOverlays(context)
+            } else {
+                true
+            }
+        } catch (_: Throwable) {
+            false
+        }
+
+        val postGranted = postNotificationsOverride ?: try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else {
+                ActionNotificationHelper.canPostNotifications(context)
+            }
+        } catch (_: Throwable) {
+            false
+        }
+
         val batUnrestricted = batteryUnrestrictedOverride ?: try {
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
             pm?.isIgnoringBatteryOptimizations(context.packageName) == true
@@ -1200,10 +1273,12 @@ object SettingsPermissionInspector {
         val svcRunning = serviceRunningOverride ?: SnowForegroundService.isServiceRunning()
 
         return SettingsPermissionSnapshot(
-            postNotificationsGranted = postGranted,
             notificationListenerGranted = listenerOk,
+            allFilesAccessGranted = allFilesOk,
             safFolderConfigured = safOk,
             safFolderName = safName,
+            overlayPermissionGranted = overlayOk,
+            postNotificationsGranted = postGranted,
             isBatteryUnrestricted = batUnrestricted,
             isForegroundServiceRunning = svcRunning
         )

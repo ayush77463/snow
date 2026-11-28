@@ -89,6 +89,8 @@ import org.snow.ui.SnowUiRepository.ClipboardItemDto
 import org.snow.ui.PcTelemetry
 import org.snow.ui.PhoneTelemetry
 import org.snow.ui.SavedDevice
+import org.snow.ui.TargetDeviceType
+import org.snow.ui.formatTransferBytes
 import org.snow.ui.components.SnowBadgeType
 import org.snow.ui.components.SnowCard
 import org.snow.ui.components.SnowGradientButton
@@ -142,16 +144,27 @@ fun HomeScreen(
     isRefreshing: Boolean = false,
     onRefresh: () -> Unit = {},
     busyClipboardItemId: String? = null,
+    activeTransfers: List<ActiveTransferInfo> = listOfNotNull(activeTransfer),
+    onCancelTransferById: (String) -> Unit = { onCancelTransfer() },
+    onDismissTransferById: (String) -> Unit = { onCancelTransfer() },
+    targetDeviceType: TargetDeviceType? = null,
     modifier: Modifier = Modifier
 ) {
     val colors = LocalSnowColors.current
     val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
     val listState = rememberLazyListState()
-    val isPhonePeer = connectedDevice?.isPhone == true
+    val isPhonePeer = targetDeviceType == TargetDeviceType.ANDROID_PEER ||
+        (targetDeviceType == null && connectedDevice?.isPhone == true)
+    val visibleTransfers = remember(activeTransfers) {
+        activeTransfers.filter { !it.status.equals("CANCELLED", ignoreCase = true) }
+    }
 
     LaunchedEffect(scrollToClipboardTrigger) {
         if (scrollToClipboardTrigger > 0) {
-            listState.animateScrollToItem(2)
+            val clipboardIndex = 2 +
+                (if (!isPhonePeer && phoneTelemetry.isAvailable) 1 else 0) +
+                visibleTransfers.size
+            listState.animateScrollToItem(clipboardIndex)
         }
     }
 
@@ -219,6 +232,26 @@ fun HomeScreen(
         if (!isPhonePeer && phoneTelemetry.isAvailable) {
             item {
                 LocalPhoneTelemetryStrip(phoneTelemetry = phoneTelemetry)
+            }
+        }
+
+        // Concurrent Active & Queued File Transfers
+        if (visibleTransfers.isNotEmpty()) {
+            items(visibleTransfers, key = { it.transferId }) { transfer ->
+                HomeActiveTransferCard(
+                    transfer = transfer,
+                    onActionClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        val isActiveOrQueued = transfer.status == "IN_PROGRESS" ||
+                            transfer.status == "STARTING" ||
+                            transfer.status.equals("QUEUED", ignoreCase = true)
+                        if (isActiveOrQueued) {
+                            onCancelTransferById(transfer.transferId)
+                        } else {
+                            onDismissTransferById(transfer.transferId)
+                        }
+                    }
+                )
             }
         }
 
@@ -1173,6 +1206,153 @@ private fun UnifiedClipboardItemRow(
                         modifier = Modifier.size(16.dp)
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeActiveTransferCard(
+    transfer: ActiveTransferInfo,
+    onActionClick: () -> Unit
+) {
+    val colors = LocalSnowColors.current
+    val pct = if (transfer.totalBytes > 0L) {
+        ((transfer.bytesTransferred * 100L) / transfer.totalBytes).toInt().coerceIn(0, 100)
+    } else 0
+    val isQueued = transfer.status.equals("QUEUED", ignoreCase = true)
+    val isActive = transfer.status == "IN_PROGRESS" || transfer.status == "STARTING"
+    val isActiveOrQueued = isActive || isQueued
+    val isUpload = transfer.direction.equals("UPLOAD", ignoreCase = true)
+    val directionLabel = if (isUpload) "Uploading" else "Downloading"
+    val statusText = when (transfer.status.uppercase()) {
+        "COMPLETED" -> "Completed"
+        "DUPLICATE" -> "Already on target"
+        "FAILED" -> "Transfer failed"
+        "QUEUED" -> "Queued"
+        else -> if (transfer.totalBytes > 0L) "$pct%" else "Transferring..."
+    }
+
+    SnowCard(
+        modifier = Modifier.fillMaxWidth(),
+        cornerRadius = 18.dp
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(CircleShape)
+                            .background(colors.surfaceElevated),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isUpload) Icons.Default.FileUpload else Icons.Default.FileDownload,
+                            contentDescription = directionLabel,
+                            tint = colors.accentCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "$directionLabel • ${transfer.fileName}",
+                            style = SnowTypography.titleSmall,
+                            color = colors.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Surface(
+                            shape = RoundedCornerShape(9999.dp),
+                            color = colors.surfaceElevated
+                        ) {
+                            Text(
+                                text = transfer.transportLabel,
+                                style = SnowTypography.labelSmall.copy(fontSize = 10.sp),
+                                color = colors.accentCyan,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(colors.surfaceElevated)
+                        .clickable(onClick = onActionClick),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = if (isActiveOrQueued) "Cancel Transfer" else "Dismiss Transfer",
+                        tint = colors.textSecondary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            if (transfer.totalBytes > 0L && !isQueued) {
+                LinearProgressIndicator(
+                    progress = (transfer.bytesTransferred.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(9999.dp)),
+                    color = if (transfer.status == "FAILED") Color(0xFFEF4444) else colors.accentBlue,
+                    trackColor = colors.surfaceElevated
+                )
+            } else if (isActive) {
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(9999.dp)),
+                    color = colors.accentBlue,
+                    trackColor = colors.surfaceElevated
+                )
+            } else if (isQueued) {
+                LinearProgressIndicator(
+                    progress = 0f,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(9999.dp)),
+                    color = colors.textMuted,
+                    trackColor = colors.surfaceElevated
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val totalLabel = if (transfer.totalBytes > 0L) formatTransferBytes(transfer.totalBytes) else "--"
+                Text(
+                    text = "${formatTransferBytes(transfer.bytesTransferred)} / $totalLabel",
+                    style = SnowTypography.labelSmall,
+                    color = colors.textMuted
+                )
+                Text(
+                    text = statusText,
+                    style = SnowTypography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                    color = if (transfer.status == "FAILED") Color(0xFFEF4444) else colors.textSecondary
+                )
             }
         }
     }

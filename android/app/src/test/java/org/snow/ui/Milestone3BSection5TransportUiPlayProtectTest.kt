@@ -181,11 +181,12 @@ class Milestone3BSection5TransportUiPlayProtectTest {
     }
 
     @Test
-    fun `play protect option 1 removes high risk permissions and dead quick settings services while keeping saf and notification fallback`() {
+    fun `m46 manifest permits scoped file access and overlay permissions while removing dead quick settings services`() {
         val manifest = resolveModuleFile("src/main/AndroidManifest.xml").readText()
-        assertFalse(manifest.contains("android.permission.MANAGE_EXTERNAL_STORAGE"))
-        assertFalse(manifest.contains("android.permission.SYSTEM_ALERT_WINDOW"))
+        assertTrue(manifest.contains("android.permission.MANAGE_EXTERNAL_STORAGE"))
+        assertTrue(manifest.contains("android.permission.SYSTEM_ALERT_WINDOW"))
         assertFalse(manifest.contains("android.permission.REQUEST_INSTALL_PACKAGES"))
+        assertFalse(manifest.contains("android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"))
         assertFalse(manifest.contains("AutoConnectTileService"))
         assertFalse(manifest.contains("ClipSyncTileService"))
         assertFalse(manifest.contains("AutoConnectTrampolineActivity"))
@@ -210,7 +211,11 @@ class Milestone3BSection5TransportUiPlayProtectTest {
         assertFalse(settingsSrc.contains("Background App Launch"))
         assertFalse(settingsSrc.contains("Quick Settings: SNOW Connect"))
         assertFalse(settingsSrc.contains("Quick Settings: SNOW Clip"))
-        assertTrue(settingsSrc.contains("Notification Sync & Listener"))
+        assertFalse(settingsSrc.contains("Notification Sync & Listener"))
+        assertTrue(settingsSrc.contains("Notification Sync"))
+        assertTrue(settingsSrc.contains("File Access"))
+        assertTrue(settingsSrc.contains("Transfer Folder"))
+        assertTrue(settingsSrc.contains("Background Run"))
         assertTrue(settingsSrc.contains("Application Updates"))
 
         val appLauncherSrc = resolveModuleFile("src/main/java/org/snow/capabilities/AppLauncherHandler.kt").readText()
@@ -220,9 +225,11 @@ class Milestone3BSection5TransportUiPlayProtectTest {
         val dispatcherSrc = resolveModuleFile("src/main/java/org/snow/capabilities/AndroidCapabilityDispatcher.kt").readText()
         assertFalse(dispatcherSrc.contains("canDrawOverlays"))
 
-        // Default SAF mode avoids Environment.isExternalStorageManager() unless test overrides
+        // M4.6: AndroidFileHandler checks Environment.isExternalStorageManager() for OWNER_MANUAL full storage only;
+        // AI_MCP stays sandboxed to Transfer Folder (SAF), and stubCtx without Android 11 runtime defaults false.
         val fileHandlerSrc = resolveModuleFile("src/main/java/org/snow/capabilities/AndroidFileHandler.kt").readText()
-        assertFalse(fileHandlerSrc.contains("isExternalStorageManager"))
+        assertTrue(fileHandlerSrc.contains("isExternalStorageManager"))
+        assertTrue(fileHandlerSrc.contains("principal == \"OWNER_MANUAL\""))
         val stubCtx = object : android.content.ContextWrapper(null) {}
         val handlerDefault = AndroidFileHandler(context = stubCtx, transferClientProvider = { null })
         assertFalse(handlerDefault.isAllFilesAccessGranted())

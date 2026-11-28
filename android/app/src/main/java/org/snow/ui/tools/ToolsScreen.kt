@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
@@ -41,8 +42,10 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.ScreenShare
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
@@ -55,6 +58,7 @@ import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Widgets
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -94,6 +98,7 @@ import kotlinx.coroutines.launch
 import org.snow.ui.ActiveTransferInfo
 import org.snow.ui.PcFileItem
 import org.snow.ui.SnowUiRepository
+import org.snow.ui.TargetDeviceType
 import org.snow.ui.TerminalExecutionState
 import org.snow.ui.formatTransferBytes
 import kotlin.math.roundToInt
@@ -127,6 +132,7 @@ enum class ToolSubTab(val title: String) {
 fun ToolsScreen(
     currentSubTab: ToolSubTab = ToolSubTab.FILES,
     onSubTabChanged: (ToolSubTab) -> Unit = {},
+    targetDeviceType: TargetDeviceType = TargetDeviceType.WINDOWS_PC,
     // Files parameters
     safFolderUri: String,
     filesList: List<PcFileItem>,
@@ -140,15 +146,25 @@ fun ToolsScreen(
     activeTransfer: ActiveTransferInfo? = null,
     onCancelTransfer: () -> Unit = {},
     onDismissTransfer: () -> Unit = {},
+    activeTransfers: List<ActiveTransferInfo> = listOfNotNull(activeTransfer),
+    onCancelTransferById: (String) -> Unit = { onCancelTransfer() },
+    onDismissTransferById: (String) -> Unit = { onDismissTransfer() },
     // Apps parameters
     allowlistedApps: List<WindowsAppItem>,
     onLaunchApp: (target: String, friendlyName: String) -> Unit,
+    peerApps: List<Pair<String, String>> = emptyList(),
+    isPeerAppsLoading: Boolean = false,
+    peerAppsError: String? = null,
+    onRefreshPeerApps: () -> Unit = {},
+    onLaunchPeerApp: (target: String, friendlyName: String) -> Unit = onLaunchApp,
     // Media & Screen parameters
     isScreenSharing: Boolean,
     onToggleScreenShare: (Boolean) -> Unit,
     onTriggerCameraCapture: () -> Unit,
     onSendMediaKey: (String) -> Unit,
     onSendMediaVolume: (Int) -> Unit = {},
+    onSendPeerMediaCommand: (String) -> Unit = onSendMediaKey,
+    onRingPeerPhone: () -> Unit = {},
     cameraDelivery: SnowUiRepository.CameraDeliveryInfo = SnowUiRepository.CameraDeliveryInfo(),
     onRetryCameraUpload: () -> Unit = {},
     onDismissCameraDelivery: () -> Unit = {},
@@ -170,25 +186,41 @@ fun ToolsScreen(
     val colors = LocalSnowColors.current
     val haptic = LocalHapticFeedback.current
     val pagerScope = rememberCoroutineScope()
-    val tabs = remember { ToolSubTab.values() }
-    val pagerState = rememberPagerState(initialPage = currentSubTab.ordinal) { tabs.size }
+    val isAndroidPeer = targetDeviceType == TargetDeviceType.ANDROID_PEER
+    val tabs = remember(isAndroidPeer) {
+        if (isAndroidPeer) {
+            listOf(ToolSubTab.FILES, ToolSubTab.APPS, ToolSubTab.MEDIA, ToolSubTab.SCREEN)
+        } else {
+            ToolSubTab.values().toList()
+        }
+    }
+    val initialPage = tabs.indexOf(currentSubTab).let { if (it >= 0) it else 0 }
+    val pagerState = rememberPagerState(initialPage = initialPage) { tabs.size }
     val latestCurrentSubTab by rememberUpdatedState(currentSubTab)
     val latestOnSubTabChanged by rememberUpdatedState(onSubTabChanged)
+    val latestTabs by rememberUpdatedState(tabs)
+
+    LaunchedEffect(isAndroidPeer, currentSubTab) {
+        if (isAndroidPeer && currentSubTab == ToolSubTab.TERMINAL) {
+            latestOnSubTabChanged(ToolSubTab.FILES)
+        }
+    }
 
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.settledPage }
             .distinctUntilChanged()
             .collect { settled ->
-                val settledTab = tabs.getOrNull(settled) ?: return@collect
+                val settledTab = latestTabs.getOrNull(settled) ?: return@collect
                 if (settledTab != latestCurrentSubTab) {
                     latestOnSubTabChanged(settledTab)
                 }
             }
     }
 
-    LaunchedEffect(currentSubTab) {
-        if (pagerState.currentPage != currentSubTab.ordinal) {
-            pagerState.animateScrollToPage(currentSubTab.ordinal)
+    LaunchedEffect(currentSubTab, tabs) {
+        val targetIdx = tabs.indexOf(currentSubTab).let { if (it >= 0) it else 0 }
+        if (pagerState.currentPage != targetIdx) {
+            pagerState.animateScrollToPage(targetIdx)
         }
     }
 
@@ -199,7 +231,7 @@ fun ToolsScreen(
     ) {
         Spacer(modifier = Modifier.height(12.dp))
 
-        // 5-Pill Segment Selector (single-line ellipsis safe across narrow widths)
+        // Adaptive Pill Segment Selector (5 tabs for Windows PC, 4 tabs hiding Terminal for Android Peer)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -208,7 +240,7 @@ fun ToolsScreen(
                 .padding(4.dp),
             horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            tabs.forEach { tab ->
+            tabs.forEachIndexed { idx, tab ->
                 val selected = currentSubTab == tab
                 Box(
                     modifier = Modifier
@@ -219,8 +251,8 @@ fun ToolsScreen(
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             onSubTabChanged(tab)
                             pagerScope.launch {
-                                if (pagerState.currentPage != tab.ordinal) {
-                                    pagerState.animateScrollToPage(tab.ordinal)
+                                if (pagerState.currentPage != idx) {
+                                    pagerState.animateScrollToPage(idx)
                                 }
                             }
                         }
@@ -250,10 +282,12 @@ fun ToolsScreen(
                 .fillMaxWidth()
                 .clipToBounds()
         ) { page ->
+            val tabForPage = tabs.getOrNull(page) ?: ToolSubTab.FILES
             Box(modifier = Modifier.fillMaxSize().clipToBounds()) {
-            when (tabs[page]) {
+            when (tabForPage) {
                 ToolSubTab.FILES -> {
                     FilesToolView(
+                        isAndroidPeer = isAndroidPeer,
                         safFolderUri = safFolderUri,
                         filesList = filesList,
                         currentPath = currentPath,
@@ -263,22 +297,31 @@ fun ToolsScreen(
                         onUploadFile = onUploadFile,
                         isRefreshing = isFilesRefreshing,
                         onRefresh = onRefreshFiles,
-                        activeTransfer = activeTransfer,
-                        onCancelTransfer = onCancelTransfer,
-                        onDismissTransfer = onDismissTransfer
+                        activeTransfers = activeTransfers,
+                        onCancelTransferById = onCancelTransferById,
+                        onDismissTransferById = onDismissTransferById
                     )
                 }
                 ToolSubTab.APPS -> {
                     AppsToolView(
+                        isAndroidPeer = isAndroidPeer,
                         allowlistedApps = allowlistedApps,
-                        onLaunchApp = onLaunchApp
+                        onLaunchApp = onLaunchApp,
+                        peerApps = peerApps,
+                        isPeerAppsLoading = isPeerAppsLoading,
+                        peerAppsError = peerAppsError,
+                        onRefreshPeerApps = onRefreshPeerApps,
+                        onLaunchPeerApp = onLaunchPeerApp
                     )
                 }
                 ToolSubTab.MEDIA -> {
                     MediaToolView(
+                        isAndroidPeer = isAndroidPeer,
                         onTriggerCameraCapture = onTriggerCameraCapture,
                         onSendMediaKey = onSendMediaKey,
                         onSendMediaVolume = onSendMediaVolume,
+                        onSendPeerMediaCommand = onSendPeerMediaCommand,
+                        onRingPeerPhone = onRingPeerPhone,
                         cameraDelivery = cameraDelivery,
                         onRetryCameraUpload = onRetryCameraUpload,
                         onDismissCameraDelivery = onDismissCameraDelivery
@@ -317,6 +360,7 @@ fun ToolsScreen(
  */
 @Composable
 private fun FilesToolView(
+    isAndroidPeer: Boolean = false,
     safFolderUri: String,
     filesList: List<PcFileItem>,
     currentPath: String,
@@ -326,9 +370,9 @@ private fun FilesToolView(
     onUploadFile: () -> Unit,
     isRefreshing: Boolean = false,
     onRefresh: () -> Unit = {},
-    activeTransfer: ActiveTransferInfo? = null,
-    onCancelTransfer: () -> Unit = {},
-    onDismissTransfer: () -> Unit = {}
+    activeTransfers: List<ActiveTransferInfo> = emptyList(),
+    onCancelTransferById: (String) -> Unit = {},
+    onDismissTransferById: (String) -> Unit = {}
 ) {
     val colors = LocalSnowColors.current
     val haptic = LocalHapticFeedback.current
@@ -337,9 +381,15 @@ private fun FilesToolView(
     val displayFiles = remember(filesList, hideHidden) {
         if (hideHidden) filesList.filter { !it.isHidden } else filesList
     }
+    val visibleTransfers = remember(activeTransfers) {
+        activeTransfers.filter { !it.status.equals("CANCELLED", ignoreCase = true) }
+    }
+    val cleanPeerPath = remember(currentPath) {
+        currentPath.trim().replace('\\', '/').trim('/')
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        // SAF Destination Bar
+        // Transfer Folder Destination Bar
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -383,7 +433,7 @@ private fun FilesToolView(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Quick Directory Chips (Desktop, Downloads, Documents) & Hide Hidden
+        // Quick Directory Chips (PC: Desktop/Downloads/Documents; Peer Phone: Root/Downloads/DCIM) & Hide Hidden
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -396,9 +446,15 @@ private fun FilesToolView(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                SnowFilterChip(text = "Desktop", selected = false, onClick = { onNavigatePath("Desktop") })
-                SnowFilterChip(text = "Downloads", selected = false, onClick = { onNavigatePath("Downloads") })
-                SnowFilterChip(text = "Documents", selected = false, onClick = { onNavigatePath("Documents") })
+                if (!isAndroidPeer) {
+                    SnowFilterChip(text = "Desktop", selected = false, onClick = { onNavigatePath("Desktop") })
+                    SnowFilterChip(text = "Downloads", selected = false, onClick = { onNavigatePath("Downloads") })
+                    SnowFilterChip(text = "Documents", selected = false, onClick = { onNavigatePath("Documents") })
+                } else {
+                    SnowFilterChip(text = "Root", selected = cleanPeerPath.isEmpty(), onClick = { onNavigatePath("") })
+                    SnowFilterChip(text = "Downloads", selected = cleanPeerPath.equals("Download", ignoreCase = true), onClick = { onNavigatePath("Download") })
+                    SnowFilterChip(text = "DCIM", selected = cleanPeerPath.equals("DCIM", ignoreCase = true), onClick = { onNavigatePath("DCIM") })
+                }
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -418,26 +474,44 @@ private fun FilesToolView(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Drive Chips & Path Navigation
+        // Drive Chips (Windows PC only) & Path Navigation
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                SnowFilterChip(text = "C:", selected = currentPath.startsWith("C", ignoreCase = true) || currentPath.isBlank(), onClick = { onNavigatePath("C:\\") })
-                SnowFilterChip(text = "D:", selected = currentPath.startsWith("D", ignoreCase = true), onClick = { onNavigatePath("D:\\") })
+            if (!isAndroidPeer) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SnowFilterChip(text = "C:", selected = currentPath.startsWith("C", ignoreCase = true) || currentPath.isBlank(), onClick = { onNavigatePath("C:\\") })
+                    SnowFilterChip(text = "D:", selected = currentPath.startsWith("D", ignoreCase = true), onClick = { onNavigatePath("D:\\") })
+                }
+            } else {
+                Text(
+                    text = "Peer Phone Storage",
+                    style = SnowTypography.labelSmall,
+                    color = colors.accentCyan
+                )
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (currentPath.isNotBlank() && currentPath != "C:\\" && currentPath != "D:\\") {
+                val canGoUp = if (isAndroidPeer) {
+                    cleanPeerPath.isNotEmpty()
+                } else {
+                    currentPath.isNotBlank() && currentPath != "C:\\" && currentPath != "D:\\"
+                }
+                if (canGoUp) {
                     Surface(
                         modifier = Modifier
                             .size(36.dp)
                             .clip(CircleShape)
                             .clickable {
-                                val parent = currentPath.trimEnd('\\').substringBeforeLast('\\', "")
-                                onNavigatePath(if (parent.isBlank() || parent.length <= 2) "${currentPath.take(2)}\\" else "$parent\\")
+                                if (isAndroidPeer) {
+                                    val parent = if (cleanPeerPath.contains('/')) cleanPeerPath.substringBeforeLast('/') else ""
+                                    onNavigatePath(parent)
+                                } else {
+                                    val parent = currentPath.trimEnd('\\').substringBeforeLast('\\', "")
+                                    onNavigatePath(if (parent.isBlank() || parent.length <= 2) "${currentPath.take(2)}\\" else "$parent\\")
+                                }
                             },
                         color = colors.surfaceElevated
                     ) {
@@ -459,8 +533,13 @@ private fun FilesToolView(
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        val displayPath = if (isAndroidPeer) {
+            if (cleanPeerPath.isEmpty()) "/" else "/$cleanPeerPath"
+        } else {
+            currentPath.ifBlank { "C:\\" }
+        }
         Text(
-            text = "Path: ${currentPath.ifBlank { "C:\\" }}",
+            text = "Path: $displayPath",
             style = SnowTypography.monospaceSmall,
             color = colors.textSecondary,
             maxLines = 1
@@ -468,28 +547,13 @@ private fun FilesToolView(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        if (activeTransfer != null && activeTransfer.status != "CANCELLED") {
-            ToolsActiveTransferCard(
-                transfer = activeTransfer,
-                onActionClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    if (activeTransfer.status == "IN_PROGRESS" || activeTransfer.status == "STARTING") {
-                        onCancelTransfer()
-                    } else {
-                        onDismissTransfer()
-                    }
-                }
-            )
-            Spacer(modifier = Modifier.height(10.dp))
-        }
-
-        // File List with Pull-to-Refresh & Bottom Bar Clearance
+        // File List & Concurrent Active Transfers with Pull-to-Refresh & Bottom Bar Clearance
         SnowPullToRefreshBox(
             isRefreshing = isRefreshing,
             onRefresh = onRefresh,
             modifier = Modifier.weight(1f).fillMaxWidth()
         ) {
-            if (displayFiles.isEmpty()) {
+            if (displayFiles.isEmpty() && visibleTransfers.isEmpty()) {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     verticalArrangement = Arrangement.Center,
@@ -497,7 +561,11 @@ private fun FilesToolView(
                 ) {
                     item {
                         Text(
-                            text = "Directory empty or loading files from PC...",
+                            text = if (isAndroidPeer) {
+                                "Directory empty or loading files from peer..."
+                            } else {
+                                "Directory empty or loading files from PC..."
+                            },
                             style = SnowTypography.bodyMedium,
                             color = colors.textMuted
                         )
@@ -506,20 +574,59 @@ private fun FilesToolView(
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    items(displayFiles) { file ->
-                        FileRowItem(
-                            item = file,
-                            onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                if (file.isDirectory) {
-                                    onNavigatePath(file.path)
-                                } else {
-                                    onDownloadFile(file)
+                    if (visibleTransfers.isNotEmpty()) {
+                        items(visibleTransfers, key = { it.transferId }) { transfer ->
+                            ToolsActiveTransferCard(
+                                transfer = transfer,
+                                onActionClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    val isActiveOrQueued = transfer.status == "IN_PROGRESS" ||
+                                        transfer.status == "STARTING" ||
+                                        transfer.status.equals("QUEUED", ignoreCase = true)
+                                    if (isActiveOrQueued) {
+                                        onCancelTransferById(transfer.transferId)
+                                    } else {
+                                        onDismissTransferById(transfer.transferId)
+                                    }
                                 }
+                            )
+                        }
+                    }
+                    if (displayFiles.isEmpty()) {
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 24.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = if (isAndroidPeer) {
+                                        "Directory empty or loading files from peer..."
+                                    } else {
+                                        "Directory empty or loading files from PC..."
+                                    },
+                                    style = SnowTypography.bodyMedium,
+                                    color = colors.textMuted
+                                )
                             }
-                        )
+                        }
+                    } else {
+                        items(displayFiles) { file ->
+                            FileRowItem(
+                                item = file,
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    if (file.isDirectory) {
+                                        onNavigatePath(file.path)
+                                    } else {
+                                        onDownloadFile(file)
+                                    }
+                                }
+                            )
+                        }
                     }
                     item {
                         Spacer(modifier = Modifier.height(96.dp))
@@ -591,12 +698,15 @@ private fun ToolsActiveTransferCard(
     val pct = if (transfer.totalBytes > 0L) {
         ((transfer.bytesTransferred * 100L) / transfer.totalBytes).toInt().coerceIn(0, 100)
     } else 0
+    val isQueued = transfer.status.equals("QUEUED", ignoreCase = true)
     val isActive = transfer.status == "IN_PROGRESS" || transfer.status == "STARTING"
+    val isActiveOrQueued = isActive || isQueued
     val directionLabel = if (transfer.direction.equals("UPLOAD", ignoreCase = true)) "Uploading" else "Downloading"
     val statusText = when (transfer.status.uppercase()) {
         "COMPLETED" -> "Completed"
         "DUPLICATE" -> "Already on target"
         "FAILED" -> "Transfer failed"
+        "QUEUED" -> "Queued"
         else -> if (transfer.totalBytes > 0L) "$pct%" else "Transferring..."
     }
 
@@ -642,7 +752,7 @@ private fun ToolsActiveTransferCard(
                 ) {
                     Icon(
                         imageVector = Icons.Default.Close,
-                        contentDescription = if (isActive) "Cancel Transfer" else "Dismiss Transfer",
+                        contentDescription = if (isActiveOrQueued) "Cancel Transfer" else "Dismiss Transfer",
                         tint = colors.textSecondary,
                         modifier = Modifier.size(16.dp)
                     )
@@ -651,7 +761,7 @@ private fun ToolsActiveTransferCard(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            if (transfer.totalBytes > 0L) {
+            if (transfer.totalBytes > 0L && !isQueued) {
                 LinearProgressIndicator(
                     progress = (transfer.bytesTransferred.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f),
                     modifier = Modifier
@@ -668,6 +778,16 @@ private fun ToolsActiveTransferCard(
                         .height(6.dp)
                         .clip(RoundedCornerShape(9999.dp)),
                     color = colors.accentBlue,
+                    trackColor = colors.surfaceElevated
+                )
+            } else if (isQueued) {
+                LinearProgressIndicator(
+                    progress = 0f,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(9999.dp)),
+                    color = colors.textMuted,
                     trackColor = colors.surfaceElevated
                 )
             }
@@ -700,17 +820,28 @@ private fun ToolsActiveTransferCard(
  */
 @Composable
 private fun AppsToolView(
+    isAndroidPeer: Boolean = false,
     allowlistedApps: List<WindowsAppItem>,
-    onLaunchApp: (target: String, friendlyName: String) -> Unit
+    onLaunchApp: (target: String, friendlyName: String) -> Unit,
+    peerApps: List<Pair<String, String>> = emptyList(),
+    isPeerAppsLoading: Boolean = false,
+    peerAppsError: String? = null,
+    onRefreshPeerApps: () -> Unit = {},
+    onLaunchPeerApp: (target: String, friendlyName: String) -> Unit = onLaunchApp
 ) {
     val colors = LocalSnowColors.current
     val haptic = LocalHapticFeedback.current
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var customTarget by rememberSaveable { mutableStateOf("") }
 
-    val filtered = remember(allowlistedApps, searchQuery) {
+    val filteredPcApps = remember(allowlistedApps, searchQuery) {
         if (searchQuery.isBlank()) allowlistedApps else allowlistedApps.filter {
             it.friendlyName.contains(searchQuery, ignoreCase = true) || it.target.contains(searchQuery, ignoreCase = true)
+        }
+    }
+    val filteredPeerApps = remember(peerApps, searchQuery) {
+        if (searchQuery.isBlank()) peerApps else peerApps.filter { (name, pkg) ->
+            name.contains(searchQuery, ignoreCase = true) || pkg.contains(searchQuery, ignoreCase = true)
         }
     }
 
@@ -724,7 +855,11 @@ private fun AppsToolView(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
                 modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("Search PC applications...") },
+                placeholder = {
+                    Text(
+                        if (isAndroidPeer) "Search peer phone apps..." else "Search PC applications..."
+                    )
+                },
                 leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = colors.textMuted) },
                 singleLine = true,
                 shape = RoundedCornerShape(12.dp),
@@ -737,71 +872,189 @@ private fun AppsToolView(
             )
         }
 
-        item {
-            SnowSectionHeader(title = "Allowlisted Apps (${filtered.size})")
-        }
-
-        items(filtered) { app ->
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .border(1.dp, colors.borderSubtle, RoundedCornerShape(14.dp))
-                    .clickable { onLaunchApp(app.target, app.friendlyName) },
-                color = colors.surface
-            ) {
+        if (isAndroidPeer) {
+            item {
                 Row(
-                    modifier = Modifier.padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Column {
+                    SnowSectionHeader(title = "Peer Phone Apps (${filteredPeerApps.size})")
+                    SnowOutlinedButton(
+                        text = if (isPeerAppsLoading) "Loading..." else "Refresh",
+                        icon = Icons.Default.Refresh,
+                        onClick = onRefreshPeerApps,
+                        isLoading = isPeerAppsLoading
+                    )
+                }
+            }
+
+            if (isPeerAppsLoading && filteredPeerApps.isEmpty()) {
+                item {
+                    SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 16.dp) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                                color = colors.accentCyan
+                            )
+                            Text(
+                                text = "Loading installed apps from peer phone...",
+                                style = SnowTypography.bodySmall,
+                                color = colors.textSecondary
+                            )
+                        }
+                    }
+                }
+            } else if (!peerAppsError.isNullOrBlank() && filteredPeerApps.isEmpty()) {
+                item {
+                    SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 16.dp) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = peerAppsError,
+                                style = SnowTypography.bodySmall,
+                                color = Color(0xFFEF4444)
+                            )
+                            SnowTonalButton(
+                                text = "Retry",
+                                onClick = onRefreshPeerApps
+                            )
+                        }
+                    }
+                }
+            } else if (filteredPeerApps.isEmpty()) {
+                item {
+                    SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 16.dp) {
                         Text(
-                            text = app.friendlyName,
-                            style = SnowTypography.titleSmall,
-                            color = colors.textPrimary
-                        )
-                        Text(
-                            text = "Target: ${app.target}",
+                            text = if (searchQuery.isBlank()) {
+                                "No peer phone apps available yet. Tap Refresh to query installed apps."
+                            } else {
+                                "No peer apps match \"$searchQuery\"."
+                            },
                             style = SnowTypography.bodySmall,
                             color = colors.textSecondary
                         )
                     }
-                    SnowTonalButton(
-                        text = "Launch",
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onLaunchApp(app.target, app.friendlyName)
+                }
+            } else {
+                itemsIndexed(
+                    items = filteredPeerApps,
+                    key = { idx, item -> "${item.second}_$idx" }
+                ) { _, (friendlyName, packageName) ->
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(1.dp, colors.borderSubtle, RoundedCornerShape(14.dp))
+                            .clickable { onLaunchPeerApp(packageName, friendlyName) },
+                        color = colors.surface
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                                Text(
+                                    text = friendlyName,
+                                    style = SnowTypography.titleSmall,
+                                    color = colors.textPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = packageName,
+                                    style = SnowTypography.bodySmall,
+                                    color = colors.textSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            SnowTonalButton(
+                                text = "Launch",
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onLaunchPeerApp(packageName, friendlyName)
+                                }
+                            )
                         }
-                    )
+                    }
                 }
             }
-        }
+        } else {
+            item {
+                SnowSectionHeader(title = "Allowlisted Apps (${filteredPcApps.size})")
+            }
 
-        item {
-            SnowSectionHeader(title = "Launch Custom PC Target")
-            SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 16.dp) {
-                Column {
-                    OutlinedTextField(
-                        value = customTarget,
-                        onValueChange = { customTarget = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("e.g. C:\\Windows\\notepad.exe") },
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp)
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    SnowTonalButton(
-                        text = "Launch Custom",
-                        onClick = {
-                            if (customTarget.isNotBlank()) {
-                                onLaunchApp(customTarget.trim(), "Custom ($customTarget)")
-                                customTarget = ""
+            items(filteredPcApps) { app ->
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .border(1.dp, colors.borderSubtle, RoundedCornerShape(14.dp))
+                        .clickable { onLaunchApp(app.target, app.friendlyName) },
+                    color = colors.surface
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 10.dp)) {
+                            Text(
+                                text = app.friendlyName,
+                                style = SnowTypography.titleSmall,
+                                color = colors.textPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "Target: ${app.target}",
+                                style = SnowTypography.bodySmall,
+                                color = colors.textSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        SnowTonalButton(
+                            text = "Launch",
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onLaunchApp(app.target, app.friendlyName)
                             }
-                        },
-                        enabled = customTarget.isNotBlank(),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                        )
+                    }
+                }
+            }
+
+            item {
+                SnowSectionHeader(title = "Launch Custom PC Target")
+                SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 16.dp) {
+                    Column {
+                        OutlinedTextField(
+                            value = customTarget,
+                            onValueChange = { customTarget = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("e.g. C:\\Windows\\notepad.exe") },
+                            singleLine = true,
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        SnowTonalButton(
+                            text = "Launch Custom",
+                            onClick = {
+                                if (customTarget.isNotBlank()) {
+                                    onLaunchApp(customTarget.trim(), "Custom ($customTarget)")
+                                    customTarget = ""
+                                }
+                            },
+                            enabled = customTarget.isNotBlank(),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 }
             }
         }
@@ -817,25 +1070,33 @@ private fun AppsToolView(
  */
 @Composable
 private fun MediaToolView(
+    isAndroidPeer: Boolean = false,
     onTriggerCameraCapture: () -> Unit,
     onSendMediaKey: (String) -> Unit,
     onSendMediaVolume: (Int) -> Unit = {},
+    onSendPeerMediaCommand: (String) -> Unit = onSendMediaKey,
+    onRingPeerPhone: () -> Unit = {},
     cameraDelivery: SnowUiRepository.CameraDeliveryInfo = SnowUiRepository.CameraDeliveryInfo(),
     onRetryCameraUpload: () -> Unit = {},
     onDismissCameraDelivery: () -> Unit = {}
 ) {
     val colors = LocalSnowColors.current
     val haptic = LocalHapticFeedback.current
+    val dispatchMedia: (String) -> Unit = { action ->
+        if (isAndroidPeer) onSendPeerMediaCommand(action) else onSendMediaKey(action)
+    }
 
     Column(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         // Remote Media Playback Card
         SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
             Column {
                 Text(
-                    text = "REMOTE PC MEDIA CONTROLS",
+                    text = if (isAndroidPeer) "PEER PHONE MEDIA CONTROLS" else "REMOTE PC MEDIA CONTROLS",
                     style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp),
                     color = colors.textMuted
                 )
@@ -848,15 +1109,15 @@ private fun MediaToolView(
                 ) {
                     MediaCircleButton(icon = Icons.Default.SkipPrevious, label = "Prev", onClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSendMediaKey("prev_track")
+                        dispatchMedia(if (isAndroidPeer) "previous" else "prev_track")
                     })
                     MediaCircleButton(icon = Icons.Default.PlayArrow, label = "Play/Pause", onClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSendMediaKey("play_pause")
+                        dispatchMedia("play_pause")
                     }, isPrimary = true)
                     MediaCircleButton(icon = Icons.Default.SkipNext, label = "Next", onClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSendMediaKey("next_track")
+                        dispatchMedia(if (isAndroidPeer) "next" else "next_track")
                     })
                 }
 
@@ -864,64 +1125,139 @@ private fun MediaToolView(
                 Divider(color = colors.borderSubtle)
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // Bounded Volume Slider (0..100 dispatched on drag release) & Mute
-                var volumeLevel by remember { mutableStateOf(70f) }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.VolumeDown,
-                        contentDescription = null,
-                        tint = colors.textMuted,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    androidx.compose.material3.Slider(
-                        value = volumeLevel,
-                        valueRange = 0f..100f,
-                        onValueChange = { volumeLevel = it.coerceIn(0f, 100f) },
-                        onValueChangeFinished = {
-                            onSendMediaVolume(volumeLevel.roundToInt().coerceIn(0, 100))
-                        },
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Icon(
-                        imageVector = Icons.Default.VolumeUp,
-                        contentDescription = null,
-                        tint = colors.textMuted,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    SnowTonalButton(
-                        text = "Mute",
-                        onClick = { onSendMediaKey("mute") }
-                    )
+                if (isAndroidPeer) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceAround
+                    ) {
+                        SnowTonalButton(
+                            text = "Volume -",
+                            icon = Icons.Default.VolumeDown,
+                            onClick = { onSendPeerMediaCommand("volume_down") }
+                        )
+                        SnowTonalButton(
+                            text = "Mute",
+                            onClick = { onSendPeerMediaCommand("volume_mute") }
+                        )
+                        SnowTonalButton(
+                            text = "Volume +",
+                            icon = Icons.Default.VolumeUp,
+                            onClick = { onSendPeerMediaCommand("volume_up") }
+                        )
+                    }
+                } else {
+                    // Bounded Volume Slider (0..100 dispatched on drag release) & Mute
+                    var volumeLevel by remember { mutableStateOf(70f) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.VolumeDown,
+                            contentDescription = null,
+                            tint = colors.textMuted,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        androidx.compose.material3.Slider(
+                            value = volumeLevel,
+                            valueRange = 0f..100f,
+                            onValueChange = { volumeLevel = it.coerceIn(0f, 100f) },
+                            onValueChangeFinished = {
+                                onSendMediaVolume(volumeLevel.roundToInt().coerceIn(0, 100))
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Icon(
+                            imageVector = Icons.Default.VolumeUp,
+                            contentDescription = null,
+                            tint = colors.textMuted,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        SnowTonalButton(
+                            text = "Mute",
+                            onClick = { onSendMediaKey("mute") }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceAround
+                    ) {
+                        SnowTonalButton(
+                            text = "Volume -",
+                            icon = Icons.Default.VolumeDown,
+                            onClick = {
+                                volumeLevel = (volumeLevel - 5f).coerceIn(0f, 100f)
+                                onSendMediaKey("volume_down")
+                            }
+                        )
+                        SnowTonalButton(
+                            text = "Volume +",
+                            icon = Icons.Default.VolumeUp,
+                            onClick = {
+                                volumeLevel = (volumeLevel + 5f).coerceIn(0f, 100f)
+                                onSendMediaKey("volume_up")
+                            }
+                        )
+                    }
                 }
+            }
+        }
 
-                Spacer(modifier = Modifier.height(10.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceAround
-                ) {
-                    SnowTonalButton(
-                        text = "Volume -",
-                        icon = Icons.Default.VolumeDown,
-                        onClick = {
-                            volumeLevel = (volumeLevel - 5f).coerceIn(0f, 100f)
-                            onSendMediaKey("volume_down")
-                        }
+        if (isAndroidPeer) {
+            // Find / Ring Peer Phone Card
+            SnowCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
+                Column {
+                    Text(
+                        text = "FIND PEER DEVICE",
+                        style = SnowTypography.labelSmall.copy(letterSpacing = 1.sp),
+                        color = colors.textMuted
                     )
-                    SnowTonalButton(
-                        text = "Volume +",
-                        icon = Icons.Default.VolumeUp,
-                        onClick = {
-                            volumeLevel = (volumeLevel + 5f).coerceIn(0f, 100f)
-                            onSendMediaKey("volume_up")
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.NotificationsActive,
+                                contentDescription = null,
+                                tint = colors.accentCyan,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "Ring Peer Phone",
+                                    style = SnowTypography.titleSmall,
+                                    color = colors.textPrimary
+                                )
+                                Text(
+                                    text = "Play audible alert on connected peer",
+                                    style = SnowTypography.bodySmall,
+                                    color = colors.textSecondary
+                                )
+                            }
                         }
-                    )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        SnowTonalButton(
+                            text = "Ring Phone",
+                            icon = Icons.Default.NotificationsActive,
+                            onClick = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onRingPeerPhone()
+                            }
+                        )
+                    }
                 }
             }
         }
@@ -951,7 +1287,11 @@ private fun MediaToolView(
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(text = "Camera Photo Delivery", style = SnowTypography.titleSmall, color = colors.textPrimary)
-                            Text(text = "Capture & upload photo to PC", style = SnowTypography.bodySmall, color = colors.textSecondary)
+                            Text(
+                                text = if (isAndroidPeer) "Capture & upload photo to peer" else "Capture & upload photo to PC",
+                                style = SnowTypography.bodySmall,
+                                color = colors.textSecondary
+                            )
                         }
                     }
 
@@ -1007,6 +1347,8 @@ private fun MediaToolView(
                 }
             }
         }
+
+        Spacer(modifier = Modifier.height(16.dp))
     }
 }
 

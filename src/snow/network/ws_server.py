@@ -219,6 +219,52 @@ class SnowWebSocketServer:
             if val is not None and not type(val).__name__.endswith("Mock"):
                 setattr(self._capability_engine, target, val)
 
+    async def _trigger_core_relay_resync(
+        self,
+        *,
+        client_device_id: str = "",
+        client_cert_fp: str = "",
+        defer_for_relay: bool = False,
+    ) -> None:
+        """Pin newly paired peer certificate and refresh active relay hub membership."""
+        cs = getattr(self, "core_server", None)
+        if cs is None:
+            return
+        relay_cli = getattr(cs, "relay_client", None)
+        if relay_cli is not None and client_device_id and client_cert_fp:
+            try:
+                relay_cli.set_peer_pinned_fingerprint(client_device_id, client_cert_fp)
+            except Exception:
+                pass
+        import inspect
+
+        async def _run_resync() -> None:
+            resync_fn = getattr(cs, "_trigger_relay_resync_safe", None) or getattr(
+                cs, "resync_relay_group_membership", None
+            )
+            if callable(resync_fn):
+                maybe_coro = resync_fn()
+                if inspect.isawaitable(maybe_coro):
+                    await maybe_coro
+
+        if defer_for_relay:
+            async def _deferred_resync() -> None:
+                try:
+                    await asyncio.sleep(0.15)
+                    await _run_resync()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.debug("Deferred relay group resync error: %s", exc)
+
+            asyncio.create_task(_deferred_resync())
+            return
+
+        try:
+            await _run_resync()
+        except Exception as exc:
+            logger.debug("Non-fatal relay resync error after pairing/merge: %s", exc)
+
     @property
     def capability_engine(self) -> CapabilityEngine:
         """Return the shared CapabilityEngine, keeping references synchronized."""
@@ -2858,7 +2904,19 @@ class SnowWebSocketServer:
                 from snow.network.node import build_windows_manifest
                 from snow.security.identity import resolve_canonical_device_snow_id
                 pair_profile = self._resolve_authoritative_permission_profile(client_device_id)
-                host_canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=self.device_identity)
+                db_path_raw = getattr(self.db_manager, "db_path", None) if self.db_manager is not None else None
+                local_key_dir = (
+                    Path(db_path_raw).parent
+                    if isinstance(db_path_raw, (str, Path))
+                    and str(db_path_raw)
+                    and str(db_path_raw) != ":memory:"
+                    and (Path(db_path_raw).parent / "device_key.json").is_file()
+                    else None
+                )
+                host_canonical_snow, _ = resolve_canonical_device_snow_id(
+                    data_dir=local_key_dir,
+                    fallback_identity=self.device_identity,
+                )
 
                 pair_data = {
                     "device_id": self.device_identity.device_id,
@@ -2892,6 +2950,11 @@ class SnowWebSocketServer:
                     },
                 )
                 await client.websocket.send(response.to_json())
+                await self._trigger_core_relay_resync(
+                    client_device_id=client_device_id,
+                    client_cert_fp=client_cert_fp,
+                    defer_for_relay=str(getattr(client, "connection_id", "")).startswith("relay:"),
+                )
             else:
                 error_code = result.error_code or ErrorCode.INTERNAL_ERROR
                 if error_code == ErrorCode.PAIRING_LOCKED:
@@ -3041,6 +3104,8 @@ class SnowWebSocketServer:
                 },
             )
             await client.websocket.send(resp.to_json())
+            if committed:
+                await self._trigger_core_relay_resync()
         except PermissionError as pex:
             err = SnowMessage.create_error(
                 code=ErrorCode.UNAUTHORIZED,

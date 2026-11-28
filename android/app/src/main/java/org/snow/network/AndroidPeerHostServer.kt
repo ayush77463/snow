@@ -62,6 +62,19 @@ data class NetworkMergeCommandResult(
     val errorMessage: String? = null
 )
 
+data class PeerAuthEvent(
+    val peerDeviceId: String,
+    val peerDeviceName: String = peerDeviceId,
+    val peerDeviceType: String = "android",
+    val peerSnowId: String? = null,
+    val peerHost: String? = null,
+    val transferPort: Int = AndroidPeerHostManager.DEFAULT_MEDIA_PORT,
+    val peerPort: Int = AndroidPeerHostManager.DEFAULT_HOST_PORT,
+    val networkId: String? = null,
+    val authToken: String? = null,
+    val isNewPairing: Boolean = false
+)
+
 /**
  * Lightweight RFC 6455 WebSocket peer host server for Android-to-Android and Python-to-Android peer mesh.
  *
@@ -102,8 +115,24 @@ class AndroidPeerHostServer(
     private data class PeerSession(
         var isAuthenticated: Boolean = false,
         var peerDeviceId: String? = null,
-        var sessionId: String? = null
+        var sessionId: String? = null,
+        var peerDeviceName: String? = null,
+        var peerDeviceType: String? = null,
+        var peerSnowId: String? = null,
+        var peerHost: String? = null,
+        var transferPort: Int = AndroidPeerHostManager.DEFAULT_MEDIA_PORT,
+        var peerPort: Int = AndroidPeerHostManager.DEFAULT_HOST_PORT,
+        var networkId: String? = null
     )
+
+    @Volatile
+    var onPeerAuthenticated: ((PeerAuthEvent) -> Unit)? = null
+
+    @Volatile
+    var onPeerDisconnected: ((peerDeviceId: String) -> Unit)? = null
+
+    @Volatile
+    var peerDownloadStager: ((peerDeviceId: String, data: Map<String, Any?>) -> Pair<Map<String, Any?>?, SnowError?>)? = null
 
     private val isRunning = AtomicBoolean(false)
     private var wsServer: WebSocketServer? = null
@@ -172,7 +201,27 @@ class AndroidPeerHostServer(
                 }
 
                 override fun onClose(conn: WebSocket, code: Int, reason: String, remote: Boolean) {
-                    SafeLog.i(TAG, "Peer WebSocket closed: code=$code reason=$reason remote=$remote")
+                    val sess = conn.getAttachment<PeerSession>()
+                    val wasAuth = sess?.isAuthenticated == true
+                    val closedPeerId = sess?.peerDeviceId?.trim()?.takeIf { it.isNotEmpty() }
+                    sess?.isAuthenticated = false
+                    SafeLog.i(TAG, "Peer WebSocket closed: code=$code reason=$reason remote=$remote peer=${closedPeerId ?: "--"}")
+                    if (wasAuth && closedPeerId != null) {
+                        val stillConnected = wsServer?.connections?.any { other ->
+                            other !== conn &&
+                                other.isOpen &&
+                                (other.getAttachment<PeerSession>()?.let { o ->
+                                    o.isAuthenticated && o.peerDeviceId.equals(closedPeerId, ignoreCase = true)
+                                } == true)
+                        } == true
+                        if (!stillConnected) {
+                            try {
+                                onPeerDisconnected?.invoke(closedPeerId)
+                            } catch (e: Exception) {
+                                SafeLog.w(TAG, "onPeerDisconnected callback error: ${e.message}")
+                            }
+                        }
+                    }
                 }
 
                 override fun onMessage(conn: WebSocket, message: String) {
@@ -239,6 +288,29 @@ class AndroidPeerHostServer(
             val sess = conn.getAttachment<PeerSession>() ?: return@mapNotNull null
             if (sess.isAuthenticated) sess.peerDeviceId?.takeIf { it.isNotBlank() } else null
         }.distinct()
+    }
+
+    fun listAuthenticatedPeerInfos(): List<PeerAuthEvent> {
+        val conns = wsServer?.connections ?: return emptyList()
+        val seen = linkedSetOf<String>()
+        return conns.mapNotNull { conn ->
+            if (!conn.isOpen) return@mapNotNull null
+            val sess = conn.getAttachment<PeerSession>() ?: return@mapNotNull null
+            val id = sess.peerDeviceId?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            if (!sess.isAuthenticated || !seen.add(id.lowercase())) return@mapNotNull null
+            PeerAuthEvent(
+                peerDeviceId = id,
+                peerDeviceName = sess.peerDeviceName ?: id,
+                peerDeviceType = sess.peerDeviceType ?: "android",
+                peerSnowId = sess.peerSnowId,
+                peerHost = sess.peerHost,
+                transferPort = sess.transferPort,
+                peerPort = sess.peerPort,
+                networkId = sess.networkId,
+                authToken = null,
+                isNewPairing = false
+            )
+        }
     }
 
     suspend fun sendRequestToPeer(
@@ -362,9 +434,24 @@ class AndroidPeerHostServer(
                 val newToken = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "")
                 tokenStorage.saveTokenForDevice(peerId, newToken)
                 val newSessionId = UUID.randomUUID().toString()
+                val peerType = (data["device_type"] as? String)?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: "android"
+                val peerSnowId = (data["snow_id"] as? String)?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+                val remoteHost = runCatching { conn.remoteSocketAddress?.address?.hostAddress }.getOrNull()?.takeIf { it.isNotBlank() }
+                val reqTransferPort = (data["transfer_port"] as? Number)?.toInt()
+                    ?: (data["media_port"] as? Number)?.toInt()
+                    ?: if (peerType == "windows" || peerType == "pc" || peerType == "desktop") 8766 else AndroidPeerHostManager.DEFAULT_MEDIA_PORT
+                val reqPeerPort = (data["host_port"] as? Number)?.toInt()
+                    ?: (data["peer_port"] as? Number)?.toInt()
+                    ?: if (peerType == "windows" || peerType == "pc" || peerType == "desktop") 8765 else AndroidPeerHostManager.DEFAULT_HOST_PORT
                 session.isAuthenticated = true
                 session.peerDeviceId = peerId
                 session.sessionId = newSessionId
+                session.peerDeviceName = peerName
+                session.peerDeviceType = peerType
+                session.peerSnowId = peerSnowId
+                session.peerHost = remoteHost
+                session.transferPort = reqTransferPort
+                session.peerPort = reqPeerPort
 
                 val hostNetId = currentHostNetworkId()
                 val rawClientNet = (data["client_network_id"] as? String)?.trim()?.uppercase()
@@ -497,6 +584,26 @@ class AndroidPeerHostServer(
                     payload = respPayload
                 )
                 conn.send(JsonSerialization.toJson(resp))
+                val resolvedNetId = respNetworkId ?: pairedNetId ?: effectiveHostNetworkId ?: hostNetId
+                session.networkId = resolvedNetId
+                try {
+                    onPeerAuthenticated?.invoke(
+                        PeerAuthEvent(
+                            peerDeviceId = peerId,
+                            peerDeviceName = peerName,
+                            peerDeviceType = session.peerDeviceType ?: "android",
+                            peerSnowId = session.peerSnowId,
+                            peerHost = session.peerHost,
+                            transferPort = session.transferPort,
+                            peerPort = session.peerPort,
+                            networkId = resolvedNetId,
+                            authToken = newToken,
+                            isNewPairing = true
+                        )
+                    )
+                } catch (e: Exception) {
+                    SafeLog.w(TAG, "onPeerAuthenticated callback error (pair): ${e.message}")
+                }
                 SafeLog.i(TAG, "Peer paired (${if (rawHandshakeToken != null) "QR handshake" else "PIN"}): device_id=$peerId session=$newSessionId netAction=$netAction")
             } else {
                 val (errCode, errMsg) = when {
@@ -558,9 +665,31 @@ class AndroidPeerHostServer(
 
             if (isValid && !peerId.isNullOrBlank()) {
                 val newSessionId = UUID.randomUUID().toString()
+                val peerName = (data["device_name"] as? String)?.trim()?.takeIf { it.isNotBlank() } ?: peerId
+                val peerType = (data["device_type"] as? String)?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: "android"
+                val peerSnowId = (data["snow_id"] as? String)?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+                val presentedNetId = (data["network_id"] as? String)?.trim()?.uppercase()?.takeIf {
+                    AndroidPeerHostManager.isValidCanonicalNetworkId(it)
+                }
+                val remoteHost = runCatching { conn.remoteSocketAddress?.address?.hostAddress }.getOrNull()?.takeIf { it.isNotBlank() }
+                val reqTransferPort = (data["transfer_port"] as? Number)?.toInt()
+                    ?: (data["media_port"] as? Number)?.toInt()
+                    ?: if (peerType == "windows" || peerType == "pc" || peerType == "desktop") 8766 else AndroidPeerHostManager.DEFAULT_MEDIA_PORT
+                val reqPeerPort = (data["host_port"] as? Number)?.toInt()
+                    ?: (data["peer_port"] as? Number)?.toInt()
+                    ?: if (peerType == "windows" || peerType == "pc" || peerType == "desktop") 8765 else AndroidPeerHostManager.DEFAULT_HOST_PORT
+                val liveNetId = currentHostNetworkId() ?: presentedNetId
+
                 session.isAuthenticated = true
                 session.peerDeviceId = peerId
                 session.sessionId = newSessionId
+                session.peerDeviceName = peerName
+                session.peerDeviceType = peerType
+                session.peerSnowId = peerSnowId
+                session.peerHost = remoteHost
+                session.transferPort = reqTransferPort
+                session.peerPort = reqPeerPort
+                session.networkId = liveNetId
 
                 val respPayload = mutableMapOf<String, Any?>(
                     "status" to "success",
@@ -573,7 +702,6 @@ class AndroidPeerHostServer(
                     "manifest" to manifestProvider()
                 )
                 if (!hostSnowId.isNullOrBlank()) respPayload["snow_id"] = hostSnowId
-                val liveNetId = currentHostNetworkId()
                 if (!liveNetId.isNullOrBlank()) respPayload["network_id"] = liveNetId
 
                 val resp = SnowMessage.createResponse(
@@ -581,6 +709,24 @@ class AndroidPeerHostServer(
                     payload = respPayload
                 )
                 conn.send(JsonSerialization.toJson(resp))
+                try {
+                    onPeerAuthenticated?.invoke(
+                        PeerAuthEvent(
+                            peerDeviceId = peerId,
+                            peerDeviceName = peerName,
+                            peerDeviceType = peerType,
+                            peerSnowId = peerSnowId,
+                            peerHost = remoteHost,
+                            transferPort = reqTransferPort,
+                            peerPort = reqPeerPort,
+                            networkId = liveNetId,
+                            authToken = storedToken ?: presentedToken,
+                            isNewPairing = false
+                        )
+                    )
+                } catch (e: Exception) {
+                    SafeLog.w(TAG, "onPeerAuthenticated callback error (auth): ${e.message}")
+                }
                 SafeLog.i(TAG, "Peer authenticated successfully: device_id=$peerId session=$newSessionId")
             } else {
                 val err = SnowMessage.createError(
@@ -797,7 +943,11 @@ class AndroidPeerHostServer(
                             }
                         }
                         val peerHost = conn.remoteSocketAddress?.address?.hostAddress ?: "127.0.0.1"
-                        val (resMap, err) = dispatcher.dispatch(relayAction, rawRelayData, peerHost, defaultMediaPort)
+                        val (resMap, err) = if ((relayAction == "desktop_file_stage_download" || relayAction == "file_stage_download") && peerDownloadStager != null) {
+                            peerDownloadStager!!.invoke(callerId ?: localDeviceId, rawRelayData)
+                        } else {
+                            dispatcher.dispatch(relayAction, rawRelayData, peerHost, defaultMediaPort)
+                        }
                         if (err != null) {
                             conn.send(JsonSerialization.toJson(SnowMessage.createError(err.code, err.message, message.id)))
                         } else {
@@ -831,12 +981,16 @@ class AndroidPeerHostServer(
                 SafeLog.i(TAG, "Dispatching capability: action=$action peer=${session.peerDeviceId}")
 
                 val (resultPayload, error) = try {
-                    dispatcher.dispatch(
-                        action = action,
-                        data = data,
-                        serverHost = peerHost,
-                        defaultTransferPort = defaultMediaPort
-                    )
+                    if ((action == "desktop_file_stage_download" || action == "file_stage_download") && peerDownloadStager != null) {
+                        peerDownloadStager!!.invoke(callerId ?: localDeviceId, data)
+                    } else {
+                        dispatcher.dispatch(
+                            action = action,
+                            data = data,
+                            serverHost = peerHost,
+                            defaultTransferPort = defaultMediaPort
+                        )
+                    }
                 } catch (e: Exception) {
                     Pair(null, SnowError(ErrorCode.INTERNAL_ERROR, "Execution failed: ${e.message}"))
                 }
@@ -860,11 +1014,16 @@ class AndroidPeerHostServer(
     }
 
     private fun isActionAllowedUnderTier(profile: String, action: String): Boolean {
+        val mappedAction = if (action == "desktop_file_stage_download" || action == "file_stage_download") {
+            "file_list"
+        } else {
+            action
+        }
         val temp = AndroidCapabilityDispatcher(
             context = dispatcher.contextProviderForProfileCheck(),
             transferClientProvider = { null }
         )
         temp.activePermissionProfile = profile
-        return temp.isActionAllowedByProfile(action)
+        return temp.isActionAllowedByProfile(mappedAction)
     }
 }

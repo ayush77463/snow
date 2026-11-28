@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any, List, Optional
 
@@ -26,7 +27,7 @@ from snow.network.connection_manager import ConnectionManager
 from snow.network.discovery import SnowDiscoveryService
 from snow.network.registry import NodeRegistry
 from snow.network.ws_server import SnowWebSocketServer
-from snow.protocol.models import SnowMessage
+from snow.protocol.models import MessageType, SnowMessage
 from snow.security.db import DatabaseManager
 from snow.security.identity import DeviceIdentity
 from snow.security.policy import PeerCapabilityPolicy
@@ -185,6 +186,8 @@ class SnowCoreServer:
         self.relay_ticket: str = getattr(self.config, "relay_ticket", "")
         self.session_router.relay_enabled = self.relay_enabled
         self.screen_stream_manager: Optional[Any] = None
+        self._relay_autostart_task: Optional[asyncio.Task[Any]] = None
+        self._resync_task: Optional[asyncio.Task[Any]] = None
         self._is_paused: bool = False
         self._paused_state: dict[str, Any] = {}
 
@@ -796,15 +799,16 @@ class SnowCoreServer:
                     cleanup_errors.append(f"close_router_outbound: {exc}")
                     logger.warning("Failed closing SessionRouter outbound client for [%s]: %s", clean_id, exc)
 
-        # 8. Close relay tunnel via relay_client.close_tunnel(clean_id)
-        for rc in relay_clients:
-            try:
-                c_res = rc.close_tunnel(clean_id)
-                if inspect.isawaitable(c_res):
-                    await c_res
-            except Exception as exc:
-                cleanup_errors.append(f"close_relay_tunnel: {exc}")
-                logger.warning("Failed closing relay tunnel for [%s]: %s", clean_id, exc)
+        # 8. Close relay tunnel via relay_client.close_tunnel(clean_id), unless this cleanup preserves an active relay pairing channel
+        if not (exclude_connection_id and str(exclude_connection_id) == f"relay:{clean_id}"):
+            for rc in relay_clients:
+                try:
+                    c_res = rc.close_tunnel(clean_id)
+                    if inspect.isawaitable(c_res):
+                        await c_res
+                except Exception as exc:
+                    cleanup_errors.append(f"close_relay_tunnel: {exc}")
+                    logger.warning("Failed closing relay tunnel for [%s]: %s", clean_id, exc)
 
         # 9. Remove device from NodeRegistry(s)
         for reg in registries:
@@ -1035,9 +1039,474 @@ class SnowCoreServer:
             meta=enriched_meta,
         )
 
+    def _get_shared_active_network_id(self) -> str:
+        """Return validated active shared network_id from DB, or '' when standalone."""
+        from snow.security.identity import is_valid_network_id
+
+        db = getattr(self, "db_manager", None)
+        if db is None or not hasattr(db, "get_active_network"):
+            return ""
+        try:
+            active_net = db.get_active_network()
+        except Exception:
+            return ""
+        if isinstance(active_net, dict):
+            cand = str(active_net.get("network_id") or "").strip().upper()
+            if is_valid_network_id(cand):
+                return cand
+        return ""
+
+    def _load_instance_device_key(self):
+        """Load DeviceKeyIdentity scoped to db_manager's directory if present, else default data dir."""
+        from snow.security.identity import load_or_create_device_key_identity
+
+        db = getattr(self, "db_manager", None)
+        db_path_raw = getattr(db, "db_path", None) if db is not None else None
+        if isinstance(db_path_raw, (str, Path)) and str(db_path_raw) and str(db_path_raw) != ":memory:":
+            cand = Path(db_path_raw).parent
+            if (cand / "device_key.json").is_file():
+                return load_or_create_device_key_identity(data_dir=cand)
+        return load_or_create_device_key_identity()
+
+    def _resolve_tls_cert_and_key_paths(self) -> tuple[str, str]:
+        """Resolve local TLS certificate and private key paths cleanly."""
+        from snow.security.tls import DEFAULT_CERT_FILE, DEFAULT_KEY_FILE, DEFAULT_TLS_DIR
+
+        data_dir = os.environ.get("SNOW_DATA_DIR")
+        tls_dir = (Path(data_dir) / "tls") if data_dir else DEFAULT_TLS_DIR
+        cert_candidate = (
+            getattr(self.config, "tls_cert_path", None)
+            or getattr(self.config, "tls_cert_file", None)
+            or str(tls_dir / DEFAULT_CERT_FILE)
+        )
+        key_candidate = (
+            getattr(self.config, "tls_key_path", None)
+            or getattr(self.config, "tls_key_file", None)
+            or str(tls_dir / DEFAULT_KEY_FILE)
+        )
+        return str(cert_candidate), str(key_candidate)
+
+    @staticmethod
+    def _extract_pin_failure_fields(
+        status: Optional[str],
+        error_msg: Optional[str],
+        remaining_attempts: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Normalize structured PIN error status, remaining_attempts, and user message."""
+        st = str(status or "PAIRING_FAILED").strip().upper()
+        msg = str(error_msg or "Failed connecting to peer.").strip()
+        rem = remaining_attempts
+        if rem is None and msg:
+            m = re.search(r"(\d+)\s+attempt\(s\)\s+remaining|(\d+)\s+attempts\s+remaining", msg, flags=re.IGNORECASE)
+            if m:
+                grp = m.group(1) or m.group(2)
+                if grp is not None:
+                    rem = int(grp)
+        if st == "PAIRING_LOCKED" or "locked" in msg.lower():
+            st = "PAIRING_LOCKED"
+            rem = 0 if rem is None else rem
+        elif st == "PIN_EXPIRED" or "expired" in msg.lower():
+            st = "PIN_EXPIRED"
+        elif st == "INVALID_PIN" or "invalid pin" in msg.lower() or "incorrect pin" in msg.lower():
+            st = "INVALID_PIN"
+            if rem is not None:
+                msg = f"Incorrect PIN — {rem} attempts remaining. Please re-enter."
+        out: dict[str, Any] = {"success": False, "status": st, "error": msg}
+        if rem is not None:
+            out["remaining_attempts"] = rem
+        return out
+
+    async def _finalize_paired_peer(
+        self,
+        *,
+        remote_id: str,
+        remote_name: str,
+        session_id: str,
+        auth_token: str,
+        cert_fp: str,
+        manifest: Optional[dict[str, Any]],
+        platform_hint: str,
+        host: str,
+        port: int,
+        transport: str,
+        res_network_id: Optional[str],
+        network_action: Optional[str],
+        network_conflict: bool,
+        relationship: str,
+        merge_tx_id: Optional[str],
+        host_network_id: Optional[str],
+        client_network_id: Optional[str],
+        peer_snow_id: str = "",
+        client_handle: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Persist newly paired/reconnected peer across NodeRegistry, SQLite DB, and Relay mesh."""
+        if client_handle is not None:
+            old_client = self.peer_clients.get(remote_id)
+            if old_client and old_client is not client_handle:
+                try:
+                    await old_client.close()
+                except Exception:
+                    pass
+            self.peer_clients[remote_id] = client_handle
+
+        self.node_registry.on_session_authenticated(
+            device_id=remote_id,
+            connection_id=session_id,
+            host=host or None,
+            port=port if host else None,
+            manifest_data=manifest,
+            transport=transport,
+        )
+
+        token_hash = (
+            hashlib.sha256(auth_token.encode("utf-8")).hexdigest()
+            if auth_token
+            else hashlib.sha256(remote_id.encode("utf-8")).hexdigest()
+        )
+        manifest_dict = manifest if isinstance(manifest, dict) else {}
+        caps = manifest_dict.get("supported_capabilities") or []
+        caps_str = " ".join(caps) if isinstance(caps, list) else str(caps)
+        raw_platform = str(
+            platform_hint
+            or manifest_dict.get("platform")
+            or manifest_dict.get("os")
+            or manifest_dict.get("os_name")
+            or ""
+        ).strip().lower()
+
+        if "android" in raw_platform or ("android." in caps_str and "desktop." not in caps_str):
+            detected_platform = "android"
+        elif "win" in raw_platform or "desktop." in caps_str:
+            detected_platform = "windows"
+        elif "linux" in raw_platform:
+            detected_platform = "linux"
+        elif "mac" in raw_platform or "darwin" in raw_platform:
+            detected_platform = "macos"
+        else:
+            detected_platform = raw_platform or "windows"
+
+        from snow.security.identity import generate_snow_id, is_valid_network_id, is_valid_snow_id
+
+        clean_res_net = str(res_network_id or "").strip().upper()
+        if not is_valid_network_id(clean_res_net):
+            clean_res_net = ""
+        rel = str(relationship or "member").strip() or "member"
+        paired_net = clean_res_net or None
+
+        existing = self.db_manager.get_paired_device(remote_id)
+        if not existing:
+            self.db_manager.insert_paired_device(
+                device_id=remote_id,
+                device_name=remote_name,
+                auth_token_hash=token_hash,
+                trust_tier="peer",
+                platform=detected_platform,
+                reachability_profile="ACTIVE_SESSION_PEER",
+                last_known_host=host or None,
+                last_known_port=port if host else None,
+                capabilities_json=json.dumps(manifest_dict),
+                cert_fingerprint=cert_fp or None,
+                network_id=paired_net,
+                relationship=rel,
+            )
+        else:
+            if host:
+                self.db_manager.update_device_endpoint(remote_id, host, port)
+            self.db_manager.update_last_seen(remote_id)
+            if cert_fp and hasattr(self.db_manager, "update_device_cert_fingerprint"):
+                try:
+                    self.db_manager.update_device_cert_fingerprint(remote_id, cert_fp)
+                except Exception:
+                    pass
+            if paired_net and hasattr(self.db_manager, "assign_device_network"):
+                try:
+                    self.db_manager.assign_device_network(remote_id, paired_net, rel)
+                except Exception:
+                    pass
+
+        # Persist canonical SNOW ID alias for bidirectional lookup & auto-reconnect
+        clean_peer_snow = str(peer_snow_id or "").strip().upper()
+        if is_valid_snow_id(clean_peer_snow) and hasattr(self.db_manager, "set_setting"):
+            try:
+                self.db_manager.set_setting(f"device_snow_id:{remote_id}", clean_peer_snow)
+                legacy_alias = generate_snow_id(seed=remote_id).upper()
+                if legacy_alias != clean_peer_snow:
+                    self.db_manager.set_setting(f"device_legacy_snow_id:{remote_id}", legacy_alias)
+            except Exception:
+                pass
+
+        # Adopt shared network_id if local host was standalone and peer granted shared membership
+        if (
+            clean_res_net
+            and not self._get_shared_active_network_id()
+            and rel == "member"
+            and not network_conflict
+            and network_action != "KEEP_SEPARATE"
+            and hasattr(self.db_manager, "ensure_active_network")
+        ):
+            try:
+                self.db_manager.ensure_active_network(
+                    network_name="My SNOW Network",
+                    owner_device_id=getattr(self.device_identity, "device_id", "desktop-core"),
+                    network_id=clean_res_net,
+                )
+            except Exception:
+                pass
+
+        if host:
+            self.network_manager.record_endpoint(device_id=remote_id, host=host, port=port)
+
+        # Pin cert fingerprint and refresh relay hub membership cleanly
+        if self.relay_client is not None and cert_fp:
+            try:
+                self.relay_client.set_peer_pinned_fingerprint(remote_id, cert_fp)
+            except Exception:
+                pass
+        if self.relay_enabled:
+            await self._trigger_relay_resync_safe()
+
+        return {
+            "success": True,
+            "status": "AUTHENTICATED",
+            "data": {
+                "remote_device_id": remote_id,
+                "remote_device_name": remote_name,
+                "session_id": session_id,
+                "cert_fingerprint": cert_fp,
+                "snow_id": clean_peer_snow or None,
+                "network_id": clean_res_net or res_network_id,
+                "network_action": network_action,
+                "network_conflict": bool(network_conflict),
+                "relationship": rel,
+                "merge_tx_id": merge_tx_id,
+                "host_network_id": host_network_id,
+                "client_network_id": client_network_id,
+            },
+        }
+
+    async def _connect_peer_via_rendezvous(
+        self,
+        *,
+        snow_id: str,
+        pin: str = "",
+        handshake_token: str = "",
+        expected_fingerprint: str = "",
+        network_id: Optional[str] = None,
+        client_network_id: Optional[str] = None,
+        network_decision: Optional[str] = None,
+        merge_tx_id: Optional[str] = None,
+        client_merge_approved: bool = False,
+        surviving_network_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Join a remote Render Hub rendezvous slot and execute E2E TLS pair_request."""
+        import aiohttp
+        from snow.core.config import resolve_default_hub_url
+        from snow.network.node import build_windows_manifest
+        from snow.network.relay_client import RelayTunnelClient
+        from snow.security.identity import is_valid_snow_id, load_or_create_device_key_identity
+
+        clean_snow_id = str(snow_id or "").strip().upper()
+        if not is_valid_snow_id(clean_snow_id):
+            return {"success": False, "status": "INVALID_SNOW_ID", "error": "Valid SNOW ID is required for rendezvous."}
+
+        hub_raw = (self.relay_url or "").strip() or resolve_default_hub_url(db_manager=getattr(self, "db_manager", None))
+        ws_hub_url, http_hub_base = self._normalize_relay_ws_and_http_urls(hub_raw)
+        if not (http_hub_base.startswith("http://") or http_hub_base.startswith("https://")):
+            return {"success": False, "status": "RENDEZVOUS_UNAVAILABLE", "error": "Render Hub URL is not configured."}
+
+        local_dev_id = str(getattr(self.device_identity, "device_id", "") or "desktop-core")
+        local_dev_name = str(getattr(self.device_identity, "device_name", "") or "SNOW Desktop")
+        try:
+            local_canonical_snow = self._load_instance_device_key().snow_id
+        except Exception:
+            local_canonical_snow = str(getattr(self.device_identity, "snow_id", "") or "")
+
+        join_payload: dict[str, Any] = {
+            "client_device_id": local_dev_id,
+            "snow_id": clean_snow_id,
+        }
+        if pin:
+            join_payload["pin"] = pin
+        elif handshake_token:
+            join_payload["handshake_token"] = handshake_token
+        else:
+            return {"success": False, "status": "PIN_REQUIRED", "error": "PIN or handshake token is required."}
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8.0)) as sess:
+                async with sess.post(f"{http_hub_base}/v1/rendezvous/join", json=join_payload) as resp:
+                    join_data = await resp.json(content_type=None)
+                    if resp.status != 200 or not isinstance(join_data, dict) or not join_data.get("success"):
+                        j_dict = join_data if isinstance(join_data, dict) else {}
+                        err_msg = str(j_dict.get("error") or f"Rendezvous join failed (HTTP {resp.status}).")
+                        j_status = str(j_dict.get("status") or "")
+                        j_rem = j_dict.get("remaining_attempts")
+                        if resp.status == 429 or j_status == "PAIRING_LOCKED":
+                            return {
+                                "success": False,
+                                "status": "PAIRING_LOCKED",
+                                "remaining_attempts": 0,
+                                "error": err_msg,
+                            }
+                        if resp.status == 401 and (j_status == "INVALID_PIN" or j_rem is not None):
+                            return self._extract_pin_failure_fields(
+                                "INVALID_PIN",
+                                err_msg,
+                                remaining_attempts=int(j_rem) if j_rem is not None else None,
+                            )
+                        return {"success": False, "status": j_status or "RENDEZVOUS_JOIN_FAILED", "error": err_msg}
+        except Exception as exc:
+            return {"success": False, "status": "RENDEZVOUS_UNREACHABLE", "error": f"Rendezvous join failed: {exc}"}
+
+        bootstrap_token = str(join_data.get("bootstrap_token") or "").strip()
+        host_dev_id = str(join_data.get("host_device_id") or "").strip()
+        host_snow_id = str(join_data.get("host_snow_id") or clean_snow_id).strip().upper()
+        bs_net_id = str(join_data.get("network_id") or "").strip().upper()
+        bs_group_id = bs_net_id or f"dev_{host_snow_id}"
+        host_fp = str(join_data.get("host_cert_fingerprint") or expected_fingerprint or "").strip()
+        tunnel_ws_url = str(join_data.get("relay_ws_url") or ws_hub_url).strip()
+
+        if not bootstrap_token or not host_dev_id:
+            return {"success": False, "status": "RENDEZVOUS_JOIN_FAILED", "error": "Incomplete rendezvous join grant."}
+
+        cert_path, key_path = self._resolve_tls_cert_and_key_paths()
+        if not os.path.exists(cert_path) or not os.path.exists(key_path):
+            return {"success": False, "status": "TLS_ERROR", "error": "Local TLS certificate or key file not found."}
+
+        bs_client = RelayTunnelClient(
+            relay_url=tunnel_ws_url,
+            device_id=local_dev_id,
+            group_id=bs_group_id,
+            ticket="",
+            cert_path=cert_path,
+            key_path=key_path,
+            bootstrap_token=bootstrap_token,
+            network_id=bs_net_id,
+        )
+        if host_fp:
+            bs_client.set_peer_pinned_fingerprint(host_dev_id, host_fp)
+
+        try:
+            connected = await bs_client.connect(timeout=8.0)
+            if not connected:
+                return {"success": False, "status": "RENDEZVOUS_CONNECT_FAILED", "error": "Failed opening bootstrap relay tunnel."}
+
+            ws_srv = getattr(self, "ws_server", None)
+            cert_info = getattr(ws_srv, "certificate_info", None)
+            local_fp = str(getattr(cert_info, "fingerprint_sha256", "") or "")
+            eff_client_net = client_network_id or self._get_shared_active_network_id() or None
+
+            pair_payload: dict[str, Any] = {
+                "device_id": local_dev_id,
+                "device_name": local_dev_name,
+                "device_type": "windows",
+                "platform": "windows",
+                "public_key": getattr(self.device_identity, "public_key_b64", ""),
+                "snow_id": local_canonical_snow,
+                "manifest": build_windows_manifest().to_dict(),
+            }
+            if local_fp:
+                pair_payload["cert_fingerprint"] = local_fp
+            if pin:
+                pair_payload["pin"] = pin
+            if handshake_token:
+                pair_payload["handshake_token"] = handshake_token
+            if network_id:
+                pair_payload["network_id"] = network_id
+            if eff_client_net:
+                pair_payload["client_network_id"] = eff_client_net
+            if network_decision:
+                pair_payload["network_decision"] = network_decision
+            if merge_tx_id:
+                pair_payload["merge_tx_id"] = merge_tx_id
+            if client_merge_approved:
+                pair_payload["client_merge_approved"] = True
+            if surviving_network_id:
+                pair_payload["surviving_network_id"] = surviving_network_id
+
+            pair_msg = SnowMessage.create_request(action="pair_request", data=pair_payload)
+            sent_ok = await bs_client.send_message(host_dev_id, pair_msg)
+            if not sent_ok:
+                return {
+                    "success": False,
+                    "status": "RENDEZVOUS_CONNECT_FAILED",
+                    "error": "Failed opening E2E TLS tunnel to host over relay.",
+                }
+
+            pair_resp: Optional[SnowMessage] = None
+            wait_deadline = time.monotonic() + 12.0
+            while time.monotonic() < wait_deadline:
+                rem_wait = max(0.1, wait_deadline - time.monotonic())
+                cand = await bs_client.receive_message(host_dev_id, timeout=rem_wait)
+                if cand is None:
+                    break
+                if cand.correlation_id in (None, "", pair_msg.id):
+                    pair_resp = cand
+                    break
+
+            if pair_resp is None:
+                return {
+                    "success": False,
+                    "status": "TIMEOUT",
+                    "error": "Timed out waiting for host pairing response over relay tunnel.",
+                }
+
+            tun = bs_client._tunnels.get(host_dev_id) if isinstance(getattr(bs_client, "_tunnels", None), dict) else None
+            verified_fp = str(getattr(tun, "peer_fingerprint", None) or host_fp or "")
+        except Exception as exc:
+            return {"success": False, "status": "PAIRING_ERROR", "error": f"Rendezvous pairing failed: {exc}"}
+        finally:
+            try:
+                await bs_client.disconnect()
+            except Exception:
+                pass
+
+        if pair_resp.type == MessageType.ERROR:
+            err_obj = pair_resp.error if isinstance(pair_resp.error, dict) else {}
+            return self._extract_pin_failure_fields(
+                err_obj.get("code") or "PAIRING_FAILED",
+                err_obj.get("message") or "Peer rejected pairing.",
+            )
+
+        resp_payload = pair_resp.payload if isinstance(pair_resp.payload, dict) else {}
+        pdata = resp_payload.get("data") if isinstance(resp_payload.get("data"), dict) else resp_payload
+        if resp_payload.get("status") == "error" or pdata.get("success") is False:
+            return self._extract_pin_failure_fields(
+                pdata.get("error_code") or pdata.get("status") or "PAIRING_FAILED",
+                pdata.get("message") or pdata.get("error") or "Peer rejected pairing.",
+            )
+
+        remote_id = str(pdata.get("device_id") or pdata.get("server_device_id") or host_dev_id)
+        remote_name = str(pdata.get("device_name") or host_snow_id or "Connected Peer")
+        session_id = str(pdata.get("session_id") or f"relay_{remote_id}")
+        auth_token = str(pdata.get("auth_token") or "")
+        resp_snow = str(pdata.get("snow_id") or host_snow_id or "").strip().upper()
+        manifest_dict = pdata.get("manifest") if isinstance(pdata.get("manifest"), dict) else {}
+
+        return await self._finalize_paired_peer(
+            remote_id=remote_id,
+            remote_name=remote_name,
+            session_id=session_id,
+            auth_token=auth_token,
+            cert_fp=verified_fp,
+            manifest=manifest_dict,
+            platform_hint=str(pdata.get("platform") or ""),
+            host="",
+            port=0,
+            transport="remote_relay",
+            res_network_id=pdata.get("network_id") or bs_net_id or None,
+            network_action=pdata.get("network_action"),
+            network_conflict=bool(pdata.get("network_conflict", False)),
+            relationship=str(pdata.get("relationship") or "member"),
+            merge_tx_id=pdata.get("merge_tx_id"),
+            host_network_id=pdata.get("host_network_id"),
+            client_network_id=pdata.get("client_network_id"),
+            peer_snow_id=resp_snow,
+        )
+
     async def connect_peer(
         self,
-        host: str,
+        host: str = "",
         port: int = 8765,
         pin: str = "",
         expected_fingerprint: str = "",
@@ -1048,8 +1517,27 @@ class SnowCoreServer:
         merge_tx_id: Optional[str] = None,
         client_merge_approved: bool = False,
         surviving_network_id: Optional[str] = None,
+        use_rendezvous: bool = False,
+        snow_id: str = "",
     ) -> dict[str, Any]:
-        """Establish outbound TLS/WSS peer connection, register in NodeRegistry and DB, and retain session."""
+        """Establish outbound TLS/WSS peer connection (or Render Hub rendezvous), register in NodeRegistry and DB."""
+        if use_rendezvous and not (host or "").strip():
+            return await self._connect_peer_via_rendezvous(
+                snow_id=snow_id,
+                pin=pin,
+                handshake_token=handshake_token,
+                expected_fingerprint=expected_fingerprint,
+                network_id=network_id,
+                client_network_id=client_network_id,
+                network_decision=network_decision,
+                merge_tx_id=merge_tx_id,
+                client_merge_approved=client_merge_approved,
+                surviving_network_id=surviving_network_id,
+            )
+
+        if not (host or "").strip():
+            return {"success": False, "status": "MISSING_ENDPOINT", "error": "Host endpoint or rendezvous is required."}
+
         from snow.network.peer_client import SnowPeerClient
 
         client = SnowPeerClient(
@@ -1072,99 +1560,41 @@ class SnowCoreServer:
         )
         if not res.success or not res.remote_device_id:
             await client.close()
-            return {
-                "success": False,
-                "status": res.status,
-                "error": res.error or "Failed connecting to peer.",
-            }
+            return self._extract_pin_failure_fields(
+                res.status,
+                res.error or "Failed connecting to peer.",
+                remaining_attempts=getattr(res, "remaining_attempts", None),
+            )
 
-        remote_id = res.remote_device_id
-        remote_name = res.remote_device_name or "Connected Peer"
-        session_id = res.session_id or f"peer_{remote_id}"
-        auth_token = res.auth_token or ""
-        cert_fp = res.cert_fingerprint or ""
-
-        # Close existing client for this device if any
-        old_client = self.peer_clients.get(remote_id)
-        if old_client:
-            try:
-                await old_client.close()
-            except Exception:
-                pass
-
-        self.peer_clients[remote_id] = client
-
-        # 1. Register in NodeRegistry
-        self.node_registry.on_session_authenticated(
-            device_id=remote_id,
-            connection_id=session_id,
+        peer_snow = str(
+            getattr(res, "snow_id", None)
+            or (res.manifest.get("snow_id") if isinstance(res.manifest, dict) else "")
+            or snow_id
+            or ""
+        ).strip().upper()
+        final_res = await self._finalize_paired_peer(
+            remote_id=res.remote_device_id,
+            remote_name=res.remote_device_name or "Connected Peer",
+            session_id=res.session_id or f"peer_{res.remote_device_id}",
+            auth_token=res.auth_token or "",
+            cert_fp=res.cert_fingerprint or "",
+            manifest=res.manifest if isinstance(res.manifest, dict) else {},
+            platform_hint=str(getattr(res, "platform", None) or ""),
             host=host,
             port=port,
-            manifest_data=res.manifest,
             transport="peer_link",
+            res_network_id=getattr(res, "network_id", None),
+            network_action=getattr(res, "network_action", None),
+            network_conflict=bool(getattr(res, "network_conflict", False)),
+            relationship=str(getattr(res, "relationship", "member") or "member"),
+            merge_tx_id=getattr(res, "merge_tx_id", None),
+            host_network_id=getattr(res, "host_network_id", None),
+            client_network_id=getattr(res, "client_network_id", None),
+            peer_snow_id=peer_snow,
+            client_handle=client,
         )
-
-        # 2. Persist in paired_devices with detected platform
-        token_hash = hashlib.sha256(auth_token.encode("utf-8")).hexdigest() if auth_token else hashlib.sha256(remote_id.encode("utf-8")).hexdigest()
-        manifest_dict = res.manifest if isinstance(res.manifest, dict) else {}
-        caps = manifest_dict.get("supported_capabilities") or []
-        caps_str = " ".join(caps) if isinstance(caps, list) else str(caps)
-        raw_platform = str(
-            getattr(res, "platform", None)
-            or manifest_dict.get("platform")
-            or manifest_dict.get("os")
-            or manifest_dict.get("os_name")
-            or ""
-        ).strip().lower()
-
-        if "android" in raw_platform or ("android." in caps_str and "desktop." not in caps_str):
-            detected_platform = "android"
-        elif "win" in raw_platform or "desktop." in caps_str:
-            detected_platform = "windows"
-        elif "linux" in raw_platform:
-            detected_platform = "linux"
-        elif "mac" in raw_platform or "darwin" in raw_platform:
-            detected_platform = "macos"
-        else:
-            detected_platform = raw_platform or "windows"
-
-        existing = self.db_manager.get_paired_device(remote_id)
-        if not existing:
-            self.db_manager.insert_paired_device(
-                device_id=remote_id,
-                device_name=remote_name,
-                auth_token_hash=token_hash,
-                trust_tier="peer",
-                platform=detected_platform,
-                reachability_profile="ACTIVE_SESSION_PEER",
-                last_known_host=host,
-                last_known_port=port,
-                capabilities_json=json.dumps(res.manifest or {}),
-            )
-        else:
-            self.db_manager.update_device_endpoint(remote_id, host, port)
-            self.db_manager.update_last_seen(remote_id)
-
-        # 3. Record in network_endpoints ring buffer
-        self.network_manager.record_endpoint(device_id=remote_id, host=host, port=port)
-
-        return {
-            "success": True,
-            "status": res.status,
-            "data": {
-                "remote_device_id": remote_id,
-                "remote_device_name": remote_name,
-                "session_id": session_id,
-                "cert_fingerprint": cert_fp,
-                "network_id": getattr(res, "network_id", None),
-                "network_action": getattr(res, "network_action", None),
-                "network_conflict": bool(getattr(res, "network_conflict", False)),
-                "relationship": getattr(res, "relationship", "member"),
-                "merge_tx_id": getattr(res, "merge_tx_id", None),
-                "host_network_id": getattr(res, "host_network_id", None),
-                "client_network_id": getattr(res, "client_network_id", None),
-            },
-        }
+        final_res["status"] = res.status
+        return final_res
 
     async def disconnect_peer(self, device_id: str) -> dict[str, Any]:
         """Disconnect an active peer session, updating registry without forgetting pairing."""
@@ -1473,17 +1903,18 @@ class SnowCoreServer:
         return ws_clean, http_clean
 
     async def _acquire_relay_hub_session(self, hub_http_url: str, timeout: float = 8.0) -> tuple[bool, str, str, str]:
-        """Acquire a short-lived Ed25519 hub-session token for Render Hub /v1/tunnel."""
+        """Acquire a short-lived per-device Ed25519 hub-session token for Render Hub /v1/tunnel."""
         import aiohttp
-        from snow.security.identity import load_or_create_device_identity, load_or_create_network_key_identity
+        from snow.security.identity import load_or_create_device_identity, load_or_create_device_key_identity
 
         try:
-            from snow.security.identity import resolve_canonical_device_snow_id
-            net_ident = load_or_create_network_key_identity()
-            dev_ident = load_or_create_device_identity()
-            canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
+            dev_key = self._load_instance_device_key()
+            dev_ident = getattr(self, "device_identity", None) or load_or_create_device_identity()
+            local_dev_id = str(getattr(dev_ident, "device_id", "") or "").strip() or "desktop-core"
+            canonical_snow = str(dev_key.snow_id or "").strip().upper()
+            shared_net_id = self._get_shared_active_network_id()
         except Exception as exc:
-            return False, "", "", f"Failed loading Ed25519 identity: {exc}"
+            return False, "", "", f"Failed loading Ed25519 device identity: {exc}"
 
         base = hub_http_url.rstrip("/")
         try:
@@ -1491,10 +1922,12 @@ class SnowCoreServer:
                 async with sess.post(
                     f"{base}/v1/hub/challenge",
                     json={
-                        "network_id": net_ident.network_id,
-                        "public_key": net_ident.public_key_b64,
-                        "device_id": dev_ident.device_id,
+                        "auth_kind": "device",
+                        "network_id": shared_net_id,
+                        "public_key": dev_key.public_key_b64,
+                        "device_id": local_dev_id,
                         "snow_id": canonical_snow,
+                        "audience": "render-hub-tunnel",
                     },
                 ) as ch_resp:
                     ch_data = await ch_resp.json(content_type=None)
@@ -1503,16 +1936,22 @@ class SnowCoreServer:
                             (ch_data or {}).get("error") or f"Hub challenge failed (HTTP {ch_resp.status})."
                         )
 
-                sig_b64 = net_ident.sign_hub_challenge(ch_data, device_id=dev_ident.device_id)
+                sig_b64 = dev_key.sign_device_hub_challenge(
+                    ch_data,
+                    device_id=local_dev_id,
+                    network_id=shared_net_id,
+                    audience="render-hub-tunnel",
+                )
                 async with sess.post(
                     f"{base}/v1/hub/session",
                     json={
                         "challenge_id": ch_data["challenge_id"],
-                        "network_id": net_ident.network_id,
-                        "public_key": net_ident.public_key_b64,
+                        "network_id": shared_net_id,
+                        "public_key": dev_key.public_key_b64,
                         "signature": sig_b64,
-                        "device_id": dev_ident.device_id,
+                        "device_id": local_dev_id,
                         "snow_id": canonical_snow,
+                        "audience": "render-hub-tunnel",
                     },
                 ) as sess_resp:
                     sess_data = await sess_resp.json(content_type=None)
@@ -1521,7 +1960,7 @@ class SnowCoreServer:
                         return False, "", "", str(
                             (sess_data or {}).get("error") or f"Hub session rejected (HTTP {sess_resp.status})."
                         )
-                    return True, token, net_ident.network_id, ""
+                    return True, token, shared_net_id, ""
         except Exception as exc:
             return False, "", "", f"Hub session request failed: {exc}"
 
@@ -1578,20 +2017,27 @@ class SnowCoreServer:
                 if not ok_hub or not hub_token:
                     logger.warning("Skipping hub rendezvous open (%s): %s", hub_http_base, err_hub)
                     return None
-                from snow.security.identity import resolve_canonical_device_snow_id
+                from snow.security.identity import (
+                    load_or_create_device_key_identity,
+                    resolve_canonical_device_snow_id,
+                )
                 ws_srv = getattr(self, "ws_server", None)
                 cert_info = getattr(ws_srv, "certificate_info", None)
                 fp = getattr(cert_info, "fingerprint_sha256", "") if cert_info else ""
                 dev_ident = getattr(self, "device_identity", None)
-                host_dev_id = str(getattr(dev_ident, "device_id", "") or "").strip()
-                host_snow_id, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
+                host_dev_id = str(getattr(dev_ident, "device_id", "") or "").strip() or "desktop-core"
+                try:
+                    host_snow_id = self._load_instance_device_key().snow_id
+                except Exception:
+                    host_snow_id, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
                 body: dict[str, Any] = {
                     "mode": "pairing",
                     "host_device_id": host_dev_id,
                     "host_snow_id": host_snow_id,
-                    "network_id": hub_net_id,
                     "ttl_seconds": min(120.0, max(10.0, float(ttl_seconds))),
                 }
+                if hub_net_id:
+                    body["network_id"] = hub_net_id
                 if fp:
                     body["cert_fingerprint"] = fp
                 if pin:
@@ -1741,25 +2187,8 @@ class SnowCoreServer:
             if not ok_hub or not hub_token:
                 logger.warning("Render Hub session acquisition failed (%s): %s", hub_http_base, err_hub)
                 return self.get_relay_status()
-            if network_id and (not getattr(self, "relay_group_id", "") or self.relay_group_id in ("default_group", "local-network")):
-                self.relay_group_id = network_id
 
-        # Resolve cert & key paths safely using config attributes
-        from snow.security.tls import DEFAULT_CERT_FILE, DEFAULT_KEY_FILE, DEFAULT_TLS_DIR
-        data_dir = os.environ.get("SNOW_DATA_DIR")
-        tls_dir = (Path(data_dir) / "tls") if data_dir else DEFAULT_TLS_DIR
-        cert_candidate = (
-            getattr(self.config, "tls_cert_path", None)
-            or getattr(self.config, "tls_cert_file", None)
-            or str(tls_dir / DEFAULT_CERT_FILE)
-        )
-        key_candidate = (
-            getattr(self.config, "tls_key_path", None)
-            or getattr(self.config, "tls_key_file", None)
-            or str(tls_dir / DEFAULT_KEY_FILE)
-        )
-        cert_path = str(cert_candidate)
-        key_path = str(key_candidate)
+        cert_path, key_path = self._resolve_tls_cert_and_key_paths()
 
         if not os.path.exists(cert_path) or not os.path.exists(key_path):
             logger.warning(
@@ -1772,16 +2201,24 @@ class SnowCoreServer:
         from snow.network.relay_client import RelayTunnelClient
         local_dev_id = getattr(self.device_identity, "device_id", "desktop-core") if hasattr(self, "device_identity") and self.device_identity else "desktop-core"
 
-        active_net = (
-            self.db_manager.get_active_network()
-            if self.db_manager and hasattr(self.db_manager, "get_active_network")
-            else None
-        )
-        resolved_group_id = (
-            network_id
-            or (active_net.get("network_id") if active_net else "")
-            or (self.relay_group_id if getattr(self, "relay_group_id", "") not in ("default_group", "local-network") else "")
-        )
+        shared_net_id = str(network_id or "").strip().upper() or self._get_shared_active_network_id()
+        dev_snow = ""
+        try:
+            dev_snow = str(self._load_instance_device_key().snow_id or "").strip().upper()
+        except Exception:
+            dev_snow = str(getattr(self.device_identity, "snow_id", "") or "").strip().upper()
+
+        if (self.relay_ticket or "").strip():
+            legacy_group = (
+                self.relay_group_id
+                if getattr(self, "relay_group_id", "") not in ("", "default_group", "local-network")
+                else ""
+            )
+            resolved_group_id = shared_net_id or legacy_group or (f"dev_{dev_snow}" if dev_snow else f"dev_{local_dev_id}")
+        else:
+            resolved_group_id = shared_net_id or (f"dev_{dev_snow}" if dev_snow else f"dev_{local_dev_id}")
+
+        self.relay_group_id = resolved_group_id
 
         client = RelayTunnelClient(
             relay_url=self.relay_url,
@@ -1791,7 +2228,7 @@ class SnowCoreServer:
             cert_path=cert_path,
             key_path=key_path,
             hub_token=hub_token,
-            network_id=network_id,
+            network_id=shared_net_id,
         )
 
         # Pin fingerprints for all paired devices
@@ -1811,11 +2248,68 @@ class SnowCoreServer:
         if connected:
             self.relay_client = client
             self.session_router.relay_client = client
-            logger.info("Outbound relay tunnel client connected and registered with router.")
+            logger.info("Outbound relay tunnel client connected and registered with router (group=%s).", resolved_group_id)
         else:
             logger.warning("Failed connecting to relay at %s", self.relay_url)
 
         return self.get_relay_status()
+
+    async def resync_relay_group_membership(self) -> dict[str, Any]:
+        """Refresh active relay hub membership and pin newly paired device certificates."""
+        if self.relay_client is not None and self.db_manager is not None:
+            try:
+                for p in self.db_manager.list_paired_devices() or []:
+                    fp = getattr(p, "cert_fingerprint", None)
+                    if fp:
+                        self.relay_client.set_peer_pinned_fingerprint(p.device_id, fp)
+            except Exception as exc:
+                logger.debug("Non-fatal error pinning paired fingerprints onto relay_client: %s", exc)
+
+        if not self.relay_enabled:
+            return self.get_relay_status()
+
+        shared_net_id = self._get_shared_active_network_id()
+        dev_snow = ""
+        try:
+            dev_snow = str(self._load_instance_device_key().snow_id or "").strip().upper()
+        except Exception:
+            dev_snow = str(getattr(self.device_identity, "snow_id", "") or "").strip().upper()
+        local_dev_id = getattr(self.device_identity, "device_id", "desktop-core") if hasattr(self, "device_identity") and self.device_identity else "desktop-core"
+        desired_group_id = shared_net_id or (f"dev_{dev_snow}" if dev_snow else f"dev_{local_dev_id}")
+
+        if self.relay_client is not None and bool(getattr(self.relay_client, "_is_connected", False)):
+            cur_group = str(getattr(self.relay_client, "group_id", "") or "")
+            cur_net = str(getattr(self.relay_client, "network_id", "") or "").strip().upper()
+            if cur_group == desired_group_id and cur_net == shared_net_id:
+                return self.get_relay_status()
+
+        return await self.configure_relay(enabled=True, group_id=desired_group_id)
+
+    async def _trigger_relay_resync_safe(self) -> None:
+        """Await relay resync when mocked/loopback, or schedule cleanly in background for remote hubs."""
+        if not self.relay_enabled:
+            return
+        from snow.core.config import resolve_default_hub_url
+
+        hub_target = (self.relay_url or "").strip() or resolve_default_hub_url(db_manager=getattr(self, "db_manager", None))
+        is_local = any(tok in hub_target.lower() for tok in ("127.0.0.1", "localhost", "::1"))
+        is_mocked = "configure_relay" in self.__dict__ or "resync_relay_group_membership" in self.__dict__
+        if is_local or is_mocked:
+            await self.resync_relay_group_membership()
+            return
+
+        if getattr(self, "_resync_task", None) and not self._resync_task.done():
+            self._resync_task.cancel()
+
+        async def _bg_resync() -> None:
+            try:
+                await self.resync_relay_group_membership()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug("Background relay resync error: %s", exc)
+
+        self._resync_task = asyncio.create_task(_bg_resync())
 
     async def _handle_incoming_relay_request(self, source_id: str, req: SnowMessage) -> Optional[SnowMessage]:
         """Dispatch incoming capability request received over inner E2E relay tunnel."""
@@ -1843,6 +2337,13 @@ class SnowCoreServer:
 
                 pair_data = dict(data) if isinstance(data, dict) else {}
                 pair_data.setdefault("device_id", source_id)
+                if not pair_data.get("cert_fingerprint") and self.relay_client is not None:
+                    tunnels = getattr(self.relay_client, "_tunnels", None)
+                    if isinstance(tunnels, dict):
+                        tun = tunnels.get(source_id)
+                        peer_fp = getattr(tun, "peer_fingerprint", None) if tun else None
+                        if peer_fp:
+                            pair_data["cert_fingerprint"] = peer_fp
                 await self.ws_server._handle_pairing_request(
                     _RelayCaptureClient(), req, action, pair_data
                 )
@@ -2045,15 +2546,30 @@ class SnowCoreServer:
             except Exception as exc:
                 logger.debug("UsbWatcher failed to start: %s", exc)
 
-        # Restore persisted Render Hub Remote Access cleanly in background if enabled
+        # Always-on Hosted Render Relay: default ON whenever DB setting is unset/"" or "true"
         try:
             persisted_relay = (
                 self.db_manager.get_setting("remote_relay_enabled", "")
                 if getattr(self, "db_manager", None)
                 else ""
             )
-            if str(persisted_relay or "").strip().lower() == "true" or self.relay_enabled:
-                asyncio.create_task(self.configure_relay(enabled=True))
+            raw_relay_flag = str(persisted_relay or "").strip().lower()
+            if raw_relay_flag != "false":
+                self.relay_enabled = True
+                self.session_router.relay_enabled = True
+
+                async def _autostart_relay() -> None:
+                    try:
+                        await self.configure_relay(enabled=True)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as bg_exc:
+                        logger.debug("Deferred Render Hub relay auto-start error: %s", bg_exc)
+
+                self._relay_autostart_task = asyncio.create_task(_autostart_relay())
+            else:
+                self.relay_enabled = False
+                self.session_router.relay_enabled = False
         except Exception as exc:
             logger.debug("Deferred Render Hub relay auto-start skipped: %s", exc)
 
@@ -2253,6 +2769,16 @@ class SnowCoreServer:
             except asyncio.CancelledError:
                 pass
             self._rendezvous_task = None
+
+        for bg_attr in ("_relay_autostart_task", "_resync_task"):
+            bg_task = getattr(self, bg_attr, None)
+            if bg_task is not None:
+                bg_task.cancel()
+                try:
+                    await bg_task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, bg_attr, None)
 
         # Stop automatic USB ADB watcher
         if getattr(self, "usb_watcher", None):

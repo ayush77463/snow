@@ -12,6 +12,9 @@ import android.os.Looper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -22,6 +25,13 @@ import org.snow.security.SafeLog
 import org.snow.transfer.FileTransferClient
 import java.io.ByteArrayOutputStream
 import java.util.UUID
+
+data class ScreenTargetEndpoint(
+    val deviceId: String,
+    val host: String,
+    val transferPort: Int,
+    val useRelay: Boolean = false
+)
 
 /**
  * Continuous live screen streaming capability using Android MediaProjection.
@@ -54,6 +64,9 @@ class LiveScreenStreamHandler(
 
         @Volatile
         var mockFramePoster: ((ByteArray, String, Int, Int, Float) -> Boolean)? = null
+
+        @Volatile
+        var mockTargetFramePoster: ((ScreenTargetEndpoint, ByteArray, String, Int, Int, Float) -> Boolean)? = null
     }
 
     enum class StreamState {
@@ -98,6 +111,13 @@ class LiveScreenStreamHandler(
     var targetDeviceIds: List<String> = emptyList()
         private set
     @Volatile
+    var activeTargets: List<ScreenTargetEndpoint> = emptyList()
+        private set
+    @Volatile
+    var relayMediaSenderForTarget: ((ScreenTargetEndpoint, Map<String, Any?>, ByteArray) -> Boolean)? = null
+    @Volatile
+    private var legacyFallbackRelayEnabled: Boolean = false
+    @Volatile
     var activeViewerCount: Int = 1
         private set
     @Volatile
@@ -126,7 +146,7 @@ class LiveScreenStreamHandler(
     var onRevoked: (() -> Unit)? = null
 
     /**
-     * Start continuous live screen streaming.
+     * Start continuous live screen streaming to a single legacy target endpoint.
      */
     fun startStreaming(
         projection: MediaProjection,
@@ -137,6 +157,62 @@ class LiveScreenStreamHandler(
         senderDeviceId: String = "",
         senderName: String = "Android Phone",
         initialViewerCount: Int = 1
+    ) {
+        val cleanIds = targetIds.filter { it.isNotBlank() }.distinct()
+        val endpoint = ScreenTargetEndpoint(
+            deviceId = cleanIds.firstOrNull().orEmpty(),
+            host = serverHost.trim(),
+            transferPort = transferPort,
+            useRelay = relayMediaSender != null && serverHost.isBlank()
+        )
+        startStreamingInternal(
+            projection = projection,
+            targets = if (serverHost.isNotBlank() || endpoint.useRelay) listOf(endpoint) else emptyList(),
+            explicitTargetIds = cleanIds,
+            legacyFallbackRelay = true,
+            targetFps = targetFps,
+            senderDeviceId = senderDeviceId,
+            senderName = senderName,
+            initialViewerCount = initialViewerCount
+        )
+    }
+
+    /**
+     * Start continuous live screen streaming with concurrent fan-out across multiple endpoints
+     * (e.g. PC port 8766, Android peer media port 8769, and/or E2E remote relay).
+     */
+    fun startStreamingTargets(
+        projection: MediaProjection,
+        targets: List<ScreenTargetEndpoint>,
+        targetFps: Float = DEFAULT_FPS,
+        senderDeviceId: String = "",
+        senderName: String = "Android Phone",
+        initialViewerCount: Int = 1
+    ) {
+        val deduped = targets
+            .filter { it.useRelay || it.host.isNotBlank() }
+            .distinctBy { "${it.deviceId.lowercase()}|${it.host}|${it.transferPort}|${it.useRelay}" }
+        startStreamingInternal(
+            projection = projection,
+            targets = deduped,
+            explicitTargetIds = deduped.map { it.deviceId }.filter { it.isNotBlank() }.distinct(),
+            legacyFallbackRelay = false,
+            targetFps = targetFps,
+            senderDeviceId = senderDeviceId,
+            senderName = senderName,
+            initialViewerCount = initialViewerCount
+        )
+    }
+
+    private fun startStreamingInternal(
+        projection: MediaProjection,
+        targets: List<ScreenTargetEndpoint>,
+        explicitTargetIds: List<String>,
+        legacyFallbackRelay: Boolean,
+        targetFps: Float,
+        senderDeviceId: String,
+        senderName: String,
+        initialViewerCount: Int
     ) {
         synchronized(this) {
             if (_streamState.value == StreamState.STREAMING || _streamState.value == StreamState.STARTING) {
@@ -150,7 +226,11 @@ class LiveScreenStreamHandler(
         val clampedFps = targetFps.coerceIn(MIN_FPS, MAX_FPS)
         val sessionId = UUID.randomUUID().toString().take(8)
         currentSessionId = sessionId
-        targetDeviceIds = targetIds.filter { it.isNotBlank() }.distinct()
+        activeTargets = targets
+        targetDeviceIds = explicitTargetIds.ifEmpty {
+            targets.map { it.deviceId }.filter { it.isNotBlank() }.distinct()
+        }
+        legacyFallbackRelayEnabled = legacyFallbackRelay
         activeViewerCount = initialViewerCount.coerceAtLeast(0)
         lastFrameSha256 = null
         lastDims = null
@@ -165,7 +245,10 @@ class LiveScreenStreamHandler(
         // Scale to bounded dimensions (max long edge 720, preserving aspect ratio)
         val (targetWidth, targetHeight) = computeScaledDimensions(rawWidth, rawHeight, MAX_LONG_EDGE)
 
-        SafeLog.i(TAG, "Initializing screen stream: ${targetWidth}x${targetHeight} @ ${clampedFps} FPS (session=$sessionId)")
+        SafeLog.i(
+            TAG,
+            "Initializing screen stream: ${targetWidth}x${targetHeight} @ ${clampedFps} FPS (session=$sessionId, targets=${targets.size})"
+        )
 
         try {
             // Android 14+ requirement: register callback before creating VirtualDisplay
@@ -173,15 +256,10 @@ class LiveScreenStreamHandler(
                 override fun onStop() {
                     SafeLog.i(TAG, "MediaProjection revoked or stopped by OS.")
                     _streamState.value = StreamState.REVOKED
-                    // Send desktop a metadata-only stop/status event with state="REVOKED"
-                    if (serverHost.isNotBlank()) {
+                    val stopTargets = activeTargets
+                    if (stopTargets.isNotEmpty()) {
                         handlerScope.launch {
-                            try {
-                                val client = transferClientProvider()
-                                client?.postScreenStreamStop(serverHost, transferPort)
-                            } catch (e: Exception) {
-                                SafeLog.w(TAG, "Could not send revoked signal: ${e.message}")
-                            }
+                            sendStopSignalsToTargets(stopTargets)
                         }
                     }
                     cleanup(isExplicitStop = false)
@@ -220,17 +298,16 @@ class LiveScreenStreamHandler(
                 lastFrameTimestamp = System.currentTimeMillis()
             )
 
-            // Start frame acquisition & transmission loop
+            // Start frame acquisition & concurrent multi-target transmission loop
             startFrameLoop(
-                reader,
-                targetWidth,
-                targetHeight,
-                clampedFps,
-                serverHost,
-                transferPort,
-                sessionId,
-                senderDeviceId,
-                senderName
+                reader = reader,
+                width = targetWidth,
+                height = targetHeight,
+                fps = clampedFps,
+                targets = targets,
+                sessionId = sessionId,
+                senderDeviceId = senderDeviceId,
+                senderName = senderName
             )
 
         } catch (e: Exception) {
@@ -250,6 +327,115 @@ class LiveScreenStreamHandler(
     }
 
     /**
+     * Fan out a captured JPEG frame concurrently across all configured targets (PC 8766, Android peer 8769, Relay).
+     */
+    internal suspend fun transmitFrameToTargets(
+        targets: List<ScreenTargetEndpoint>,
+        frameBytes: ByteArray,
+        sessionId: String,
+        width: Int,
+        height: Int,
+        fps: Float,
+        senderDeviceId: String,
+        senderName: String,
+        frameSeq: Long
+    ): Boolean {
+        val targetHook = mockTargetFramePoster
+        val legacyHook = mockFramePoster
+        val effectiveTargets = targets.ifEmpty {
+            listOf(ScreenTargetEndpoint(deviceId = "", host = "", transferPort = 8766, useRelay = relayMediaSender != null))
+        }
+
+        if (targetHook != null || legacyHook != null) {
+            return coroutineScope {
+                effectiveTargets.map { endpoint ->
+                    async(Dispatchers.IO) {
+                        try {
+                            targetHook?.invoke(endpoint, frameBytes, sessionId, width, height, fps)
+                                ?: legacyHook?.invoke(frameBytes, sessionId, width, height, fps)
+                                ?: false
+                        } catch (_: Exception) {
+                            false
+                        }
+                    }
+                }.awaitAll().any { it }
+            }
+        }
+
+        val transferClient = transferClientProvider()
+        return coroutineScope {
+            targets.map { endpoint ->
+                async(Dispatchers.IO) {
+                    try {
+                        val targetMeta = mapOf(
+                            "sender_device_id" to senderDeviceId,
+                            "sender_name" to senderName,
+                            "sender_platform" to "android",
+                            "session_id" to sessionId,
+                            "frame_seq" to frameSeq,
+                            "frame_width" to width,
+                            "frame_height" to height,
+                            "fps" to fps,
+                            "target_device_id" to endpoint.deviceId,
+                            "target_device_ids" to listOf(endpoint.deviceId).filter { it.isNotBlank() }.ifEmpty { targetDeviceIds }
+                        )
+                        var ok = false
+                        if (endpoint.useRelay || (legacyFallbackRelayEnabled && relayMediaSender != null)) {
+                            ok = relayMediaSenderForTarget?.invoke(endpoint, targetMeta, frameBytes)
+                                ?: relayMediaSender?.invoke(targetMeta, frameBytes)
+                                ?: false
+                        }
+                        if (!ok && !endpoint.useRelay &&
+                            endpoint.host.isNotBlank() &&
+                            !endpoint.host.startsWith("ws://", ignoreCase = true) &&
+                            !endpoint.host.startsWith("wss://", ignoreCase = true)
+                        ) {
+                            ok = transferClient?.postScreenFrame(
+                                serverHost = endpoint.host,
+                                transferPort = endpoint.transferPort,
+                                frameBytes = frameBytes,
+                                sessionId = sessionId,
+                                width = width,
+                                height = height,
+                                fps = fps,
+                                senderId = senderDeviceId.ifBlank { null },
+                                senderName = senderName,
+                                senderPlatform = "android",
+                                frameSeq = frameSeq,
+                                targetDeviceIds = listOf(endpoint.deviceId).filter { it.isNotBlank() }.ifEmpty { targetDeviceIds }
+                            ) ?: false
+                        }
+                        ok
+                    } catch (e: Exception) {
+                        SafeLog.w(TAG, "Frame push to ${endpoint.deviceId}/${endpoint.host}:${endpoint.transferPort} failed: ${e.message}")
+                        false
+                    }
+                }
+            }.awaitAll().any { it }
+        }
+    }
+
+    private suspend fun sendStopSignalsToTargets(targets: List<ScreenTargetEndpoint>) {
+        val transferClient = transferClientProvider() ?: return
+        coroutineScope {
+            targets.filter {
+                !it.useRelay &&
+                    it.host.isNotBlank() &&
+                    !it.host.startsWith("ws://", ignoreCase = true) &&
+                    !it.host.startsWith("wss://", ignoreCase = true)
+            }.distinctBy { "${it.host}:${it.transferPort}" }.map { endpoint ->
+                async(Dispatchers.IO) {
+                    try {
+                        transferClient.postScreenStreamStop(endpoint.host, endpoint.transferPort)
+                    } catch (e: Exception) {
+                        SafeLog.w(TAG, "Could not send stop frame signal to ${endpoint.host}:${endpoint.transferPort}: ${e.message}")
+                    }
+                }
+            }.awaitAll()
+        }
+    }
+
+    /**
      * Continuous frame loop running on Dispatchers.IO.
      */
     private fun startFrameLoop(
@@ -257,8 +443,7 @@ class LiveScreenStreamHandler(
         width: Int,
         height: Int,
         fps: Float,
-        serverHost: String,
-        transferPort: Int,
+        targets: List<ScreenTargetEndpoint>,
         sessionId: String,
         senderDeviceId: String = "",
         senderName: String = "Android Phone"
@@ -313,47 +498,18 @@ class LiveScreenStreamHandler(
                         if (frameBytes.size.toLong() <= MAX_FRAME_BYTES) {
                             frameSeqCounter++
                             val seq = frameSeqCounter
-                            // 2. Transmit frame over authenticated HTTPS or E2E Relay
-                            val sent = if (mockFramePoster != null) {
-                                mockFramePoster!!.invoke(frameBytes, sessionId, width, height, fps)
-                            } else {
-                                var ok = false
-                                val relayFn = relayMediaSender
-                                if (relayFn != null) {
-                                    ok = relayFn.invoke(
-                                        mapOf(
-                                            "sender_device_id" to senderDeviceId,
-                                            "sender_name" to senderName,
-                                            "sender_platform" to "android",
-                                            "session_id" to sessionId,
-                                            "frame_seq" to seq,
-                                            "frame_width" to width,
-                                            "frame_height" to height,
-                                            "fps" to fps,
-                                            "target_device_ids" to targetDeviceIds
-                                        ),
-                                        frameBytes
-                                    )
-                                }
-                                if (!ok && serverHost.isNotBlank()) {
-                                    val transferClient = transferClientProvider()
-                                    ok = transferClient?.postScreenFrame(
-                                        serverHost = serverHost,
-                                        transferPort = transferPort,
-                                        frameBytes = frameBytes,
-                                        sessionId = sessionId,
-                                        width = width,
-                                        height = height,
-                                        fps = fps,
-                                        senderId = senderDeviceId.ifBlank { null },
-                                        senderName = senderName,
-                                        senderPlatform = "android",
-                                        frameSeq = seq,
-                                        targetDeviceIds = targetDeviceIds
-                                    ) ?: false
-                                }
-                                ok
-                            }
+                            // 2. Transmit frame concurrently across all selected targets
+                            val sent = transmitFrameToTargets(
+                                targets = targets,
+                                frameBytes = frameBytes,
+                                sessionId = sessionId,
+                                width = width,
+                                height = height,
+                                fps = fps,
+                                senderDeviceId = senderDeviceId,
+                                senderName = senderName,
+                                frameSeq = seq
+                            )
 
                             if (sent) {
                                 frameCount++
@@ -468,22 +624,26 @@ class LiveScreenStreamHandler(
             _streamState.value = StreamState.STOPPING
         }
 
+        val stopTargets = buildList {
+            addAll(activeTargets)
+            if (!serverHost.isNullOrBlank()) {
+                add(ScreenTargetEndpoint(deviceId = "", host = serverHost.trim(), transferPort = transferPort, useRelay = false))
+            }
+        }
+
         cleanup(isExplicitStop = true)
         lastFrameSha256 = null
         lastDims = null
         wasPausedZeroViewers = false
         frameSeqCounter = 0L
         targetDeviceIds = emptyList()
+        activeTargets = emptyList()
+        legacyFallbackRelayEnabled = false
 
-        // Inform desktop server of stream termination
-        if (!serverHost.isNullOrBlank()) {
+        // Inform all streaming target servers of stream termination
+        if (stopTargets.isNotEmpty()) {
             handlerScope.launch {
-                try {
-                    val client = transferClientProvider()
-                    client?.postScreenStreamStop(serverHost, transferPort)
-                } catch (e: Exception) {
-                    SafeLog.w(TAG, "Could not send stop frame signal: ${e.message}")
-                }
+                sendStopSignalsToTargets(stopTargets)
             }
         }
 

@@ -80,23 +80,31 @@ html, body {
 .text-xs { font-size: 11px; }
 .text-sm { font-size: 13px; }
 .text-muted { color: var(--snow-text-muted); }
+.text-primary { color: var(--snow-text-primary); }
 .text-secondary { color: var(--snow-text-secondary); }
 .text-cyan { color: var(--snow-accent-cyan); }
 .text-emerald { color: var(--snow-accent-emerald); }
 .text-amber { color: var(--snow-accent-amber); }
 .text-rose { color: var(--snow-accent-rose); }
 .text-blue { color: var(--snow-accent-blue); }
+.font-semibold, .fw-600 { font-weight: 600; }
+.font-bold { font-weight: 700; }
 
 .flex { display: flex; }
 .flex-col { display: flex; flex-direction: column; }
+.flex-wrap { flex-wrap: wrap; }
+.flex-1 { flex: 1 1 0%; min-width: 0; }
+.min-w-0 { min-width: 0; }
 .items-center { align-items: center; }
 .justify-between { justify-content: space-between; }
 .justify-center { justify-content: center; }
+.justify-end { justify-content: flex-end; }
 .gap-1 { gap: 4px; }
 .gap-2 { gap: 8px; }
 .gap-3 { gap: 12px; }
 .gap-4 { gap: 16px; }
 .w-full { width: 100%; }
+.mt-1 { margin-top: 4px; }
 .mt-2 { margin-top: 8px; }
 .mt-3 { margin-top: 12px; }
 .mt-4 { margin-top: 16px; }
@@ -363,6 +371,9 @@ html.theme-light .nav-item.active {
     flex-direction: column;
     width: 100%;
 }
+.sidebar.collapsed .sidebar-core-actions span {
+    display: none;
+}
 
 /* =========================================================================
    3. TOPBAR HEADER
@@ -604,6 +615,17 @@ html.theme-light .nav-item.active {
     color: #FFFFFF;
 }
 
+.btn-ghost {
+    background-color: transparent;
+    color: var(--snow-text-secondary);
+    border: 1px solid transparent;
+}
+.btn-ghost:hover {
+    background-color: var(--snow-bg-card-hover);
+    color: var(--snow-text-primary);
+    border-color: var(--snow-border);
+}
+
 .chip {
     display: inline-flex;
     align-items: center;
@@ -757,6 +779,8 @@ html.theme-light .nav-item.active {
     padding: 20px;
     box-shadow: var(--snow-shadow-sm);
     position: relative;
+    min-width: 0;
+    max-width: 100%;
 }
 .card-header-row {
     display: flex;
@@ -863,6 +887,53 @@ html.theme-light .nav-item.active {
     transition: width 0.3s;
 }
 
+.transfer-rows-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.transfer-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    background-color: var(--snow-bg-card);
+    border: 1px solid var(--snow-border);
+    border-radius: var(--snow-radius-md);
+}
+
+.transfer-row-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.transfer-row-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1 1 160px;
+    flex-wrap: wrap;
+}
+
+.transfer-row-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--snow-text-primary);
+    max-width: 100%;
+}
+
+.pairing-step2-box {
+    padding: 12px 14px;
+    background-color: var(--snow-bg-elevated);
+    border: 1px solid var(--snow-border-strong);
+    border-radius: var(--snow-radius-md);
+}
+
 /* Quick Actions 2x3 Grid */
 .quick-actions-grid {
     display: grid;
@@ -957,6 +1028,7 @@ html.theme-light .nav-item.active {
 /* VIEW 2: DEVICES & NETWORK */
 .devices-filter-bar {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 16px;
 }
@@ -1668,7 +1740,7 @@ html.theme-light .file-dropzone {
     .devices-v5-layout,
     .files-v5-layout,
     .ai-assistant-grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr);
     }
     .pairing-qr-split {
         flex-direction: column;
@@ -1684,11 +1756,130 @@ html.theme-light .file-dropzone {
     }
     .sidebar:not(.collapsed) .nav-label,
     .sidebar:not(.collapsed) .brand-text,
-    .sidebar:not(.collapsed) .core-status-pill span:not(.status-dot) {
+    .sidebar:not(.collapsed) .core-status-pill span:not(.status-dot),
+    .sidebar:not(.collapsed) .sidebar-core-actions span,
+    .sidebar.collapsed .sidebar-core-actions span {
         display: none;
+    }
+    .sidebar:not(.collapsed) .sidebar-core-actions {
+        flex-direction: column;
+        width: 100%;
     }
     .sidebar:not(.collapsed) .nav-item {
         justify-content: center;
         padding: 10px;
+    }
+}
+
+@media (max-width: 640px) {
+    .sidebar:not(.collapsed) {
+        width: 56px;
+    }
+    .topbar {
+        padding: 0 8px;
+        gap: 4px;
+    }
+    .topbar-left {
+        flex: 1 1 auto;
+        gap: 4px;
+        min-width: 0;
+        overflow: hidden;
+    }
+    .device-capsule-btn {
+        max-width: 112px;
+        min-width: 0;
+        overflow: hidden;
+        padding: 4px 8px;
+        gap: 6px;
+    }
+    .capsule-name {
+        min-width: 0;
+    }
+    #topbar-device-transport-chip {
+        display: none;
+    }
+    .topbar-center {
+        flex: 0 0 auto;
+        max-width: 30px;
+        margin: 0;
+    }
+    .command-palette-trigger {
+        width: 30px;
+        height: 30px;
+        padding: 0;
+        justify-content: center;
+    }
+    .command-palette-trigger span {
+        display: none;
+    }
+    .topbar-actions {
+        gap: 4px;
+        flex-shrink: 0;
+    }
+    #btn-topbar-connect {
+        padding: 4px 7px;
+        height: 30px;
+        min-width: 30px;
+    }
+    #btn-topbar-connect span {
+        display: none;
+    }
+    .icon-btn {
+        width: 30px;
+        height: 30px;
+    }
+    .content-body {
+        padding: 12px;
+    }
+    .card {
+        padding: 14px;
+    }
+    .card-header-row {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+    .segmented-nav {
+        max-width: 100%;
+        flex-wrap: wrap;
+    }
+    .segmented-tab {
+        padding: 6px 10px;
+        font-size: 12px;
+    }
+    .device-card select.form-input {
+        max-width: 100%;
+    }
+    #pairing-input,
+    #modal-connect-input {
+        min-width: 0 !important;
+    }
+    .quick-actions-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }
+    .device-island {
+        left: 12px !important;
+        right: 12px;
+        width: auto;
+        top: 64px;
+    }
+    .modal-overlay {
+        padding: 12px;
+    }
+    .modal-card {
+        padding: 16px;
+        max-width: calc(100vw - 24px);
+    }
+    #now-playing-panel {
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+    #files-search-input,
+    #clipview-search-input,
+    #apps-search-input,
+    #mcp-tunnel-url-display {
+        width: 100% !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
     }
 }

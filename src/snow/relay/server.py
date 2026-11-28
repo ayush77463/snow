@@ -403,8 +403,16 @@ class SnowRelayServer:
         if sess.get("revoked") or now > float(sess.get("expires_at", 0.0)):
             self._bootstrap_sessions.pop(tok_hash, None)
             return False, None, "Bootstrap session token has expired or been revoked."
-        if required_network_id and sess.get("network_id") != required_network_id.strip().upper():
-            return False, None, "Bootstrap token network scope mismatch."
+        req_net = (required_network_id or "").strip().upper()
+        if req_net:
+            sess_net = str(sess.get("network_id") or "").strip().upper()
+            host_snow = str(sess.get("host_snow_id") or "").strip().upper()
+            allowed_standalone = f"DEV_{host_snow}" if host_snow else ""
+            if sess_net:
+                if sess_net != req_net:
+                    return False, None, "Bootstrap token network scope mismatch."
+            elif not allowed_standalone or req_net != allowed_standalone:
+                return False, None, "Bootstrap token network scope mismatch."
         if claimed_device_id and claimed_device_id != sess.get("client_device_id"):
             return False, None, "Bootstrap token device scope mismatch."
         return True, sess, ""
@@ -843,14 +851,30 @@ class SnowRelayServer:
             return err_resp
         assert body is not None
 
-        authed_net_id = str(hub_sess["network_id"]).strip().upper()
+        auth_kind = str(hub_sess.get("auth_kind") or "network")
+        authed_net_id = str(hub_sess.get("network_id") or "").strip().upper()
         req_net_id = str(body.get("network_id") or authed_net_id).strip().upper()
-        if not is_valid_network_id(req_net_id) or req_net_id != authed_net_id:
-            return web.json_response(
-                {"success": False, "error": "Forbidden: cannot open rendezvous for another network."},
-                status=403,
-                headers={"Cache-Control": "no-store"},
-            )
+        if auth_kind == "device":
+            if authed_net_id:
+                if not is_valid_network_id(req_net_id) or req_net_id != authed_net_id:
+                    return web.json_response(
+                        {"success": False, "error": "Forbidden: cannot open rendezvous for another network."},
+                        status=403,
+                        headers={"Cache-Control": "no-store"},
+                    )
+            elif req_net_id:
+                return web.json_response(
+                    {"success": False, "error": "Forbidden: standalone device cannot open rendezvous for another network."},
+                    status=403,
+                    headers={"Cache-Control": "no-store"},
+                )
+        else:
+            if not is_valid_network_id(req_net_id) or req_net_id != authed_net_id:
+                return web.json_response(
+                    {"success": False, "error": "Forbidden: cannot open rendezvous for another network."},
+                    status=403,
+                    headers={"Cache-Control": "no-store"},
+                )
 
         sess_dev = str(hub_sess.get("device_id") or "").strip()
         host_device_id = str(body.get("host_device_id") or sess_dev or "").strip()
@@ -878,11 +902,18 @@ class SnowRelayServer:
             )
         ttl_seconds = min(MAX_RENDEZVOUS_TTL_SECONDS, max(10.0, float(raw_ttl)))
 
-        host_snow_id = str(body.get("host_snow_id") or body.get("snow_id") or hub_sess.get("snow_id") or "").strip().upper()
+        sess_snow = str(hub_sess.get("snow_id") or "").strip().upper()
+        host_snow_id = str(body.get("host_snow_id") or body.get("snow_id") or sess_snow or "").strip().upper()
         if host_snow_id and not is_valid_snow_id(host_snow_id):
             return web.json_response(
                 {"success": False, "error": "Invalid host_snow_id format."},
                 status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        if auth_kind == "device" and sess_snow and host_snow_id != sess_snow:
+            return web.json_response(
+                {"success": False, "error": "Forbidden: host_snow_id does not match authenticated device session."},
+                status=403,
                 headers={"Cache-Control": "no-store"},
             )
 
@@ -1000,8 +1031,17 @@ class SnowRelayServer:
             entry = self._rendezvous_openings.get(rdv_id)
             if not entry:
                 return web.json_response({"success": False, "error": "Rendezvous entry not found."}, status=404, headers={"Cache-Control": "no-store"})
-            if entry["network_id"] != hub_sess["network_id"]:
+            entry_net = str(entry.get("network_id") or "").strip().upper()
+            sess_net = str(hub_sess.get("network_id") or "").strip().upper()
+            if entry_net != sess_net:
                 return web.json_response({"success": False, "error": "Forbidden: rendezvous belongs to another network."}, status=403, headers={"Cache-Control": "no-store"})
+            if not entry_net:
+                entry_dev = str(entry.get("host_device_id") or "").strip()
+                entry_snow = str(entry.get("host_snow_id") or "").strip().upper()
+                sess_dev = str(hub_sess.get("device_id") or "").strip()
+                sess_snow = str(hub_sess.get("snow_id") or "").strip().upper()
+                if (entry_dev and sess_dev != entry_dev) or (entry_snow and sess_snow != entry_snow):
+                    return web.json_response({"success": False, "error": "Forbidden: rendezvous belongs to another device."}, status=403, headers={"Cache-Control": "no-store"})
             entry["revoked"] = True
             self._rendezvous_openings.pop(rdv_id, None)
 
@@ -1096,6 +1136,7 @@ class SnowRelayServer:
 
             saw_scope_mismatch = False
             saw_lockout = False
+            last_remaining_attempts: Optional[int] = None
             for entry in candidates:
                 if entry.get("revoked") or entry.get("consumed") or now > float(entry.get("expires_at", 0.0)):
                     continue
@@ -1135,6 +1176,7 @@ class SnowRelayServer:
                     self._bootstrap_sessions[tok_hash] = {
                         "network_id": entry["network_id"],
                         "host_device_id": entry["host_device_id"],
+                        "host_snow_id": entry.get("host_snow_id") or "",
                         "client_device_id": client_device_id,
                         "mode": entry["mode"],
                         "rendezvous_id": entry["rendezvous_id"],
@@ -1145,6 +1187,7 @@ class SnowRelayServer:
                     break
                 else:
                     entry["failed_attempts"] = int(entry.get("failed_attempts", 0)) + 1
+                    last_remaining_attempts = max(0, MAX_RENDEZVOUS_FAILED_ATTEMPTS - entry["failed_attempts"])
                     if entry["failed_attempts"] >= MAX_RENDEZVOUS_FAILED_ATTEMPTS:
                         entry["revoked"] = True
                         self._rendezvous_openings.pop(entry["rendezvous_id"], None)
@@ -1152,8 +1195,15 @@ class SnowRelayServer:
 
         if not matched_snapshot:
             if saw_lockout:
+                err_body: Dict[str, Any] = {
+                    "success": False,
+                    "error": "Rendezvous locked after excessive failed attempts.",
+                }
+                if join_kind == "pin":
+                    err_body["status"] = "PAIRING_LOCKED"
+                    err_body["remaining_attempts"] = 0
                 return web.json_response(
-                    {"success": False, "error": "Rendezvous locked after excessive failed attempts."},
+                    err_body,
                     status=429,
                     headers={"Cache-Control": "no-store"},
                 )
@@ -1163,8 +1213,15 @@ class SnowRelayServer:
                     status=403,
                     headers={"Cache-Control": "no-store"},
                 )
+            err_fail: Dict[str, Any] = {
+                "success": False,
+                "error": "Rendezvous verification failed.",
+            }
+            if join_kind == "pin" and last_remaining_attempts is not None:
+                err_fail["status"] = "INVALID_PIN"
+                err_fail["remaining_attempts"] = last_remaining_attempts
             return web.json_response(
-                {"success": False, "error": "Rendezvous verification failed."},
+                err_fail,
                 status=401,
                 headers={"Cache-Control": "no-store"},
             )
@@ -1300,17 +1357,43 @@ class SnowRelayServer:
                 headers={"Cache-Control": "no-store"},
             )
 
-        # 2. Check per-device / legacy _snow_routes within authorized scope
+        # 2. Check per-device / legacy _snow_routes and open rendezvous slots within authorized scope
+        now_dir = time.time()
+        has_open_rdv = any(
+            not r.get("revoked")
+            and not r.get("consumed")
+            and now_dir <= float(r.get("expires_at", 0.0))
+            and str(r.get("host_snow_id") or "").strip().upper() == raw_snow_id
+            for r in self._rendezvous_openings.values()
+        )
         route = self._snow_routes.get(raw_snow_id)
         if not route:
+            if has_open_rdv:
+                return web.json_response(
+                    {"success": False, "error": "Rendezvous onboarding open; PIN verification required."},
+                    status=403,
+                    headers={"Cache-Control": "no-store"},
+                )
             return web.json_response({"success": False, "error": f"SNOW ID '{raw_snow_id}' not found."}, status=404)
         route_group = route.get("network_id") or route.get("group_id") or ""
+        ws = route.get("ws")
+        data_ws = route.get("data_ws")
+        mcp_ws = route.get("mcp_ws")
+        online = bool(
+            (ws is not None and not ws.closed)
+            or (data_ws is not None and not data_ws.closed)
+            or (mcp_ws is not None and not mcp_ws.closed)
+        )
         is_self = caller_snow_id and caller_snow_id == raw_snow_id
         if not is_admin and not is_self:
             if not caller_net or route_group != caller_net:
+                if not online and not has_open_rdv:
+                    return web.json_response({"success": False, "error": f"SNOW ID '{raw_snow_id}' not found."}, status=404)
                 return web.json_response({"success": False, "error": "Cross-network directory lookup denied."}, status=403)
-        ws = route.get("ws")
-        online = bool(ws is not None and not ws.closed)
+        mcp_live = bool(
+            (mcp_ws is not None and not mcp_ws.closed)
+            or (ws is not None and not ws.closed and route.get("mcp_tunnel"))
+        )
         return web.json_response(
             {
                 "success": True,
@@ -1318,7 +1401,7 @@ class SnowRelayServer:
                 "network_id": route.get("network_id") or route.get("group_id"),
                 "device_id": route.get("device_id"),
                 "online": online,
-                "mcp_tunnel_active": bool(online and route.get("mcp_tunnel")),
+                "mcp_tunnel_active": mcp_live,
                 "lan_endpoints": list(route.get("lan_endpoints") or []),
                 "relay_ws_url": f"{ws_proto}://{host}/v1/tunnel",
                 "mcp_url": f"{proto}://{host}/u/{raw_snow_id}/mcp",
@@ -1619,13 +1702,12 @@ class SnowRelayServer:
             auth_mode = "ticket"
             hub_session_gen = 1
             bootstrap_allowed_target: Optional[str] = None
+            is_mcp_tunnel = bool(hello_data.get("mcp_tunnel", False))
+            hub_sess: Optional[Dict[str, Any]] = None
 
             if hub_token:
                 claimed_net_id = str(hello_data.get("network_id") or "").strip().upper()
-                ok_hub, hub_sess, hub_err = self._authenticate_hub_session(
-                    hub_token,
-                    required_network_id=claimed_net_id or None,
-                )
+                ok_hub, hub_sess, hub_err = self._authenticate_hub_session(hub_token)
                 if not ok_hub or not hub_sess:
                     await ws.close(code=4001, message=f"Auth failed: {hub_err}".encode("utf-8"))
                     return ws
@@ -1648,23 +1730,52 @@ class SnowRelayServer:
                         return ws
                     raw_hello_snow_id = authed_snow_id
                     opt_net = str(hub_sess.get("network_id") or "").strip().upper()
+                    if opt_net:
+                        if claimed_net_id and claimed_net_id != opt_net:
+                            await ws.close(code=4001, message=b"Hub session token does not match target network scope.")
+                            return ws
+                    elif claimed_net_id and claimed_net_id != f"DEV_{authed_snow_id}":
+                        await ws.close(code=4001, message=b"Standalone device session cannot claim external network scope.")
+                        return ws
                     authed_network_id = opt_net if (opt_net and bool(hello_data.get("register_network_coordinator", False))) else None
                     group_id = opt_net or f"dev_{authed_snow_id}"
 
                     existing_route = self._snow_routes.get(raw_hello_snow_id)
                     if existing_route:
                         existing_pub = str(existing_route.get("public_key_b64") or "")
-                        existing_ws = existing_route.get("ws")
                         if existing_pub and existing_pub != authed_pub_b64:
                             await ws.close(code=4003, message=b"Collision rejected: SNOW ID bound to a different public key.")
                             return ws
+                        same_dev_dual = existing_route.get("device_id") == device_id
+                        if same_dev_dual and is_mcp_tunnel:
+                            existing_ws = (
+                                existing_route.get("mcp_ws")
+                                if "mcp_ws" in existing_route
+                                else (existing_route.get("ws") if existing_route.get("mcp_tunnel") else None)
+                            )
+                            cur_gen = int(
+                                existing_route.get("mcp_session_generation", existing_route.get("session_generation", 0))
+                                or 0
+                            )
+                        elif same_dev_dual and not is_mcp_tunnel:
+                            existing_ws = (
+                                existing_route.get("data_ws")
+                                if "data_ws" in existing_route
+                                else (existing_route.get("ws") if not existing_route.get("mcp_tunnel") else None)
+                            )
+                            cur_gen = int(
+                                existing_route.get("data_session_generation", existing_route.get("session_generation", 0))
+                                or 0
+                            )
+                        else:
+                            existing_ws = existing_route.get("ws")
+                            cur_gen = int(existing_route.get("session_generation", 0) or 0)
                         if existing_ws is not None and not existing_ws.closed and existing_ws is not ws:
                             recovery_takeover = bool(hello_data.get("recovery_takeover", False))
                             try:
                                 claimed_gen = int(hello_data.get("session_generation", hub_session_gen) or hub_session_gen)
                             except (TypeError, ValueError):
                                 claimed_gen = 0
-                            cur_gen = int(existing_route.get("session_generation", 0) or 0)
                             if recovery_takeover and claimed_gen > cur_gen:
                                 try:
                                     await existing_ws.close(code=4009, message=b"SESSION_SUPERSEDED: authenticated recovery takeover.")
@@ -1675,6 +1786,10 @@ class SnowRelayServer:
                                 await ws.close(code=4009, message=b"IDENTITY_CONFLICT_FENCED: active session already owns this SNOW ID.")
                                 return ws
                 else:
+                    sess_net = str(hub_sess.get("network_id") or "").strip().upper()
+                    if claimed_net_id and sess_net != claimed_net_id:
+                        await ws.close(code=4001, message=b"Hub session token does not match target network scope.")
+                        return ws
                     auth_mode = "ed25519_network"
                     authed_network_id = str(hub_sess["network_id"])
                     group_id = authed_network_id
@@ -1694,7 +1809,9 @@ class SnowRelayServer:
                     await ws.close(code=4001, message=f"Auth failed: {bs_err}".encode("utf-8"))
                     return ws
                 device_id = str(bs_sess["client_device_id"])
-                group_id = str(bs_sess["network_id"])
+                bs_net = str(bs_sess.get("network_id") or "").strip().upper()
+                host_snow = str(bs_sess.get("host_snow_id") or "").strip().upper()
+                group_id = bs_net or f"dev_{host_snow}"
                 bootstrap_allowed_target = str(bs_sess["host_device_id"])
             else:
                 is_valid, claimed_dev, claimed_grp, err_msg = verify_relay_ticket(ticket, self.config.shared_secret)
@@ -1727,10 +1844,21 @@ class SnowRelayServer:
                             await ws.close(code=4003, message=b"SNOW ID owned by another active session.")
                             return ws
 
-            reg_ok, reg_err = self.registry.register(device_id, group_id, ws)
-            if not reg_ok:
-                await ws.close(code=4003, message=reg_err.encode("utf-8"))
-                return ws
+            cur_reg = self.registry._devices.get(device_id)
+            preserve_data_reg = bool(
+                is_mcp_tunnel
+                and auth_mode == "ed25519_device"
+                and cur_reg is not None
+                and cur_reg.group_id == group_id
+                and cur_reg.ws_session is not None
+                and not cur_reg.ws_session.closed
+                and cur_reg.ws_session is not ws
+            )
+            if not preserve_data_reg:
+                reg_ok, reg_err = self.registry.register(device_id, group_id, ws)
+                if not reg_ok:
+                    await ws.close(code=4003, message=reg_err.encode("utf-8"))
+                    return ws
             ws_registered = True
 
             now = time.time()
@@ -1791,18 +1919,35 @@ class SnowRelayServer:
                 is_primary = primary_device_id == device_id
 
             if raw_hello_snow_id and auth_mode == "ed25519_device":
+                prev_route = self._snow_routes.get(raw_hello_snow_id) or {}
+                same_dev = prev_route.get("device_id") == device_id and prev_route.get("public_key_b64") == authed_pub_b64
+                prev_mcp_ws = prev_route.get("mcp_ws") if same_dev else None
+                prev_data_ws = prev_route.get("data_ws") if same_dev else None
+                if same_dev and prev_mcp_ws is None and prev_route.get("mcp_tunnel"):
+                    prev_mcp_ws = prev_route.get("ws")
+                if same_dev and prev_data_ws is None and not prev_route.get("mcp_tunnel"):
+                    prev_data_ws = prev_route.get("ws")
+                mcp_ws_val = ws if is_mcp_tunnel else prev_mcp_ws
+                data_ws_val = ws if not is_mcp_tunnel else prev_data_ws
+                mcp_live = bool(mcp_ws_val is not None and not mcp_ws_val.closed)
+                data_live = bool(data_ws_val is not None and not data_ws_val.closed)
+                primary_ws = mcp_ws_val if mcp_live else (data_ws_val if data_live else ws)
                 self._device_snow_ids[device_id] = raw_hello_snow_id
                 self._snow_routes[raw_hello_snow_id] = {
                     "snow_id": raw_hello_snow_id,
                     "device_id": device_id,
                     "group_id": group_id,
-                    "network_id": str(hub_sess.get("network_id") or "") if hub_token else "",
+                    "network_id": str(hub_sess.get("network_id") or "") if hub_sess else "",
                     "public_key_b64": authed_pub_b64,
                     "auth_mode": auth_mode,
                     "session_generation": hub_session_gen,
-                    "ws": ws,
-                    "mcp_tunnel": bool(hello_data.get("mcp_tunnel", False)),
-                    "lan_endpoints": clean_endpoints,
+                    "mcp_session_generation": hub_session_gen if is_mcp_tunnel else int(prev_route.get("mcp_session_generation", 0) or 0),
+                    "data_session_generation": hub_session_gen if not is_mcp_tunnel else int(prev_route.get("data_session_generation", 0) or 0),
+                    "ws": primary_ws,
+                    "mcp_ws": mcp_ws_val if mcp_live else None,
+                    "data_ws": data_ws_val if data_live else None,
+                    "mcp_tunnel": mcp_live,
+                    "lan_endpoints": clean_endpoints or (list(prev_route.get("lan_endpoints") or []) if same_dev else []),
                     "last_seen": now,
                 }
             elif raw_hello_snow_id and not authed_network_id:
@@ -2029,7 +2174,9 @@ class SnowRelayServer:
         finally:
             self._active_sockets.discard(ws)
             if device_id and ws_registered:
-                self.registry.mark_dormant(device_id)
+                cur_reg = self.registry._devices.get(device_id)
+                if cur_reg is not None and cur_reg.ws_session is ws:
+                    self.registry.mark_dormant(device_id)
                 if authed_network_id and authed_network_id in self._network_coordinators:
                     coord = self._network_coordinators[authed_network_id]
                     removed = coord.hosts.get(device_id)
@@ -2041,13 +2188,31 @@ class SnowRelayServer:
                         elif changed:
                             await self._broadcast_coordinator_update(coord)
                 sid = self._device_snow_ids.get(device_id)
-                if sid and sid in self._snow_routes and self._snow_routes[sid].get("ws") is ws:
-                    self._snow_routes[sid]["ws"] = None
-                    self._snow_routes[sid]["mcp_tunnel"] = False
-                    self._snow_routes[sid]["last_seen"] = time.time()
-                for req_id, (owner_dev, fut) in list(self._pending_http_forwards.items()):
-                    if owner_dev == device_id and not fut.done():
-                        fut.set_exception(ConnectionError("Tunnel disconnected"))
+                route = self._snow_routes.get(sid) if sid else None
+                if route is not None:
+                    if route.get("mcp_ws") is ws:
+                        route["mcp_ws"] = None
+                        route["mcp_tunnel"] = False
+                    if route.get("data_ws") is ws:
+                        route["data_ws"] = None
+                    if route.get("ws") is ws or route.get("ws") is None:
+                        rem_mcp = route.get("mcp_ws")
+                        rem_data = route.get("data_ws")
+                        if rem_mcp is not None and not rem_mcp.closed:
+                            route["ws"] = rem_mcp
+                            route["mcp_tunnel"] = True
+                        elif rem_data is not None and not rem_data.closed:
+                            route["ws"] = rem_data
+                            route["mcp_tunnel"] = False
+                        else:
+                            route["ws"] = None
+                            route["mcp_tunnel"] = False
+                    route["last_seen"] = time.time()
+                mcp_still_live = bool(route and route.get("mcp_ws") is not None and not route["mcp_ws"].closed)
+                if not mcp_still_live:
+                    for req_id, (owner_dev, fut) in list(self._pending_http_forwards.items()):
+                        if owner_dev == device_id and not fut.done():
+                            fut.set_exception(ConnectionError("Tunnel disconnected"))
 
         return ws
 

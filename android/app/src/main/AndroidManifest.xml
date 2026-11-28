@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Strictly for explicit OWNER_MANUAL File Access browsing/uploads; AI_MCP operations remain strictly sandboxed to Transfer Folder. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- Background Run / Display over other apps permission for reliable peer-initiated foreground launching. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- Android 14+ (API 34+) connectedDevice FGS prerequisite:
          Starting a Foreground Service with type "connectedDevice" strictly requires
          at least one qualifying permission (e.g. CHANGE_NETWORK_STATE, CHANGE_WIFI_MULTICAST_STATE,

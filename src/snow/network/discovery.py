@@ -247,6 +247,17 @@ class SnowDiscoveryService:
 
     def _create_beacon(self, wake_target: Optional[str] = None) -> DiscoveryBeacon:
         """Build a new signed discovery beacon for this instance."""
+        canonical_snow_id = getattr(self.device_identity, "snow_id", None)
+        try:
+            from snow.security.identity import resolve_canonical_device_snow_id
+
+            resolved_snow_id, _ = resolve_canonical_device_snow_id(
+                fallback_identity=self.device_identity
+            )
+            if resolved_snow_id:
+                canonical_snow_id = resolved_snow_id
+        except Exception:
+            pass
         return DiscoveryBeacon(
             device_id=self.device_identity.device_id,
             device_name=self.device_identity.device_name,
@@ -257,7 +268,7 @@ class SnowDiscoveryService:
             timestamp=time.time(),
             nonce=secrets.token_hex(16),
             wake_target=wake_target,
-            snow_id=getattr(self.device_identity, "snow_id", None),
+            snow_id=canonical_snow_id,
         )
 
     def _get_broadcast_destinations(self) -> List[str]:

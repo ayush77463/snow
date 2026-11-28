@@ -2,8 +2,10 @@ package org.snow.capabilities
 
 import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -533,13 +535,13 @@ class AndroidFileHandler @JvmOverloads constructor(
     }
 
     /**
-     * Check whether direct full-storage mode is overridden (SAF folder mode is used by default).
+     * Check whether MANAGE_EXTERNAL_STORAGE (All Files Access) is granted on Android 11+.
      */
     fun isAllFilesAccessGranted(): Boolean {
         if (allFilesAccessProvider != null) {
             return allFilesAccessProvider.invoke()
         }
-        return false
+        return Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()
     }
 
     /**
@@ -551,10 +553,10 @@ class AndroidFileHandler @JvmOverloads constructor(
         val showHidden = (data?.get("show_hidden") as? Boolean) ?: false
         val subpath = (data?.get("subpath") as? String ?: data?.get("path") as? String)?.trim()?.trim('/')
 
-        // AI_MCP is strictly restricted to SAF mode in this phase
-        val isFullStorageEligible = isAllFilesAccessGranted() && principal != "AI_MCP" && requestedScope != "saf"
+        // Enforce full shared storage access strictly for OWNER_MANUAL; AI_MCP stays sandboxed to Transfer Folder.
+        val isFullStorageEligible = isAllFilesAccessGranted() && principal == "OWNER_MANUAL" && requestedScope != "saf"
 
-        if (requestedScope == "full" && !isAllFilesAccessGranted()) {
+        if (requestedScope == "full" && principal == "OWNER_MANUAL" && !isAllFilesAccessGranted()) {
             return mapOf(
                 "status" to "ALL_FILES_ACCESS_REQUIRED",
                 "error" to "Full Phone Storage Access is not granted on this device. Please grant access in Android Settings.",
@@ -698,6 +700,50 @@ class AndroidFileHandler @JvmOverloads constructor(
             )
         }
 
+        if (!subpath.isNullOrEmpty()) {
+            for (segment in subpath.split('/')) {
+                if (segment == ".." || segment.contains('\\')) {
+                    return mapOf(
+                        "status" to "error",
+                        "error" to "PATH_TRAVERSAL_DETECTED",
+                        "message" to "Relative path traversal '..' is forbidden.",
+                        "storage_mode" to "saf_tree"
+                    )
+                }
+            }
+        }
+
+        // Fast single-query DocumentsContract cursor projection (< 50ms) before falling back to DocumentFile.
+        when (val fastOutcome = querySafChildrenFast(treeUri, subpath)) {
+            is FastSafResult.Success -> {
+                return mapOf(
+                    "status" to "success",
+                    "storage_mode" to "saf_tree",
+                    "folder_name" to (fastOutcome.folderName ?: safManager.getDestinationDisplayName() ?: "Transfer Folder"),
+                    "subpath" to (subpath ?: ""),
+                    "count" to fastOutcome.items.size,
+                    "items" to fastOutcome.items
+                )
+            }
+            is FastSafResult.DirectoryNotFound -> {
+                return mapOf(
+                    "status" to "DIRECTORY_NOT_FOUND",
+                    "error" to "Subdirectory '${fastOutcome.segment}' not found in SAF tree.",
+                    "storage_mode" to "saf_tree",
+                    "items" to emptyList<Any>()
+                )
+            }
+            is FastSafResult.PermissionRevoked -> {
+                return mapOf(
+                    "status" to "SAF_PERMISSION_REVOKED",
+                    "error" to "Persisted Transfer Folder permission has expired or been revoked.",
+                    "storage_mode" to "saf_tree",
+                    "items" to emptyList<Any>()
+                )
+            }
+            FastSafResult.FallbackRequired -> Unit
+        }
+
         val rootDoc = try {
             androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
         } catch (e: Exception) {
@@ -761,11 +807,117 @@ class AndroidFileHandler @JvmOverloads constructor(
         return mapOf(
             "status" to "success",
             "storage_mode" to "saf_tree",
-            "folder_name" to (targetDoc.name ?: safManager?.getDestinationDisplayName() ?: "Transfer Folder"),
+            "folder_name" to (targetDoc.name ?: safManager.getDestinationDisplayName() ?: "Transfer Folder"),
             "subpath" to (subpath ?: ""),
             "count" to items.size,
             "items" to items
         )
+    }
+
+    private sealed class FastSafResult {
+        data class Success(val items: List<Map<String, Any?>>, val folderName: String?) : FastSafResult()
+        data class DirectoryNotFound(val segment: String) : FastSafResult()
+        data object PermissionRevoked : FastSafResult()
+        data object FallbackRequired : FastSafResult()
+    }
+
+    private fun querySafChildrenFast(treeUri: Uri, subpath: String?): FastSafResult {
+        val resolver = try {
+            context.contentResolver
+        } catch (_: Exception) {
+            return FastSafResult.FallbackRequired
+        }
+        val rootDocId = try {
+            DocumentsContract.getTreeDocumentId(treeUri)
+        } catch (_: Exception) {
+            null
+        } ?: return FastSafResult.FallbackRequired
+
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED
+        )
+
+        var currentDocId = rootDocId
+        var currentFolderName: String? = null
+
+        try {
+            if (!subpath.isNullOrEmpty()) {
+                for (segment in subpath.split('/')) {
+                    if (segment.isBlank() || segment == ".") continue
+                    val navUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, currentDocId)
+                    val navCursor = resolver.query(navUri, projection, null, null, null)
+                        ?: return FastSafResult.FallbackRequired
+                    var matchedDocId: String? = null
+                    var matchedName: String? = null
+                    navCursor.use { c ->
+                        val idCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                        val nameCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                        val mimeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                        while (c.moveToNext()) {
+                            val dName = if (nameCol >= 0) c.getString(nameCol) else null
+                            if (dName == segment) {
+                                val dMime = if (mimeCol >= 0) c.getString(mimeCol) else null
+                                if (dMime == DocumentsContract.Document.MIME_TYPE_DIR && idCol >= 0) {
+                                    matchedDocId = c.getString(idCol)
+                                    matchedName = dName
+                                }
+                                break
+                            }
+                        }
+                    }
+                    if (matchedDocId.isNullOrBlank()) {
+                        return FastSafResult.DirectoryNotFound(segment)
+                    }
+                    currentDocId = matchedDocId!!
+                    currentFolderName = matchedName
+                }
+            }
+
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, currentDocId)
+            val cursor = resolver.query(childrenUri, projection, null, null, null)
+                ?: return FastSafResult.FallbackRequired
+            val items = mutableListOf<Map<String, Any?>>()
+            cursor.use { c ->
+                val idCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val modCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+
+                while (c.moveToNext() && items.size < 100) {
+                    val docId = if (idCol >= 0) c.getString(idCol) else null
+                    val name = (if (nameCol >= 0) c.getString(nameCol) else null) ?: "unknown"
+                    val mime = if (mimeCol >= 0) c.getString(mimeCol) else null
+                    val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                    val size = if (isDir || sizeCol < 0 || c.isNull(sizeCol)) 0L else c.getLong(sizeCol)
+                    val lastMod = if (modCol < 0 || c.isNull(modCol)) 0L else c.getLong(modCol)
+                    val docUri = if (!docId.isNullOrBlank()) {
+                        DocumentsContract.buildDocumentUriUsingTree(treeUri, docId).toString()
+                    } else {
+                        treeUri.toString()
+                    }
+                    items.add(
+                        mapOf(
+                            "name" to name,
+                            "type" to if (isDir) "directory" else "file",
+                            "size_bytes" to size,
+                            "last_modified" to lastMod,
+                            "uri" to docUri,
+                            "storage_mode" to "saf_tree"
+                        )
+                    )
+                }
+            }
+            return FastSafResult.Success(items = items, folderName = currentFolderName)
+        } catch (_: SecurityException) {
+            return FastSafResult.PermissionRevoked
+        } catch (_: Exception) {
+            return FastSafResult.FallbackRequired
+        }
     }
 
     /**

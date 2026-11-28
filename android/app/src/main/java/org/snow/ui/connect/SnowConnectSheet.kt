@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
@@ -52,8 +53,10 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.snow.ui.SnowIdStep1Result
 import org.snow.ui.components.SnowOutlinedButton
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
@@ -86,25 +89,44 @@ fun SnowConnectSheet(
     onPreparePairingQr: () -> Unit = {},
     onRegeneratePairingPin: () -> Unit = {},
     onCancelPairingPin: () -> Unit = {},
-    myNetworkId: String? = null
+    myNetworkId: String? = null,
+    onConnectSnowIdStep1: ((String, (SnowIdStep1Result) -> Unit) -> Unit)? = null,
+    onConnectSnowIdStep2: ((snowId: String, pin: String, onResult: (Boolean, String?, Int?) -> Unit) -> Unit)? = null
 ) {
     if (!visible) return
 
     val colors = LocalSnowColors.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var inputQuery by remember { mutableStateOf("") }
-    var manualVerifyPin by remember { mutableStateOf("") }
+    var pendingStep2SnowId by remember { mutableStateOf<String?>(null) }
+    var pendingStep2DisplayName by remember { mutableStateOf<String?>(null) }
+    var step2Pin by remember { mutableStateOf("") }
+    var stepBusy by remember { mutableStateOf(false) }
+    var localStepError by remember { mutableStateOf<String?>(null) }
     val clipboardManager = LocalClipboardManager.current
     var copiedFeedback by remember { mutableStateOf(false) }
 
+    val resetStepFlow = {
+        pendingStep2SnowId = null
+        pendingStep2DisplayName = null
+        step2Pin = ""
+        stepBusy = false
+        localStepError = null
+    }
+    val dismissSheet = {
+        resetStepFlow()
+        onDismiss()
+    }
+
     LaunchedEffect(visible) {
         if (visible) {
+            resetStepFlow()
             onPreparePairingQr()
         }
     }
 
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = dismissSheet,
         sheetState = sheetState,
         shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
         containerColor = if (colors.isDark) Color(0xFF161616) else Color.White,
@@ -136,7 +158,7 @@ fun SnowConnectSheet(
                     color = colors.accentCyan,
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
-                        .clickable(onClick = onDismiss)
+                        .clickable(onClick = dismissSheet)
                         .padding(6.dp)
                 )
             }
@@ -147,14 +169,14 @@ fun SnowConnectSheet(
                 icon = Icons.Default.QrCodeScanner,
                 onClick = {
                     onScanQr()
-                    onDismiss()
+                    dismissSheet()
                 },
                 modifier = Modifier.fillMaxWidth()
             )
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Action 2: Direct or Code Link (Collapsible Manual IP / Address)
+            // Action 2: 2-Step SNOW ID -> PIN Connection Card
             var showManualInput by remember { mutableStateOf(false) }
 
             SnowCard(
@@ -191,92 +213,209 @@ fun SnowConnectSheet(
                     }
 
                     if (showManualInput) {
+                        val effectiveBusy = isConnecting || stepBusy
+                        val effectiveError = localStepError ?: errorMessage
+                        val step2SnowId = pendingStep2SnowId
+
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Enter a peer SNOW ID (SNW-...), or SNOW ID + 6-digit PIN.",
-                            style = SnowTypography.bodySmall,
-                            color = colors.textSecondary
-                        )
-                        Spacer(modifier = Modifier.height(12.dp))
 
-                        OutlinedTextField(
-                            value = inputQuery,
-                            onValueChange = { inputQuery = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            label = { Text("SNOW ID or Network ID") },
-                            placeholder = {
-                                Text(
-                                    text = "SNW-XXXX-XXXX or SNW-NET-XXXXXXXX",
-                                    style = SnowTypography.bodyMedium,
-                                    color = colors.textMuted
-                                )
-                            },
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = colors.accentBlue,
-                                unfocusedBorderColor = colors.border,
-                                focusedTextColor = colors.textPrimary,
-                                unfocusedTextColor = colors.textPrimary,
-                                cursorColor = colors.accentCyan
-                            ),
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp)
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        OutlinedTextField(
-                            value = manualVerifyPin,
-                            onValueChange = { raw ->
-                                manualVerifyPin = raw.filter { it.isDigit() }.take(6)
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            label = { Text("6-Digit Verify PIN (optional if saved)") },
-                            placeholder = {
-                                Text(
-                                    text = "123456",
-                                    style = SnowTypography.monospaceSmall,
-                                    color = colors.textMuted
-                                )
-                            },
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = colors.accentBlue,
-                                unfocusedBorderColor = colors.border,
-                                focusedTextColor = colors.textPrimary,
-                                unfocusedTextColor = colors.textPrimary,
-                                cursorColor = colors.accentCyan
-                            ),
-                            singleLine = true,
-                            shape = RoundedCornerShape(12.dp)
-                        )
-
-                        if (!errorMessage.isNullOrBlank()) {
-                            Spacer(modifier = Modifier.height(8.dp))
+                        if (step2SnowId == null) {
+                            // Step 1: Enter Peer SNOW ID -> Connect
                             Text(
-                                text = errorMessage,
+                                text = "Enter a peer SNOW ID (SNW-...) to pair or reconnect.",
                                 style = SnowTypography.bodySmall,
-                                color = Color(0xFFEF4444)
+                                color = colors.textSecondary
                             )
-                        }
+                            Spacer(modifier = Modifier.height(12.dp))
 
-                        Spacer(modifier = Modifier.height(14.dp))
+                            OutlinedTextField(
+                                value = inputQuery,
+                                onValueChange = {
+                                    inputQuery = it
+                                    localStepError = null
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("Enter Peer SNOW ID") },
+                                placeholder = {
+                                    Text(
+                                        text = "SNW-XXXX-XXXX or SNW-NET-XXXXXXXX",
+                                        style = SnowTypography.bodyMedium,
+                                        color = colors.textMuted
+                                    )
+                                },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = colors.accentBlue,
+                                    unfocusedBorderColor = colors.border,
+                                    focusedTextColor = colors.textPrimary,
+                                    unfocusedTextColor = colors.textPrimary,
+                                    cursorColor = colors.accentCyan
+                                ),
+                                singleLine = true,
+                                shape = RoundedCornerShape(12.dp)
+                            )
 
-                        SnowTonalButton(
-                            text = if (isConnecting) "Connecting..." else "Connect",
-                            onClick = {
-                                val target = inputQuery.trim()
-                                val cleanPin = manualVerifyPin.trim()
-                                if (target.isNotEmpty()) {
-                                    val combined = if (cleanPin.length == 6 && !target.contains(" ")) {
-                                        "$target $cleanPin"
-                                    } else {
-                                        target
-                                    }
-                                    onConnectInput(combined)
+                            if (!effectiveError.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Surface(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.45f), RoundedCornerShape(10.dp)),
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = Color(0xFFEF4444).copy(alpha = 0.12f)
+                                ) {
+                                    Text(
+                                        text = effectiveError,
+                                        style = SnowTypography.bodySmall,
+                                        color = Color(0xFFEF4444),
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                    )
                                 }
-                            },
-                            enabled = inputQuery.isNotBlank() && !isConnecting,
-                            modifier = Modifier.fillMaxWidth()
-                        )
+                            }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            SnowTonalButton(
+                                text = if (effectiveBusy) "Connecting..." else "Connect",
+                                onClick = {
+                                    val target = inputQuery.trim()
+                                    if (target.isNotEmpty()) {
+                                        val step1Handler = onConnectSnowIdStep1
+                                        if (step1Handler != null) {
+                                            stepBusy = true
+                                            localStepError = null
+                                            step1Handler(target) { result ->
+                                                stepBusy = false
+                                                when (result) {
+                                                    is SnowIdStep1Result.AlreadyConnected -> {
+                                                        dismissSheet()
+                                                    }
+                                                    is SnowIdStep1Result.NeedsPin -> {
+                                                        pendingStep2SnowId = result.snowId
+                                                        pendingStep2DisplayName = result.displayName
+                                                        step2Pin = ""
+                                                        localStepError = null
+                                                    }
+                                                    is SnowIdStep1Result.Error -> {
+                                                        localStepError = result.message
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            onConnectInput(target)
+                                        }
+                                    }
+                                },
+                                enabled = inputQuery.isNotBlank() && !effectiveBusy,
+                                isLoading = effectiveBusy,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        } else {
+                            // Step 2: Enter the 6-digit PIN shown on peer -> Verify & Pair / Change ID
+                            Text(
+                                text = "Enter the 6-digit PIN shown on $step2SnowId",
+                                style = SnowTypography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = colors.textPrimary
+                            )
+                            val peerDisplay = pendingStep2DisplayName
+                            if (!peerDisplay.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = peerDisplay,
+                                    style = SnowTypography.labelSmall,
+                                    color = colors.textSecondary
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            OutlinedTextField(
+                                value = step2Pin,
+                                onValueChange = { raw ->
+                                    step2Pin = raw.filter { it.isDigit() }.take(6)
+                                    localStepError = null
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("6-Digit PIN") },
+                                placeholder = {
+                                    Text(
+                                        text = "123456",
+                                        style = SnowTypography.monospaceSmall,
+                                        color = colors.textMuted
+                                    )
+                                },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = colors.accentBlue,
+                                    unfocusedBorderColor = colors.border,
+                                    focusedTextColor = colors.textPrimary,
+                                    unfocusedTextColor = colors.textPrimary,
+                                    cursorColor = colors.accentCyan
+                                ),
+                                singleLine = true,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+
+                            if (!effectiveError.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Surface(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .border(1.dp, Color(0xFFEF4444).copy(alpha = 0.45f), RoundedCornerShape(10.dp)),
+                                    shape = RoundedCornerShape(10.dp),
+                                    color = Color(0xFFEF4444).copy(alpha = 0.12f)
+                                ) {
+                                    Text(
+                                        text = effectiveError,
+                                        style = SnowTypography.bodySmall,
+                                        color = Color(0xFFEF4444),
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                SnowOutlinedButton(
+                                    text = "Change ID",
+                                    onClick = { resetStepFlow() },
+                                    enabled = !effectiveBusy,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                SnowGradientButton(
+                                    text = if (effectiveBusy) "Verifying..." else "Verify & Pair",
+                                    onClick = {
+                                        val step2Handler = onConnectSnowIdStep2
+                                        if (step2Handler != null) {
+                                            stepBusy = true
+                                            localStepError = null
+                                            step2Handler(step2SnowId, step2Pin) { success, msg, remainingAttempts ->
+                                                stepBusy = false
+                                                if (success) {
+                                                    dismissSheet()
+                                                } else {
+                                                    // Stay on Step 2, keep snowId intact, clear invalid PIN for re-entry
+                                                    step2Pin = ""
+                                                    localStepError = if (remainingAttempts != null && remainingAttempts > 0) {
+                                                        "Incorrect PIN — $remainingAttempts attempts remaining. Please re-enter."
+                                                    } else {
+                                                        msg?.takeIf { it.isNotBlank() }
+                                                            ?: "Incorrect PIN. Please re-enter."
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            onConnectInput("$step2SnowId $step2Pin")
+                                        }
+                                    },
+                                    enabled = step2Pin.length == 6 && !effectiveBusy,
+                                    isLoading = effectiveBusy,
+                                    modifier = Modifier.weight(1.4f)
+                                )
+                            }
+                        }
                     }
                 }
             }

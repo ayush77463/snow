@@ -103,6 +103,7 @@
     let currentStorageMode = "saf_tree";
     let isCorePaused = false;
     let isCoreOnline = true;
+    let consecutiveCoreOfflinePolls = 0;
     let registeredDevices = [];
     let federationGrants = [];
     let activeNotifications = [];
@@ -128,9 +129,15 @@
     let activeMeshNetworkId = null;
     let activeMeshNetworkFormed = false;
     let pendingNetworkMergeProposals = [];
-    let activeUploadXhr = null;
-    let activeUploadTransferId = null;
-    let activeDownloadController = null;
+    const MAX_CONCURRENT_TRANSFERS = 3;
+    const activeTransfers = new Map();
+    const queuedTransfers = [];
+    let transferClientCounter = 0;
+    let filesLoadSeq = 0;
+    const twoStepPairingState = {
+        pairing: { snowId: "", step: 1 },
+        modal: { snowId: "", step: 1 },
+    };
     let pcTransfersDestDir = "";
     let pendingUpdateMeta = null;
     let modalPurposeMode = "share"; // "share" | "clipboard"
@@ -265,20 +272,6 @@
         if (t.includes("relay") || t.includes("remote") || badge.startsWith("remote") || ep.includes("/v1/tunnel")) return "Remote";
         if (t === "peer") return "Direct Peer";
         return "Wi-Fi";
-    }
-
-    function parseHostAndPort(rawInput) {
-        const trimmed = String(rawInput || "").trim();
-        if (!trimmed) return null;
-        if (trimmed.includes(":")) {
-            const parts = trimmed.split(":");
-            const port = parseInt(parts[parts.length - 1], 10);
-            const host = parts.slice(0, -1).join(":").trim();
-            if (host && !isNaN(port) && port > 0 && port <= 65535) {
-                return { host, port };
-            }
-        }
-        return { host: trimmed, port: 8765 };
     }
 
     // =========================================================================
@@ -478,12 +471,17 @@
             clearInterval(qrCountdownTimer);
             qrCountdownTimer = null;
         }
-        if (activeDownloadController) {
+        queuedTransfers.length = 0;
+        activeTransfers.forEach((entry) => {
+            entry.cancelled = true;
             try {
-                activeDownloadController.abort();
+                if (entry.xhr) entry.xhr.abort();
             } catch (e) {}
-            activeDownloadController = null;
-        }
+            try {
+                if (entry.abortController) entry.abortController.abort();
+            } catch (e) {}
+        });
+        activeTransfers.clear();
         if (visibilityChangeHandlerRef) {
             document.removeEventListener("visibilitychange", visibilityChangeHandlerRef);
             visibilityChangeHandlerRef = null;
@@ -982,16 +980,7 @@
             });
         }
 
-        document.getElementById("btn-hero-lock-pc")?.addEventListener("click", async (e) => {
-            await withButtonLoading(e.currentTarget, "Locking...", async () => {
-                const res = await apiRequest("/api/desktop/lock", "POST", {});
-                if (res && res.success) {
-                    showNotificationToast("Windows workstation locked.", "success");
-                } else {
-                    showNotificationToast(res?.error || "Failed locking workstation", "error");
-                }
-            });
-        });
+        document.getElementById("btn-hero-lock-pc")?.addEventListener("click", (e) => triggerLockPc(e.currentTarget, "Locking..."));
 
         const fileInput = document.getElementById("file-upload-input");
         document.getElementById("btn-hero-send-file")?.addEventListener("click", () => {
@@ -1007,14 +996,22 @@
             document.getElementById("device-island-container")?.classList.remove("d-none");
         });
 
-        // Quick Actions 2x3 Grid
+        // Target-Adaptive Quick Actions 2x3 Grid
+        document.getElementById("btn-qa-lock-pc")?.addEventListener("click", (e) => triggerLockPc(e.currentTarget, ""));
         document.getElementById("btn-qa-ring")?.addEventListener("click", (e) => triggerRingPhone(e.currentTarget));
         document.getElementById("btn-qa-screen")?.addEventListener("click", (e) => triggerScreenCapture(e.currentTarget));
         document.getElementById("btn-qa-camera")?.addEventListener("click", (e) => triggerCameraCapture(e.currentTarget));
-        document.getElementById("btn-qa-media")?.addEventListener("click", () => triggerMediaAction("play_pause"));
         document.getElementById("btn-qa-send-files")?.addEventListener("click", () => {
             if (fileInput) fileInput.click();
         });
+        document.getElementById("btn-qa-browse-files")?.addEventListener("click", () => {
+            switchTab("files");
+            focusFilesSegment("files");
+        });
+        document.getElementById("btn-qa-media")?.addEventListener("click", () => triggerMediaAction("play_pause"));
+        document.getElementById("btn-qa-share-pc-screen")?.addEventListener("click", openPcSharePicker);
+        document.getElementById("btn-qa-sync-clipboard")?.addEventListener("click", (e) => triggerSyncClipboard(e.currentTarget));
+        document.getElementById("btn-qa-open-folder")?.addEventListener("click", (e) => openTransfersFolder(e.currentTarget));
         document.getElementById("btn-qa-share-note")?.addEventListener("click", () => openTextModal("share"));
 
         // Media Controls Bar (Prev, Play/Pause, Next, Mute, Volume)
@@ -1080,6 +1077,48 @@
         return firstPhone ? firstPhone.device_id : "";
     }
 
+    async function triggerLockPc(triggerBtn = null, loadingLabel = "") {
+        await withButtonLoading(triggerBtn instanceof Element ? triggerBtn : null, loadingLabel, async () => {
+            const dev = getSelectedDeviceObj();
+            const payload = (dev && !isLocalNode(dev)) ? { device_id: dev.device_id } : {};
+            const res = await apiRequest("/api/desktop/lock", "POST", payload);
+            if (res && res.success) {
+                showNotificationToast("Windows workstation locked.", "success");
+            } else {
+                showNotificationToast(res?.error || "Failed locking workstation", "error");
+            }
+        });
+    }
+
+    async function triggerSyncClipboard(triggerBtn = null) {
+        await withButtonLoading(triggerBtn instanceof Element ? triggerBtn : null, "", async () => {
+            const res = await apiRequest("/api/clipboard/sync", "POST", {
+                direction: "both",
+                device_id: resolveTargetDeviceId(),
+            });
+            if (res && res.success) {
+                showNotificationToast("Clipboard synchronized.", "success");
+                loadHomeWidgets();
+            } else {
+                showNotificationToast(res?.error || "Clipboard sync failed", "error");
+            }
+        });
+    }
+
+    async function openTransfersFolder(triggerBtn = null) {
+        await withButtonLoading(triggerBtn instanceof Element ? triggerBtn : null, "", async () => {
+            const res = await apiRequest("/api/files/open-transfers-folder", "POST", {});
+            if (res && res.success) {
+                showNotificationToast(
+                    res.opened ? `Opened ${res.path || "Transfers folder"}` : `Transfers folder: ${res.path}`,
+                    "success"
+                );
+            } else {
+                showNotificationToast(res?.error || "Unable to open transfers folder", "error");
+            }
+        });
+    }
+
     async function triggerRingPhone(triggerBtn = null) {
         const targetId = resolveTargetDeviceId();
         if (!targetId) {
@@ -1097,12 +1136,41 @@
     }
 
     async function triggerScreenCapture(triggerBtn = null) {
+        const selectedDev = getSelectedDeviceObj();
+        const statusText = document.getElementById("latest-capture-status-text");
+        if (!selectedDev || isLocalNode(selectedDev)) {
+            if (!isCoreOnline) {
+                showNotificationToast("SNOW Core is offline.", "warning");
+                return;
+            }
+            if (statusText) statusText.textContent = "Capturing Windows PC screen...";
+            const res = await withButtonLoading(triggerBtn instanceof Element ? triggerBtn : null, "", () =>
+                apiRequest("/api/workflows/run", "POST", { workflow_id: "pc_screenshot", arguments: {} }, { timeoutMs: 12000 })
+            );
+            if (res && res.success) {
+                const fileName = res.file_name
+                    || res.data?.file_name
+                    || res.data?.capture_summary?.file_name
+                    || res.data?.step_pc_screenshot?.file_name
+                    || res.data?.step_capture_screen?.file_name;
+                if (fileName) {
+                    const capUrl = `/api/captures/${encodeURIComponent(fileName)}?t=${Date.now()}`;
+                    showCapturePreview(capUrl, "PC Screen Capture");
+                }
+                showNotificationToast("PC screen captured!", "success");
+            } else {
+                const errMsg = res?.error || "Failed capturing PC screen";
+                if (statusText) statusText.textContent = errMsg;
+                showNotificationToast(errMsg, "error");
+            }
+            return;
+        }
+
         const targetId = resolveTargetDeviceId();
         if (!targetId) {
             showNotificationToast("Select or connect an online phone for screen capture.", "warning");
             return;
         }
-        const statusText = document.getElementById("latest-capture-status-text");
         if (statusText) statusText.textContent = "Awaiting phone consent for one-time screen capture...";
 
         let baselineFilename = "";
@@ -1594,6 +1662,68 @@
         }
     }
 
+    function setQuickActionVisible(id, visible, disabled = false) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.classList.toggle("d-none", !visible);
+        el.disabled = Boolean(disabled);
+    }
+
+    function applyQuickActionsForTarget(device, isOnline) {
+        const isLocal = !device || isLocalNode(device);
+        const isAndroid = Boolean(device && isAndroidDevice(device));
+        const isRemotePc = Boolean(device && !isLocal && !isAndroid);
+        const isDisabled = !isOnline;
+
+        const screenBtn = document.getElementById("btn-qa-screen");
+        const screenLabel = screenBtn?.querySelector(".qa-tile-label");
+
+        if (isLocal) {
+            setQuickActionVisible("btn-qa-lock-pc", true, isDisabled);
+            setQuickActionVisible("btn-qa-screen", true, isDisabled);
+            if (screenLabel) screenLabel.textContent = "Capture PC Screen";
+            if (screenBtn) screenBtn.title = "Capture this PC screen";
+            setQuickActionVisible("btn-qa-media", true, isDisabled);
+            setQuickActionVisible("btn-qa-sync-clipboard", true, isDisabled);
+            setQuickActionVisible("btn-qa-open-folder", true, isDisabled);
+            setQuickActionVisible("btn-qa-share-note", true, isDisabled);
+
+            setQuickActionVisible("btn-qa-ring", false, true);
+            setQuickActionVisible("btn-qa-camera", false, true);
+            setQuickActionVisible("btn-qa-send-files", false, true);
+            setQuickActionVisible("btn-qa-browse-files", false, true);
+            setQuickActionVisible("btn-qa-share-pc-screen", false, true);
+        } else if (isRemotePc) {
+            setQuickActionVisible("btn-qa-lock-pc", true, isDisabled);
+            setQuickActionVisible("btn-qa-send-files", true, isDisabled);
+            setQuickActionVisible("btn-qa-browse-files", true, isDisabled);
+            setQuickActionVisible("btn-qa-media", true, isDisabled);
+            setQuickActionVisible("btn-qa-share-pc-screen", true, isDisabled);
+            setQuickActionVisible("btn-qa-share-note", true, isDisabled);
+
+            setQuickActionVisible("btn-qa-ring", false, true);
+            setQuickActionVisible("btn-qa-screen", false, true);
+            setQuickActionVisible("btn-qa-camera", false, true);
+            setQuickActionVisible("btn-qa-sync-clipboard", false, true);
+            setQuickActionVisible("btn-qa-open-folder", false, true);
+        } else {
+            setQuickActionVisible("btn-qa-ring", true, isDisabled);
+            setQuickActionVisible("btn-qa-screen", true, isDisabled);
+            if (screenLabel) screenLabel.textContent = "Capture Screen";
+            if (screenBtn) screenBtn.title = "Capture remote phone screen";
+            setQuickActionVisible("btn-qa-camera", true, isDisabled);
+            setQuickActionVisible("btn-qa-media", true, isDisabled);
+            setQuickActionVisible("btn-qa-send-files", true, isDisabled);
+            setQuickActionVisible("btn-qa-share-note", true, isDisabled);
+
+            setQuickActionVisible("btn-qa-lock-pc", false, true);
+            setQuickActionVisible("btn-qa-browse-files", false, true);
+            setQuickActionVisible("btn-qa-share-pc-screen", false, true);
+            setQuickActionVisible("btn-qa-sync-clipboard", false, true);
+            setQuickActionVisible("btn-qa-open-folder", false, true);
+        }
+    }
+
     function updateHeroCard(device) {
         const heroCard = document.getElementById("hero-card");
         const bezelFrame = document.getElementById("hero-bezel-frame");
@@ -1702,11 +1832,12 @@
             }
             if (capBtn) {
                 capBtn.classList.remove("d-none");
-                capBtn.disabled = !isCoreOnline || !hasOnlinePhone;
-                capBtn.title = hasOnlinePhone ? "Capture connected phone screen" : "Connect a phone to capture screen";
+                capBtn.disabled = !isCoreOnline;
+                capBtn.title = "Capture PC screen";
             }
             if (primaryActions) primaryActions.classList.remove("d-none");
             if (offlineActions) offlineActions.classList.add("d-none");
+            applyQuickActionsForTarget(device, isCoreOnline);
             applyOfflineUsbDimming(!isCoreOnline);
             return;
         }
@@ -1797,6 +1928,7 @@
         }
 
         if (offlineActions) offlineActions.classList.toggle("d-none", isConn);
+        applyQuickActionsForTarget(device, isConn);
         applyOfflineUsbDimming(!isConn);
     }
 
@@ -1804,14 +1936,14 @@
         const seq = ++homeWidgetsSeq;
         isHomeWidgetsInFlight = true;
         try {
-        // 1. Shared Clipboard Preview
-        const clipRes = await apiRequest("/api/clipboard/buffer");
-        if (seq !== homeWidgetsSeq) return;
+        // 1. Shared Clipboard Preview (only fetch if legacy Home container exists)
         const clipContainer = document.getElementById("clipboard-items-container");
         const clipBadge = document.getElementById("clipboard-count-badge");
         const clipEmpty = document.getElementById("clipboard-empty-state");
 
         if (clipContainer) {
+            const clipRes = await apiRequest("/api/clipboard/buffer");
+            if (seq !== homeWidgetsSeq) return;
             const items = (clipRes && Array.isArray(clipRes.items)) ? clipRes.items : (clipRes?.data?.items || []);
             if (clipBadge) clipBadge.textContent = items.length;
             clipContainer.innerHTML = "";
@@ -1892,14 +2024,31 @@
             }
         }
 
-        // 2. Phone Notifications
-        const targetId = resolveTargetDeviceId();
-        const notifUrl = targetId ? "/api/notifications?device_id=" + encodeURIComponent(targetId) : "/api/notifications";
-        const notifRes = await apiRequest(notifUrl);
-        if (seq !== homeWidgetsSeq) return;
+        // 2. Phone Notifications (only poll when a remote Android phone is connected)
         const notifContainer = document.getElementById("notifications-container");
         const notifBadge = document.getElementById("notifications-count-badge");
         const notifEmpty = document.getElementById("notifications-empty-state");
+        const activeDevObj = getSelectedDeviceObj();
+        const connectedPhone = registeredDevices.find(
+            d => !isLocalNode(d) && isAndroidDevice(d) && d.is_connected === true
+        );
+        const notifTargetId = (activeDevObj && !isLocalNode(activeDevObj) && isAndroidDevice(activeDevObj) && activeDevObj.is_connected === true)
+            ? activeDevObj.device_id
+            : (connectedPhone ? connectedPhone.device_id : "");
+
+        if (!notifTargetId) {
+            activeNotifications = [];
+            if (notifBadge) notifBadge.textContent = "0";
+            if (notifContainer) notifContainer.replaceChildren();
+            openNotificationReplyKeys.clear();
+            notificationReplyDrafts.clear();
+            notifEmpty?.classList.remove("d-none");
+            return;
+        }
+
+        const notifUrl = "/api/notifications?device_id=" + encodeURIComponent(notifTargetId);
+        const notifRes = await apiRequest(notifUrl);
+        if (seq !== homeWidgetsSeq) return;
 
         if (notifContainer) {
             activeNotifications = (notifRes && Array.isArray(notifRes.notifications)) ? notifRes.notifications : [];
@@ -2161,31 +2310,7 @@
             await withButtonLoading(e.currentTarget, "Cancelling...", cancelPairingPin);
         });
 
-        const btnPairConnect = document.getElementById("btn-pairing-connect");
-        const inputPair = document.getElementById("pairing-input");
-        const inputPairPin = document.getElementById("pairing-pin-input");
-        if (btnPairConnect && inputPair) {
-            btnPairConnect.onclick = async () => {
-                await withButtonLoading(btnPairConnect, "Connecting...", async () => {
-                    await handleUnifiedConnectInput(inputPair.value.trim(), inputPairPin ? inputPairPin.value.trim() : "");
-                });
-            };
-        }
-
-        document.getElementById("btn-validate-qr-json")?.addEventListener("click", async () => {
-            const rawQr = document.getElementById("pairing-qr-json-input")?.value.trim() || "";
-            await validateQrJsonInput(rawQr, "pairing-qr-json-preview");
-        });
-        document.getElementById("btn-accept-qr-json")?.addEventListener("click", async (e) => {
-            const rawQr = document.getElementById("pairing-qr-json-input")?.value.trim() || "";
-            await withButtonLoading(e.currentTarget, "Connecting...", async () => {
-                const ok = await acceptQrJsonInput(rawQr, "pairing-qr-json-preview");
-                if (ok) {
-                    const inp = document.getElementById("pairing-qr-json-input");
-                    if (inp) inp.value = "";
-                }
-            });
-        });
+        wireTwoStepPairingContext("pairing");
 
         // Remote Access Toggle (Zero-config Render Hub by default)
         const chkRelay = document.getElementById("chk-relay-tunnel-toggle");
@@ -2293,113 +2418,236 @@
         modal.classList.remove("d-none");
     }
 
-    async function validateQrJsonInput(rawJson, previewId) {
-        const previewEl = document.getElementById(previewId);
-        if (!rawJson) {
-            if (previewEl) {
-                previewEl.textContent = "Paste QR v2 JSON payload first.";
-                previewEl.className = "text-xs text-rose";
-            }
-            return null;
+    const TWO_STEP_PAIRING_CFG = {
+        pairing: {
+            isModal: false,
+            step1Box: "pairing-step1-container",
+            inputId: "pairing-input",
+            connectBtnId: "btn-pairing-connect",
+            step1ErrId: "pairing-step1-error",
+            step2Box: "pairing-step2-container",
+            step2LabelId: "pairing-step2-label",
+            pinInputId: "pairing-step2-pin",
+            verifyBtnId: "btn-pairing-verify-pin",
+            changeIdBtnId: "btn-pairing-change-id",
+            step2ErrId: "pairing-step2-error",
+        },
+        modal: {
+            isModal: true,
+            step1Box: "modal-step1-container",
+            inputId: "modal-connect-input",
+            connectBtnId: "btn-modal-connect-submit",
+            step1ErrId: "modal-step1-error",
+            step2Box: "modal-step2-container",
+            step2LabelId: "modal-step2-label",
+            pinInputId: "modal-step2-pin",
+            verifyBtnId: "btn-modal-verify-pin",
+            changeIdBtnId: "btn-modal-change-id",
+            step2ErrId: "modal-step2-error",
+        },
+    };
+
+    function setTwoStepError(errId, msg) {
+        const el = document.getElementById(errId);
+        if (!el) return;
+        if (msg) {
+            el.textContent = msg;
+            el.classList.remove("d-none");
+        } else {
+            el.textContent = "";
+            el.classList.add("d-none");
         }
-        const res = await apiRequest("/api/pair/qr/validate", "POST", { qr_json: rawJson });
-        if (res && res.success) {
-            const msg = `Valid QR v2 • Peer: ${res.snow_id}${res.network_id ? ` • Network: ${res.network_id}` : ""}${res.device_name ? ` (${res.device_name})` : ""}`;
-            if (previewEl) {
-                previewEl.textContent = msg;
-                previewEl.className = "text-xs text-emerald";
-            }
-            return res;
-        }
-        if (previewEl) {
-            previewEl.textContent = res?.error || "Invalid QR v2 JSON payload.";
-            previewEl.className = "text-xs text-rose";
-        }
-        return null;
     }
 
-    async function acceptQrJsonInput(rawJson, previewId) {
-        const previewEl = document.getElementById(previewId);
-        if (!rawJson) {
-            showNotificationToast("Paste QR v2 JSON payload first.", "warning");
-            return false;
+    function resetTwoStepPairing(ctxKey, clearIdInput = false) {
+        const cfg = TWO_STEP_PAIRING_CFG[ctxKey];
+        if (!cfg) return;
+        const inp = document.getElementById(cfg.inputId);
+        const pinInp = document.getElementById(cfg.pinInputId);
+        const step1Box = document.getElementById(cfg.step1Box);
+        const step2Box = document.getElementById(cfg.step2Box);
+        if (clearIdInput && inp) inp.value = "";
+        if (pinInp) pinInp.value = "";
+        setTwoStepError(cfg.step1ErrId, "");
+        setTwoStepError(cfg.step2ErrId, "");
+        step2Box?.classList.add("d-none");
+        step1Box?.classList.remove("d-none");
+        twoStepPairingState[ctxKey] = {
+            snowId: clearIdInput ? "" : (inp?.value?.trim().toUpperCase() || ""),
+            step: 1,
+        };
+    }
+
+    function enterTwoStepPin(ctxKey, snowId) {
+        const cfg = TWO_STEP_PAIRING_CFG[ctxKey];
+        if (!cfg) return;
+        const cleanId = String(snowId || "").trim().toUpperCase();
+        const inp = document.getElementById(cfg.inputId);
+        const pinInp = document.getElementById(cfg.pinInputId);
+        const step1Box = document.getElementById(cfg.step1Box);
+        const step2Box = document.getElementById(cfg.step2Box);
+        const labelEl = document.getElementById(cfg.step2LabelId);
+        if (inp) inp.value = cleanId;
+        twoStepPairingState[ctxKey] = { snowId: cleanId, step: 2 };
+        setTwoStepError(cfg.step1ErrId, "");
+        setTwoStepError(cfg.step2ErrId, "");
+        if (labelEl) labelEl.textContent = `Enter the 6-digit PIN shown on ${cleanId}`;
+        if (pinInp) pinInp.value = "";
+        step1Box?.classList.add("d-none");
+        step2Box?.classList.remove("d-none");
+        pinInp?.focus();
+    }
+
+    async function handleTwoStepResolve(ctxKey) {
+        const cfg = TWO_STEP_PAIRING_CFG[ctxKey];
+        if (!cfg) return;
+        const inp = document.getElementById(cfg.inputId);
+        const rawId = (inp?.value || "").trim().toUpperCase();
+        if (inp) inp.value = rawId;
+        setTwoStepError(cfg.step1ErrId, "");
+        if (!rawId) {
+            setTwoStepError(cfg.step1ErrId, "Enter a peer SNOW ID (e.g. SNW-A1B2-C3D4).");
+            inp?.focus();
+            return;
         }
-        const res = await apiRequest("/api/pair/qr/accept", "POST", { qr_json: rawJson });
+
+        const res = await apiRequest(
+            "/api/devices/connect-peer",
+            "POST",
+            { snow_id: rawId, step: "resolve" },
+            { timeoutMs: 12000 }
+        );
+
+        const targetSnowId = String(res?.snow_id || res?.data?.snow_id || rawId).trim().toUpperCase();
+        const requiresPin = Boolean(
+            res && (
+                res.requires_pin === true ||
+                res.data?.requires_pin === true ||
+                String(res.status || "").toUpperCase() === "PIN_REQUIRED" ||
+                String(res.status || "").toUpperCase() === "CONNECTED_UNAUTHENTICATED"
+            )
+        );
+        if (requiresPin) {
+            enterTwoStepPin(ctxKey, targetSnowId);
+            return;
+        }
+
         if (res && res.success) {
-            if (previewEl) {
-                previewEl.textContent = `Paired with ${res.snow_id || "peer"}.`;
-                previewEl.className = "text-xs text-emerald";
+            const conflictData = res.data?.network_conflict ? res.data : (res.network_conflict ? res : null);
+            resetTwoStepPairing(ctxKey, true);
+            if (cfg.isModal) {
+                document.getElementById("connect-modal")?.classList.add("d-none");
             }
-            showNotificationToast(`Paired cleanly with ${res.snow_id || "peer"}!`, "success");
-            const conflictData = res.network_conflict ? res : (res.data?.network_conflict ? res.data : null);
+            showNotificationToast(`Connected to ${targetSnowId}!`, "success");
             if (conflictData && conflictData.merge_tx_id) {
                 openMergeDecisionModal(conflictData);
             }
             await refreshAllData();
-            return true;
+            return;
         }
-        const errMsg = res?.error || "Could not connect using pasted QR JSON.";
-        if (previewEl) {
-            previewEl.textContent = errMsg;
-            previewEl.className = "text-xs text-rose";
-        }
+
+        const errMsg = res?.error || `Could not resolve or connect to ${rawId}.`;
+        setTwoStepError(cfg.step1ErrId, errMsg);
         showNotificationToast(errMsg, "error");
-        return false;
     }
 
-    async function handleUnifiedConnectInput(rawVal, optionalPin = "") {
-        if (!rawVal) {
-            showNotificationToast("Enter a peer SNOW ID (SNW-...), Network ID, or IP address.", "warning");
+    async function handleTwoStepVerifyPin(ctxKey) {
+        const cfg = TWO_STEP_PAIRING_CFG[ctxKey];
+        if (!cfg) return;
+        const inp = document.getElementById(cfg.inputId);
+        const pinInp = document.getElementById(cfg.pinInputId);
+        const snowId = (twoStepPairingState[ctxKey]?.snowId || inp?.value || "").trim().toUpperCase();
+        const pin = (pinInp?.value || "").trim();
+        setTwoStepError(cfg.step2ErrId, "");
+
+        if (!snowId) {
+            resetTwoStepPairing(ctxKey, false);
             return;
         }
-        const trimmed = rawVal.trim();
-        if (trimmed.startsWith("{")) {
-            await acceptQrJsonInput(trimmed, "pairing-qr-json-preview");
+        if (!/^\d{6}$/.test(pin)) {
+            setTwoStepError(cfg.step2ErrId, "Enter the 6-digit numeric PIN shown on the peer device.");
+            pinInp?.focus();
             return;
         }
 
-        const cleanId = trimmed.toUpperCase();
-        if (/^SNW-(NET-[A-F0-9]{8}|[A-Z0-9]{4}-[A-Z0-9]{4})$/i.test(cleanId)) {
-            showNotificationToast(`Resolving ${cleanId}...`, "info");
-            const dirRes = await apiRequest(`/api/directory/resolve/${encodeURIComponent(cleanId)}`);
-            if (!dirRes || !dirRes.found) {
-                showNotificationToast(dirRes?.error || `No online peer found for ${cleanId}.`, "error");
-                return;
-            }
-            const connRes = await apiRequest("/api/devices/connect-peer", "POST", {
-                snow_id: cleanId,
-                pin: optionalPin,
-            });
-            if (connRes && connRes.success) {
-                showNotificationToast(`Connected to ${cleanId}!`, "success");
-                const conflictData = connRes.data?.network_conflict ? connRes.data : (connRes.network_conflict ? connRes : null);
-                if (conflictData && conflictData.merge_tx_id) {
-                    openMergeDecisionModal(conflictData);
-                }
-                refreshAllData();
-            } else {
-                showNotificationToast(connRes?.error || `Found ${cleanId} via ${dirRes.source || "directory"}, pairing confirmation may be required.`, "info");
-            }
-            return;
-        }
+        const res = await apiRequest(
+            "/api/devices/connect-peer",
+            "POST",
+            { snow_id: snowId, pin },
+            { timeoutMs: 12000 }
+        );
 
-        const parsed = parseHostAndPort(trimmed);
-        if (!parsed) return;
-        showNotificationToast(`Connecting to ${parsed.host}:${parsed.port}...`, "info");
-        const res = await apiRequest("/api/devices/connect-peer", "POST", {
-            host: parsed.host,
-            port: parsed.port,
-            pin: optionalPin,
-        });
         if (res && res.success) {
-            showNotificationToast("Connected to peer device!", "success");
             const conflictData = res.data?.network_conflict ? res.data : (res.network_conflict ? res : null);
+            const finalId = String(res.snow_id || res.data?.snow_id || snowId).trim().toUpperCase();
+            resetTwoStepPairing(ctxKey, true);
+            if (cfg.isModal) {
+                document.getElementById("connect-modal")?.classList.add("d-none");
+            }
+            showNotificationToast(`Paired and connected to ${finalId}!`, "success");
             if (conflictData && conflictData.merge_tx_id) {
                 openMergeDecisionModal(conflictData);
             }
-            refreshAllData();
-        } else {
-            showNotificationToast(res?.error || "Connection failed (check Advanced Diagnostics or QR JSON paste)", "error");
+            await refreshAllData();
+            return;
+        }
+
+        // Keep Step 2 open with entered SNOW ID intact on wrong PIN / failure
+        if (inp) inp.value = snowId;
+        twoStepPairingState[ctxKey] = { snowId, step: 2 };
+        const attemptsRem = res?.attempts_remaining
+            ?? res?.remaining_attempts
+            ?? res?.data?.attempts_remaining
+            ?? res?.data?.remaining_attempts;
+        let errMsg = res?.error || "Incorrect PIN. Please re-enter.";
+        if (typeof attemptsRem === "number" && !Number.isNaN(attemptsRem)) {
+            errMsg = `Incorrect PIN — ${attemptsRem} attempt${attemptsRem === 1 ? "" : "s"} remaining. Please re-enter.`;
+        }
+        setTwoStepError(cfg.step2ErrId, errMsg);
+        showNotificationToast(errMsg, "error");
+        pinInp?.focus();
+    }
+
+    function wireTwoStepPairingContext(ctxKey) {
+        const cfg = TWO_STEP_PAIRING_CFG[ctxKey];
+        if (!cfg) return;
+        const connectBtn = document.getElementById(cfg.connectBtnId);
+        const inp = document.getElementById(cfg.inputId);
+        const verifyBtn = document.getElementById(cfg.verifyBtnId);
+        const pinInp = document.getElementById(cfg.pinInputId);
+        const changeBtn = document.getElementById(cfg.changeIdBtnId);
+
+        if (connectBtn) {
+            connectBtn.addEventListener("click", async () => {
+                await withButtonLoading(connectBtn, "Connecting...", () => handleTwoStepResolve(ctxKey));
+            });
+        }
+        if (inp) {
+            inp.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    connectBtn?.click();
+                }
+            });
+        }
+        if (verifyBtn) {
+            verifyBtn.addEventListener("click", async () => {
+                await withButtonLoading(verifyBtn, "Verifying...", () => handleTwoStepVerifyPin(ctxKey));
+            });
+        }
+        if (pinInp) {
+            pinInp.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") {
+                    e.preventDefault();
+                    verifyBtn?.click();
+                }
+            });
+        }
+        if (changeBtn) {
+            changeBtn.addEventListener("click", () => {
+                resetTwoStepPairing(ctxKey, false);
+                document.getElementById(cfg.inputId)?.focus();
+            });
         }
     }
 
@@ -3012,17 +3260,7 @@
                 if (pickBtn) pickBtn.disabled = false;
             }
         });
-        document.getElementById("btn-open-transfers-folder")?.addEventListener("click", async () => {
-            const res = await apiRequest("/api/files/open-transfers-folder", "POST", {});
-            if (res && res.success) {
-                showNotificationToast(
-                    res.opened ? `Opened ${res.path || "Transfers folder"}` : `Transfers folder: ${res.path}`,
-                    "success"
-                );
-            } else {
-                showNotificationToast(res?.error || "Unable to open transfers folder", "error");
-            }
-        });
+        document.getElementById("btn-open-transfers-folder")?.addEventListener("click", (e) => openTransfersFolder(e.currentTarget));
 
         document.getElementById("btn-file-up")?.addEventListener("click", () => {
             if (currentStorageMode === "desktop_remote") {
@@ -3050,21 +3288,6 @@
                 }
             };
         }
-
-        document.getElementById("btn-share-pc-screen")?.addEventListener("click", openPcSharePicker);
-        document.getElementById("btn-stop-pc-share")?.addEventListener("click", stopPcScreenShare);
-        document.getElementById("btn-close-pc-share-modal")?.addEventListener("click", () => {
-            document.getElementById("pc-share-targets-modal")?.classList.add("d-none");
-        });
-        document.getElementById("btn-pc-share-cancel")?.addEventListener("click", () => {
-            document.getElementById("pc-share-targets-modal")?.classList.add("d-none");
-        });
-        document.getElementById("btn-pc-share-confirm")?.addEventListener("click", confirmStartPcScreenShare);
-        document.getElementById("btn-stop-screen-stream")?.addEventListener("click", stopRemoteScreenStream);
-        document.getElementById("btn-retry-screen-stream")?.addEventListener("click", () => {
-            screenFrameErrorCount = 0;
-            pollScreenStreamStatus();
-        });
     }
 
     function focusFilesSegment(seg) {
@@ -3113,19 +3336,122 @@
         return { text: "Wi-Fi • Zero Data", cls: "chip chip-sm chip-cyan" };
     }
 
-    function updateTransferProgressUi({
-        visible,
-        title = "",
-        loaded = 0,
-        total = 0,
-        pct = 0,
-        speedBps = 0,
-        indeterminate = false,
-        routeBadge = null,
-    }) {
-        const containers = [
+    function nextClientTransferId(prefix = "tx") {
+        transferClientCounter += 1;
+        return `${prefix}-${transferClientCounter}-${Date.now()}`;
+    }
+
+    function renderTransferRowList(rowsContainer, entries) {
+        if (!rowsContainer) return;
+        const desiredIds = new Set(entries.map(e => e.id));
+        const existingMap = new Map();
+        rowsContainer.querySelectorAll(".transfer-row[data-transfer-id]").forEach(el => {
+            const eid = el.dataset.transferId || "";
+            if (!desiredIds.has(eid)) {
+                el.remove();
+            } else {
+                existingMap.set(eid, el);
+            }
+        });
+
+        entries.forEach((entry, idx) => {
+            let row = existingMap.get(entry.id);
+            if (!row) {
+                row = document.createElement("div");
+                row.className = "transfer-row";
+                row.dataset.transferId = entry.id;
+                row.innerHTML = `
+                    <div class="transfer-row-header">
+                        <div class="transfer-row-meta">
+                            <span class="chip chip-sm chip-neutral transfer-row-dir"></span>
+                            <span class="transfer-row-name truncate"></span>
+                            <span class="transfer-row-route"></span>
+                            <span class="chip chip-sm chip-neutral mono transfer-row-speed"></span>
+                        </div>
+                        <button type="button" class="btn btn-xs btn-danger btn-transfer-row-cancel">Cancel</button>
+                    </div>
+                    <div class="progress-track">
+                        <div class="progress-fill transfer-row-progress" style="width: 0%;"></div>
+                    </div>
+                    <div class="flex items-center justify-between text-xs text-muted">
+                        <span class="transfer-row-bytes"></span>
+                        <span class="transfer-row-pct"></span>
+                    </div>
+                `;
+                row.querySelector(".btn-transfer-row-cancel").addEventListener("click", () => {
+                    cancelTransferById(entry.id);
+                });
+            }
+
+            const isQueued = entry.status === "queued";
+            const dirEl = row.querySelector(".transfer-row-dir");
+            const nameEl = row.querySelector(".transfer-row-name");
+            const routeEl = row.querySelector(".transfer-row-route");
+            const speedEl = row.querySelector(".transfer-row-speed");
+            const barEl = row.querySelector(".transfer-row-progress");
+            const bytesEl = row.querySelector(".transfer-row-bytes");
+            const pctEl = row.querySelector(".transfer-row-pct");
+
+            if (dirEl) dirEl.textContent = entry.direction === "download" ? "Download" : "Upload";
+            if (nameEl) {
+                nameEl.textContent = entry.filename || "File";
+                nameEl.title = entry.filename || "File";
+            }
+            if (routeEl && entry.routeBadge) {
+                routeEl.textContent = entry.routeBadge.text;
+                routeEl.className = `transfer-row-route ${entry.routeBadge.cls}`;
+            }
+            if (speedEl) {
+                speedEl.textContent = isQueued
+                    ? "Queued"
+                    : (entry.speedBps > 0 ? `${formatBytes(entry.speedBps)}/s` : (entry.indeterminate ? "HTTPS :8766" : "0 KB/s"));
+            }
+            if (barEl) {
+                barEl.classList.toggle("indeterminate", Boolean(!isQueued && entry.indeterminate));
+                if (!entry.indeterminate || isQueued) {
+                    const w = isQueued ? 0 : Math.max(0, Math.min(100, Number(entry.pct || 0)));
+                    barEl.style.width = `${w}%`;
+                }
+            }
+            if (bytesEl) {
+                bytesEl.textContent = isQueued
+                    ? (entry.total > 0 ? `Queued (${formatBytes(entry.total)})` : "Queued")
+                    : (entry.total > 0
+                        ? `${formatBytes(entry.loaded || 0)} / ${formatBytes(entry.total)}`
+                        : (entry.loaded > 0 ? formatBytes(entry.loaded) : "Streaming over HTTPS..."));
+            }
+            if (pctEl) {
+                pctEl.textContent = isQueued ? "Queued" : (entry.indeterminate ? "In Progress" : `${entry.pct || 0}%`);
+            }
+
+            const curAtIdx = rowsContainer.children[idx];
+            if (curAtIdx !== row) {
+                rowsContainer.insertBefore(row, curAtIdx || null);
+            }
+        });
+    }
+
+    function renderActiveTransfers() {
+        const allEntries = [...activeTransfers.values(), ...queuedTransfers];
+        const visible = allEntries.length > 0;
+        const primary = allEntries[0] || null;
+
+        const topbarChip = document.getElementById("topbar-active-transfer-chip");
+        if (topbarChip) {
+            topbarChip.classList.toggle("d-none", !visible);
+            if (visible) {
+                const activeCount = activeTransfers.size;
+                const queuedCount = queuedTransfers.length;
+                topbarChip.textContent = queuedCount > 0
+                    ? `${activeCount} Active • ${queuedCount} Queued`
+                    : `${activeCount} Active Transfer${activeCount === 1 ? "" : "s"}`;
+            }
+        }
+
+        const surfaces = [
             {
                 card: document.getElementById("active-transfer-container"),
+                rows: document.getElementById("active-transfer-rows"),
                 name: document.getElementById("active-transfer-name"),
                 badge: document.getElementById("active-transfer-route-badge"),
                 speed: document.getElementById("active-transfer-speed"),
@@ -3135,6 +3461,7 @@
             },
             {
                 card: document.getElementById("files-active-transfer-card"),
+                rows: document.getElementById("files-active-transfer-rows"),
                 name: document.getElementById("files-transfer-name"),
                 badge: document.getElementById("files-transfer-route-badge"),
                 speed: document.getElementById("files-transfer-speed"),
@@ -3143,63 +3470,243 @@
                 pctEl: document.getElementById("files-transfer-percent"),
             },
         ];
-        const topbarChip = document.getElementById("topbar-active-transfer-chip");
-        topbarChip?.classList.toggle("d-none", !visible);
 
-        containers.forEach(c => {
-            if (!c.card) return;
-            c.card.classList.toggle("d-none", !visible);
-            if (!visible) {
-                if (c.bar) {
-                    c.bar.classList.remove("indeterminate");
-                    c.bar.style.width = "0%";
+        surfaces.forEach(s => {
+            if (!s.card) return;
+            s.card.classList.toggle("d-none", !visible);
+            renderTransferRowList(s.rows, allEntries);
+            if (!visible || !primary) {
+                if (s.bar) {
+                    s.bar.classList.remove("indeterminate");
+                    s.bar.style.width = "0%";
                 }
                 return;
             }
-            if (c.name && title) c.name.textContent = title;
-            if (c.badge && routeBadge) {
-                c.badge.textContent = routeBadge.text;
-                c.badge.className = routeBadge.cls;
+            if (s.name) s.name.textContent = `${primary.direction === "download" ? "Downloading" : "Sending"} ${primary.filename}`;
+            if (s.badge && primary.routeBadge) {
+                s.badge.textContent = primary.routeBadge.text;
+                s.badge.className = primary.routeBadge.cls;
             }
-            if (c.bar) {
-                c.bar.classList.toggle("indeterminate", Boolean(indeterminate));
-                if (!indeterminate) c.bar.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+            if (s.bar) {
+                s.bar.classList.toggle("indeterminate", Boolean(primary.indeterminate));
+                if (!primary.indeterminate) s.bar.style.width = `${Math.max(0, Math.min(100, primary.pct || 0))}%`;
             }
-            if (c.pctEl) c.pctEl.textContent = indeterminate ? "In Progress" : `${pct}%`;
-            if (c.bytes) {
-                c.bytes.textContent = total > 0
-                    ? `${formatBytes(loaded)} / ${formatBytes(total)}`
-                    : (loaded > 0 ? formatBytes(loaded) : "Streaming over HTTPS...");
+            if (s.pctEl) s.pctEl.textContent = primary.indeterminate ? "In Progress" : `${primary.pct || 0}%`;
+            if (s.bytes) {
+                s.bytes.textContent = primary.total > 0
+                    ? `${formatBytes(primary.loaded || 0)} / ${formatBytes(primary.total)}`
+                    : "Streaming over HTTPS...";
             }
-            if (c.speed) {
-                c.speed.textContent = speedBps > 0 ? `${formatBytes(speedBps)}/s` : (indeterminate ? "HTTPS :8766" : "0 KB/s");
+            if (s.speed) {
+                s.speed.textContent = primary.speedBps > 0 ? `${formatBytes(primary.speedBps)}/s` : "0 KB/s";
             }
         });
     }
 
+    function finishTransferEntry(tid, opts = {}) {
+        if (!activeTransfers.has(tid)) return;
+        activeTransfers.delete(tid);
+        pumpTransferQueue();
+        if (opts.reloadFiles && activeTransfers.size === 0 && queuedTransfers.length === 0 && currentTab === "files") {
+            loadFiles(currentSubpath);
+        }
+    }
+
+    async function cancelTransferById(tid) {
+        const qIdx = queuedTransfers.findIndex(q => q.id === tid);
+        if (qIdx !== -1) {
+            const [removed] = queuedTransfers.splice(qIdx, 1);
+            if (removed) removed.cancelled = true;
+            renderActiveTransfers();
+            showNotificationToast(`Cancelled ${removed?.filename || "queued transfer"}.`, "warning");
+            return true;
+        }
+
+        const entry = activeTransfers.get(tid);
+        if (!entry) return false;
+        entry.cancelled = true;
+        entry.status = "cancelled";
+        const serverTid = entry.serverTransferId || "";
+        const devId = entry.deviceId || "";
+        const kind = entry.kind;
+        activeTransfers.delete(tid);
+
+        try {
+            if (entry.xhr) entry.xhr.abort();
+        } catch (e) {}
+        try {
+            if (entry.abortController) entry.abortController.abort();
+        } catch (e) {}
+
+        const cancelTid = serverTid || (kind === "download" ? tid : "");
+        if (cancelTid) {
+            apiRequest("/api/files/transfer/cancel", "POST", { transfer_id: cancelTid, device_id: devId }).catch(() => {});
+        }
+        pumpTransferQueue();
+        showNotificationToast(`Cancelled ${entry.filename}.`, "warning");
+        return true;
+    }
+
     async function cancelActiveTransfer() {
-        let didCancel = false;
-        if (activeUploadXhr) {
-            activeUploadXhr.abort();
-            activeUploadXhr = null;
-            didCancel = true;
+        const ids = [
+            ...Array.from(activeTransfers.keys()),
+            ...queuedTransfers.map(q => q.id),
+        ];
+        if (ids.length === 0) return;
+        for (const id of ids) {
+            await cancelTransferById(id);
         }
-        if (activeUploadTransferId) {
-            const tid = activeUploadTransferId;
-            activeUploadTransferId = null;
-            didCancel = true;
-            apiRequest("/api/files/transfer/cancel", "POST", { transfer_id: tid }).catch(() => {});
+    }
+
+    function runUploadTransfer(entry) {
+        const formData = new FormData();
+        formData.append("device_id", entry.deviceId);
+        formData.append("async_transfer", "true");
+        formData.append("file", entry.file);
+
+        const startTime = performance.now();
+        const xhr = new XMLHttpRequest();
+        entry.xhr = xhr;
+        xhr.open("POST", "/api/files/upload?async=1", true);
+        if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+
+        xhr.upload.onprogress = (e) => {
+            if (entry.cancelled || !activeTransfers.has(entry.id)) return;
+            if (e.lengthComputable) {
+                const pct = Math.round((e.loaded / e.total) * 100);
+                const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
+                entry.loaded = e.loaded;
+                entry.total = e.total;
+                entry.pct = pct;
+                entry.speedBps = e.loaded / elapsedSec;
+                entry.indeterminate = false;
+                renderActiveTransfers();
+            }
+        };
+
+        xhr.onload = async () => {
+            entry.xhr = null;
+            if (entry.cancelled) {
+                finishTransferEntry(entry.id);
+                return;
+            }
+            let reload = false;
+            try {
+                const data = JSON.parse(xhr.responseText || "{}");
+                const serverTid = data.transfer_id || data.data?.transfer_id;
+                if ((xhr.status === 202 || data.status === "ACCEPTED") && serverTid) {
+                    entry.serverTransferId = serverTid;
+                    entry.status = "delivering";
+                    while (!entry.cancelled && activeTransfers.has(entry.id)) {
+                        await new Promise(r => setTimeout(r, 750));
+                        if (entry.cancelled || !activeTransfers.has(entry.id)) break;
+                        const st = await apiRequest(`/api/files/transfer/${encodeURIComponent(serverTid)}/status`);
+                        if (entry.cancelled || !activeTransfers.has(entry.id)) break;
+                        const stData = st?.data || {};
+                        const state = String(stData.state || stData.transfer_status || "").toUpperCase();
+                        if (state === "COMPLETED") {
+                            showNotificationToast(`Sent ${entry.filename}!`, "success");
+                            reload = true;
+                            break;
+                        } else if (state === "CANCELLED" || state === "FAILED" || !st?.success) {
+                            showNotificationToast(stData.error_message || st?.error || `Failed sending ${entry.filename}`, "error");
+                            break;
+                        } else {
+                            const curOff = Number(stData.current_offset || 0);
+                            const tot = Number(stData.file_size || entry.total || 0);
+                            entry.loaded = curOff;
+                            entry.total = tot;
+                            entry.pct = tot > 0 ? Math.min(99, Math.round((curOff / tot) * 100)) : 50;
+                            entry.indeterminate = tot === 0;
+                            renderActiveTransfers();
+                        }
+                    }
+                } else if (xhr.status >= 200 && xhr.status < 300 && data.success) {
+                    const savedPath = data.data?.saved_path || data.saved_path;
+                    showNotificationToast(
+                        savedPath ? `Sent ${entry.filename} -> ${savedPath}` : `Sent ${entry.filename}!`,
+                        "success"
+                    );
+                    reload = true;
+                } else {
+                    showNotificationToast(data.error || `Failed sending ${entry.filename}`, "error");
+                }
+            } catch (e) {
+                if (!entry.cancelled) {
+                    showNotificationToast(`Failed sending ${entry.filename}`, "error");
+                }
+            } finally {
+                finishTransferEntry(entry.id, { reloadFiles: reload });
+            }
+        };
+
+        xhr.onerror = () => {
+            entry.xhr = null;
+            if (!entry.cancelled) {
+                showNotificationToast(`Network error uploading ${entry.filename}`, "error");
+            }
+            finishTransferEntry(entry.id);
+        };
+
+        xhr.onabort = () => {
+            entry.xhr = null;
+            finishTransferEntry(entry.id);
+        };
+
+        xhr.send(formData);
+    }
+
+    async function runDownloadTransfer(entry) {
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        entry.abortController = controller;
+        entry.indeterminate = true;
+        renderActiveTransfers();
+        showNotificationToast(`Downloading ${entry.filename} to PC transfers...`, "info");
+        try {
+            const headers = { "Content-Type": "application/json" };
+            if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+            const resp = await fetch("/api/files/download", {
+                method: "POST",
+                headers,
+                signal: controller ? controller.signal : undefined,
+                body: JSON.stringify({
+                    file_name: entry.filename,
+                    subpath: entry.subpath,
+                    device_id: entry.deviceId,
+                    client_transfer_id: entry.id,
+                }),
+            });
+            const dlRes = await resp.json().catch(() => ({}));
+            if (entry.cancelled) return;
+            if (resp.ok && dlRes && dlRes.success) {
+                const savedDir = dlRes.destination_dir || pcTransfersDestDir || "PC Transfers";
+                showNotificationToast(`Downloaded ${entry.filename} to ${savedDir}`, "success");
+            } else {
+                showNotificationToast(dlRes?.error || `Download failed for ${entry.filename}`, "error");
+            }
+        } catch (err) {
+            if (!entry.cancelled && (!err || err.name !== "AbortError")) {
+                showNotificationToast(err?.message || `Download failed for ${entry.filename}`, "error");
+            }
+        } finally {
+            entry.abortController = null;
+            finishTransferEntry(entry.id);
         }
-        if (activeDownloadController) {
-            activeDownloadController.abort();
-            activeDownloadController = null;
-            didCancel = true;
-            apiRequest("/api/files/transfer/cancel", "POST", {}).catch(() => {});
+    }
+
+    function pumpTransferQueue() {
+        while (activeTransfers.size < MAX_CONCURRENT_TRANSFERS && queuedTransfers.length > 0) {
+            const next = queuedTransfers.shift();
+            if (!next || next.cancelled) continue;
+            next.status = "running";
+            activeTransfers.set(next.id, next);
+            if (next.kind === "upload") {
+                runUploadTransfer(next);
+            } else {
+                runDownloadTransfer(next);
+            }
         }
-        updateTransferProgressUi({ visible: false });
-        if (didCancel) {
-            showNotificationToast("File transfer cancelled.", "warning");
-        }
+        renderActiveTransfers();
     }
 
     async function refreshFileDestinations() {
@@ -3222,6 +3729,7 @@
     }
 
     async function loadFiles(subpath = "") {
+        const seq = ++filesLoadSeq;
         currentSubpath = subpath;
         refreshFileDestinations();
         const breadcrumbEl = document.getElementById("file-breadcrumbs");
@@ -3278,8 +3786,13 @@
         emptyState?.classList.add("d-none");
 
         const res = await apiRequest(
-            `/api/files?subpath=${encodeURIComponent(subpath)}&hide_hidden=${hideHidden}&device_id=${encodeURIComponent(targetId)}&device_type=${encodeURIComponent(devTypeHint)}`
+            `/api/files?subpath=${encodeURIComponent(subpath)}&hide_hidden=${hideHidden}&device_id=${encodeURIComponent(targetId)}&device_type=${encodeURIComponent(devTypeHint)}`,
+            "GET",
+            null,
+            { timeoutMs: 15000 }
         );
+        if (seq !== filesLoadSeq) return;
+
         const items = res?.items || res?.files || res?.data?.items || [];
         currentStorageMode = res?.storage_mode || (isAndroid ? "saf_tree" : "desktop_remote");
         currentRemoteParent = res?.parent || "";
@@ -3344,57 +3857,28 @@
                 row.querySelector(".btn-open-dir").onclick = enterDir;
                 row.querySelector(".file-row-open").onclick = enterDir;
             } else {
-                row.querySelector(".btn-dl-file").onclick = async () => {
+                row.querySelector(".btn-dl-file").onclick = () => {
                     const routeBadge = getTransferRouteBadgeInfo(devObj);
-                    if (activeDownloadController) activeDownloadController.abort();
-                    activeDownloadController = new AbortController();
-                    updateTransferProgressUi({
-                        visible: true,
-                        title: `Downloading ${f.name}`,
+                    queuedTransfers.push({
+                        id: nextClientTransferId("dl"),
+                        kind: "download",
+                        direction: "download",
+                        serverTransferId: null,
+                        filename: f.name,
+                        subpath,
+                        deviceId: targetId,
+                        loaded: 0,
                         total: Number(rawSize || 0),
+                        pct: 0,
+                        speedBps: 0,
                         indeterminate: true,
                         routeBadge,
+                        status: "queued",
+                        xhr: null,
+                        abortController: null,
+                        cancelled: false,
                     });
-                    showNotificationToast(`Downloading ${f.name} to PC transfers...`, "info");
-                    try {
-                        const headers = { "Content-Type": "application/json" };
-                        if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
-                        const resp = await fetch("/api/files/download", {
-                            method: "POST",
-                            headers,
-                            signal: activeDownloadController.signal,
-                            body: JSON.stringify({
-                                file_name: f.name,
-                                subpath: currentSubpath,
-                                device_id: targetId,
-                            }),
-                        });
-                        const dlRes = await resp.json().catch(() => ({}));
-                        if (resp.ok && dlRes && dlRes.success) {
-                            const savedDir = dlRes.destination_dir || pcTransfersDestDir || "PC Transfers";
-                            updateTransferProgressUi({
-                                visible: true,
-                                title: `Downloaded ${f.name}`,
-                                loaded: Number(rawSize || 0),
-                                total: Number(rawSize || 0),
-                                pct: 100,
-                                indeterminate: false,
-                                routeBadge,
-                            });
-                            setTimeout(() => updateTransferProgressUi({ visible: false }), 1800);
-                            showNotificationToast(`Downloaded ${f.name} to ${savedDir}`, "success");
-                        } else {
-                            updateTransferProgressUi({ visible: false });
-                            showNotificationToast(dlRes?.error || "Download failed", "error");
-                        }
-                    } catch (err) {
-                        updateTransferProgressUi({ visible: false });
-                        if (err && err.name !== "AbortError") {
-                            showNotificationToast(err.message || "Download failed", "error");
-                        }
-                    } finally {
-                        activeDownloadController = null;
-                    }
+                    pumpTransferQueue();
                 };
             }
             tbody.appendChild(row);
@@ -3406,128 +3890,34 @@
         if (!files || files.length === 0) return;
         const targetId = resolveTargetDeviceId();
         if (!targetId) {
-            showNotificationToast("Connect or select an Android phone to send files.", "warning");
+            showNotificationToast("Connect or select a remote device to send files.", "warning");
             return;
         }
         const devObj = registeredDevices.find(d => d.device_id === targetId) || getSelectedDeviceObj();
         const routeBadge = getTransferRouteBadgeInfo(devObj);
 
-        let idx = 0;
-        function sendNext() {
-            if (idx >= files.length) {
-                activeUploadXhr = null;
-                updateTransferProgressUi({ visible: false });
-                loadFiles(currentSubpath);
-                return;
-            }
-
-            const file = files[idx];
-            const formData = new FormData();
-            formData.append("device_id", targetId);
-            formData.append("async_transfer", "true");
-            formData.append("file", file);
-
-            updateTransferProgressUi({
-                visible: true,
-                title: `Sending ${file.name}`,
+        Array.from(files).forEach(file => {
+            queuedTransfers.push({
+                id: nextClientTransferId("up"),
+                kind: "upload",
+                direction: "upload",
+                serverTransferId: null,
+                file,
+                filename: file.name,
+                deviceId: targetId,
                 loaded: 0,
                 total: file.size || 0,
                 pct: 0,
                 speedBps: 0,
                 indeterminate: false,
                 routeBadge,
+                status: "queued",
+                xhr: null,
+                abortController: null,
+                cancelled: false,
             });
-
-            const startTime = performance.now();
-            const xhr = new XMLHttpRequest();
-            activeUploadXhr = xhr;
-            activeUploadTransferId = null;
-            xhr.open("POST", "/api/files/upload?async=1", true);
-            if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
-
-            xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable) {
-                    const pct = Math.round((e.loaded / e.total) * 100);
-                    const elapsedSec = Math.max(0.1, (performance.now() - startTime) / 1000);
-                    const bps = e.loaded / elapsedSec;
-                    updateTransferProgressUi({
-                        visible: true,
-                        title: `Sending ${file.name}`,
-                        loaded: e.loaded,
-                        total: e.total,
-                        pct,
-                        speedBps: bps,
-                        indeterminate: false,
-                        routeBadge,
-                    });
-                }
-            };
-
-            xhr.onload = async () => {
-                activeUploadXhr = null;
-                try {
-                    const data = JSON.parse(xhr.responseText || "{}");
-                    const tid = data.transfer_id || data.data?.transfer_id;
-                    if ((xhr.status === 202 || data.status === "ACCEPTED") && tid) {
-                        activeUploadTransferId = tid;
-                        while (activeUploadTransferId === tid) {
-                            await new Promise(r => setTimeout(r, 750));
-                            if (activeUploadTransferId !== tid) break;
-                            const st = await apiRequest(`/api/files/transfer/${encodeURIComponent(tid)}/status`);
-                            const stData = st?.data || {};
-                            const state = String(stData.state || stData.transfer_status || "").toUpperCase();
-                            if (state === "COMPLETED") {
-                                showNotificationToast(`Sent ${file.name}!`, "success");
-                                break;
-                            } else if (state === "CANCELLED" || state === "FAILED" || !st?.success) {
-                                showNotificationToast(stData.error_message || st?.error || `Failed sending ${file.name}`, "error");
-                                break;
-                            } else {
-                                const curOff = Number(stData.current_offset || 0);
-                                const tot = Number(stData.file_size || file.size || 0);
-                                const pct = tot > 0 ? Math.min(99, Math.round((curOff / tot) * 100)) : 50;
-                                updateTransferProgressUi({
-                                    visible: true,
-                                    title: `Delivering ${file.name} to phone...`,
-                                    loaded: curOff,
-                                    total: tot,
-                                    pct,
-                                    indeterminate: tot === 0,
-                                    routeBadge,
-                                });
-                            }
-                        }
-                        if (activeUploadTransferId === tid) activeUploadTransferId = null;
-                    } else if (xhr.status >= 200 && xhr.status < 300 && data.success) {
-                        const savedPath = data.data?.saved_path || data.saved_path;
-                        showNotificationToast(
-                            savedPath ? `Sent ${file.name} -> ${savedPath}` : `Sent ${file.name}!`,
-                            "success"
-                        );
-                    } else {
-                        showNotificationToast(data.error || `Failed sending ${file.name}`, "error");
-                    }
-                } catch (e) {
-                    showNotificationToast(`Failed sending ${file.name}`, "error");
-                }
-                idx++;
-                sendNext();
-            };
-
-            xhr.onerror = () => {
-                showNotificationToast(`Network error uploading ${file.name}`, "error");
-                idx++;
-                sendNext();
-            };
-
-            xhr.onabort = () => {
-                activeUploadXhr = null;
-                updateTransferProgressUi({ visible: false });
-            };
-
-            xhr.send(formData);
-        }
-        sendNext();
+        });
+        pumpTransferQueue();
     }
 
     function filterAppTiles() {
@@ -4275,26 +4665,29 @@
         const providerSel = document.getElementById("mcp-tunnel-provider");
         const permUrlInput = document.getElementById("mcp-tunnel-permanent-input");
         const tokenStatusBadge = document.getElementById("mcp-tunnel-token-status");
-        const netBadge = document.getElementById("diag-network-key-id");
 
         const cfg = cfgRes?.config || {};
         const selectedProvider = cfg.provider || "render";
         if (providerSel) providerSel.value = selectedProvider;
-        if (netBadge && hubRes?.network_id) netBadge.textContent = hubRes.network_id;
         if (devIdRes?.snow_id) canonicalSnowId = devIdRes.snow_id;
+        if (hubRes?.network_id && !activeMeshNetworkId) {
+            activeMeshNetworkId = hubRes.network_id;
+        }
         const diagSnowEl = document.getElementById("diag-my-snow-id");
         const diagNetEl = document.getElementById("diag-my-network-id");
         if (diagSnowEl) diagSnowEl.textContent = canonicalSnowId || "--";
         if (diagNetEl) diagNetEl.textContent = activeMeshNetworkId || "Standalone";
 
-        const configuredRenderRoute = statusRes?.configured_render_url || devIdRes?.permanent_mcp_url || "";
-        const isPrefEnabled = statusRes?.enabled !== false;
-        const isActive = Boolean(statusRes && statusRes.active && (statusRes.mcp_endpoint || statusRes.public_url));
-        const activeEndpointPreview = (isActive && (statusRes.mcp_endpoint || statusRes.public_url))
-            ? (statusRes.mcp_endpoint || `${statusRes.public_url.replace(/\/$/, "")}/mcp`)
+        const statusOk = Boolean(statusRes && statusRes.success);
+        const configuredRenderRoute = (statusOk ? statusRes.configured_render_url : "") || devIdRes?.permanent_mcp_url || "";
+        const isPrefEnabled = Boolean(statusOk && statusRes.enabled === true);
+        const isActive = Boolean(statusOk && statusRes.active === true);
+        const rawPublic = statusOk ? (statusRes.mcp_endpoint || statusRes.public_url) : "";
+        const activeEndpointPreview = (isActive && rawPublic)
+            ? (statusRes.mcp_endpoint || `${String(statusRes.public_url).replace(/\/$/, "")}/mcp`)
             : configuredRenderRoute;
 
-        if (chkTunnel && document.activeElement !== chkTunnel) {
+        if (chkTunnel) {
             chkTunnel.checked = isPrefEnabled;
         }
         if (permUrlInput && document.activeElement !== permUrlInput) {
@@ -4640,57 +5033,7 @@
             showNotificationToast(`Copied ${val}`, "success");
         });
 
-        document.getElementById("btn-modal-connect-submit")?.addEventListener("click", async () => {
-            const val = document.getElementById("modal-connect-input")?.value.trim();
-            const pin = document.getElementById("modal-connect-pin-input")?.value.trim() || "";
-            if (!val) return;
-            connectModal?.classList.add("d-none");
-            await handleUnifiedConnectInput(val, pin);
-        });
-
-        document.getElementById("btn-modal-validate-qr")?.addEventListener("click", async () => {
-            const rawQr = document.getElementById("modal-qr-json-input")?.value.trim() || "";
-            await validateQrJsonInput(rawQr, "modal-qr-json-preview");
-        });
-        document.getElementById("btn-modal-accept-qr")?.addEventListener("click", async (e) => {
-            const rawQr = document.getElementById("modal-qr-json-input")?.value.trim() || "";
-            await withButtonLoading(e.currentTarget, "Connecting...", async () => {
-                const ok = await acceptQrJsonInput(rawQr, "modal-qr-json-preview");
-                if (ok) {
-                    const inp = document.getElementById("modal-qr-json-input");
-                    if (inp) inp.value = "";
-                    connectModal?.classList.add("d-none");
-                }
-            });
-        });
-
-        document.getElementById("btn-connect-peer-submit")?.addEventListener("click", async () => {
-            const host = document.getElementById("connect-peer-host")?.value.trim();
-            const port = parseInt(document.getElementById("connect-peer-port")?.value || "8765", 10);
-            const pin = document.getElementById("connect-peer-pin")?.value.trim() || "";
-            const fp = document.getElementById("connect-peer-fp")?.value.trim() || "";
-            if (!host) {
-                showNotificationToast("Enter peer host IP address.", "warning");
-                return;
-            }
-            showNotificationToast(`Connecting to ${host}:${port}...`, "info");
-            const res = await apiRequest("/api/devices/connect-peer", "POST", {
-                host,
-                port,
-                pin,
-                expected_fingerprint: fp,
-            });
-            if (res && res.success) {
-                showNotificationToast("Connected to peer host!", "success");
-                connectModal?.classList.add("d-none");
-                if (res.data?.network_conflict && res.data?.merge_tx_id) {
-                    openMergeDecisionModal(res.data);
-                }
-                refreshAllData();
-            } else {
-                showNotificationToast(res?.error || "Peer host connection failed", "error");
-            }
-        });
+        wireTwoStepPairingContext("modal");
 
         document.getElementById("btn-close-merge-modal")?.addEventListener("click", () => {
             document.getElementById("network-merge-decision-modal")?.classList.add("d-none");
@@ -4904,6 +5247,7 @@
     function openConnectModal() {
         const modal = document.getElementById("connect-modal");
         if (modal) {
+            resetTwoStepPairing("modal", false);
             modal.classList.remove("d-none");
             refreshPairingState();
         }
@@ -4966,7 +5310,7 @@
             netChipEl.className = `chip chip-sm mono ${activeMeshNetworkId ? "chip-cyan" : "chip-neutral"}`;
         }
         if (modalNetEl) {
-            modalNetEl.textContent = activeMeshNetworkId || (canonicalSnowId && canonicalSnowId !== "--" ? canonicalSnowId : "Standalone");
+            modalNetEl.textContent = activeMeshNetworkId || "Standalone";
         }
         if (diagNetEl) {
             diagNetEl.textContent = netDisplay;
@@ -5052,11 +5396,9 @@
             }
             renderNetworkIdentityAndMerges();
 
-            let pollSucceeded = false;
+            const statusOk = Boolean(statusRes && statusRes.success && (statusRes.daemon_online ?? true));
             if (statusRes && statusRes.success) {
                 lastStatusSnapshot = statusRes;
-                isCoreOnline = Boolean(statusRes.daemon_online ?? true);
-                pollSucceeded = isCoreOnline;
                 if (statusRes.snow_id) canonicalSnowId = statusRes.snow_id;
                 if (statusRes.device_id) localHostDeviceId = statusRes.device_id;
                 if (statusRes.device_name) localHostIdentity = statusRes.device_name;
@@ -5069,15 +5411,18 @@
                 if (diagSnowEl && canonicalSnowId && canonicalSnowId !== "--") {
                     diagSnowEl.textContent = canonicalSnowId;
                 }
-            } else {
-                isCoreOnline = false;
-                pollSucceeded = false;
             }
 
-            if (pollSucceeded) {
+            if (statusOk) {
+                consecutiveCoreOfflinePolls = 0;
                 consecutivePollFailures = 0;
+                isCoreOnline = true;
             } else {
+                consecutiveCoreOfflinePolls++;
                 consecutivePollFailures++;
+                if (consecutiveCoreOfflinePolls >= 3) {
+                    isCoreOnline = false;
+                }
             }
             pollRecorded = true;
 
@@ -5143,6 +5488,11 @@
         } catch (err) {
             if (!pollRecorded && !isPageTearingDown && myPollSeq === pollStateSeq) {
                 consecutivePollFailures++;
+                consecutiveCoreOfflinePolls++;
+                if (consecutiveCoreOfflinePolls >= 3) {
+                    isCoreOnline = false;
+                    updateCoreStatusBadge();
+                }
             }
         } finally {
             isPollStateInFlight = false;

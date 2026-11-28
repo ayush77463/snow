@@ -1625,6 +1625,18 @@ class SessionRouter:
         logger.info("Promoted route for [%s] to %s (%s:%d)", clean_id, badge, clean_host, int(port))
         return dict(status_rec)
 
+    def _has_active_verified_relay_session(self, device_id: str) -> bool:
+        """Return True only when an already-connected, TLS-verified relay tunnel exists for device_id."""
+        if not (self.relay_enabled and self.relay_client is not None):
+            return False
+        if not bool(getattr(self.relay_client, "_is_connected", False)):
+            return False
+        tunnels = getattr(self.relay_client, "_tunnels", None)
+        if not isinstance(tunnels, dict):
+            return False
+        tun = tunnels.get(device_id)
+        return bool(tun is not None and getattr(tun, "handshake_done", False))
+
     async def route_request(
         self,
         action: str,
@@ -1635,6 +1647,7 @@ class SessionRouter:
         timeout: float = 30.0,
         hop_limit: int = 3,
         visited_peers: Optional[list[str]] = None,
+        passive: bool = False,
     ) -> dict[str, Any]:
         """Resolve target, establish transport session if needed, and dispatch capability action.
 
@@ -1732,8 +1745,10 @@ class SessionRouter:
                 "last_known_endpoint": last_endpoint,
             }
 
-        # Clean payload: strip caller-supplied authority overrides
+        # Clean payload: strip caller-supplied authority overrides and internal routing hints
         clean_data = dict(data) if isinstance(data, dict) else {}
+        data_passive = bool(clean_data.pop("passive", False))
+        is_passive = bool(passive or data_passive)
         clean_data.pop("principal", None)
         clean_data.pop("trust_tier", None)
         clean_data.pop("execution_principal", None)
@@ -1763,9 +1778,31 @@ class SessionRouter:
         if not conn_mode:
             conn_mode = "auto"
         eff_mode = self._resolve_effective_transport_mode(device_id, paired_rec)
+        has_verified_relay = self._has_active_verified_relay_session(device_id) if is_passive else False
 
         # Policy Rule: remote_only or manual remote_relay forces relay tunnel directly, bypassing local LAN/USB tiers
         if eff_mode in ("remote_only", "remote_relay"):
+            if is_passive and not has_verified_relay:
+                status_val = (
+                    "RELAY_UNAVAILABLE"
+                    if not (self.relay_enabled and self.relay_client and getattr(self.relay_client, "_is_connected", False))
+                    else "DEVICE_UNREACHABLE"
+                )
+                return self._with_transport_badge(
+                    {
+                        "success": False,
+                        "status": status_val,
+                        "error": f"Passive poll skipped: no active verified relay session for device '{device_id}'.",
+                        "target_device_id": device_id,
+                        "attempted_transports": attempted_transports,
+                        "last_reachability_state": last_state,
+                        "last_known_endpoint": last_endpoint,
+                        "connection_mode": eff_mode,
+                        "passive_skipped": True,
+                    },
+                    transport="remote_relay",
+                    connection_mode="remote_only",
+                )
             attempted_transports.append("remote_relay_tunnel")
             logger.info("Router Policy: '%s' configured for [%s]. Skipping local tiers.", eff_mode, device_id)
             if self.relay_enabled and self.relay_client is not None:
@@ -1829,7 +1866,8 @@ class SessionRouter:
         candidate_dispatches.sort(key=lambda item: item[0])
         # Automatic Relay -> Local promotion check: if only Remote active routes exist, probe live local discovery candidate first
         if (
-            candidate_dispatches
+            not is_passive
+            and candidate_dispatches
             and all(prio == 3 for prio, _, _, _ in candidate_dispatches)
             and eff_mode not in ("remote_only", "remote_relay")
         ):
@@ -1896,7 +1934,10 @@ class SessionRouter:
         # Tier 2: Outbound Direct Connection (for PERSISTENT_DAEMON or FOREGROUND_HOST peers)
         # =====================================================================
         # For targets that listen on inbound ports (Windows desktop core / server nodes / Android host)
-        if node.reachability_profile in (ReachabilityProfile.PERSISTENT_DAEMON, ReachabilityProfile.FOREGROUND_HOST):
+        if not is_passive and node.reachability_profile in (
+            ReachabilityProfile.PERSISTENT_DAEMON,
+            ReachabilityProfile.FOREGROUND_HOST,
+        ):
             dial_host = "127.0.0.1" if eff_mode == "usb" else node.host
             dial_port = node.wss_port or 8765
             dial_tt = normalize_transport_type(transport=getattr(node, "transport", None), host=dial_host)
@@ -1934,7 +1975,7 @@ class SessionRouter:
         # Tier 3: Android Active-Session Peer Recovery
         # =====================================================================
         # For Android peers whose connection was terminated or dormant
-        if node.reachability_profile == ReachabilityProfile.ACTIVE_SESSION_PEER:
+        if not is_passive and node.reachability_profile == ReachabilityProfile.ACTIVE_SESSION_PEER:
             attempted_transports.append("android_wake_and_await")
             logger.info(
                 "Router Tier 3: Attempting wake-and-await for Android peer [%s] (grace_period=%.1fs)...",
@@ -2025,7 +2066,7 @@ class SessionRouter:
         next_visited = list(traversed)
         if local_node_id and local_node_id not in next_visited:
             next_visited.append(local_node_id)
-        if remaining_hops > 1:
+        if not is_passive and remaining_hops > 1:
             relay_res = await self._attempt_peer_relay(
                 node=node,
                 action=action,
@@ -2044,7 +2085,7 @@ class SessionRouter:
         # =====================================================================
         # Tier 3.75: Dedicated Remote E2E Relay Tunnel
         # =====================================================================
-        if self.relay_enabled and self.relay_client is not None:
+        if self.relay_enabled and self.relay_client is not None and (not is_passive or has_verified_relay):
             attempted_transports.append("remote_relay_tunnel")
             logger.info("Router Tier 3.75: Attempting remote E2E relay tunnel for [%s]...", device_id)
             relay_tunnel_res = await self._attempt_remote_relay_tunnel(
@@ -2069,7 +2110,7 @@ class SessionRouter:
             target_name,
             attempted_transports,
         )
-        return {
+        failure_res: dict[str, Any] = {
             "success": False,
             "status": "DEVICE_UNREACHABLE",
             "error": f"Device '{device_id}' ({target_name}) is unreachable across all attempted transports.",
@@ -2078,6 +2119,9 @@ class SessionRouter:
             "target_device_id": device_id,
             "last_known_endpoint": last_endpoint,
         }
+        if is_passive:
+            failure_res["passive_skipped"] = True
+        return failure_res
 
     def _record_transfer_route(self, device_id: str, transfer_id: str, res: dict[str, Any]) -> None:
         while len(self._completed_transfer_routes) >= 512:

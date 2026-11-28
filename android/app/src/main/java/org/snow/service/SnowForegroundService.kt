@@ -31,7 +31,10 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.snow.R
 import org.snow.capabilities.AndroidCapabilityDispatcher
 import org.snow.network.AuthState
@@ -56,6 +59,15 @@ class SnowForegroundService : Service() {
     private var stateObserverJob: Job? = null
     private var discoveryObserverJob: Job? = null
     private var authObserverJob: Job? = null
+    private var relayConnectJob: Job? = null
+    private var adoptedNetObserverJob: Job? = null
+    private val hubHttpClient: okhttp3.OkHttpClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
 
     val client: SnowWebSocketClient by lazy {
         val identity = DeviceIdentity.getOrCreate(applicationContext)
@@ -123,6 +135,16 @@ class SnowForegroundService : Service() {
             }
             fallbackTargetProvider = { failedHost, failedRoute ->
                 buildTransferFallbackTargets(failedHost, failedRoute, client.activeTargetDeviceId())
+            }
+            targetHostTokenLookup = { host ->
+                org.snow.ui.SnowUiRepository.getInstance(applicationContext).resolveTransferTokenForHost(host)
+            }
+            targetHostDeviceLookup = { host ->
+                org.snow.ui.SnowUiRepository.getInstance(applicationContext).resolveDeviceIdForHost(host)
+            }
+            onTransferSessionStarted = { tid, fname, dir, host ->
+                org.snow.ui.SnowUiRepository.getInstance(applicationContext)
+                    .onTransferSessionStartedFromClient(tid, fname, dir, host)
             }
         }
     }
@@ -226,7 +248,9 @@ class SnowForegroundService : Service() {
 
     private fun createConfiguredRelayClient(
         endpoint: String,
-        targetDeviceId: String? = null
+        targetDeviceId: String? = null,
+        overrideHubToken: String? = null,
+        overrideNetworkId: String? = null
     ): Pair<org.snow.network.RelayClient?, String?> {
         val effectiveEndpoint = resolveEffectiveRelayEndpoint(endpoint)
         if (effectiveEndpoint.isBlank() ||
@@ -241,32 +265,43 @@ class SnowForegroundService : Service() {
             applicationContext,
             prefName = "snow_relay_security"
         )
+        val cachedExpMs = relaySecurityPrefs.getLong(PREF_RELAY_HUB_TOKEN_EXPIRES_AT, 0L)
+        val rawCachedHub = relaySecurityPrefs.getString(PREF_RELAY_HUB_TOKEN, null)
+        val validCachedHub = if (cachedExpMs > 0L && clockMsProvider() + 30_000L >= cachedExpMs) null else rawCachedHub
+        val effectiveHubToken = overrideHubToken?.trim()?.takeIf { it.isNotBlank() } ?: validCachedHub
         val authMaterial = resolveEffectiveRelayAuth(
             ticket = relayTokenStorage.getToken(),
             bootstrapToken = relaySecurityPrefs.getString(PREF_RELAY_BOOTSTRAP_TOKEN, null),
-            hubToken = relaySecurityPrefs.getString(PREF_RELAY_HUB_TOKEN, null)
+            hubToken = effectiveHubToken
         )
         if (authMaterial == null) {
-            SafeLog.i("SnowForegroundService", "Remote relay standby: awaiting Render Hub rendezvous or Desktop relay credentials.")
+            SafeLog.i("SnowForegroundService", "Remote relay standby: awaiting Render Hub hub_token or pairing credentials.")
             return null to "No usable relay credentials available (awaiting Render Hub session or pairing credentials)."
         }
+        val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
         val prefs = getSharedPreferences(org.snow.ui.SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
-        val savedNetId = relaySecurityPrefs.getString(PREF_RELAY_NETWORK_ID, null)
-            ?: prefs.getString("last_known_network_id", null)
+        val savedNetId = overrideNetworkId?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            ?: repo.getEffectiveNetworkId()?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            ?: relaySecurityPrefs.getString(PREF_RELAY_NETWORK_ID, null)?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            ?: prefs.getString("last_known_network_id", null)?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
             ?: ""
+        if (savedNetId.isNotBlank()) {
+            relaySecurityPrefs.edit().putString(PREF_RELAY_NETWORK_ID, savedNetId).apply()
+        }
         val groupId = prefs.getString("remote_relay_group_id", null)
             ?: savedNetId.takeIf { it.isNotBlank() }
             ?: "default_group"
         val configuredTargetPeer = prefs.getString("remote_relay_target_peer", null)?.trim()
+        val firstSavedPeer = repo.savedDevices.value.firstOrNull()?.deviceId?.trim()
         val targetPeerId = targetDeviceId?.trim()?.takeIf { it.isNotBlank() }
             ?: configuredTargetPeer?.takeIf { it.isNotBlank() }
+            ?: firstSavedPeer?.takeIf { it.isNotBlank() }
             ?: "desktop-core"
         val expectedFingerprint = resolveRelayTargetFingerprint(certPinStorage, targetPeerId)
         if (expectedFingerprint.isNullOrBlank()) {
             SafeLog.w("SnowForegroundService", "Refusing startRelay without pinned TLS certificate fingerprint for peer $targetPeerId.")
             return null to "No pinned TLS certificate fingerprint for target device '$targetPeerId'."
         }
-        val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
         val matchedSaved = repo.savedDevices.value.find { it.deviceId.equals(targetPeerId, ignoreCase = true) }
         val defaultTransferPort = resolveRelayTransferPort(matchedSaved?.deviceType)
         val usePublicCaOuter = effectiveEndpoint.startsWith("wss://") &&
@@ -320,12 +355,148 @@ class SnowForegroundService : Service() {
         return configured to null
     }
 
+    private suspend fun acquireDeviceHubSessionToken(
+        hubHttpBase: String,
+        networkId: String
+    ): String? = withContext(Dispatchers.IO) {
+        val cleanBase = hubHttpBase.trim().trimEnd('/')
+        if (!cleanBase.startsWith("https://") && !cleanBase.startsWith("http://")) {
+            return@withContext null
+        }
+        try {
+            val devKey = org.snow.security.DeviceKeyManager(applicationContext).getOrCreate()
+            val devId = DeviceIdentity.getOrCreate(applicationContext).deviceId
+            val cleanNet = networkId.trim().uppercase()
+            val jsonMedia = "application/json; charset=utf-8".toMediaType()
+
+            val chBody = org.json.JSONObject().apply {
+                put("snow_id", devKey.snowId)
+                put("public_key", devKey.publicKeyB64)
+                put("device_id", devId)
+                if (cleanNet.isNotEmpty()) put("network_id", cleanNet)
+            }
+            val chReq = okhttp3.Request.Builder()
+                .url("$cleanBase/v1/hub/challenge")
+                .post(chBody.toString().toRequestBody(jsonMedia))
+                .build()
+            val chObj = hubHttpClient.newCall(chReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    SafeLog.w("SnowForegroundService", "Render Hub challenge failed (HTTP ${resp.code})")
+                    return@withContext null
+                }
+                org.json.JSONObject(resp.body?.string().orEmpty())
+            }
+            val challengeId = chObj.optString("challenge_id").trim()
+            val nonce = chObj.optString("nonce").trim()
+            val expiresAt = chObj.optLong("expires_at", 0L)
+            val audience = chObj.optString("audience", "render-hub-tunnel").trim()
+            if (challengeId.isEmpty() || nonce.isEmpty() || expiresAt <= 0L) return@withContext null
+
+            val sigB64 = devKey.signDeviceHubChallenge(
+                challengeId = challengeId,
+                nonce = nonce,
+                expiresAt = expiresAt,
+                deviceId = devId,
+                networkId = cleanNet,
+                audience = audience
+            )
+            val sessBody = org.json.JSONObject().apply {
+                put("challenge_id", challengeId)
+                put("snow_id", devKey.snowId)
+                put("public_key", devKey.publicKeyB64)
+                put("signature", sigB64)
+                put("device_id", devId)
+                if (cleanNet.isNotEmpty()) put("network_id", cleanNet)
+            }
+            val sessReq = okhttp3.Request.Builder()
+                .url("$cleanBase/v1/hub/session")
+                .post(sessBody.toString().toRequestBody(jsonMedia))
+                .build()
+            hubHttpClient.newCall(sessReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    SafeLog.w("SnowForegroundService", "Render Hub session exchange failed (HTTP ${resp.code})")
+                    return@withContext null
+                }
+                val obj = org.json.JSONObject(resp.body?.string().orEmpty())
+                val tok = obj.optString("token").trim()
+                val ttlSec = obj.optLong("expires_in", 300L).coerceAtLeast(60L)
+                if (tok.isNotEmpty()) {
+                    val relayPrefs = getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE)
+                    relayPrefs.edit()
+                        .putString(PREF_RELAY_HUB_TOKEN, tok)
+                        .putLong(PREF_RELAY_HUB_TOKEN_EXPIRES_AT, clockMsProvider() + ttlSec * 1000L)
+                        .apply {
+                            if (cleanNet.isNotEmpty()) putString(PREF_RELAY_NETWORK_ID, cleanNet)
+                        }
+                        .apply()
+                }
+                tok.takeIf { it.isNotEmpty() }
+            }
+        } catch (e: Exception) {
+            SafeLog.w("SnowForegroundService", "acquireDeviceHubSessionToken error: ${e.message}")
+            null
+        }
+    }
+
+    private fun resolveTargetNetworkIdForRelay(): String {
+        val repo = SnowUiRepository.getInstance(applicationContext)
+        val relaySecurityPrefs = getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE)
+        val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+        return repo.getEffectiveNetworkId()?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            ?: relaySecurityPrefs.getString(PREF_RELAY_NETWORK_ID, null)?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            ?: settingsPrefs.getString("last_known_network_id", null)?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+            ?: ""
+    }
+
+    private fun hasPinnedRelayPeerTarget(): Boolean {
+        val certPinStorage = EncryptedCertPinStorage(applicationContext)
+        val prefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+        val configuredPeer = prefs.getString("remote_relay_target_peer", null)?.trim()
+        val firstSaved = SnowUiRepository.getInstance(applicationContext).savedDevices.value.firstOrNull()?.deviceId
+        val targetPeer = configuredPeer?.takeIf { it.isNotBlank() } ?: firstSaved ?: "desktop-core"
+        return !resolveRelayTargetFingerprint(certPinStorage, targetPeer).isNullOrBlank()
+    }
+
     fun startRelay(endpoint: String) {
         stopRelay()
         val (configured, _) = createConfiguredRelayClient(endpoint)
-        if (configured == null) return
-        relayClient = configured
-        configured.connect()
+        if (configured != null) {
+            relayClient = configured
+            configured.connect()
+            return
+        }
+        val effectiveEndpoint = resolveEffectiveRelayEndpoint(endpoint)
+        if (effectiveEndpoint.isBlank() || !hasPinnedRelayPeerTarget()) {
+            return
+        }
+        val hubBase = toHttpHubBaseUrl(effectiveEndpoint)
+        if (hubBase.isBlank()) return
+
+        relayConnectJob?.cancel()
+        relayConnectJob = serviceScope.launch(Dispatchers.IO) {
+            val schedule = org.snow.network.BackoffPolicy.STAGE6C_BATTERY_SCHEDULE_MS
+            for (attempt in 0..schedule.size) {
+                if (!isActive || userDisconnected) return@launch
+                val netId = resolveTargetNetworkIdForRelay()
+                val acquiredTok = acquireDeviceHubSessionToken(hubBase, netId)
+                if (!acquiredTok.isNullOrBlank()) {
+                    val (asyncClient, _) = createConfiguredRelayClient(
+                        endpoint = effectiveEndpoint,
+                        overrideHubToken = acquiredTok,
+                        overrideNetworkId = netId
+                    )
+                    if (asyncClient != null) {
+                        relayClient = asyncClient
+                        asyncClient.connect()
+                        return@launch
+                    }
+                    return@launch
+                }
+                if (attempt < schedule.size) {
+                    delay(schedule[attempt])
+                }
+            }
+        }
     }
 
     /**
@@ -338,7 +509,25 @@ class SnowForegroundService : Service() {
         timeoutMs: Long = 8_000L
     ): Pair<Boolean, String> {
         stopRelay()
-        val (configured, prepErr) = createConfiguredRelayClient(endpoint, targetDeviceId)
+        var (configured, prepErr) = createConfiguredRelayClient(endpoint, targetDeviceId)
+        if (configured == null) {
+            val effectiveEndpoint = resolveEffectiveRelayEndpoint(endpoint)
+            val hubBase = toHttpHubBaseUrl(effectiveEndpoint)
+            if (hubBase.isNotBlank()) {
+                val netId = resolveTargetNetworkIdForRelay()
+                val freshToken = acquireDeviceHubSessionToken(hubBase, netId)
+                if (!freshToken.isNullOrBlank()) {
+                    val retry = createConfiguredRelayClient(
+                        endpoint = effectiveEndpoint,
+                        targetDeviceId = targetDeviceId,
+                        overrideHubToken = freshToken,
+                        overrideNetworkId = netId
+                    )
+                    configured = retry.first
+                    prepErr = retry.second
+                }
+            }
+        }
         if (configured == null) {
             return false to (prepErr ?: "Remote relay could not be initialized.")
         }
@@ -393,6 +582,8 @@ class SnowForegroundService : Service() {
     }
 
     fun stopRelay() {
+        relayConnectJob?.cancel()
+        relayConnectJob = null
         relayClient?.disconnect()
         relayClient = null
     }
@@ -457,6 +648,17 @@ class SnowForegroundService : Service() {
             repo.getPermanentDeviceKeyIdentity().snowId
         } catch (_: Exception) {
             SnowUiRepository.deriveCanonicalSnowId(identity.deviceId)
+        }
+        peerHostManager.hubHttpUrlProvider = { repo.getDefaultHubUrl(allowDevLoopback = false) }
+        peerHostManager.deviceKeyIdentityProvider = {
+            try { repo.getPermanentDeviceKeyIdentity() } catch (_: Exception) { null }
+        }
+        peerHostManager.localDeviceIdProvider = { identity.deviceId }
+        peerHostManager.onPeerAuthenticated = { event ->
+            repo.onInboundPeerAuthenticated(event)
+        }
+        peerHostManager.onPeerDisconnected = { peerId ->
+            repo.onInboundPeerDisconnected(peerId)
         }
         val tokenStorage = SharedPreferencesTokenStorage(
             applicationContext,
@@ -537,6 +739,38 @@ class SnowForegroundService : Service() {
             )
         }
         androidRemoteMcpController.startIfEnabled()
+        adoptedNetObserverJob?.cancel()
+        adoptedNetObserverJob = serviceScope.launch {
+            val repo = org.snow.ui.SnowUiRepository.getInstance(applicationContext)
+            var initialized = false
+            var lastNet = repo.adoptedNetworkId.value?.trim()?.uppercase()
+            repo.adoptedNetworkId.collectLatest { updated ->
+                val normNet = updated?.trim()?.uppercase()?.takeIf { it.isNotBlank() }
+                if (!initialized) {
+                    initialized = true
+                    lastNet = normNet
+                    return@collectLatest
+                }
+                if (normNet == lastNet) return@collectLatest
+                lastNet = normNet
+                val relayPrefs = getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE)
+                relayPrefs.edit()
+                    .apply {
+                        if (normNet != null) putString(PREF_RELAY_NETWORK_ID, normNet)
+                        else remove(PREF_RELAY_NETWORK_ID)
+                    }
+                    .remove(PREF_RELAY_HUB_TOKEN)
+                    .remove(PREF_RELAY_HUB_TOKEN_EXPIRES_AT)
+                    .apply()
+                peerHostManager.setConfiguredNetworkId(normNet)
+                val prefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
+                val relayEnabled = prefs.getBoolean(SnowUiRepository.PREF_KEY_REMOTE_RELAY_ENABLED, true)
+                if (relayEnabled && !userDisconnected && (relayClient != null || hasPinnedRelayPeerTarget())) {
+                    val endpoint = resolveEffectiveRelayEndpoint(prefs.getString(SnowUiRepository.PREF_KEY_REMOTE_RELAY_ENDPOINT, null))
+                    startRelay(endpoint)
+                }
+            }
+        }
     }
 
     val androidRemoteMcpController: org.snow.mcp.AndroidRemoteMcpController by lazy {
@@ -819,6 +1053,15 @@ class SnowForegroundService : Service() {
                         demoteScreenShareNotification()
                     }
                     val devIdentity = DeviceIdentity.getOrCreate(applicationContext)
+                    val repo = SnowUiRepository.getInstance(applicationContext)
+                    val screenTargets = repo.buildScreenTargetEndpoints(targetIds)
+                    val senderModelName = android.os.Build.MODEL ?: devIdentity.deviceName
+                    liveScreenHandler.relayMediaSenderForTarget = { endpoint, meta, jpegBytes ->
+                        val rc = relayClient
+                        if (endpoint.useRelay && rc != null && rc.reachabilityState.value == org.snow.network.ReachabilityState.ONLINE_RELAYED) {
+                            rc.sendScreenFrame(meta, jpegBytes)
+                        } else false
+                    }
                     liveScreenHandler.relayMediaSender = { meta, jpegBytes ->
                         val rc = relayClient
                         if (rc != null && rc.reachabilityState.value == org.snow.network.ReachabilityState.ONLINE_RELAYED &&
@@ -828,35 +1071,56 @@ class SnowForegroundService : Service() {
                             rc.sendScreenFrame(meta, jpegBytes)
                         } else false
                     }
-                    val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
+                    val startPayload = mapOf(
+                        "sender_name" to senderModelName,
+                        "sender_platform" to "android",
+                        "target_device_ids" to (screenTargets.map { it.deviceId }.filter { it.isNotBlank() }.ifEmpty { targetIds })
+                    )
                     if (client.connectionState.value == ConnectionState.CONNECTED &&
                         client.authState.value is AuthState.Authenticated
                     ) {
                         client.sendRequest(
                             action = "screen_stream_start",
-                            data = mapOf(
-                                "sender_name" to (android.os.Build.MODEL ?: devIdentity.deviceName),
-                                "sender_platform" to "android",
-                                "target_device_ids" to targetIds
-                            )
+                            data = startPayload
                         ) {}
                     }
-                    liveScreenHandler.startStreaming(
-                        projection = projection,
-                        serverHost = host,
-                        transferPort = 8766,
-                        targetIds = targetIds,
-                        senderDeviceId = devIdentity.deviceId,
-                        senderName = (android.os.Build.MODEL ?: devIdentity.deviceName),
-                        initialViewerCount = 1
-                    )
+                    val inboundPeers = peerHostManager.listAuthenticatedPeers()
+                    if (inboundPeers.isNotEmpty()) {
+                        serviceScope.launch(Dispatchers.IO) {
+                            for (pid in inboundPeers) {
+                                if (targetIds.isEmpty() || targetIds.any { it.equals(pid, ignoreCase = true) }) {
+                                    peerHostManager.sendRequestToPeer(pid, "screen_stream_start", startPayload)
+                                }
+                            }
+                        }
+                    }
+                    if (screenTargets.isNotEmpty()) {
+                        liveScreenHandler.startStreamingTargets(
+                            projection = projection,
+                            targets = screenTargets,
+                            senderDeviceId = devIdentity.deviceId,
+                            senderName = senderModelName,
+                            initialViewerCount = 1
+                        )
+                    } else {
+                        val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
+                        liveScreenHandler.startStreaming(
+                            projection = projection,
+                            serverHost = host,
+                            transferPort = repo.resolveActiveTransferPort(),
+                            targetIds = targetIds,
+                            senderDeviceId = devIdentity.deviceId,
+                            senderName = senderModelName,
+                            initialViewerCount = 1
+                        )
+                    }
                 } else {
                     org.snow.security.SafeLog.w("SnowForegroundService", "MediaProjection is null after elevation, cannot start screen share.")
                     demoteScreenShareNotification()
                 }
             }
             ACTION_STOP_SCREEN_SHARE -> {
-                val host = client.currentTargetHost.ifBlank { "127.0.0.1" }
+                val host = client.currentTargetHost.takeIf { it.isNotBlank() }
                 liveScreenHandler.stopStreaming(host, 8766)
                 demoteScreenShareNotification()
             }
@@ -1462,25 +1726,18 @@ class SnowForegroundService : Service() {
 
             if (userDisconnected) return@launch
 
-            // Step 4: Saved Remote Relay or Built-in Render Hub fallback
+            // Step 4: Saved Remote Relay or Built-in Render Hub fallback (always-on default = true)
             val settingsPrefs = getSharedPreferences(SnowUiRepository.PREFS_SETTINGS, Context.MODE_PRIVATE)
-            val relayEnabled = settingsPrefs.getBoolean("remote_relay_enabled", false)
-            val relayEndpoint = resolveEffectiveRelayEndpoint(settingsPrefs.getString("remote_relay_endpoint", null))
-            val relaySecurityPrefs = getSharedPreferences("snow_relay_security", Context.MODE_PRIVATE)
-            val relayTokenStorage = SharedPreferencesTokenStorage(applicationContext, prefName = "snow_relay_security")
-            val authMaterial = resolveEffectiveRelayAuth(
-                ticket = relayTokenStorage.getToken(),
-                bootstrapToken = relaySecurityPrefs.getString(PREF_RELAY_BOOTSTRAP_TOKEN, null),
-                hubToken = relaySecurityPrefs.getString(PREF_RELAY_HUB_TOKEN, null)
-            )
+            val relayEnabled = settingsPrefs.getBoolean(SnowUiRepository.PREF_KEY_REMOTE_RELAY_ENABLED, true)
+            val relayEndpoint = resolveEffectiveRelayEndpoint(settingsPrefs.getString(SnowUiRepository.PREF_KEY_REMOTE_RELAY_ENDPOINT, null))
 
             if ((relayEnabled || effMode == org.snow.network.TransportMode.REMOTE_ONLY || effMode == org.snow.network.TransportMode.REMOTE_RELAY) &&
-                relayEndpoint.isNotBlank() && authMaterial != null
+                relayEndpoint.isNotBlank()
             ) {
-                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Falling back to Render Hub / Remote Relay endpoint $relayEndpoint...")
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Ensuring Render Hub / Remote Relay connection at $relayEndpoint...")
                 startRelay(relayEndpoint)
             } else {
-                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Remote relay disabled or awaiting hub credentials.")
+                SafeLog.i("SnowForegroundService", "AutoConnect Step 4: Remote relay explicitly disabled or endpoint missing.")
             }
 
             // Passive NetworkCallback remains registered (via registerNetworkCallback in onCreate)
@@ -1600,6 +1857,11 @@ class SnowForegroundService : Service() {
         discoveryObserverJob = null
         authObserverJob?.cancel()
         authObserverJob = null
+        relayConnectJob?.cancel()
+        relayConnectJob = null
+        adoptedNetObserverJob?.cancel()
+        adoptedNetObserverJob = null
+        stopRelay()
         usbPromotionJob?.cancel()
         usbPromotionJob = null
         usbFallbackJob?.cancel()
@@ -1652,7 +1914,23 @@ class SnowForegroundService : Service() {
 
         const val PREF_RELAY_BOOTSTRAP_TOKEN = "relay_bootstrap_token"
         const val PREF_RELAY_HUB_TOKEN = "relay_hub_token"
+        const val PREF_RELAY_HUB_TOKEN_EXPIRES_AT = "relay_hub_token_expires_at"
         const val PREF_RELAY_NETWORK_ID = "relay_network_id"
+
+        @JvmStatic
+        fun toHttpHubBaseUrl(endpoint: String?): String {
+            val clean = endpoint?.trim().orEmpty()
+            if (clean.isBlank()) return ""
+            val httpUrl = when {
+                clean.startsWith("wss://", ignoreCase = true) -> "https://" + clean.substring(6)
+                clean.startsWith("ws://", ignoreCase = true) -> "http://" + clean.substring(5)
+                else -> clean
+            }
+            return httpUrl
+                .removeSuffix("/v1/tunnel")
+                .removeSuffix("/v1/tunnel/")
+                .trimEnd('/')
+        }
 
         const val USB_PROMOTION_COOLDOWN_MS = 5000L
         const val USB_PROBE_INTERVAL_MS = 4000L

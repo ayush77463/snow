@@ -504,16 +504,23 @@ class SnowIpcServer:
                     p_id = str(getattr(peer, "device_id", "") or "").strip()
                     if not p_id:
                         continue
+                    p_legacy = generate_snow_id(seed=p_id).upper()
                     p_snow = str(
-                        getattr(peer, "snow_id", None) or generate_snow_id(seed=p_id)
+                        getattr(peer, "snow_id", None) or p_legacy
                     ).strip().upper()
-                    if snow_id_filter and p_snow != snow_id_filter and p_id.upper() != snow_id_filter:
+                    if (
+                        snow_id_filter
+                        and p_snow != snow_id_filter
+                        and p_legacy != snow_id_filter
+                        and p_id.upper() != snow_id_filter
+                    ):
                         continue
                     peers_out.append({
                         "device_id": p_id,
                         "device_name": str(getattr(peer, "device_name", "") or "LAN Peer"),
                         "device_type": str(getattr(peer, "device_type", "") or "unknown"),
                         "snow_id": p_snow,
+                        "legacy_snow_id": p_legacy,
                         "host": str(getattr(peer, "ip_address", "") or ""),
                         "port": int(getattr(peer, "port", 8765) or 8765),
                         "transfer_port": int(getattr(peer, "transfer_port", 8766) or 8766),
@@ -626,6 +633,13 @@ class SnowIpcServer:
                     fed_mgr = getattr(self.core_server, "federation_manager", None)
                     if fed_mgr is not None and updated.get("surviving_network_id"):
                         fed_mgr.local_network_id = updated["surviving_network_id"]
+                    resync_fn = getattr(self.core_server, "_trigger_relay_resync_safe", None) or getattr(
+                        self.core_server, "resync_relay_group_membership", None
+                    )
+                    if callable(resync_fn):
+                        maybe_coro = resync_fn()
+                        if inspect.isawaitable(maybe_coro):
+                            await maybe_coro
                 return {
                     "version": IPC_PROTOCOL_VERSION,
                     "request_id": request_id,
@@ -660,7 +674,7 @@ class SnowIpcServer:
                     "error": "Operation requires OWNER_MANUAL authority.",
                 }, now_authed
 
-            host = payload.get("host")
+            host = payload.get("host") or ""
             port = payload.get("port", 8765)
             pin = payload.get("pin", "")
             expected_fingerprint = payload.get("expected_fingerprint", "")
@@ -671,7 +685,9 @@ class SnowIpcServer:
             merge_tx_id = payload.get("merge_tx_id")
             client_merge_approved = bool(payload.get("client_merge_approved", False))
             surviving_network_id = payload.get("surviving_network_id")
-            if not host:
+            use_rendezvous = bool(payload.get("use_rendezvous", False))
+            snow_id = str(payload.get("snow_id") or "").strip().upper()
+            if not host and not use_rendezvous:
                 return {
                     "version": IPC_PROTOCOL_VERSION,
                     "request_id": request_id,
@@ -681,27 +697,42 @@ class SnowIpcServer:
                 }, now_authed
 
             if hasattr(self.core_server, "connect_peer"):
-                res = await self.core_server.connect_peer(
-                    host=host,
-                    port=port,
-                    pin=pin,
-                    expected_fingerprint=expected_fingerprint,
-                    handshake_token=handshake_token,
-                    network_id=network_id,
-                    client_network_id=client_network_id,
-                    network_decision=network_decision,
-                    merge_tx_id=merge_tx_id,
-                    client_merge_approved=client_merge_approved,
-                    surviving_network_id=surviving_network_id,
-                )
-                return {
+                connect_kwargs: dict[str, Any] = {
+                    "host": host,
+                    "port": port,
+                    "pin": pin,
+                    "expected_fingerprint": expected_fingerprint,
+                    "handshake_token": handshake_token,
+                    "network_id": network_id,
+                    "client_network_id": client_network_id,
+                    "network_decision": network_decision,
+                    "merge_tx_id": merge_tx_id,
+                    "client_merge_approved": client_merge_approved,
+                    "surviving_network_id": surviving_network_id,
+                }
+                try:
+                    sig_cp = inspect.signature(self.core_server.connect_peer)
+                    accepts_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_cp.parameters.values()
+                    )
+                    if accepts_kw or "use_rendezvous" in sig_cp.parameters:
+                        connect_kwargs["use_rendezvous"] = use_rendezvous
+                    if accepts_kw or "snow_id" in sig_cp.parameters:
+                        connect_kwargs["snow_id"] = snow_id
+                except Exception:
+                    pass
+                res = await self.core_server.connect_peer(**connect_kwargs)
+                out_resp: dict[str, Any] = {
                     "version": IPC_PROTOCOL_VERSION,
                     "request_id": request_id,
                     "success": res.get("success", False),
                     "status": res.get("status", "ERROR"),
                     "data": res.get("data"),
                     "error": res.get("error"),
-                }, now_authed
+                }
+                if res.get("remaining_attempts") is not None:
+                    out_resp["remaining_attempts"] = res.get("remaining_attempts")
+                return out_resp, now_authed
             else:
                 return {
                     "version": IPC_PROTOCOL_VERSION,
@@ -1695,11 +1726,16 @@ class SnowIpcServer:
             }, now_authed
 
         if op == "notifications_list":
-            dev_resp = await self._handle_device_request({
+            req_payload: dict[str, Any] = {
                 "device_id": payload.get("device_id"),
                 "action": "notifications_list",
                 "data": {},
-            }, ctx=ctx)
+            }
+            if payload.get("passive") is not None:
+                req_payload["passive"] = bool(payload.get("passive"))
+            if payload.get("timeout") is not None:
+                req_payload["timeout"] = payload.get("timeout")
+            dev_resp = await self._handle_device_request(req_payload, ctx=ctx)
             resp_data = dev_resp.get("data")
             if not isinstance(resp_data, dict):
                 resp_data = {"notifications": [], "count": 0}
@@ -2631,8 +2667,23 @@ class SnowIpcServer:
         """Route a request action to a connected, authenticated Android device."""
         device_id = payload.get("device_id")
         action = payload.get("action")
-        data = payload.get("data")
-        timeout = float(payload.get("timeout") or 30.0)
+        raw_data = payload.get("data")
+        raw_timeout = payload.get("timeout")
+        timeout = float(raw_timeout or 30.0)
+        explicit_passive = payload.get("passive")
+        data_passive = bool(isinstance(raw_data, dict) and raw_data.get("passive"))
+        short_poll_hint = bool(
+            explicit_passive is None
+            and raw_timeout is not None
+            and float(raw_timeout) <= 2.5
+            and action in ("notifications_list", "android_notifications_list", "android_battery", "battery_status")
+        )
+        is_passive = bool(explicit_passive or data_passive or short_poll_hint)
+        if isinstance(raw_data, dict) and "passive" in raw_data:
+            data = dict(raw_data)
+            data.pop("passive", None)
+        else:
+            data = raw_data
 
         if not device_id or not isinstance(device_id, str):
             # Authoritative default device resolution via NodeRegistry or SessionManager
@@ -2774,13 +2825,23 @@ class SnowIpcServer:
             or (not type(router).__name__.endswith("Mock") and hasattr(router, "route_request"))
         )
         if has_real_router:
-            return await router.route_request(
-                action=action,
-                target=device_id,
-                data=data,
-                ctx=ctx,
-                timeout=timeout,
-            )
+            route_kwargs: dict[str, Any] = {
+                "action": action,
+                "target": device_id,
+                "data": data,
+                "ctx": ctx,
+                "timeout": timeout,
+            }
+            try:
+                sig_rr = inspect.signature(router.route_request)
+                accepts_kw = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_rr.parameters.values()
+                )
+                if accepts_kw or "passive" in sig_rr.parameters:
+                    route_kwargs["passive"] = is_passive
+            except Exception:
+                pass
+            return await router.route_request(**route_kwargs)
 
         cs = self.core_server
 
@@ -2797,7 +2858,7 @@ class SnowIpcServer:
         session = cs.session_manager.get_session_by_device(device_id)
         conn = cs.connection_manager.get(session.connection_id) if session and session.connection_id else None
 
-        if not conn or not conn.is_active:
+        if not is_passive and (not conn or not conn.is_active):
             grace_period = getattr(cs.config, "device_connect_grace_period", 6.0)
             disc_svc = getattr(cs, "discovery_service", None)
             if disc_svc and disc_svc.is_running and grace_period > 0:

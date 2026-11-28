@@ -18,10 +18,10 @@
   - 5-tier fail-closed Android access profiles (`full_control`, `files_and_clipboard`, `files_only`, `clipboard_only`, `not_allowed`) + Share Code owner/capability guards.
   - Universal Clipboard (`15`-item SQLite Schema v8 queue, max `5` pinned, `100 MiB` media budget, `text`/`image`/`file`/`file_bundle` / `CF_HDROP`, zero-echo & durable acks, Android user-selected Transfer Folder delivery).
   - Native Jetpack Compose Material 3 Android UI (`Home`, `Tools` with bidirectional 5-tab `HorizontalPager`, `Devices`, `Settings`) with fail-closed APK release signing (`versionCode = 5`, `versionName = "7.0.0"`).
-  - **Transport Orchestration & Identity Recovery (M4.1–M4.5):**
-    - Unified priority routing **USB (`usb`) -> Hotspot (`hotspot`) -> Wi-Fi LAN (`wifi_lan`) -> Remote Relay (`remote_relay`)** with make-before-break switching and bidirectional USB ADB forwarding.
-    - Permanent per-device Ed25519 identity (`SNW-XXXX-XXXX`) with cryptographic recovery (`SNW-REC-V1` / encrypted backup) that atomically wipes prior peer trust, pinned certs, and OAuth tokens (`recovery_takeover`); Render Hub acts strictly as a rendezvous/transport forwarder, never a trust root.
-    - Unified live zero-PIN QR v2 pairing with optional 6-digit PIN, pasteable QR v2 JSON accept/validate flow, Mutual Network Merge vs Keep Separate conflict resolution, and Authorized AI Clients OAuth 2.1 listing/revocation.
+  - **Transport Orchestration, Identity Recovery & Multi-Peer Mesh (M4.1–M4.6):**
+    - Unified priority routing **USB (`usb`) -> Hotspot (`hotspot`) -> Wi-Fi LAN (`wifi_lan`) -> Remote Relay (`remote_relay`)** with make-before-break switching and bidirectional USB ADB forwarding, plus `passive=True` fast-fail on idle background telemetry polls.
+    - Permanent per-device Ed25519 identity (`SNW-XXXX-XXXX`) with cryptographic recovery (`SNW-REC-V1` / encrypted backup) that atomically wipes prior peer trust, pinned certs, and OAuth tokens (`recovery_takeover`); default-on Hosted Render Relay (`auth_kind="device"`, shared network group sync, dual MCP/data WebSockets, standalone `/v1/rendezvous/open`) acts strictly as a rendezvous/transport forwarder, never a trust root.
+    - Immediate live zero-PIN QR v2 pairing + clean 2-step `SNOW ID -> PIN` resolution (Paired DB -> LAN UDP beacon -> Render Hub rendezvous), Mutual Network Merge vs Keep Separate conflict resolution, Authorized AI Clients OAuth 2.1 listing/revocation, bidirectional Android<->Android mesh hosting, concurrent multi-target Screen Sharing fan-out, and up to 3 concurrent resumable SHA-256 transfers with fast `DocumentsContract` SAF enumeration and `OWNER_MANUAL`-scoped `MANAGE_EXTERNAL_STORAGE` (`AI_MCP` sandboxed to Transfer Folder).
 
 ---
 

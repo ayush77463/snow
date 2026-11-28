@@ -266,19 +266,15 @@
 
                                 <!-- Active Transfer Banner inside Hero when running -->
                                 <div id="active-transfer-container" class="active-transfer-card d-none" style="margin: 0 20px 18px 20px;">
-                                    <div class="flex items-center justify-between gap-2">
-                                        <div class="flex items-center gap-2 min-w-0">
-                                            <svg class="svg-icon svg-icon-sm text-cyan" viewBox="0 0 24 24"><line x1="12" x2="12" y1="19" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
-                                            <span id="active-transfer-name" class="text-sm font-semibold truncate">Sending file...</span>
-                                            <span id="active-transfer-route-badge" class="chip chip-sm chip-cyan">Wi-Fi • Zero Data</span>
-                                            <span id="active-transfer-speed" class="chip chip-sm chip-cyan mono">0 KB/s</span>
+                                    <div id="active-transfer-rows" class="transfer-rows-list flex flex-col gap-2"></div>
+                                    <div id="active-transfer-legacy-summary" class="d-none" aria-hidden="true">
+                                        <span id="active-transfer-name" class="text-sm font-semibold truncate">Sending file...</span>
+                                        <span id="active-transfer-route-badge" class="chip chip-sm chip-cyan">Wi-Fi • Zero Data</span>
+                                        <span id="active-transfer-speed" class="chip chip-sm chip-cyan mono">0 KB/s</span>
+                                        <button id="btn-active-transfer-cancel" class="btn btn-xs btn-danger" type="button">Cancel</button>
+                                        <div class="progress-track">
+                                            <div id="active-transfer-progress" class="progress-fill" style="width: 0%;"></div>
                                         </div>
-                                        <button id="btn-active-transfer-cancel" class="btn btn-xs btn-danger">Cancel</button>
-                                    </div>
-                                    <div class="progress-track">
-                                        <div id="active-transfer-progress" class="progress-fill" style="width: 0%;"></div>
-                                    </div>
-                                    <div class="flex items-center justify-between text-xs text-muted">
                                         <span id="active-transfer-bytes">0 B / 0 B</span>
                                         <span id="active-transfer-percent">0%</span>
                                     </div>
@@ -295,46 +291,81 @@
                                     <span class="text-xs text-muted">Target-aware capabilities</span>
                                 </div>
                                 <div class="quick-actions-grid">
-                                    <button id="btn-qa-ring" class="action-tile" title="Ring target phone">
+                                    <button id="btn-qa-lock-pc" class="action-tile" type="button" title="Lock Windows workstation">
+                                        <div class="action-tile-icon">
+                                            <svg class="svg-icon" viewBox="0 0 24 24"><rect height="11" rx="2" ry="2" width="18" x="3" y="11"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                                        </div>
+                                        <span class="text-xs font-semibold qa-tile-label">Lock PC</span>
+                                    </button>
+
+                                    <button id="btn-qa-ring" class="action-tile d-none" type="button" title="Ring target phone">
                                         <div class="action-tile-icon">
                                             <svg class="svg-icon" viewBox="0 0 24 24"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path></svg>
                                         </div>
-                                        <span class="text-xs font-semibold">Ring Phone</span>
+                                        <span class="text-xs font-semibold qa-tile-label">Ring Phone</span>
                                     </button>
 
-                                    <button id="btn-qa-screen" class="action-tile" title="Capture remote screen frame">
+                                    <button id="btn-qa-screen" class="action-tile" type="button" title="Capture screen frame">
                                         <div class="action-tile-icon">
                                             <svg class="svg-icon" viewBox="0 0 24 24"><rect height="14" rx="2" width="18" x="3" y="4"></rect><line x1="12" x2="12" y1="18" y2="21"></line><line x1="8" x2="16" y1="21" y2="21"></line></svg>
                                         </div>
-                                        <span class="text-xs font-semibold">Capture Screen</span>
+                                        <span class="text-xs font-semibold qa-tile-label">Capture PC Screen</span>
                                     </button>
 
-                                    <button id="btn-qa-camera" class="action-tile" title="Capture remote camera photo">
+                                    <button id="btn-qa-camera" class="action-tile d-none" type="button" title="Capture remote camera photo">
                                         <div class="action-tile-icon">
                                             <svg class="svg-icon" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
                                         </div>
-                                        <span class="text-xs font-semibold">Camera Photo</span>
+                                        <span class="text-xs font-semibold qa-tile-label">Camera Photo</span>
                                     </button>
 
-                                    <button id="btn-qa-media" class="action-tile" title="Toggle remote media playback">
-                                        <div class="action-tile-icon">
-                                            <svg class="svg-icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-                                        </div>
-                                        <span class="text-xs font-semibold">Media Playback</span>
-                                    </button>
-
-                                    <button id="btn-qa-send-files" class="action-tile" title="Initiate file transfer">
+                                    <button id="btn-qa-send-files" class="action-tile d-none" type="button" title="Initiate file transfer">
                                         <div class="action-tile-icon">
                                             <svg class="svg-icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" x2="12" y1="3" y2="15"></line></svg>
                                         </div>
-                                        <span class="text-xs font-semibold">Send Files</span>
+                                        <span class="text-xs font-semibold qa-tile-label">Send Files</span>
                                     </button>
 
-                                    <button id="btn-qa-share-note" class="action-tile" title="Share text or link">
+                                    <button id="btn-qa-browse-files" class="action-tile d-none" type="button" title="Browse remote device files">
+                                        <div class="action-tile-icon">
+                                            <svg class="svg-icon" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                                        </div>
+                                        <span class="text-xs font-semibold qa-tile-label">Browse Files</span>
+                                    </button>
+
+                                    <button id="btn-qa-media" class="action-tile" type="button" title="Toggle media playback">
+                                        <div class="action-tile-icon">
+                                            <svg class="svg-icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                                        </div>
+                                        <span class="text-xs font-semibold qa-tile-label">Media Playback</span>
+                                    </button>
+
+                                    <button id="btn-qa-share-pc-screen" class="action-tile d-none" type="button" title="Share this PC screen">
+                                        <div class="action-tile-icon">
+                                            <svg class="svg-icon" viewBox="0 0 24 24"><rect height="14" rx="2" width="18" x="3" y="4"></rect><polyline points="9 11 12 8 15 11"></polyline><line x1="12" x2="12" y1="8" y2="15"></line></svg>
+                                        </div>
+                                        <span class="text-xs font-semibold qa-tile-label">Share PC Screen</span>
+                                    </button>
+
+                                    <button id="btn-qa-sync-clipboard" class="action-tile" type="button" title="Synchronize shared clipboard">
+                                        <div class="action-tile-icon">
+                                            <svg class="svg-icon" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect height="4" rx="1" ry="1" width="8" x="8" y="2"></rect></svg>
+                                        </div>
+                                        <span class="text-xs font-semibold qa-tile-label">Sync Clipboard</span>
+                                    </button>
+
+                                    <button id="btn-qa-open-folder" class="action-tile" type="button" title="Open incoming transfer folder">
+                                        <div class="action-tile-icon">
+                                            <svg class="svg-icon" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path><polyline points="12 11 12 17"></polyline><polyline points="9 14 12 17 15 14"></polyline></svg>
+                                        </div>
+                                        <span class="text-xs font-semibold qa-tile-label">Open Transfer Folder</span>
+                                    </button>
+
+                                    <button id="btn-qa-share-note" class="action-tile" type="button" title="Share text or link">
                                         <div class="action-tile-icon">
                                             <svg class="svg-icon" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
                                         </div>
-                                        <span class="text-xs font-semibold">Share Link</span>
+                                        <span class="text-xs font-semibold qa-tile-label">Share Link</span>
                                     </button>
                                 </div>
                             </div>
@@ -518,25 +549,25 @@
                                         <button id="btn-pairing-cancel-pin" class="btn btn-xs btn-danger btn-radius-md d-none" style="flex-shrink: 0;">Cancel PIN</button>
                                         <button id="btn-pairing-refresh-live-qr" class="btn btn-xs btn-ghost btn-radius-md" type="button" title="Refresh live QR">Refresh QR</button>
                                     </div>
-                                    <div class="flex gap-2 flex-wrap">
-                                        <input type="text" id="pairing-input" class="form-input flex-1" style="min-width: 170px;" placeholder="Peer SNOW ID (SNW-...) or Network ID">
-                                        <input type="text" id="pairing-pin-input" class="form-input mono" style="max-width: 145px;" maxlength="6" placeholder="6-digit PIN (opt)">
-                                        <button id="btn-pairing-connect" class="btn btn-primary btn-sm btn-radius-md">Connect</button>
-                                    </div>
-                                    <details id="paste-qr-json-accordion" class="peer-connect-accordion">
-                                        <summary>
-                                            <span>Paste QR v2 JSON</span>
-                                            <span class="text-xs text-cyan">Validate &amp; Pair</span>
-                                        </summary>
-                                        <div class="flex flex-col gap-2 mt-2">
-                                            <textarea id="pairing-qr-json-input" class="form-input text-xs mono" rows="3" placeholder='{"v":2,"snow_id":"SNW-...","handshake_token":"..."}'></textarea>
-                                            <div id="pairing-qr-json-preview" class="text-xs text-muted d-none"></div>
-                                            <div class="flex gap-2">
-                                                <button id="btn-validate-qr-json" class="btn btn-xs btn-tonal btn-radius-md" type="button">Validate QR</button>
-                                                <button id="btn-accept-qr-json" class="btn btn-xs btn-primary btn-radius-md flex-1" type="button">Connect via QR</button>
-                                            </div>
+                                    <div id="pairing-step1-container" class="flex flex-col gap-2">
+                                        <label class="form-label" for="pairing-input">Enter Peer SNOW ID</label>
+                                        <div class="flex gap-2 flex-wrap">
+                                            <input type="text" id="pairing-input" class="form-input mono flex-1" style="min-width: 170px;" placeholder="Enter Peer SNOW ID (e.g. SNW-A1B2-C3D4)">
+                                            <button id="btn-pairing-connect" class="btn btn-primary btn-sm btn-radius-md" type="button">Connect</button>
                                         </div>
-                                    </details>
+                                        <div id="pairing-step1-error" class="text-xs text-rose d-none"></div>
+                                    </div>
+                                    <div id="pairing-step2-container" class="pairing-step2-box flex flex-col gap-2 d-none">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span id="pairing-step2-label" class="text-xs font-semibold text-primary">Enter the 6-digit PIN shown on --</span>
+                                            <button id="btn-pairing-change-id" class="btn btn-xs btn-ghost btn-radius-md" type="button">Change ID</button>
+                                        </div>
+                                        <div class="flex gap-2 flex-wrap">
+                                            <input type="text" id="pairing-step2-pin" class="form-input mono flex-1" inputmode="numeric" maxlength="6" placeholder="6-digit PIN">
+                                            <button id="btn-pairing-verify-pin" class="btn btn-primary btn-sm btn-radius-md" type="button">Verify &amp; Pair</button>
+                                        </div>
+                                        <div id="pairing-step2-error" class="text-xs text-rose d-none"></div>
+                                    </div>
                                 </div>
 
                                 <!-- Tab 2: Install APK -->
@@ -631,18 +662,15 @@
 
                             <!-- Inline Active Transfer Progress Card inside Files & Apps -->
                             <div id="files-active-transfer-card" class="active-transfer-card d-none">
-                                <div class="flex items-center justify-between gap-2 flex-wrap">
-                                    <div class="flex items-center gap-2 min-w-0">
-                                        <span id="files-transfer-name" class="text-sm font-semibold truncate">Transferring...</span>
-                                        <span id="files-transfer-route-badge" class="chip chip-sm chip-cyan">Wi-Fi • Zero Data</span>
-                                        <span id="files-transfer-speed" class="chip chip-sm chip-neutral mono">0 KB/s</span>
+                                <div id="files-active-transfer-rows" class="transfer-rows-list flex flex-col gap-2"></div>
+                                <div id="files-transfer-legacy-summary" class="d-none" aria-hidden="true">
+                                    <span id="files-transfer-name" class="text-sm font-semibold truncate">Transferring...</span>
+                                    <span id="files-transfer-route-badge" class="chip chip-sm chip-cyan">Wi-Fi • Zero Data</span>
+                                    <span id="files-transfer-speed" class="chip chip-sm chip-neutral mono">0 KB/s</span>
+                                    <button id="btn-files-transfer-cancel" class="btn btn-xs btn-danger" type="button">Cancel</button>
+                                    <div class="progress-track">
+                                        <div id="files-transfer-progress" class="progress-fill" style="width: 0%;"></div>
                                     </div>
-                                    <button id="btn-files-transfer-cancel" class="btn btn-xs btn-danger">Cancel</button>
-                                </div>
-                                <div class="progress-track">
-                                    <div id="files-transfer-progress" class="progress-fill" style="width: 0%;"></div>
-                                </div>
-                                <div class="flex items-center justify-between text-xs text-muted">
                                     <span id="files-transfer-bytes">0 B / 0 B</span>
                                     <span id="files-transfer-percent">0%</span>
                                 </div>
@@ -773,10 +801,10 @@
                         <div class="card-header-row" style="margin-bottom: 0;">
                             <div class="flex items-center gap-2">
                                 <h3 class="card-title">Remote AI Link</h3>
-                                <span id="mcp-tunnel-status" class="chip chip-neutral">Starting...</span>
+                                <span id="mcp-tunnel-status" class="chip chip-neutral">Off</span>
                             </div>
                             <label class="snow-switch" aria-label="Toggle Remote AI Link">
-                                <input type="checkbox" id="chk-mcp-tunnel-toggle" checked title="Toggle Remote AI Link">
+                                <input type="checkbox" id="chk-mcp-tunnel-toggle" title="Toggle Remote AI Link">
                                 <span class="snow-switch-slider"></span>
                             </label>
                         </div>
@@ -886,7 +914,7 @@
                                         <div id="update-status-banner" class="text-xs text-muted d-none"></div>
 
                                         <div class="text-xs text-muted">
-                                            Web Dashboard Binding: <strong id="diag-port" class="mono text-primary">127.0.0.1:8769</strong> &bull; Hub Identity: <strong id="diag-network-key-id" class="mono text-cyan">--</strong>
+                                            Web Dashboard Binding: <strong id="diag-port" class="mono text-primary">127.0.0.1:8769</strong>
                                         </div>
                                         <div class="flex gap-1 flex-wrap mono">
                                             <span class="chip chip-sm chip-cyan">:8765 Control WSS</span>
@@ -984,7 +1012,7 @@
                     <svg class="svg-icon svg-icon-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                 </button>
             </div>
-            <p class="text-xs text-muted">Scan live zero-PIN QR v2 with SNOW Mobile or another PC, paste a QR v2 JSON payload, or enter a SNOW ID.</p>
+            <p class="text-xs text-muted">Scan live zero-PIN QR v2 with SNOW Mobile or another PC, or enter a peer SNOW ID.</p>
             <div class="flex gap-4 items-center pairing-qr-split">
                 <div id="modal-qr-container" class="qr-surface" style="width: 140px; height: 140px; flex-shrink: 0;">
                     <span class="text-xs text-muted text-center">Preparing live QR...</span>
@@ -1021,47 +1049,26 @@
                 </div>
             </div>
 
-            <div class="form-group">
-                <label class="form-label">SNOW ID / Network ID &amp; Optional PIN</label>
+            <div id="modal-step1-container" class="form-group">
+                <label class="form-label" for="modal-connect-input">Enter Peer SNOW ID</label>
                 <div class="flex gap-2 flex-wrap">
-                    <input type="text" id="modal-connect-input" class="form-input mono flex-1" style="min-width: 170px;" placeholder="e.g. SNW-A1B2-C3D4 or 192.168.1.50:8767">
-                    <input type="text" id="modal-connect-pin-input" class="form-input mono" style="max-width: 135px;" maxlength="6" placeholder="6-digit PIN (opt)">
-                    <button id="btn-modal-connect-submit" class="btn btn-primary btn-sm btn-radius-md">Connect</button>
+                    <input type="text" id="modal-connect-input" class="form-input mono flex-1" style="min-width: 170px;" placeholder="Enter Peer SNOW ID (e.g. SNW-A1B2-C3D4)">
+                    <button id="btn-modal-connect-submit" class="btn btn-primary btn-sm btn-radius-md" type="button">Connect</button>
                 </div>
+                <div id="modal-step1-error" class="text-xs text-rose d-none"></div>
             </div>
 
-            <details class="peer-connect-accordion" id="modal-paste-qr-accordion">
-                <summary>
-                    <span>Paste QR v2 JSON</span>
-                    <span class="text-xs text-cyan">Validate &amp; Pair</span>
-                </summary>
-                <div class="flex flex-col gap-2 mt-2">
-                    <textarea id="modal-qr-json-input" class="form-input text-xs mono" rows="2" placeholder='{"v":2,"snow_id":"SNW-...","handshake_token":"..."}'></textarea>
-                    <div id="modal-qr-json-preview" class="text-xs text-muted d-none"></div>
-                    <div class="flex gap-2">
-                        <button id="btn-modal-validate-qr" class="btn btn-xs btn-tonal btn-radius-md" type="button">Validate</button>
-                        <button id="btn-modal-accept-qr" class="btn btn-xs btn-primary btn-radius-md flex-1" type="button">Connect via QR</button>
-                    </div>
+            <div id="modal-step2-container" class="pairing-step2-box flex flex-col gap-2 d-none">
+                <div class="flex items-center justify-between gap-2">
+                    <span id="modal-step2-label" class="text-xs font-semibold text-primary">Enter the 6-digit PIN shown on --</span>
+                    <button id="btn-modal-change-id" class="btn btn-xs btn-ghost btn-radius-md" type="button">Change ID</button>
                 </div>
-            </details>
-
-            <details class="peer-connect-accordion" id="connect-advanced-accordion">
-                <summary>
-                    <span>Advanced Diagnostics (Manual Peer IP &amp; PIN)</span>
-                    <span class="text-xs text-cyan">LAN Manual</span>
-                </summary>
-                <div class="flex flex-col gap-2 mt-2">
-                    <div class="flex gap-2">
-                        <input type="text" id="connect-peer-host" class="form-input text-xs" placeholder="Peer IP / Hostname">
-                        <input type="number" id="connect-peer-port" class="form-input text-xs" style="max-width: 96px;" value="8765" placeholder="Port">
-                    </div>
-                    <div class="flex gap-2">
-                        <input type="text" id="connect-peer-pin" class="form-input text-xs mono" placeholder="6-digit Pairing PIN (optional)">
-                        <input type="text" id="connect-peer-fp" class="form-input text-xs mono" placeholder="TLS Fingerprint (optional)">
-                    </div>
-                    <button id="btn-connect-peer-submit" class="btn btn-sm btn-primary w-full">Connect to Peer Host</button>
+                <div class="flex gap-2 flex-wrap">
+                    <input type="text" id="modal-step2-pin" class="form-input mono flex-1" inputmode="numeric" maxlength="6" placeholder="6-digit PIN">
+                    <button id="btn-modal-verify-pin" class="btn btn-primary btn-sm btn-radius-md" type="button">Verify &amp; Pair</button>
                 </div>
-            </details>
+                <div id="modal-step2-error" class="text-xs text-rose d-none"></div>
+            </div>
         </div>
     </div>
 

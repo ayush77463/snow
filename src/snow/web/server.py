@@ -24,6 +24,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import subprocess
@@ -338,6 +339,74 @@ class SnowWebServer:
         # In-memory short-lived per-device telemetry cache (never persisted to disk/SQLite)
         self._device_telemetry_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._device_telemetry_locks: dict[str, asyncio.Lock] = {}
+        self._last_ipc_success_ts: Optional[float] = None
+
+    def _mark_ipc_success(self) -> None:
+        """Record a recent successful Core IPC round-trip timestamp."""
+        self._last_ipc_success_ts = time.monotonic()
+
+    def _has_recent_ipc_success(self, window_sec: float = 3.0) -> bool:
+        """Return True if Core IPC succeeded within the last window_sec seconds."""
+        ts = getattr(self, "_last_ipc_success_ts", None)
+        return ts is not None and (time.monotonic() - ts) <= window_sec
+
+    async def _call_passive_device_poll(
+        self,
+        *,
+        method_name: str,
+        action_name: str,
+        device_id: str,
+        timeout: float,
+    ) -> Any:
+        """Execute a background device poll with passive=True safely across real and mocked bridges."""
+        bridge = self.bridge
+        bridge_dict = getattr(bridge, "__dict__", {})
+        is_unpatched_bridge = (
+            isinstance(bridge, SnowMcpBridge)
+            and method_name not in bridge_dict
+            and "send_device_request" not in bridge_dict
+            and "call_cross_device" not in bridge_dict
+        )
+        if is_unpatched_bridge:
+            target_id = await bridge._resolve_android_target(device_id)
+            res = await asyncio.wait_for(
+                bridge.call_cross_device(
+                    "device_request",
+                    payload={
+                        "device_id": target_id or device_id,
+                        "action": action_name,
+                        "data": {},
+                        "passive": True,
+                        "timeout": timeout,
+                    },
+                    timeout=timeout,
+                ),
+                timeout=timeout,
+            )
+            if isinstance(res, dict) and res.get("status") not in ("CORE_OFFLINE", "IPC_ERROR", "IPC_TIMEOUT"):
+                self._mark_ipc_success()
+            return res
+
+        fn = getattr(bridge, method_name)
+        target_callable = getattr(fn, "side_effect", None)
+        sig_target = target_callable if callable(target_callable) else fn
+        kwargs: dict[str, Any] = {"device_id": device_id}
+        try:
+            sig = inspect.signature(sig_target)
+            if "passive" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                kwargs["passive"] = True
+        except Exception:
+            pass
+        call_res = fn(**kwargs)
+        if inspect.isawaitable(call_res):
+            res = await asyncio.wait_for(call_res, timeout=timeout)
+        else:
+            res = call_res
+        if isinstance(res, dict) and res.get("status") not in ("CORE_OFFLINE", "IPC_ERROR", "IPC_TIMEOUT"):
+            self._mark_ipc_success()
+        return res
 
     async def _get_http_session(self) -> aiohttp.ClientSession:
         """Return a shared, reusable aiohttp ClientSession bound to the running event loop."""
@@ -727,11 +796,12 @@ class SnowWebServer:
                     return None, "unavailable", None
                 per_dev_timeout = min(TELEMETRY_PER_DEVICE_TIMEOUT_SECONDS, remaining_after_sem)
                 try:
-                    raw_bat = self.bridge.android_battery(device_id=device_id)
-                    if inspect.isawaitable(raw_bat):
-                        bat_res = await asyncio.wait_for(raw_bat, timeout=per_dev_timeout)
-                    else:
-                        bat_res = raw_bat
+                    bat_res = await self._call_passive_device_poll(
+                        method_name="android_battery",
+                        action_name="battery_status",
+                        device_id=device_id,
+                        timeout=per_dev_timeout,
+                    )
                     if (
                         isinstance(bat_res, dict)
                         and bat_res.get("success")
@@ -779,9 +849,31 @@ class SnowWebServer:
 
         async def _get_daemon_online() -> bool:
             if dm is None:
+                self._mark_ipc_success()
                 return True
-            raw = await _safe_bridge_call(dm.is_ipc_ready(timeout=0.2), timeout=1.0, default=False)
-            return bool(raw) if not isinstance(raw, dict) else True
+            raw = await _safe_bridge_call(dm.is_ipc_ready(timeout=1.0), timeout=1.5, default=False)
+            is_ready = bool(raw) if not isinstance(raw, dict) else True
+            if is_ready:
+                self._mark_ipc_success()
+                return True
+            if self._has_recent_ipc_success(3.0):
+                return True
+            bridge_dict = getattr(self.bridge, "__dict__", {})
+            if isinstance(self.bridge, SnowMcpBridge) and "call" not in bridge_dict:
+                status_res = await _safe_bridge_call(
+                    self.bridge.call("get_device_status", timeout=1.0),
+                    timeout=1.2,
+                    default=None,
+                )
+                if isinstance(status_res, dict) and status_res.get("success"):
+                    self._mark_ipc_success()
+                    return True
+            elif "get_device_status" in bridge_dict:
+                status_res = await _safe_bridge_call(self.bridge.get_device_status(), timeout=1.2, default=None)
+                if isinstance(status_res, dict) and status_res.get("success"):
+                    self._mark_ipc_success()
+                    return True
+            return False
 
         async def _get_sys_info() -> dict[str, Any]:
             if not hasattr(self.bridge, "windows_system_info"):
@@ -953,6 +1045,8 @@ class SnowWebServer:
     async def handle_api_devices(self, request: web.Request) -> web.Response:
         """Query connected and paired devices with bounded parallel telemetry."""
         res = await self.bridge.list_devices()
+        if isinstance(res, dict) and res.get("success"):
+            self._mark_ipc_success()
         devices = []
         if isinstance(res.get("data"), dict) and "devices" in res["data"]:
             devices = res["data"]["devices"]
@@ -1212,6 +1306,203 @@ class SnowWebServer:
         res = await self.bridge.call("device_reconnect", {"device_id": device_id})
         return web.json_response(res)
 
+    async def _auto_reconnect_paired_peer(
+        self,
+        *,
+        snow_id: str,
+        resolved_entry: dict[str, Any],
+    ) -> web.Response:
+        """Auto-reconnect or confirm active connection for an already-paired peer with zero PIN."""
+        clean_snow = str(resolved_entry.get("snow_id") or snow_id or "").strip().upper()
+        dev_id = str(resolved_entry.get("device_id") or "").strip()
+
+        if hasattr(self.bridge, "list_devices"):
+            try:
+                devs_res = await self.bridge.list_devices()
+                if isinstance(devs_res, dict):
+                    raw_devs = (
+                        devs_res["data"].get("devices", [])
+                        if isinstance(devs_res.get("data"), dict)
+                        else devs_res.get("devices", [])
+                    )
+                    for d in raw_devs or []:
+                        if not isinstance(d, dict):
+                            continue
+                        d_id = str(d.get("device_id") or "").strip()
+                        d_snow = str(d.get("snow_id") or "").strip().upper()
+                        if ((dev_id and d_id == dev_id) or (clean_snow and d_snow == clean_snow)) and d.get("is_connected"):
+                            return web.json_response({
+                                "success": True,
+                                "already_paired": True,
+                                "status": "CONNECTED",
+                                "snow_id": clean_snow,
+                                "device_id": d_id or dev_id,
+                            })
+            except Exception:
+                pass
+
+        if dev_id and hasattr(self.bridge, "call"):
+            try:
+                recon = await self.bridge.call("device_reconnect", {"device_id": dev_id})
+                if isinstance(recon, dict) and recon.get("success"):
+                    return web.json_response({
+                        "success": True,
+                        "already_paired": True,
+                        "status": "CONNECTED",
+                        "snow_id": clean_snow,
+                        "device_id": dev_id,
+                        "data": recon.get("data") or {},
+                    })
+            except Exception:
+                pass
+
+        host = str(resolved_entry.get("host") or "").strip()
+        if host and hasattr(self.bridge, "mesh_connect_peer"):
+            try:
+                port = int(resolved_entry.get("port") or 8765)
+            except (TypeError, ValueError):
+                port = 8765
+            try:
+                conn_res = await self.bridge.mesh_connect_peer(
+                    host=host,
+                    port=port,
+                    pin="",
+                    expected_fingerprint=str(resolved_entry.get("cert_fingerprint") or ""),
+                    handshake_token="",
+                )
+                if isinstance(conn_res, dict) and conn_res.get("success"):
+                    return web.json_response({
+                        "success": True,
+                        "already_paired": True,
+                        "status": "CONNECTED",
+                        "snow_id": clean_snow,
+                        "device_id": dev_id,
+                        "data": conn_res.get("data") or {},
+                    })
+            except Exception:
+                pass
+
+        return web.json_response(
+            {
+                "success": False,
+                "already_paired": True,
+                "status": "DEVICE_OFFLINE",
+                "snow_id": clean_snow,
+                "device_id": dev_id,
+                "error": "Paired peer is currently unreachable.",
+            },
+            status=503,
+        )
+
+    async def _invoke_mesh_connect_peer(
+        self,
+        *,
+        host: str,
+        port: int,
+        pin: str,
+        expected_fingerprint: str,
+        handshake_token: str,
+        network_id: Optional[str],
+        client_network_id: Optional[str],
+        network_decision: Optional[str],
+        merge_tx_id: Optional[str],
+        client_merge_approved: bool,
+        surviving_network_id: Optional[str],
+        use_rendezvous: bool = False,
+        snow_id: str = "",
+    ) -> dict[str, Any]:
+        """Call bridge.mesh_connect_peer (or IPC mesh_connect_peer directly when using rendezvous)."""
+        bridge = self.bridge
+        bridge_dict = getattr(bridge, "__dict__", {})
+        payload: dict[str, Any] = {
+            "host": host,
+            "port": port,
+            "pin": pin,
+            "expected_fingerprint": expected_fingerprint,
+            "handshake_token": handshake_token,
+            "network_id": network_id,
+            "client_network_id": client_network_id,
+            "network_decision": network_decision,
+            "merge_tx_id": merge_tx_id,
+            "client_merge_approved": client_merge_approved,
+            "surviving_network_id": surviving_network_id,
+        }
+        if use_rendezvous:
+            if (
+                isinstance(bridge, SnowMcpBridge)
+                and "mesh_connect_peer" not in bridge_dict
+                and "call" not in bridge_dict
+            ):
+                payload["use_rendezvous"] = True
+                payload["snow_id"] = snow_id
+                return await bridge.call("mesh_connect_peer", payload=payload, timeout=20.0)
+            fn = getattr(bridge, "mesh_connect_peer", None)
+            if callable(fn):
+                target_callable = getattr(fn, "side_effect", None)
+                sig_target = target_callable if callable(target_callable) else fn
+                try:
+                    sig = inspect.signature(sig_target)
+                    accepts_kw = any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    )
+                    if accepts_kw or "use_rendezvous" in sig.parameters:
+                        kw = dict(payload, use_rendezvous=True)
+                        if accepts_kw or "snow_id" in sig.parameters:
+                            kw["snow_id"] = snow_id
+                        return await fn(**kw)
+                except Exception:
+                    pass
+            if hasattr(bridge, "call"):
+                payload["use_rendezvous"] = True
+                payload["snow_id"] = snow_id
+                return await bridge.call("mesh_connect_peer", payload=payload, timeout=20.0)
+
+        return await bridge.mesh_connect_peer(**payload)
+
+    @staticmethod
+    def _format_pin_connect_failure(res: dict[str, Any]) -> Optional[web.Response]:
+        """Return HTTP 400 structured response for PIN/lockout/expiry failures, else None."""
+        st = str(res.get("status") or "").strip().upper()
+        err = str(res.get("error") or "").strip()
+        rem = res.get("remaining_attempts")
+        if rem is None and err:
+            m = re.search(r"(\d+)\s+attempt\(s\)\s+remaining|(\d+)\s+attempts\s+remaining", err, flags=re.IGNORECASE)
+            if m:
+                grp = m.group(1) or m.group(2)
+                if grp is not None:
+                    rem = int(grp)
+
+        err_lower = err.lower()
+        is_pin_err = (
+            st in ("INVALID_PIN", "PIN_EXPIRED", "PAIRING_LOCKED")
+            or "incorrect pin" in err_lower
+            or "invalid pin" in err_lower
+            or "pin_expired" in err_lower
+            or "pin expired" in err_lower
+            or ("locked" in err_lower and ("pin" in err_lower or "pairing" in err_lower or "attempt" in err_lower))
+        )
+        if not is_pin_err:
+            return None
+
+        if st == "PAIRING_LOCKED" or "locked" in err_lower:
+            norm_st = "PAIRING_LOCKED"
+            rem = 0 if rem is None else rem
+        elif st == "PIN_EXPIRED" or "expired" in err_lower:
+            norm_st = "PIN_EXPIRED"
+        else:
+            norm_st = "INVALID_PIN"
+            if rem is not None:
+                err = f"Incorrect PIN — {rem} attempts remaining. Please re-enter."
+
+        body: dict[str, Any] = {
+            "success": False,
+            "status": norm_st,
+            "error": err or "PIN verification failed.",
+        }
+        if rem is not None:
+            body["remaining_attempts"] = rem
+        return web.json_response(body, status=400)
+
     async def handle_api_devices_connect_peer(self, request: web.Request) -> web.Response:
         """Federate or connect to another SNOW Core or Android Peer Host by host/port, SNOW ID, or QR v2 JSON."""
         try:
@@ -1219,6 +1510,7 @@ class SnowWebServer:
         except Exception:
             return web.json_response({"success": False, "error": "Invalid JSON body."}, status=400)
 
+        step = str(body.get("step") or "").strip().lower()
         snow_id_query = (body.get("snow_id") or "").strip().upper()
         host = (body.get("host") or "").strip()
         port_raw = body.get("port", 8765)
@@ -1231,6 +1523,56 @@ class SnowWebServer:
         merge_tx_id = (body.get("merge_tx_id") or "").strip() or None
         client_merge_approved = bool(body.get("client_merge_approved", False))
         surviving_network_id = (body.get("surviving_network_id") or "").strip().upper() or None
+
+        if step == "resolve":
+            from snow.relay.auth import is_valid_network_id, is_valid_snow_id
+
+            if not (is_valid_snow_id(snow_id_query) or is_valid_network_id(snow_id_query)):
+                return web.json_response(
+                    {"success": False, "status": "INVALID_SNOW_ID", "error": "Invalid SNOW ID format."},
+                    status=400,
+                )
+            resolved_entry = await self._resolve_snow_id_directory(snow_id_query)
+            if resolved_entry.get("found"):
+                if resolved_entry.get("is_paired") or resolved_entry.get("source") == "paired_db":
+                    return await self._auto_reconnect_paired_peer(
+                        snow_id=snow_id_query,
+                        resolved_entry=resolved_entry,
+                    )
+                return web.json_response({
+                    "success": True,
+                    "requires_pin": True,
+                    "snow_id": str(resolved_entry.get("snow_id") or snow_id_query),
+                    "source": str(resolved_entry.get("source") or "lan_discovery"),
+                    "host": str(resolved_entry.get("host") or ""),
+                    "port": int(resolved_entry.get("port") or 8765),
+                    "cert_fingerprint": str(resolved_entry.get("cert_fingerprint") or ""),
+                })
+            if resolved_entry.get("status") == "FORBIDDEN":
+                return web.json_response({
+                    "success": True,
+                    "requires_pin": True,
+                    "snow_id": snow_id_query,
+                    "source": "render_hub",
+                    "host": "",
+                    "port": 8765,
+                })
+            err_status = str(resolved_entry.get("status") or "SNOW_ID_NOT_FOUND")
+            http_code = {
+                "INVALID_SNOW_ID": 400,
+                "HUB_AUTH_FAILED": 401,
+                "FORBIDDEN": 403,
+                "INVALID_ENDPOINT": 502,
+                "HUB_UNAVAILABLE": 503,
+            }.get(err_status, 404)
+            return web.json_response(
+                {
+                    "success": False,
+                    "status": err_status,
+                    "error": resolved_entry.get("error") or f"Could not resolve SNOW ID '{snow_id_query}'.",
+                },
+                status=http_code,
+            )
 
         if body.get("qr_json") is not None:
             from snow.security.pairing import validate_qr_pairing_payload
@@ -1252,9 +1594,32 @@ class SnowWebServer:
             if network_id is None and validated_qr.get("network_id"):
                 network_id = str(validated_qr["network_id"]).strip().upper()
 
+        use_rendezvous = False
         if not host and snow_id_query:
             resolved_entry = await self._resolve_snow_id_directory(snow_id_query)
-            if not resolved_entry.get("found"):
+            if resolved_entry.get("found"):
+                if resolved_entry.get("is_paired") and not pin and not handshake_token:
+                    return await self._auto_reconnect_paired_peer(
+                        snow_id=snow_id_query,
+                        resolved_entry=resolved_entry,
+                    )
+                host = str(resolved_entry.get("host") or "").strip()
+                if resolved_entry.get("port"):
+                    port_raw = resolved_entry.get("port")
+                if not expected_fingerprint and resolved_entry.get("cert_fingerprint"):
+                    expected_fingerprint = str(resolved_entry.get("cert_fingerprint"))
+                if not host:
+                    if pin or handshake_token:
+                        use_rendezvous = True
+                    else:
+                        return web.json_response({
+                            "success": False,
+                            "status": "NO_DIRECT_LAN_ENDPOINT",
+                            "error": f"Resolved '{snow_id_query}' without a direct LAN host endpoint; use relay or QR onboarding.",
+                        }, status=400)
+            elif resolved_entry.get("status") == "FORBIDDEN" and (pin or handshake_token):
+                use_rendezvous = True
+            else:
                 err_status = str(resolved_entry.get("status") or "SNOW_ID_NOT_FOUND")
                 http_code = {
                     "INVALID_SNOW_ID": 400,
@@ -1268,19 +1633,8 @@ class SnowWebServer:
                     "status": err_status,
                     "error": resolved_entry.get("error") or f"Could not resolve SNOW ID '{snow_id_query}'.",
                 }, status=http_code)
-            host = str(resolved_entry.get("host") or "").strip()
-            if resolved_entry.get("port"):
-                port_raw = resolved_entry.get("port")
-            if not expected_fingerprint and resolved_entry.get("cert_fingerprint"):
-                expected_fingerprint = str(resolved_entry.get("cert_fingerprint"))
-            if not host:
-                return web.json_response({
-                    "success": False,
-                    "status": "NO_DIRECT_LAN_ENDPOINT",
-                    "error": f"Resolved '{snow_id_query}' without a direct LAN host endpoint; use relay or QR onboarding.",
-                }, status=400)
 
-        if not host:
+        if not host and not use_rendezvous:
             return web.json_response({"success": False, "error": "Missing required field 'host' or resolvable 'snow_id'."}, status=400)
 
         try:
@@ -1288,7 +1642,9 @@ class SnowWebServer:
             if port <= 0 or port > 65535:
                 raise ValueError()
         except (ValueError, TypeError):
-            return web.json_response({"success": False, "error": "Invalid port number."}, status=400)
+            if not use_rendezvous:
+                return web.json_response({"success": False, "error": "Invalid port number."}, status=400)
+            port = 8765
 
         # Resolve local network_id automatically when caller is already part of a mesh network
         if client_network_id is None:
@@ -1303,7 +1659,7 @@ class SnowWebServer:
                 pass
 
         # Call bridge to connect peer (Never log PINs or secret tokens)
-        res = await self.bridge.mesh_connect_peer(
+        res = await self._invoke_mesh_connect_peer(
             host=host,
             port=port,
             pin=pin,
@@ -1315,10 +1671,43 @@ class SnowWebServer:
             merge_tx_id=merge_tx_id,
             client_merge_approved=client_merge_approved,
             surviving_network_id=surviving_network_id,
+            use_rendezvous=use_rendezvous,
+            snow_id=snow_id_query,
         )
 
-        # If successful, record endpoint in SnowNetworkManager
-        if res.get("success") and res.get("data"):
+        # Fallback to Render Hub rendezvous if direct LAN dial failed unreachable and snow_id+pin were given
+        if (
+            not res.get("success")
+            and not use_rendezvous
+            and snow_id_query
+            and (pin or handshake_token)
+            and str(res.get("status") or "").upper()
+            in ("PAIRING_UNREACHABLE", "TRANSPORT_ERROR", "TIMEOUT", "CONNECTION_REFUSED", "CONNECT_ERROR")
+        ):
+            res = await self._invoke_mesh_connect_peer(
+                host="",
+                port=0,
+                pin=pin,
+                expected_fingerprint=expected_fingerprint,
+                handshake_token=handshake_token,
+                network_id=network_id,
+                client_network_id=client_network_id,
+                network_decision=network_decision,
+                merge_tx_id=merge_tx_id,
+                client_merge_approved=client_merge_approved,
+                surviving_network_id=surviving_network_id,
+                use_rendezvous=True,
+                snow_id=snow_id_query,
+            )
+
+        if not res.get("success"):
+            pin_err_resp = self._format_pin_connect_failure(res)
+            if pin_err_resp is not None:
+                return pin_err_resp
+            return web.json_response(res)
+
+        # If successful, record endpoint in SnowNetworkManager when direct host is present
+        if res.get("data") and host:
             remote_dev_id = res["data"].get("remote_device_id")
             if remote_dev_id:
                 try:
@@ -2508,8 +2897,10 @@ class SnowWebServer:
         """List active non-sensitive notifications from the connected phone."""
         device_id = request.query.get("device_id", "")
         try:
-            res = await asyncio.wait_for(
-                self.bridge.android_notifications_list(device_id=device_id),
+            res = await self._call_passive_device_poll(
+                method_name="android_notifications_list",
+                action_name="notifications_list",
+                device_id=device_id,
                 timeout=2.5,
             )
         except asyncio.TimeoutError:
@@ -4017,30 +4408,55 @@ class SnowWebServer:
         self, session: Any, hub_url: str
     ) -> tuple[bool, str, str, str]:
         """Acquire a short-lived Ed25519 hub-session Bearer token via /v1/hub/challenge & /v1/hub/session."""
-        from snow.security.identity import load_or_create_device_identity, load_or_create_network_key_identity
+        from snow.security.identity import (
+            is_valid_network_id,
+            load_or_create_device_identity,
+            load_or_create_device_key_identity,
+            load_or_create_network_key_identity,
+            resolve_canonical_device_snow_id,
+        )
+
+        shared_net_id = ""
+        try:
+            cap_engine = getattr(getattr(self, "bridge", None), "capability_engine", None)
+            db_mgr = getattr(self, "db_manager", None) or getattr(cap_engine, "db_manager", None)
+            if db_mgr is not None and hasattr(db_mgr, "get_active_network"):
+                active_net = db_mgr.get_active_network()
+                if isinstance(active_net, dict):
+                    cand = str(active_net.get("network_id") or "").strip().upper()
+                    if is_valid_network_id(cand):
+                        shared_net_id = cand
+        except Exception:
+            shared_net_id = ""
 
         try:
-            from snow.security.identity import resolve_canonical_device_snow_id
-            net_ident = load_or_create_network_key_identity()
             dev_ident = load_or_create_device_identity()
-            canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
-        except Exception as exc:
-            return False, "", "HUB_AUTH_FAILED", f"Failed loading local hub Ed25519 identity: {exc}"
-
-        if not net_ident or not dev_ident:
-            return False, "", "HUB_AUTH_FAILED", "Local hub Ed25519 identity is unavailable."
-
-        base = hub_url.rstrip("/")
-        try:
-            async with session.post(
-                f"{base}/v1/hub/challenge",
-                json={
+            if shared_net_id:
+                dev_key = load_or_create_device_key_identity()
+                canonical_snow = str(dev_key.snow_id or "").strip().upper()
+                challenge_body = {
+                    "auth_kind": "device",
+                    "network_id": shared_net_id,
+                    "public_key": dev_key.public_key_b64,
+                    "device_id": dev_ident.device_id,
+                    "snow_id": canonical_snow,
+                    "audience": "render-hub-tunnel",
+                }
+            else:
+                net_ident = load_or_create_network_key_identity()
+                canonical_snow, _ = resolve_canonical_device_snow_id(fallback_identity=dev_ident)
+                challenge_body = {
                     "network_id": net_ident.network_id,
                     "public_key": net_ident.public_key_b64,
                     "device_id": dev_ident.device_id,
                     "snow_id": canonical_snow,
-                },
-            ) as ch_resp:
+                }
+        except Exception as exc:
+            return False, "", "HUB_AUTH_FAILED", f"Failed loading local hub Ed25519 identity: {exc}"
+
+        base = hub_url.rstrip("/")
+        try:
+            async with session.post(f"{base}/v1/hub/challenge", json=challenge_body) as ch_resp:
                 try:
                     ch_data = await ch_resp.json(content_type=None)
                 except Exception:
@@ -4058,18 +4474,33 @@ class SnowWebServer:
                         ch_data.get("error") or f"Hub challenge failed (HTTP {ch_resp.status})."
                     )
 
-            sig_b64 = net_ident.sign_hub_challenge(ch_data, device_id=dev_ident.device_id)
-            async with session.post(
-                f"{base}/v1/hub/session",
-                json={
+            if shared_net_id:
+                sig_b64 = dev_key.sign_device_hub_challenge(
+                    ch_data,
+                    device_id=dev_ident.device_id,
+                    network_id=shared_net_id,
+                    audience="render-hub-tunnel",
+                )
+                session_body = {
+                    "challenge_id": ch_data["challenge_id"],
+                    "network_id": shared_net_id,
+                    "public_key": dev_key.public_key_b64,
+                    "signature": sig_b64,
+                    "device_id": dev_ident.device_id,
+                    "snow_id": canonical_snow,
+                    "audience": "render-hub-tunnel",
+                }
+            else:
+                sig_b64 = net_ident.sign_hub_challenge(ch_data, device_id=dev_ident.device_id)
+                session_body = {
                     "challenge_id": ch_data["challenge_id"],
                     "network_id": net_ident.network_id,
                     "public_key": net_ident.public_key_b64,
                     "signature": sig_b64,
                     "device_id": dev_ident.device_id,
                     "snow_id": canonical_snow,
-                },
-            ) as sess_resp:
+                }
+            async with session.post(f"{base}/v1/hub/session", json=session_body) as sess_resp:
                 try:
                     sess_data = await sess_resp.json(content_type=None)
                 except Exception:
@@ -4183,7 +4614,7 @@ class SnowWebServer:
                 if cand_snow == clean_id or str(p.device_id).upper() == clean_id:
                     paired_match = p
                     break
-        if paired_match is not None and str(paired_match.last_known_host or "").strip():
+        if paired_match is not None:
             resolved_peer_snow = ""
             if db_mgr is not None and hasattr(db_mgr, "get_setting"):
                 try:
@@ -4195,18 +4626,57 @@ class SnowWebServer:
                 or str(getattr(paired_match, "snow_id", "") or "").strip().upper()
                 or clean_id
             )
-            return {
+            paired_entry = {
                 "success": True,
                 "found": True,
                 "source": "paired_db",
                 "snow_id": resolved_peer_snow,
                 "device_id": paired_match.device_id,
                 "device_name": paired_match.device_name,
-                "host": str(paired_match.last_known_host).strip(),
+                "host": str(paired_match.last_known_host or "").strip(),
                 "port": paired_match.last_known_port or 8765,
                 "cert_fingerprint": paired_match.cert_fingerprint or "",
                 "is_paired": True,
             }
+            if paired_entry["host"]:
+                return paired_entry
+        else:
+            paired_entry = None
+            if getattr(self, "bridge", None) and hasattr(self.bridge, "list_devices"):
+                try:
+                    ld_res = await self.bridge.list_devices()
+                    if isinstance(ld_res, dict):
+                        ld_devs = (
+                            ld_res["data"].get("devices", [])
+                            if isinstance(ld_res.get("data"), dict)
+                            else ld_res.get("devices", [])
+                        )
+                        for d in ld_devs or []:
+                            if not isinstance(d, dict) or not d.get("is_paired"):
+                                continue
+                            d_id = str(d.get("device_id") or "").strip()
+                            d_snow = str(d.get("snow_id") or "").strip().upper()
+                            d_legacy = str(
+                                d.get("legacy_snow_id") or (generate_snow_id(seed=d_id) if d_id else "")
+                            ).strip().upper()
+                            if clean_id in {d_snow, d_legacy, d_id.upper()} - {""}:
+                                paired_entry = {
+                                    "success": True,
+                                    "found": True,
+                                    "source": "paired_db",
+                                    "snow_id": d_snow or clean_id,
+                                    "device_id": d_id,
+                                    "device_name": str(d.get("device_name") or "Paired Peer"),
+                                    "host": str(d.get("host") or "").strip(),
+                                    "port": int(d.get("port") or 8765),
+                                    "cert_fingerprint": str(d.get("cert_fingerprint") or ""),
+                                    "is_paired": True,
+                                }
+                                if paired_entry["host"]:
+                                    return paired_entry
+                                break
+                except Exception:
+                    pass
 
         # 3 & 4. Query Core LAN discovery service via bounded Core IPC operation
         discovery_status = "OK"
@@ -4223,10 +4693,17 @@ class SnowWebServer:
                         if not isinstance(peer, dict):
                             continue
                         p_id = str(peer.get("device_id") or "").strip()
-                        p_snow = str(
-                            peer.get("snow_id") or (generate_snow_id(seed=p_id) if p_id else "")
+                        p_legacy = str(
+                            peer.get("legacy_snow_id") or (generate_snow_id(seed=p_id) if p_id else "")
                         ).strip().upper()
-                        if p_snow == clean_id or (p_id and p_id.upper() == clean_id):
+                        p_snow = str(
+                            peer.get("snow_id") or p_legacy
+                        ).strip().upper()
+                        if (
+                            p_snow == clean_id
+                            or (p_legacy and p_legacy == clean_id)
+                            or (p_id and p_id.upper() == clean_id)
+                        ):
                             p_host = str(peer.get("host") or peer.get("ip_address") or "").strip()
                             try:
                                 p_port = int(peer.get("port") or 8765)
@@ -4237,7 +4714,7 @@ class SnowWebServer:
                                     "success": True,
                                     "found": True,
                                     "source": "lan_discovery",
-                                    "snow_id": clean_id,
+                                    "snow_id": p_snow or clean_id,
                                     "device_id": p_id,
                                     "device_name": str(peer.get("device_name") or "LAN Peer"),
                                     "device_type": str(peer.get("device_type") or "unknown"),
@@ -4291,6 +4768,8 @@ class SnowWebServer:
                         hub_data = {}
 
                     if resp.status == 401:
+                        if paired_entry is not None:
+                            return paired_entry
                         return {
                             "success": False,
                             "found": False,
@@ -4300,6 +4779,8 @@ class SnowWebServer:
                             "source": "hub_directory",
                         }
                     if resp.status == 403:
+                        if paired_entry is not None:
+                            return paired_entry
                         return {
                             "success": False,
                             "found": False,
@@ -4309,6 +4790,8 @@ class SnowWebServer:
                             "source": "hub_directory",
                         }
                     if resp.status == 404:
+                        if paired_entry is not None:
+                            return paired_entry
                         return {
                             "success": False,
                             "found": False,
@@ -4318,6 +4801,8 @@ class SnowWebServer:
                             "source": "hub_directory",
                         }
                     if resp.status >= 500 or resp.status != 200 or not isinstance(hub_data, dict):
+                        if paired_entry is not None:
+                            return paired_entry
                         return {
                             "success": False,
                             "found": False,
@@ -4328,6 +4813,8 @@ class SnowWebServer:
                         }
 
                     if "online" in hub_data and not hub_data.get("online"):
+                        if paired_entry is not None:
+                            return paired_entry
                         return {
                             "success": False,
                             "found": False,
@@ -4354,6 +4841,7 @@ class SnowWebServer:
                         "source": "hub_directory",
                         "snow_id": clean_id,
                         "hub_url": hub_url,
+                        **({"is_paired": True} if paired_entry is not None else {}),
                         **hub_data,
                     }
                     if ep_host:
@@ -4361,6 +4849,8 @@ class SnowWebServer:
                         result["port"] = ep_port
                     return result
             except asyncio.TimeoutError:
+                if paired_entry is not None:
+                    return paired_entry
                 return {
                     "success": False,
                     "found": False,
@@ -4372,6 +4862,8 @@ class SnowWebServer:
                 }
             except Exception as exc:
                 logger.debug("Hub directory lookup failed for %s: %s", clean_id, exc)
+                if paired_entry is not None:
+                    return paired_entry
                 return {
                     "success": False,
                     "found": False,
@@ -4382,6 +4874,8 @@ class SnowWebServer:
                     **({"discovery_error": discovery_error} if discovery_error else {}),
                 }
 
+        if paired_entry is not None:
+            return paired_entry
         if discovery_status == "DISCOVERY_UNAVAILABLE":
             return {
                 "success": False,
@@ -5136,15 +5630,15 @@ class SnowWebServer:
 
             network_id = ""
             try:
+                from snow.security.identity import is_valid_network_id
+
                 active_net = db_mgr.get_active_network() if db_mgr and hasattr(db_mgr, "get_active_network") else None
-                if active_net and active_net.get("network_id"):
-                    network_id = str(active_net["network_id"])
-                else:
-                    key_ident = load_or_create_network_key_identity()
-                    if key_ident and getattr(key_ident, "network_id", ""):
-                        network_id = str(key_ident.network_id)
+                if isinstance(active_net, dict) and active_net.get("network_id"):
+                    cand_net = str(active_net["network_id"]).strip().upper()
+                    if is_valid_network_id(cand_net):
+                        network_id = cand_net
             except Exception as exc:
-                logger.debug("Relay hub network_key_id resolution fallback: %s", exc)
+                logger.debug("Relay hub shared network lookup skipped: %s", exc)
 
             if db_mgr is not None and hasattr(db_mgr, "set_setting"):
                 try:
@@ -5691,6 +6185,7 @@ class SnowWebServer:
                 "is_paused": False,
                 "error": res.get("error", "Core daemon unreachable"),
             })
+        self._mark_ipc_success()
         data = res.get("data", {})
         return web.json_response({
             "success": True,

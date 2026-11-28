@@ -436,6 +436,33 @@ class AndroidPeerMediaServer(
                     }
                     writeJson(output, 200, JSONObject().put("success", true).put("senders", arr))
                 }
+                method == "GET" && path == "/api/v1/screen/status" -> {
+                    val active = getActiveSenders()
+                    val arr = JSONArray()
+                    active.forEach { s ->
+                        arr.put(
+                            JSONObject()
+                                .put("sender_device_id", s.senderDeviceId)
+                                .put("sender_name", s.senderName)
+                                .put("sender_platform", s.senderPlatform)
+                                .put("session_id", s.sessionId)
+                                .put("frame_seq", s.frameSeq)
+                                .put("frame_width", s.width)
+                                .put("frame_height", s.height)
+                                .put("fps", s.fps.toDouble())
+                                .put("has_frame", s.frameBytes != null)
+                        )
+                    }
+                    writeJson(
+                        output,
+                        200,
+                        JSONObject()
+                            .put("success", true)
+                            .put("active", active.isNotEmpty())
+                            .put("sender_count", active.size)
+                            .put("senders", arr)
+                    )
+                }
                 method == "GET" && path == "/api/v1/screen/frame" -> {
                     val senderId = extractQueryParam(query, "sender_id") ?: extractQueryParam(query, "device_id")
                     val slot = getLatestFrame(senderId)
@@ -450,9 +477,13 @@ class AndroidPeerMediaServer(
                     }
                 }
                 method == "POST" && path == "/api/v1/screen/stop" -> {
-                    val senderId = headers["x-snow-sender-id"] ?: headers["x-snow-device-id"] ?: authedDeviceId
+                    val senderId = extractQueryParam(query, "sender_id")
+                        ?: extractQueryParam(query, "device_id")
+                        ?: headers["x-snow-sender-id"]
+                        ?: headers["x-snow-device-id"]
+                        ?: authedDeviceId
                     setSessionStopped(senderId)
-                    writeJson(output, 200, JSONObject().put("status", "STOPPED"))
+                    writeJson(output, 200, JSONObject().put("status", "STOPPED").put("sender_device_id", senderId))
                 }
                 method == "POST" && path == "/api/v1/screen/subscribe" -> {
                     writeJson(output, 200, JSONObject().put("success", true))

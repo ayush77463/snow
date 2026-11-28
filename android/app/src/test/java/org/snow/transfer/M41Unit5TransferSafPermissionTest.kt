@@ -393,60 +393,52 @@ class M41Unit5TransferSafPermissionTest {
     }
 
     @Test
-    fun honestPermissionsServiceObservabilityAndNoRestrictedManifestPermissions() {
-        val snapOptimizedStopped = SettingsPermissionInspector.inspect(
+    fun honestPermissionsServiceObservabilityAndScopedRestrictedManifestPermissions() {
+        val snapSetupNeeded = SettingsPermissionInspector.inspect(
             context = context,
-            listenerGranted = true,
-            postNotificationsOverride = true,
+            listenerGranted = false,
+            allFilesAccessOverride = false,
             safConfiguredOverride = false,
-            batteryUnrestrictedOverride = false,
-            serviceRunningOverride = false
+            overlayPermissionOverride = false
         )
-        assertEquals("OPTIMIZED", snapOptimizedStopped.backgroundBadgeText())
-        assertFalse(snapOptimizedStopped.isBackgroundFullyHealthy())
-        assertTrue(snapOptimizedStopped.backgroundSummaryText().contains("Battery: Optimized"))
-        assertTrue(snapOptimizedStopped.backgroundSummaryText().contains("Service: Stopped"))
+        assertEquals("SETUP", snapSetupNeeded.notificationSyncBadgeText())
+        assertEquals("SETUP", snapSetupNeeded.fileAccessBadgeText())
+        assertEquals("DEFAULT", snapSetupNeeded.transferFolderBadgeText())
+        assertEquals("SETUP", snapSetupNeeded.backgroundRunBadgeText())
 
         // Never shows fake "Background Run: Granted"
-        assertFalse(snapOptimizedStopped.backgroundBadgeText().contains("GRANTED"))
+        assertFalse(snapSetupNeeded.backgroundRunBadgeText().contains("GRANTED"))
 
-        SnowForegroundService.setServiceRunningForTest(true)
-        assertTrue(SnowForegroundService.isServiceRunning())
-        val snapRunningOptimized = SettingsPermissionInspector.inspect(
+        val snapGranted = SettingsPermissionInspector.inspect(
             context = context,
             listenerGranted = true,
-            postNotificationsOverride = true,
+            allFilesAccessOverride = true,
             safConfiguredOverride = true,
-            batteryUnrestrictedOverride = false
+            safFolderNameOverride = "SNOW_Backup",
+            overlayPermissionOverride = true
         )
-        assertEquals("PARTIAL", snapRunningOptimized.backgroundBadgeText())
-        assertTrue(snapRunningOptimized.backgroundSummaryText().contains("Service: Running"))
-
-        val snapHealthy = SettingsPermissionInspector.inspect(
-            context = context,
-            listenerGranted = true,
-            postNotificationsOverride = true,
-            safConfiguredOverride = true,
-            batteryUnrestrictedOverride = true
-        )
-        assertEquals("UNRESTRICTED", snapHealthy.backgroundBadgeText())
-        assertTrue(snapHealthy.isBackgroundFullyHealthy())
+        assertEquals("GRANTED", snapGranted.notificationSyncBadgeText())
+        assertEquals("GRANTED", snapGranted.fileAccessBadgeText())
+        assertEquals("CONFIGURED", snapGranted.transferFolderBadgeText())
+        assertEquals("GRANTED", snapGranted.backgroundRunBadgeText())
+        assertEquals("SNOW_Backup", snapGranted.safFolderName)
 
         // Verify AppLauncherHandler no longer references "Display over other apps"
         val launcherSrc = resolveModuleFile("src/main/java/org/snow/capabilities/AppLauncherHandler.kt").readText()
         assertFalse(launcherSrc.contains("Display over other apps"))
 
-        // Verify SettingsScreen contains ON_RESUME refresh, SAF OpenDocumentTree, and no fake granted badge
+        // Verify SettingsScreen contains ON_RESUME refresh, SAF OpenDocumentTree, M4.6 intents, and no fake granted badge
         val settingsSrc = resolveModuleFile("src/main/java/org/snow/ui/settings/SettingsScreen.kt").readText()
         assertTrue(settingsSrc.contains("ON_RESUME"))
         assertTrue(settingsSrc.contains("OpenDocumentTree"))
-        assertTrue(settingsSrc.contains("ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS"))
+        assertTrue(settingsSrc.contains("ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION"))
+        assertTrue(settingsSrc.contains("ACTION_MANAGE_OVERLAY_PERMISSION"))
         assertFalse(settingsSrc.contains("Background Run: Granted"))
 
-        // Verify AndroidManifest contains zero restricted permissions
+        // Verify AndroidManifest declares strictly MANAGE_EXTERNAL_STORAGE + SYSTEM_ALERT_WINDOW (never INSTALL_PACKAGES / BATTERY_OPT)
         val manifest = resolveModuleFile("src/main/AndroidManifest.xml").readText()
-        assertFalse(manifest.contains("SYSTEM_ALERT_WINDOW"))
-        assertFalse(manifest.contains("MANAGE_EXTERNAL_STORAGE"))
+        assertTrue(manifest.contains("android.permission.SYSTEM_ALERT_WINDOW"))
+        assertTrue(manifest.contains("android.permission.MANAGE_EXTERNAL_STORAGE"))
         assertFalse(manifest.contains("REQUEST_INSTALL_PACKAGES"))
         assertFalse(manifest.contains("REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"))
     }

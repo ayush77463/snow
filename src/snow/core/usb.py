@@ -290,6 +290,11 @@ def unlock_android_permissions(
             False,
         ),
         (
+            "Restricted Settings Access",
+            [str(bin_path), "-s", dev_serial, "shell", "appops", "set", package_name, "ACCESS_RESTRICTED_SETTINGS", "allow"],
+            False,
+        ),
+        (
             "Install Unknown Apps",
             [str(bin_path), "-s", dev_serial, "shell", "appops", "set", package_name, "REQUEST_INSTALL_PACKAGES", "allow"],
             False,

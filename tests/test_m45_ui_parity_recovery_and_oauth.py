@@ -527,6 +527,22 @@ class TestM45WebUiHeadlessEdgeCDPAudit(unittest.IsolatedAsyncioTestCase):
         if (urlStr.startsWith("/api/network/merge/pending")) {{
             return ok({{ proposals: [] }});
         }}
+        if (urlStr.startsWith("/api/devices/connect-peer")) {{
+            const payload = JSON.parse(body || "{{}}");
+            if (payload.step === "resolve") {{
+                return ok({{
+                    requires_pin: true,
+                    snow_id: payload.snow_id || "SNW-PEER-2026",
+                }});
+            }}
+            return ok({{
+                snow_id: payload.snow_id || "SNW-PEER-2026",
+                network_conflict: true,
+                merge_tx_id: "tx-cdp-merge-1",
+                source_network_id: "SNW-NET-12345678",
+                target_network_id: "SNW-NET-87654321",
+            }});
+        }}
         if (urlStr.startsWith("/api/devices")) {{
             return ok({{
                 devices: [
@@ -543,21 +559,6 @@ class TestM45WebUiHeadlessEdgeCDPAudit(unittest.IsolatedAsyncioTestCase):
                 pin: window.__AUDIT_STATE__.hasPin ? "654321" : "",
                 remaining_seconds: window.__AUDIT_STATE__.hasPin ? 59 : 0,
                 svg: {json.dumps(live_svg)},
-            }});
-        }}
-        if (urlStr.startsWith("/api/pair/qr/validate")) {{
-            return ok({{
-                valid: true,
-                summary: {{ snow_id: "SNW-PEER-2026", network_id: "SNW-NET-87654321", has_handshake_token: true }},
-            }});
-        }}
-        if (urlStr.startsWith("/api/pair/qr/accept")) {{
-            return ok({{
-                snow_id: "SNW-PEER-2026",
-                network_conflict: true,
-                merge_tx_id: "tx-cdp-merge-1",
-                source_network_id: "SNW-NET-12345678",
-                target_network_id: "SNW-NET-87654321",
             }});
         }}
         if (urlStr.startsWith("/api/pair/qr")) {{
@@ -693,23 +694,20 @@ class TestM45WebUiHeadlessEdgeCDPAudit(unittest.IsolatedAsyncioTestCase):
     await new Promise(r => setTimeout(r, 150));
     const pinAfter = document.getElementById('pairing-pin-display')?.textContent?.trim();
 
-    const acc = document.getElementById('paste-qr-json-accordion');
-    if (acc) acc.open = true;
-    document.getElementById('pairing-qr-json-input').value = JSON.stringify({
-        v: 2, snow_id: "SNW-PEER-2026", handshake_token: "tok", ips: ["192.168.1.50"], port: 8765, fp: "C".repeat(64)
-    });
-    document.getElementById('btn-validate-qr-json')?.click();
+    document.getElementById('pairing-input').value = 'SNW-PEER-2026';
+    document.getElementById('btn-pairing-connect')?.click();
     await new Promise(r => setTimeout(r, 120));
-    const valPreview = document.getElementById('pairing-qr-json-preview')?.textContent?.trim();
+    const step2Label = document.getElementById('pairing-step2-label')?.textContent?.trim();
 
-    document.getElementById('btn-accept-qr-json')?.click();
+    document.getElementById('pairing-step2-pin').value = '654321';
+    document.getElementById('btn-pairing-verify-pin')?.click();
     await new Promise(r => setTimeout(r, 150));
     const mergeModalEl = document.getElementById('network-merge-decision-modal');
     const mergeModalOpen = Boolean(mergeModalEl) && !mergeModalEl.classList.contains('d-none');
     document.getElementById('btn-close-merge-modal')?.click();
 
     return {
-        qrHasSvg, mySnowId, myNetId, hasFedCard, pinAfter, valPreview, mergeModalOpen,
+        qrHasSvg, mySnowId, myNetId, hasFedCard, pinAfter, step2Label, mergeModalOpen,
         rawUuidInDevices: /\b550e8400-e29b-41d4-a716-446655440000\b/i.test(bodyText),
     };
 })()
@@ -719,7 +717,7 @@ class TestM45WebUiHeadlessEdgeCDPAudit(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(dev_check["myNetId"], "SNW-NET-12345678")
             self.assertFalse(dev_check["hasFedCard"])
             self.assertIn("654", dev_check["pinAfter"])
-            self.assertIn("Valid QR v2", dev_check["valPreview"])
+            self.assertEqual(dev_check["step2Label"], "Enter the 6-digit PIN shown on SNW-PEER-2026")
             self.assertTrue(dev_check["mergeModalOpen"])
             self.assertFalse(dev_check["rawUuidInDevices"])
 
@@ -765,7 +763,7 @@ class TestM45WebUiHeadlessEdgeCDPAudit(unittest.IsolatedAsyncioTestCase):
     const advDetails = document.querySelector('#advanced-diagnostics-card details.advanced-accordion');
     if (advDetails) advDetails.open = true;
     const writesBeforeReveal = window.__AUDIT_STATE__.clipboardWrites.length;
-    document.getElementById('btn-open-recovery-key')?.click();
+    document.getElementById('btn-recovery-open-export')?.click();
     await new Promise(r => setTimeout(r, 80));
     document.getElementById('btn-recovery-reveal-confirm')?.click();
     await new Promise(r => setTimeout(r, 150));

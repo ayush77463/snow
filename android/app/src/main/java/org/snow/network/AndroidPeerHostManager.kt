@@ -2,19 +2,38 @@ package org.snow.network
 
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import org.snow.capabilities.AndroidCapabilityDispatcher
+import org.snow.protocol.ErrorCode
+import org.snow.protocol.SnowError
 import org.snow.security.AndroidSelfSignedCertGenerator
+import org.snow.security.DeviceIdentity
+import org.snow.security.DeviceKeyIdentity
+import org.snow.security.DeviceKeyManager
 import org.snow.security.EncryptedFilePeerHostCertStorage
 import org.snow.security.PeerHostCertStorage
 import org.snow.security.SafeLog
 import org.snow.security.TokenStorage
+import org.snow.transfer.FileTransferClient
+import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.security.MessageDigest
 import java.util.Base64
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -62,7 +81,9 @@ data class PeerHostState(
 class AndroidPeerHostManager(
     private val certStorage: PeerHostCertStorage? = null
 ) {
-    constructor(context: Context) : this(EncryptedFilePeerHostCertStorage(context))
+    constructor(context: Context) : this(EncryptedFilePeerHostCertStorage(context)) {
+        appContext = context.applicationContext
+    }
 
     companion object {
         private const val TAG = "AndroidPeerHostManager"
@@ -209,6 +230,7 @@ class AndroidPeerHostManager(
 
     private val hostModeSettingEnabled = AtomicBoolean(false)
     private val isRunning = AtomicBoolean(false)
+    private var appContext: Context? = null
     private var server: AndroidPeerHostServer? = null
     private var mediaServer: AndroidPeerMediaServer? = null
     private var currentEphemeralPin: EphemeralPin? = null
@@ -216,12 +238,40 @@ class AndroidPeerHostManager(
     private var configuredSnowId: String? = null
     private var configuredNetworkId: String? = null
     private var configuredLocalDeviceId: String = ""
+    private var provisionalRendezvousNetworkId: String? = null
     private var onHostNetworkUpdatedCallback: ((String?) -> Unit)? = null
     private val mergeProposals = java.util.concurrent.ConcurrentHashMap<String, MergeProposalRecord>()
     private var failedPinAttempts: Int = 0
     private var lockoutUntilMillis: Long = 0L
     internal var clockMillis: () -> Long = { System.currentTimeMillis() }
     private val secureRandom = java.security.SecureRandom()
+    private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var activeRendezvousRegisterJob: Job? = null
+    private val hubHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .writeTimeout(12, TimeUnit.SECONDS)
+            .build()
+    }
+
+    @Volatile
+    var onPeerAuthenticated: ((PeerAuthEvent) -> Unit)? = null
+
+    @Volatile
+    var onPeerDisconnected: ((peerDeviceId: String) -> Unit)? = null
+
+    @Volatile
+    var hubHttpUrlProvider: (() -> String?)? = null
+
+    @Volatile
+    var deviceKeyIdentityProvider: (() -> DeviceKeyIdentity?)? = null
+
+    @Volatile
+    var localDeviceIdProvider: (() -> String?)? = null
+
+    @Volatile
+    var rendezvousRegistrar: ((pin: String, handshakeToken: String?, snowId: String?, networkId: String?, ttlSeconds: Long) -> Unit)? = null
 
     private val _hostState = MutableStateFlow(PeerHostState())
     val hostState: StateFlow<PeerHostState> = _hostState.asStateFlow()
@@ -336,6 +386,8 @@ class AndroidPeerHostManager(
             errorMessage = null
         )
         SafeLog.i(TAG, "Generated ephemeral 6-digit pairing PIN (valid for ${PIN_VALIDITY_MS / 1000L}s)")
+        val activeHandshakeTok = currentHandshakeToken?.takeIf { !it.isConsumed && now <= it.expiresAtMillis }?.token
+        scheduleRendezvousSlotRegistration(pin = pinVal, handshakeToken = activeHandshakeTok)
         return pinVal
     }
 
@@ -343,6 +395,8 @@ class AndroidPeerHostManager(
     fun cancelPairingPin() {
         currentEphemeralPin = null
         currentHandshakeToken = null
+        activeRendezvousRegisterJob?.cancel()
+        activeRendezvousRegisterJob = null
         _hostState.value = _hostState.value.copy(
             pairingPin = null,
             pinExpiresInSeconds = 0L,
@@ -350,6 +404,188 @@ class AndroidPeerHostManager(
             lockoutRemainingSeconds = getRemainingLockoutSeconds()
         )
         SafeLog.i(TAG, "Cancelled active pairing PIN and handshake token.")
+    }
+
+    @Synchronized
+    fun registerActivePairingOnRenderHub(pin: String? = null, handshakeToken: String? = null) {
+        val now = clockMillis()
+        val effectivePin = pin?.trim()?.takeIf { it.length == 6 && it.all(Char::isDigit) }
+            ?: currentEphemeralPin?.takeIf { !it.isConsumed && now <= it.expiresAtMillis }?.pin.orEmpty()
+        val effectiveHandshake = handshakeToken?.trim()?.takeIf { it.isNotBlank() }
+            ?: currentHandshakeToken?.takeIf { !it.isConsumed && now <= it.expiresAtMillis }?.token
+        if (effectivePin.isBlank() && effectiveHandshake.isNullOrBlank()) return
+        scheduleRendezvousSlotRegistration(pin = effectivePin, handshakeToken = effectiveHandshake)
+    }
+
+    @Synchronized
+    private fun resolveRendezvousNetworkId(): String {
+        val current = configuredNetworkId?.trim()?.uppercase(Locale.ROOT)
+        if (current != null && isValidCanonicalNetworkId(current)) {
+            return current
+        }
+        val existing = provisionalRendezvousNetworkId
+        if (existing != null && isValidCanonicalNetworkId(existing)) {
+            return existing
+        }
+        return generateCanonicalNetworkId().also { provisionalRendezvousNetworkId = it }
+    }
+
+    private fun scheduleRendezvousSlotRegistration(pin: String, handshakeToken: String?) {
+        val cleanPin = pin.trim()
+        val cleanHtok = handshakeToken?.trim()?.takeIf { it.isNotBlank() }
+        if (cleanPin.isBlank() && cleanHtok == null) return
+
+        val customRegistrar = rendezvousRegistrar
+        val hubUrl = hubHttpUrlProvider?.invoke()?.trim()?.trimEnd('/')
+        if (customRegistrar == null && hubUrl.isNullOrBlank()) {
+            return
+        }
+
+        val netId = resolveRendezvousNetworkId()
+        val devKey = try {
+            deviceKeyIdentityProvider?.invoke()
+                ?: appContext?.let { DeviceKeyManager(it).getOrCreate() }
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "DeviceKeyManager unavailable for rendezvous slot registration: ${e.message}")
+            null
+        }
+        val snowId = configuredSnowId?.trim()?.uppercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
+            ?: devKey?.snowId
+        val devId = localDeviceIdProvider?.invoke()?.trim()?.takeIf { it.isNotBlank() }
+            ?: configuredLocalDeviceId.trim().takeIf { it.isNotBlank() }
+            ?: appContext?.let { runCatching { DeviceIdentity.getOrCreate(it).deviceId }.getOrNull() }
+            ?: ""
+        val certFp = _hostState.value.certFingerprint
+            .replace(":", "")
+            .replace(" ", "")
+            .trim()
+            .uppercase(Locale.ROOT)
+            .takeIf { it.length == 64 && it.all { ch -> ch in '0'..'9' || ch in 'A'..'F' } }
+        val ttlSec = (PIN_VALIDITY_MS / 1000L).coerceIn(10L, 120L)
+
+        activeRendezvousRegisterJob?.cancel()
+        activeRendezvousRegisterJob = managerScope.launch {
+            if (customRegistrar != null) {
+                try {
+                    customRegistrar.invoke(cleanPin, cleanHtok, snowId, netId, ttlSec)
+                } catch (e: Exception) {
+                    SafeLog.w(TAG, "Custom rendezvous registrar error: ${e.message}")
+                }
+                return@launch
+            }
+            if (hubUrl.isNullOrBlank() || devKey == null || devId.isBlank()) {
+                return@launch
+            }
+            openRendezvousSlotOnHub(
+                hubBase = hubUrl,
+                devKey = devKey,
+                deviceId = devId,
+                networkId = netId,
+                snowId = snowId ?: devKey.snowId,
+                certFingerprintHex = certFp,
+                pin = cleanPin,
+                handshakeToken = cleanHtok,
+                ttlSeconds = ttlSec
+            )
+        }
+    }
+
+    private fun openRendezvousSlotOnHub(
+        hubBase: String,
+        devKey: DeviceKeyIdentity,
+        deviceId: String,
+        networkId: String,
+        snowId: String,
+        certFingerprintHex: String?,
+        pin: String,
+        handshakeToken: String?,
+        ttlSeconds: Long
+    ) {
+        try {
+            val mediaType = "application/json; charset=utf-8".toMediaType()
+            val challengeReqJson = JSONObject().apply {
+                put("snow_id", devKey.snowId)
+                put("public_key", devKey.publicKeyB64)
+                put("device_id", deviceId)
+                put("network_id", networkId)
+            }
+            val challengeReq = Request.Builder()
+                .url("$hubBase/v1/hub/challenge")
+                .post(challengeReqJson.toString().toRequestBody(mediaType))
+                .build()
+
+            val chObj = hubHttpClient.newCall(challengeReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    SafeLog.w(TAG, "Rendezvous hub challenge failed: HTTP ${resp.code}")
+                    return
+                }
+                JSONObject(resp.body?.string().orEmpty())
+            }
+            val challengeId = chObj.optString("challenge_id").trim()
+            val nonce = chObj.optString("nonce").trim()
+            val expiresAt = chObj.optLong("expires_at", 0L)
+            val audience = chObj.optString("audience", "render-hub-tunnel").trim()
+            if (challengeId.isEmpty() || nonce.isEmpty() || expiresAt <= 0L) {
+                SafeLog.w(TAG, "Malformed /v1/hub/challenge response while opening PIN rendezvous.")
+                return
+            }
+
+            val signature = devKey.signDeviceHubChallenge(
+                challengeId = challengeId,
+                nonce = nonce,
+                expiresAt = expiresAt,
+                deviceId = deviceId,
+                networkId = networkId,
+                audience = audience
+            )
+            val sessionReqJson = JSONObject().apply {
+                put("challenge_id", challengeId)
+                put("snow_id", devKey.snowId)
+                put("public_key", devKey.publicKeyB64)
+                put("signature", signature)
+                put("device_id", deviceId)
+                put("network_id", networkId)
+            }
+            val sessionReq = Request.Builder()
+                .url("$hubBase/v1/hub/session")
+                .post(sessionReqJson.toString().toRequestBody(mediaType))
+                .build()
+
+            val hubToken = hubHttpClient.newCall(sessionReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    SafeLog.w(TAG, "Rendezvous hub session exchange failed: HTTP ${resp.code}")
+                    return
+                }
+                JSONObject(resp.body?.string().orEmpty()).optString("token").trim()
+            }
+            if (hubToken.isEmpty()) return
+
+            val openJson = JSONObject().apply {
+                put("network_id", networkId)
+                put("host_device_id", deviceId)
+                put("host_snow_id", snowId)
+                if (!certFingerprintHex.isNullOrBlank()) put("cert_fingerprint", certFingerprintHex)
+                put("mode", "pairing")
+                put("ttl_seconds", ttlSeconds)
+                if (pin.isNotBlank()) put("pin", pin)
+                if (!handshakeToken.isNullOrBlank()) put("handshake_token", handshakeToken)
+            }
+            val openReq = Request.Builder()
+                .url("$hubBase/v1/rendezvous/open")
+                .addHeader("Authorization", "Bearer $hubToken")
+                .post(openJson.toString().toRequestBody(mediaType))
+                .build()
+            hubHttpClient.newCall(openReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val rdvId = JSONObject(resp.body?.string().orEmpty()).optString("rendezvous_id")
+                    SafeLog.i(TAG, "Registered /v1/rendezvous/open slot ($rdvId) for snow_id=$snowId")
+                } else {
+                    SafeLog.w(TAG, "Failed registering /v1/rendezvous/open slot: HTTP ${resp.code}")
+                }
+            }
+        } catch (e: Exception) {
+            SafeLog.w(TAG, "Rendezvous hub registration skipped/error: ${e.message}")
+        }
     }
 
     @Synchronized
@@ -779,6 +1015,24 @@ class AndroidPeerHostManager(
         val success = newServer.start()
         if (success) {
             server = newServer
+            newServer.onPeerAuthenticated = { event ->
+                val count = (server ?: newServer).listAuthenticatedPeerDeviceIds().size
+                _hostState.value = _hostState.value.copy(peerCount = count)
+                try {
+                    onPeerAuthenticated?.invoke(event)
+                } catch (e: Exception) {
+                    SafeLog.w(TAG, "AndroidPeerHostManager onPeerAuthenticated error: ${e.message}")
+                }
+            }
+            newServer.onPeerDisconnected = { peerId ->
+                val count = (server ?: newServer).listAuthenticatedPeerDeviceIds().size
+                _hostState.value = _hostState.value.copy(peerCount = count)
+                try {
+                    onPeerDisconnected?.invoke(peerId)
+                } catch (e: Exception) {
+                    SafeLog.w(TAG, "AndroidPeerHostManager onPeerDisconnected error: ${e.message}")
+                }
+            }
             activePort = newServer.boundPort
             isRunning.set(true)
             activeMediaPort = if (mediaPort > 0) mediaPort else 0
@@ -796,6 +1050,9 @@ class AndroidPeerHostManager(
                 if (ms.start()) {
                     mediaServer = ms
                     activeMediaPort = ms.boundPort
+                    newServer.peerDownloadStager = { peerId, reqData ->
+                        stageDownloadForPeer(ms, dispatcher, peerId, reqData)
+                    }
                 }
             }
             val rankedIps = enumerateLocalIpv4Candidates()
@@ -808,7 +1065,7 @@ class AndroidPeerHostManager(
                 port = activePort,
                 mediaPort = activeMediaPort,
                 certFingerprint = certResult.fingerprint,
-                peerCount = 0,
+                peerCount = newServer.listAuthenticatedPeerDeviceIds().size,
                 pairingPin = currentEphemeralPin?.pin,
                 pinExpiresInSeconds = pinRemainingSec,
                 isPairingLocked = isPinLockedOut(),
@@ -871,6 +1128,80 @@ class AndroidPeerHostManager(
     }
 
     fun listAuthenticatedPeers(): List<String> = server?.listAuthenticatedPeerDeviceIds() ?: emptyList()
+
+    fun listAuthenticatedPeerInfos(): List<PeerAuthEvent> = server?.listAuthenticatedPeerInfos() ?: emptyList()
+
+    private fun stageDownloadForPeer(
+        ms: AndroidPeerMediaServer,
+        dispatcher: AndroidCapabilityDispatcher,
+        peerDeviceId: String,
+        data: Map<String, Any?>
+    ): Pair<Map<String, Any?>?, SnowError?> {
+        val rawPath = (data["path"] as? String)?.trim()?.replace('\\', '/')?.trim('/')
+            ?: (data["file_name"] as? String)?.trim()?.replace('\\', '/')?.trim('/')
+            ?: ""
+        if (rawPath.isBlank() || rawPath.split('/').any { it == ".." }) {
+            return null to SnowError(ErrorCode.INVALID_PAYLOAD, "Invalid or empty file path.")
+        }
+        val slashIdx = rawPath.lastIndexOf('/')
+        val subpath = if (slashIdx > 0) rawPath.substring(0, slashIdx) else null
+        val fileName = if (slashIdx >= 0) rawPath.substring(slashIdx + 1) else rawPath
+        if (fileName.isBlank() || fileName == "." || fileName == "..") {
+            return null to SnowError(ErrorCode.INVALID_PAYLOAD, "Invalid file name.")
+        }
+        val principal = (data["principal"] as? String)?.trim() ?: "OWNER_MANUAL"
+        val scope = (data["scope"] as? String)?.trim()
+        val fh = dispatcher.fileHandler
+
+        var localFile: File? = if (fh.isAllFilesAccessGranted() && principal == "OWNER_MANUAL" && scope != "saf") {
+            fh.resolveSharedStorageFile(subpath, fileName)?.takeIf { it.exists() && it.isFile && it.canRead() }
+        } else {
+            null
+        }
+
+        if (localFile == null) {
+            val safDoc = fh.resolveSafDocument(subpath, fileName)
+            if (safDoc == null || !safDoc.exists() || !safDoc.isFile) {
+                return null to SnowError(ErrorCode.FILE_NOT_FOUND, "File '$rawPath' not found on peer device.")
+            }
+            val staged = File(ms.partsRoot, "staged_${UUID.randomUUID().toString().take(8)}_${File(fileName).name}")
+            try {
+                dispatcher.contextProviderForProfileCheck().contentResolver.openInputStream(safDoc.uri)?.use { input ->
+                    staged.outputStream().use { out -> input.copyTo(out) }
+                } ?: return null to SnowError(ErrorCode.INTERNAL_ERROR, "Unable to read SAF file stream.")
+            } catch (e: Exception) {
+                staged.delete()
+                return null to SnowError(ErrorCode.INTERNAL_ERROR, "Failed staging SAF file: ${e.message}")
+            }
+            localFile = staged
+        }
+
+        val sha256 = try {
+            FileTransferClient.computeSha256(localFile)
+        } catch (e: Exception) {
+            return null to SnowError(ErrorCode.INTERNAL_ERROR, "Failed computing digest: ${e.message}")
+        }
+        val record = try {
+            ms.registerDownloadTransfer(
+                deviceId = peerDeviceId,
+                file = localFile,
+                sha256 = sha256,
+                fileSize = localFile.length()
+            )
+        } catch (e: Exception) {
+            return null to SnowError(ErrorCode.INTERNAL_ERROR, "Failed registering transfer: ${e.message}")
+        }
+        return mapOf(
+            "status" to "success",
+            "data" to mapOf(
+                "transfer_id" to record.transferId,
+                "file_name" to File(fileName).name,
+                "file_size" to record.fileSize,
+                "sha256" to record.sha256,
+                "transfer_port" to ms.boundPort
+            )
+        ) to null
+    }
 
     suspend fun sendRequestToPeer(
         targetDeviceId: String,

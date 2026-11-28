@@ -103,7 +103,7 @@ fun SnowApp(
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
 
-    // State observation from SnowUiRepository (UI connected ONLY when transport is CONNECTED AND Authenticated)
+    // State observation from SnowUiRepository (UI connected ONLY when transport is CONNECTED AND Authenticated, or active peer/relay session)
     val connectionState by repository.uiConnectionState.collectAsState()
     val authState by repository.authState.collectAsState()
     val connectedEndpoint by repository.connectedEndpoint.collectAsState()
@@ -111,7 +111,10 @@ fun SnowApp(
     val savedDevices by repository.savedDevices.collectAsState()
     val transportSnapshots by repository.transportSnapshots.collectAsState()
     val discoveredPeers by repository.discoveredPeers.collectAsState()
+    val connectedPeerSessions by repository.connectedPeerSessions.collectAsState()
+    val selectedTargetDeviceId by repository.selectedTargetDeviceId.collectAsState()
     val activeTransfer by repository.activeTransfer.collectAsState()
+    val activeTransfers by repository.activeTransfers.collectAsState()
     val pendingApprovalsCount by repository.pendingApprovalsCount.collectAsState()
     val phoneTelemetry by repository.phoneTelemetry.collectAsState()
     val pcTelemetry by repository.pcTelemetry.collectAsState()
@@ -129,7 +132,7 @@ fun SnowApp(
     val isScreenSharing = screenShareState == org.snow.capabilities.LiveScreenStreamHandler.StreamState.STREAMING
     val incomingStreams by repository.incomingScreenStreams.collectAsState()
     val selectedIncomingSenderId by repository.selectedIncomingSenderId.collectAsState()
-    val eligibleScreenTargets = remember(savedDevices, connectedEndpoint, authState, activePermissionProfile) {
+    val eligibleScreenTargets = remember(savedDevices, connectedEndpoint, authState, activePermissionProfile, connectedPeerSessions) {
         repository.getEligibleScreenTargets()
     }
 
@@ -162,9 +165,13 @@ fun SnowApp(
     var shareInput by remember { mutableStateOf("") }
     var scrollToClipboardTrigger by remember { mutableIntStateOf(0) }
 
-    // Files state
+    // Files & Peer Apps state
     var currentPcPath by remember { mutableStateOf("C:\\") }
+    var currentPeerPath by remember { mutableStateOf("") }
     var pcFilesList by remember { mutableStateOf<List<PcFileItem>>(emptyList()) }
+    var peerAppsList by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
+    var isPeerAppsLoading by remember { mutableStateOf(false) }
+    var peerAppsError by remember { mutableStateOf<String?>(null) }
     val safFolderUri = repository.safFolderManager.getDestinationDisplayName()
 
     // Approvals state (observed directly from shared repository StateFlow)
@@ -199,47 +206,128 @@ fun SnowApp(
         }
     }
 
-    // Determine currently active authenticated device reactively
+    // Determine currently active authenticated device reactively across outbound client + inbound peerHostManager + relayClient
     val activeAuth = authState as? org.snow.network.AuthState.Authenticated
-    val activeHostFromEndpoint = remember(connectedEndpoint, connectionState, authState) {
-        if (SnowUiRepository.isSessionTrulyConnected(connectionState, authState)) {
+    val isTrulyConnected = connectionState == ConnectionState.CONNECTED ||
+        SnowUiRepository.isSessionTrulyConnected(connectionState, authState) ||
+        connectedPeerSessions.isNotEmpty()
+    val activeHostFromEndpoint = remember(connectedEndpoint, connectionState, authState, isTrulyConnected) {
+        if (isTrulyConnected) {
             connectedEndpoint?.substringBeforeLast(":")?.trim().orEmpty()
         } else {
             ""
         }
     }
-    val activeDevice = remember(savedDevices, activeHostFromEndpoint, activeAuth, connectionState) {
-        if (!SnowUiRepository.isSessionTrulyConnected(connectionState, authState)) {
+    val activeSession = remember(connectedPeerSessions, selectedTargetDeviceId, activeAuth) {
+        val selId = selectedTargetDeviceId?.trim()?.takeIf { it.isNotBlank() }
+        (if (selId != null) {
+            connectedPeerSessions.values.firstOrNull {
+                it.deviceId.equals(selId, ignoreCase = true) ||
+                    (!it.snowId.isNullOrBlank() && it.snowId.equals(selId, ignoreCase = true))
+            }
+        } else null) ?: connectedPeerSessions.values.firstOrNull { sess ->
+            val authPeerId = activeAuth?.peerDeviceId
+            val authSnowId = activeAuth?.peerSnowId?.trim()?.takeIf { it.isNotBlank() }
+            (authPeerId != null && sess.deviceId.equals(authPeerId, ignoreCase = true)) ||
+                (authSnowId != null && sess.snowId.equals(authSnowId, ignoreCase = true))
+        } ?: connectedPeerSessions.values.firstOrNull()
+    }
+    val activeDevice = remember(
+        savedDevices,
+        connectedPeerSessions,
+        selectedTargetDeviceId,
+        activeHostFromEndpoint,
+        activeAuth,
+        connectionState,
+        isTrulyConnected,
+        activeSession
+    ) {
+        if (!isTrulyConnected) {
             null
         } else {
-            savedDevices.find { dev ->
-                (activeAuth?.peerSnowId != null && dev.snowId == activeAuth.peerSnowId) ||
-                    (activeAuth?.peerDeviceId != null && dev.deviceId == activeAuth.peerDeviceId) ||
-                    (activeHostFromEndpoint.isNotBlank() && (dev.host == activeHostFromEndpoint || (activeHostFromEndpoint == "127.0.0.1" && dev.host == "127.0.0.1")))
+            val candidate = repository.activeSelectedDevice()
+            val authPeerId = activeAuth?.peerDeviceId
+            val authSnowId = activeAuth?.peerSnowId?.trim()?.takeIf { it.isNotBlank() }
+            val candidateIsLive = candidate != null && (
+                connectedPeerSessions.values.any {
+                    it.deviceId.equals(candidate.deviceId, ignoreCase = true) ||
+                        (!it.snowId.isNullOrBlank() && it.snowId.equals(candidate.snowId, ignoreCase = true))
+                } ||
+                    (authPeerId != null && candidate.deviceId.equals(authPeerId, ignoreCase = true)) ||
+                    (authSnowId != null && candidate.snowId.equals(authSnowId, ignoreCase = true)) ||
+                    (activeHostFromEndpoint.isNotBlank() && candidate.host == activeHostFromEndpoint)
+                )
+            if (candidateIsLive) {
+                candidate
+            } else if (activeSession != null) {
+                savedDevices.firstOrNull { it.deviceId.equals(activeSession.deviceId, ignoreCase = true) }
+                    ?: SavedDevice(
+                        deviceId = activeSession.deviceId,
+                        deviceName = activeSession.deviceName,
+                        host = activeSession.host,
+                        port = activeSession.port,
+                        snowId = activeSession.snowId,
+                        deviceType = if (activeSession.deviceType.equals("android", ignoreCase = true) ||
+                            activeSession.deviceType.equals("phone", ignoreCase = true)
+                        ) "phone" else "pc",
+                        permissionProfile = activeAuth?.permissionProfile ?: "full_control",
+                        transferPort = activeSession.transferPort,
+                        networkId = activeSession.networkId
+                    )
+            } else {
+                candidate
             }
         }
     }
+    val targetDeviceType = remember(activeDevice, connectionState, authState, connectedPeerSessions, selectedTargetDeviceId) {
+        repository.resolveTargetDeviceType(activeDevice, connectionState)
+    }
+    val activeTargetId = activeDevice?.deviceId ?: activeSession?.deviceId
+    val activeBrowsePath = if (targetDeviceType == TargetDeviceType.ANDROID_PEER) currentPeerPath else currentPcPath
 
     val activeDeviceName = activeDevice?.deviceName?.ifBlank { null }
+        ?: activeSession?.deviceName?.ifBlank { null }
         ?: activeAuth?.peerDeviceName?.ifBlank { null }
-        ?: pcTelemetry.hostname
-        ?: if (SnowUiRepository.isSessionTrulyConnected(connectionState, authState)) "SNOW Core" else "No device"
+        ?: (if (targetDeviceType == TargetDeviceType.WINDOWS_PC) pcTelemetry.hostname?.ifBlank { null } else null)
+        ?: if (isTrulyConnected) "SNOW Core" else "No device"
 
-    val transport = remember(connectedEndpoint) {
+    val transport = remember(connectedEndpoint, activeSession) {
         val ep = connectedEndpoint ?: ""
         when {
-            ep.isBlank() -> "Auto"
+            activeSession?.transportKind == "relay" -> "Relay"
+            activeSession?.transportKind == "peer_host" -> "Wi-Fi Peer"
+            ep.isBlank() -> if (activeSession != null) "Direct" else "Auto"
             else -> org.snow.network.TransportClassifier.classifyRoute(host = ep).shortLabel
         }
     }
 
-    // Refresh files when navigating to Tools Files tab, or screen streams on Screen tab
-    LaunchedEffect(currentTab, currentToolSubTab, currentPcPath, connectionState) {
+    LaunchedEffect(targetDeviceType) {
+        if (targetDeviceType == TargetDeviceType.ANDROID_PEER && currentToolSubTab == ToolSubTab.TERMINAL) {
+            currentToolSubTab = ToolSubTab.FILES
+        }
+    }
+
+    LaunchedEffect(activeTargetId, targetDeviceType) {
+        pcFilesList = emptyList()
+        peerAppsList = emptyList()
+        peerAppsError = null
+    }
+
+    // Refresh files/apps/screen when navigating to Tools tabs
+    LaunchedEffect(currentTab, currentToolSubTab, activeBrowsePath, connectionState, targetDeviceType, activeTargetId) {
         if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.FILES && connectionState == ConnectionState.CONNECTED) {
-            repository.listPcDirectory(currentPcPath) { files, err ->
+            repository.listPeerDirectory(path = activeBrowsePath, targetDeviceId = activeTargetId) { files, _ ->
                 if (files != null) {
                     pcFilesList = files
                 }
+            }
+        } else if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.APPS && connectionState == ConnectionState.CONNECTED && targetDeviceType == TargetDeviceType.ANDROID_PEER) {
+            isPeerAppsLoading = true
+            peerAppsError = null
+            repository.listPeerApps(targetDeviceId = activeTargetId) { apps, err ->
+                isPeerAppsLoading = false
+                peerAppsList = apps
+                peerAppsError = err
             }
         } else if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.SCREEN && connectionState == ConnectionState.CONNECTED) {
             repository.refreshIncomingStreamsOnce()
@@ -265,16 +353,18 @@ fun SnowApp(
     }
 
     // Lifecycle-aware 3s auto-refresh ticker when Activity is STARTED/resumed
-    LaunchedEffect(lifecycleOwner, connectionState, currentTab, currentToolSubTab, currentPcPath) {
+    LaunchedEffect(lifecycleOwner, connectionState, currentTab, currentToolSubTab, activeBrowsePath, targetDeviceType, activeTargetId) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 repository.refreshPhoneTelemetry()
                 if (connectionState == ConnectionState.CONNECTED) {
-                    repository.queryPcStatus()
+                    if (targetDeviceType != TargetDeviceType.ANDROID_PEER) {
+                        repository.queryPcStatus()
+                    }
                     repository.fetchClipboardBuffer()
                     repository.refreshPendingApprovals()
                     if (currentTab == SnowTab.TOOLS && currentToolSubTab == ToolSubTab.FILES) {
-                        repository.listPcDirectory(currentPcPath) { files, _ ->
+                        repository.listPeerDirectory(path = activeBrowsePath, targetDeviceId = activeTargetId) { files, _ ->
                             if (files != null) pcFilesList = files
                         }
                     }
@@ -420,7 +510,7 @@ fun SnowApp(
                                 }
                             },
                             onRingPhone = {
-                                repository.ringPeerPhone { success, err ->
+                                repository.ringPeerPhone(targetDeviceId = activeTargetId) { success, err ->
                                     Toast.makeText(context, if (success) "Ringing peer phone..." else "Ring failed: $err", Toast.LENGTH_SHORT).show()
                                 }
                             },
@@ -440,7 +530,11 @@ fun SnowApp(
                                     }
                                     "terminal" -> {
                                         currentTab = SnowTab.TOOLS
-                                        currentToolSubTab = ToolSubTab.TERMINAL
+                                        currentToolSubTab = if (targetDeviceType == TargetDeviceType.ANDROID_PEER) {
+                                            ToolSubTab.FILES
+                                        } else {
+                                            ToolSubTab.TERMINAL
+                                        }
                                     }
                                     "media_screen" -> {
                                         currentTab = SnowTab.TOOLS
@@ -500,12 +594,18 @@ fun SnowApp(
                             autoSyncScreenshots = autoSyncScreenshots,
                             isRefreshing = isHomeRefreshing,
                             busyClipboardItemId = busyClipboardItemId,
+                            activeTransfers = activeTransfers,
+                            onCancelTransferById = { transferId -> repository.cancelTransfer(transferId) },
+                            onDismissTransferById = { transferId -> repository.dismissTransfer(transferId) },
+                            targetDeviceType = targetDeviceType,
                             onRefresh = {
                                 isHomeRefreshing = true
                                 repository.refreshPhoneTelemetry()
                                 if (connectionState == ConnectionState.CONNECTED) {
-                                    repository.queryPcStatus()
-                                    repository.refreshDesktopWallpaper()
+                                    if (targetDeviceType != TargetDeviceType.ANDROID_PEER) {
+                                        repository.queryPcStatus()
+                                        repository.refreshDesktopWallpaper()
+                                    }
                                     repository.fetchClipboardBuffer()
                                 }
                                 scope.launch {
@@ -525,7 +625,8 @@ fun SnowApp(
                             activeHost = activeHostFromEndpoint,
                             federationGrants = federationGrantsList,
                             onConnectDevice = { dev: SavedDevice ->
-                                repository.connect(dev.host, dev.port)
+                                repository.selectTargetDevice(dev.deviceId)
+                                repository.connect(dev.host, dev.port, targetDeviceId = dev.deviceId)
                             },
                             onDisconnectDevice = {
                                 repository.disconnect()
@@ -551,7 +652,8 @@ fun SnowApp(
                                 }
                             },
                             onPairDiscoveredPeer = { peer ->
-                                repository.connect(peer.ipAddress, peer.port)
+                                repository.selectTargetDevice(peer.deviceId)
+                                repository.connect(peer.ipAddress, peer.port, targetDeviceId = peer.deviceId)
                             },
                             canShareCode = shareCodeAvailability.allowed,
                             shareCodeDisabledReason = shareCodeAvailability.reason,
@@ -624,7 +726,7 @@ fun SnowApp(
                             onOpenConnectSheet = { showConnectSheet = true },
                             generatedFederationInvite = generatedFederationCode,
                             onDismissFederationInvite = { generatedFederationCode = null },
-                            isConnected = SnowUiRepository.isSessionTrulyConnected(connectionState, authState) || peerHostState.isActive,
+                            isConnected = isTrulyConnected || peerHostState.isActive,
                             autoConnectNearby = autoConnectNearby,
                             onToggleAutoConnect = { checked ->
                                 autoConnectNearby = checked
@@ -655,13 +757,18 @@ fun SnowApp(
                         ToolsScreen(
                             currentSubTab = currentToolSubTab,
                             onSubTabChanged = { currentToolSubTab = it },
+                            targetDeviceType = targetDeviceType,
                             safFolderUri = safFolderUri,
                             filesList = pcFilesList,
-                            currentPath = currentPcPath,
+                            currentPath = activeBrowsePath,
                             onChangeSafFolder = onPickSafFolder,
                             onNavigatePath = { newPath ->
-                                currentPcPath = newPath
-                                repository.listPcDirectory(newPath) { files, _ ->
+                                if (targetDeviceType == TargetDeviceType.ANDROID_PEER) {
+                                    currentPeerPath = newPath
+                                } else {
+                                    currentPcPath = newPath
+                                }
+                                repository.listPeerDirectory(path = newPath, targetDeviceId = activeTargetId) { files, _ ->
                                     if (files != null) pcFilesList = files
                                 }
                             },
@@ -672,7 +779,7 @@ fun SnowApp(
                             isFilesRefreshing = isFilesRefreshing,
                             onRefreshFiles = {
                                 isFilesRefreshing = true
-                                repository.listPcDirectory(currentPcPath) { files, _ ->
+                                repository.listPeerDirectory(path = activeBrowsePath, targetDeviceId = activeTargetId) { files, _ ->
                                     if (files != null) pcFilesList = files
                                     isFilesRefreshing = false
                                 }
@@ -680,9 +787,29 @@ fun SnowApp(
                             activeTransfer = activeTransfer,
                             onCancelTransfer = { repository.cancelActiveTransfer() },
                             onDismissTransfer = { repository.dismissActiveTransfer() },
+                            activeTransfers = activeTransfers,
+                            onCancelTransferById = { transferId -> repository.cancelTransfer(transferId) },
+                            onDismissTransferById = { transferId -> repository.dismissTransfer(transferId) },
                             allowlistedApps = AppLauncherBottomSheet.ALLOWLISTED_WINDOWS_APPS,
                             onLaunchApp = { target, friendlyName ->
                                 repository.launchWindowsApp(target) { success, err ->
+                                    Toast.makeText(context, if (success) "Launched $friendlyName" else "Launch failed: $err", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            peerApps = peerAppsList,
+                            isPeerAppsLoading = isPeerAppsLoading,
+                            peerAppsError = peerAppsError,
+                            onRefreshPeerApps = {
+                                isPeerAppsLoading = true
+                                peerAppsError = null
+                                repository.listPeerApps(targetDeviceId = activeTargetId) { apps, err ->
+                                    isPeerAppsLoading = false
+                                    peerAppsList = apps
+                                    peerAppsError = err
+                                }
+                            },
+                            onLaunchPeerApp = { target, friendlyName ->
+                                repository.launchPeerApp(target = target, targetDeviceId = activeTargetId) { success, err ->
                                     Toast.makeText(context, if (success) "Launched $friendlyName" else "Launch failed: $err", Toast.LENGTH_SHORT).show()
                                 }
                             },
@@ -713,6 +840,16 @@ fun SnowApp(
                             onSendMediaVolume = { vol ->
                                 repository.sendMediaKey("volume_set", vol) { success, err ->
                                     if (!success) Toast.makeText(context, "Volume set failed: $err", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onSendPeerMediaCommand = { cmd ->
+                                repository.sendPeerMediaCommand(action = cmd, targetDeviceId = activeTargetId) { success, err ->
+                                    if (!success) Toast.makeText(context, "Media command failed: $err", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onRingPeerPhone = {
+                                repository.ringPeerPhone(targetDeviceId = activeTargetId) { success, err ->
+                                    Toast.makeText(context, if (success) "Ringing peer phone..." else "Ring failed: $err", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             cameraDelivery = cameraDelivery,
@@ -884,9 +1021,16 @@ fun SnowApp(
                     localSnowId = repository.canonicalSnowId,
                     peerHostActive = peerHostState.isActive,
                     pairedDevices = savedDevices,
-                    activeDeviceHost = repository.currentTargetHost,
+                    activeDeviceHost = activeDevice?.host?.ifBlank { null } ?: repository.currentTargetHost,
                     onSelectDevice = { dev: SavedDevice ->
-                        repository.connect(dev.host, dev.port)
+                        repository.selectTargetDevice(dev.deviceId)
+                        val alreadyLive = connectedPeerSessions.values.any { sess ->
+                            sess.deviceId.equals(dev.deviceId, ignoreCase = true) ||
+                                (!dev.snowId.isNullOrBlank() && sess.snowId.equals(dev.snowId, ignoreCase = true))
+                        }
+                        if (!alreadyLive && dev.host.isNotBlank() && dev.port > 0) {
+                            repository.connect(dev.host, dev.port, targetDeviceId = dev.deviceId)
+                        }
                     },
                     onJoinAnotherNetwork = {
                         showConnectSheet = true
@@ -988,6 +1132,28 @@ fun SnowApp(
                             } else {
                                 connectErrorMessage = msg
                             }
+                        }
+                    },
+                    onConnectSnowIdStep1 = { target, callback ->
+                        isConnectingByInput = true
+                        connectErrorMessage = null
+                        repository.connectSnowIdStep1(target) { result ->
+                            isConnectingByInput = false
+                            if (result is SnowIdStep1Result.AlreadyConnected) {
+                                Toast.makeText(context, result.message, Toast.LENGTH_SHORT).show()
+                            }
+                            callback(result)
+                        }
+                    },
+                    onConnectSnowIdStep2 = { snowId, pin, callback ->
+                        isConnectingByInput = true
+                        connectErrorMessage = null
+                        repository.connectSnowIdStep2WithPin(snowId, pin) { success, msg, remainingAttempts ->
+                            isConnectingByInput = false
+                            if (success) {
+                                Toast.makeText(context, msg ?: "Connected successfully", Toast.LENGTH_SHORT).show()
+                            }
+                            callback(success, msg, remainingAttempts)
                         }
                     },
                     mySnowId = repository.permanentDeviceSnowId.collectAsState().value.ifBlank { repository.canonicalSnowId },

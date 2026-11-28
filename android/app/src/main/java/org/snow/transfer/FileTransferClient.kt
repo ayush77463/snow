@@ -30,7 +30,6 @@ import java.io.InputStream
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -62,7 +61,15 @@ open class FileTransferClient(
     @Volatile
     var fallbackTargetProvider: (suspend (failedHost: String, failedRoute: org.snow.network.TransportRoute) -> Pair<String, Int>?)? = null
     @Volatile
+    var targetHostTokenLookup: ((serverHost: String) -> String?)? = null
+    @Volatile
+    var targetHostDeviceLookup: ((serverHost: String) -> String?)? = null
+    @Volatile
+    var onTransferSessionStarted: ((transferId: String, fileName: String, direction: String, serverHost: String) -> Unit)? = null
+    @Volatile
     var maxRelayTransferBytes: Long = DEFAULT_MAX_RELAY_TRANSFER_BYTES
+    private val hasCustomClient: Boolean = customClient != null
+    private val perDeviceClients = ConcurrentHashMap<String, OkHttpClient>()
 
     companion object {
         const val TAG = "FileTransferClient"
@@ -185,21 +192,23 @@ open class FileTransferClient(
     private val httpClient: OkHttpClient = customClient ?: buildHttpClient()
     private val activeCall = AtomicReference<Call?>(null)
     private val activeCallsById = ConcurrentHashMap<String, Call>()
-    private val transferCancelled = AtomicBoolean(false)
+    private val activeTransferIds = ConcurrentHashMap.newKeySet<String>()
     private val cancelledIds = ConcurrentHashMap.newKeySet<String>()
 
     /**
      * Cancel any active in-flight HTTP file upload or download immediately.
      */
     fun cancelActiveTransfer() {
-        transferCancelled.set(true)
         activeCall.getAndSet(null)?.cancel()
+        val idsSnapshot = (activeTransferIds.toList() + activeCallsById.keys.toList()).distinct()
+        idsSnapshot.forEach { id -> cancelledIds.add(id) }
         activeCallsById.values.forEach { it.cancel() }
         activeCallsById.clear()
+        activeTransferIds.clear()
     }
 
     /**
-     * Cancel a specific transfer by ID without disturbing unrelated transfers.
+     * Cancel a specific transfer by ID without disturbing concurrent unrelated transfers.
      */
     fun cancelTransfer(transferId: String?) {
         val cleanId = transferId?.trim().orEmpty()
@@ -208,11 +217,12 @@ open class FileTransferClient(
             return
         }
         cancelledIds.add(cleanId)
+        activeTransferIds.remove(cleanId)
         activeCallsById.remove(cleanId)?.cancel()
     }
 
     private fun isCancelledFor(transferId: String?): Boolean {
-        if (transferCancelled.get() || Thread.currentThread().isInterrupted) return true
+        if (Thread.currentThread().isInterrupted) return true
         val cleanId = transferId?.trim().orEmpty()
         return cleanId.isNotEmpty() && cancelledIds.contains(cleanId)
     }
@@ -262,7 +272,7 @@ open class FileTransferClient(
         transferId: String
     ): Long? {
         val url = "${getBaseUrl(serverHost, transferPort)}/api/v1/transfers/upload/$transferId/status"
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val req = Request.Builder()
             .url(url)
             .addHeader("Authorization", "Bearer $token")
@@ -270,7 +280,7 @@ open class FileTransferClient(
             .get()
             .build()
         return try {
-            httpClient.newCall(req).execute().use { resp ->
+            clientForHost(serverHost).newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return null
                 val json = JSONObject(resp.body?.string() ?: "{}")
                 json.optLong("current_offset", 0L).coerceAtLeast(0L)
@@ -300,7 +310,32 @@ open class FileTransferClient(
         return builder.build()
     }
 
-    private fun getAuthToken(): String? {
+    private fun clientForHost(serverHost: String?): OkHttpClient {
+        val cleanHost = serverHost?.trim()?.takeIf { it.isNotEmpty() } ?: return httpClient
+        if (hasCustomClient || !useTls) return httpClient
+        val resolvedDevId = targetHostDeviceLookup?.invoke(cleanHost)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: return httpClient
+        val currentDefaultId = targetDeviceIdProvider?.invoke()?.trim()
+        if (resolvedDevId.equals(currentDefaultId, ignoreCase = true)) {
+            return httpClient
+        }
+        return perDeviceClients.computeIfAbsent(resolvedDevId) { devId ->
+            val storage = certPinStorage ?: EncryptedCertPinStorage(context)
+            val idProvider: () -> String? = { devId }
+            val trustManager = SnowTrustManager(pinStorage = storage, targetDeviceIdProvider = idProvider)
+            val sslContext = TlsConfig.createSslContext(trustManager)
+            httpClient.newBuilder()
+                .sslSocketFactory(sslContext.socketFactory, trustManager)
+                .hostnameVerifier(TlsConfig.createHostnameVerifier(storage, idProvider))
+                .build()
+        }
+    }
+
+    private fun getAuthToken(serverHost: String? = null): String? {
+        val cleanHost = serverHost?.trim()?.takeIf { it.isNotEmpty() }
+        if (cleanHost != null) {
+            targetHostTokenLookup?.invoke(cleanHost)?.takeIf { it.isNotBlank() }?.let { return it }
+        }
         val storage = tokenStorage ?: return null
         val targetId = targetDeviceIdProvider?.invoke()?.trim()?.takeIf { it.isNotEmpty() }
         if (targetId != null) {
@@ -335,7 +370,7 @@ open class FileTransferClient(
             put("sha256", sha256)
         }.toString()
 
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val request = Request.Builder()
             .url(url)
             .addHeader("Authorization", "Bearer $token")
@@ -344,7 +379,7 @@ open class FileTransferClient(
             .build()
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            clientForHost(serverHost).newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     SafeLog.w(TAG, "Duplicate check failed with HTTP ${response.code}")
                     return@withContext DuplicateCheckResult(false, false, null)
@@ -384,7 +419,7 @@ open class FileTransferClient(
             put("direction", direction)
         }.toString()
 
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val request = Request.Builder()
             .url(url)
             .addHeader("Authorization", "Bearer $token")
@@ -393,7 +428,7 @@ open class FileTransferClient(
             .build()
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            clientForHost(serverHost).newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     SafeLog.w(TAG, "Transfer initialization failed: HTTP ${response.code}")
                     return@withContext null
@@ -445,8 +480,9 @@ open class FileTransferClient(
         val transferId = init.first
         var resumeOffset = init.second
 
-        transferCancelled.set(false)
+        activeTransferIds.add(transferId)
         cancelledIds.remove(transferId)
+        onTransferSessionStarted?.invoke(transferId, fileName, "UPLOAD", activeHost)
 
         var activeRoute = initialRoute
         var activeBadge = initialBadge
@@ -522,7 +558,7 @@ open class FileTransferClient(
                     }
                 }
 
-                val token = getAuthToken() ?: ""
+                val token = getAuthToken(activeHost) ?: ""
                 val reqBuilder = Request.Builder()
                     .url(uploadUrl)
                     .addHeader("Authorization", "Bearer $token")
@@ -537,7 +573,7 @@ open class FileTransferClient(
                 }
 
                 val request = reqBuilder.post(requestBody).build()
-                val call = httpClient.newCall(request)
+                val call = clientForHost(activeHost).newCall(request)
                 activeCall.set(call)
                 activeCallsById[transferId] = call
 
@@ -592,6 +628,7 @@ open class FileTransferClient(
             }
             lastError ?: TransferResult.Error(transferId, "Upload failed after retries.")
         } finally {
+            activeTransferIds.remove(transferId)
             transportOrchestrator?.unpinTransfer(transferId)
         }
     }
@@ -626,8 +663,9 @@ open class FileTransferClient(
         val transferId = init.first
         var resumeOffset = init.second
 
-        transferCancelled.set(false)
+        activeTransferIds.add(transferId)
         cancelledIds.remove(transferId)
+        onTransferSessionStarted?.invoke(transferId, fileName, "UPLOAD", serverHost)
 
         val peerKey = targetDeviceIdProvider?.invoke()?.takeIf { it.isNotBlank() } ?: serverHost
         transportOrchestrator?.pinTransfer(transferId, peerKey, initialRoute, serverHost, transferPort)
@@ -689,7 +727,7 @@ open class FileTransferClient(
                 }
             }
 
-            val token = getAuthToken() ?: ""
+            val token = getAuthToken(serverHost) ?: ""
             val reqBuilder = Request.Builder()
                 .url(uploadUrl)
                 .addHeader("Authorization", "Bearer $token")
@@ -703,7 +741,7 @@ open class FileTransferClient(
             }
 
             val request = reqBuilder.post(requestBody).build()
-            val call = httpClient.newCall(request)
+            val call = clientForHost(serverHost).newCall(request)
             activeCall.set(call)
             activeCallsById[transferId] = call
 
@@ -759,6 +797,7 @@ open class FileTransferClient(
         }
         lastError ?: TransferResult.Error(transferId, "Upload failed after retries.")
         } finally {
+            activeTransferIds.remove(transferId)
             transportOrchestrator?.unpinTransfer(transferId)
         }
     }
@@ -779,8 +818,9 @@ open class FileTransferClient(
         val partFile = File(destinationFile.parentFile, "${destinationFile.name}.part")
         destinationFile.parentFile?.mkdirs()
 
-        transferCancelled.set(false)
+        activeTransferIds.add(transferId)
         cancelledIds.remove(transferId)
+        onTransferSessionStarted?.invoke(transferId, destinationFile.name, "DOWNLOAD", serverHost)
 
         var activeHost = serverHost
         var activePort = transferPort
@@ -821,7 +861,7 @@ open class FileTransferClient(
                 val baseUrl = getBaseUrl(activeHost, activePort)
                 val downloadUrl = "$baseUrl/api/v1/transfers/download/$transferId"
                 val resumeOffset = if (resume && partFile.exists()) partFile.length() else 0L
-                val token = getAuthToken() ?: ""
+                val token = getAuthToken(activeHost) ?: ""
                 val reqBuilder = Request.Builder()
                     .url(downloadUrl)
                     .addHeader("Authorization", "Bearer $token")
@@ -833,7 +873,7 @@ open class FileTransferClient(
                 }
 
             val request = reqBuilder.get().build()
-            val call = httpClient.newCall(request)
+            val call = clientForHost(activeHost).newCall(request)
             activeCall.set(call)
             activeCallsById[transferId] = call
 
@@ -990,6 +1030,7 @@ open class FileTransferClient(
         }
         lastError ?: TransferResult.Error(transferId, "Download failed after retries.")
         } finally {
+            activeTransferIds.remove(transferId)
             transportOrchestrator?.unpinTransfer(transferId)
         }
     }
@@ -1035,7 +1076,7 @@ open class FileTransferClient(
     ): Boolean = withContext(Dispatchers.IO) {
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val url = "$baseUrl/api/v1/screen/frame"
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val mediaType = "image/jpeg".toMediaType()
         val reqBody = frameBytes.toRequestBody(mediaType)
         val reqBuilder = Request.Builder()
@@ -1060,7 +1101,7 @@ open class FileTransferClient(
         val request = reqBuilder.post(reqBody).build()
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            clientForHost(serverHost).newCall(request).execute().use { response ->
                 response.isSuccessful
             }
         } catch (e: Exception) {
@@ -1078,7 +1119,7 @@ open class FileTransferClient(
     ): List<ScreenSenderInfo> = withContext(Dispatchers.IO) {
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val url = "$baseUrl/api/v1/screen/senders"
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val req = Request.Builder()
             .url(url)
             .get()
@@ -1086,7 +1127,7 @@ open class FileTransferClient(
             .addHeader("X-Snow-Device-Id", deviceId)
             .build()
         try {
-            httpClient.newCall(req).execute().use { resp ->
+            clientForHost(serverHost).newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@withContext emptyList()
                 val raw = resp.body?.string() ?: return@withContext emptyList()
                 val obj = JSONObject(raw)
@@ -1128,7 +1169,7 @@ open class FileTransferClient(
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val suffix = if (!senderId.isNullOrBlank()) "?sender_id=${java.net.URLEncoder.encode(senderId, "UTF-8")}" else ""
         val url = "$baseUrl/api/v1/screen/frame$suffix"
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val req = Request.Builder()
             .url(url)
             .get()
@@ -1136,7 +1177,7 @@ open class FileTransferClient(
             .addHeader("X-Snow-Device-Id", deviceId)
             .build()
         try {
-            httpClient.newCall(req).execute().use { resp ->
+            clientForHost(serverHost).newCall(req).execute().use { resp ->
                 if (resp.code != 200) return@withContext null
                 val bytes = resp.body?.bytes() ?: return@withContext null
                 if (bytes.isEmpty() || bytes.size > 524288) return@withContext null
@@ -1165,7 +1206,7 @@ open class FileTransferClient(
     ): Boolean = withContext(Dispatchers.IO) {
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val url = "$baseUrl/api/v1/screen/subscribe"
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val body = JSONObject().put("action", if (subscribe) "subscribe" else "unsubscribe").toString()
             .toRequestBody(JSON_MEDIA_TYPE)
         val req = Request.Builder()
@@ -1175,7 +1216,7 @@ open class FileTransferClient(
             .addHeader("X-Snow-Device-Id", deviceId)
             .build()
         try {
-            httpClient.newCall(req).execute().use { it.isSuccessful }
+            clientForHost(serverHost).newCall(req).execute().use { it.isSuccessful }
         } catch (_: Exception) {
             false
         }
@@ -1190,7 +1231,7 @@ open class FileTransferClient(
     ): Boolean = withContext(Dispatchers.IO) {
         val baseUrl = getBaseUrl(serverHost, transferPort)
         val url = "$baseUrl/api/v1/screen/stop"
-        val token = getAuthToken() ?: ""
+        val token = getAuthToken(serverHost) ?: ""
         val emptyBody = "".toRequestBody(JSON_MEDIA_TYPE)
         val request = Request.Builder()
             .url(url)
@@ -1200,7 +1241,7 @@ open class FileTransferClient(
             .build()
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            clientForHost(serverHost).newCall(request).execute().use { response ->
                 response.isSuccessful
             }
         } catch (e: Exception) {
@@ -1225,7 +1266,7 @@ open class FileTransferClient(
             .get()
             .addHeader("X-Snow-Device-Id", deviceId)
 
-        val token = getAuthToken()
+        val token = getAuthToken(serverHost)
         if (!token.isNullOrBlank()) {
             reqBuilder.addHeader("Authorization", "Bearer $token")
         }
@@ -1234,7 +1275,7 @@ open class FileTransferClient(
         }
 
         try {
-            httpClient.newCall(reqBuilder.build()).execute().use { response ->
+            clientForHost(serverHost).newCall(reqBuilder.build()).execute().use { response ->
                 val etag = response.header("ETag")
                 if (response.code == 304) {
                     return@withContext WallpaperResult.NotModified
@@ -1266,13 +1307,13 @@ open class FileTransferClient(
             .get()
             .addHeader("X-Snow-Device-Id", deviceId)
 
-        val token = getAuthToken()
+        val token = getAuthToken(serverHost)
         if (!token.isNullOrBlank()) {
             reqBuilder.addHeader("Authorization", "Bearer $token")
         }
 
         try {
-            httpClient.newCall(reqBuilder.build()).execute().use { response ->
+            clientForHost(serverHost).newCall(reqBuilder.build()).execute().use { response ->
                 if (!response.isSuccessful) {
                     return@withContext Result.failure(Exception("Update info request failed with HTTP ${response.code}"))
                 }
@@ -1310,7 +1351,7 @@ open class FileTransferClient(
             .get()
             .addHeader("X-Snow-Device-Id", deviceId)
 
-        val token = getAuthToken()
+        val token = getAuthToken(serverHost)
         if (!token.isNullOrBlank()) {
             reqBuilder.addHeader("Authorization", "Bearer $token")
         }
@@ -1320,7 +1361,7 @@ open class FileTransferClient(
         if (tempFile.exists()) tempFile.delete()
 
         try {
-            httpClient.newCall(reqBuilder.build()).execute().use { response ->
+            clientForHost(serverHost).newCall(reqBuilder.build()).execute().use { response ->
                 if (!response.isSuccessful) {
                     return@withContext Result.failure(Exception("APK download failed with HTTP ${response.code}"))
                 }

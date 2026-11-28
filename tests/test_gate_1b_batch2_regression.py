@@ -265,9 +265,12 @@ class TestF16DashboardMetadataAndWorkflows(unittest.TestCase):
     def test_index_html_has_connect_peer_card(self):
         html_path = Path(__file__).parent.parent / "src" / "snow" / "web" / "static" / "index.html"
         html_text = html_path.read_text(encoding="utf-8")
-        self.assertIn("Connect to Peer Host", html_text)
-        self.assertIn("connect-peer-host", html_text)
-        self.assertIn("btn-connect-peer-submit", html_text)
+        self.assertIn("Connect Device or Network", html_text)
+        self.assertIn("modal-connect-input", html_text)
+        self.assertIn("btn-modal-connect-submit", html_text)
+        self.assertIn("modal-step2-container", html_text)
+        self.assertIn("btn-modal-verify-pin", html_text)
+        self.assertNotIn("connect-advanced-accordion", html_text)
 
 
 class TestF17RemoteClipboardImageTransfer(unittest.IsolatedAsyncioTestCase):

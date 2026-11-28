@@ -55,7 +55,10 @@ class TestMilestone3AWebUiStructure(unittest.TestCase):
         self.assertGreater(dev_list_pos, 0)
         self.assertGreater(net_info_pos, dev_list_pos)
         self.assertGreater(connect_pos, net_info_pos)
-        self.assertIn('id="paste-qr-json-accordion"', devices_html)
+        self.assertIn('id="pairing-step1-container"', devices_html)
+        self.assertIn('id="pairing-step2-container"', devices_html)
+        self.assertNotIn('id="paste-qr-json-accordion"', devices_html)
+        self.assertNotIn('id="connect-advanced-accordion"', self.html)
         self.assertNotIn("Fingerprint:", devices_html)
 
         # Remote Access lives in AI & Settings without "Handled automatically"
